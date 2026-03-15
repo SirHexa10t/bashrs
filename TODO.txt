@@ -1,0 +1,4 @@
+Reimplement the bashrc commands in my other repo
+
+Copy over the TODOs
+
