@@ -1,31 +1,13 @@
-mod commands;
-
-use clap::{Parser, Subcommand};
+use clap::Parser;
+use bashrs::enums::{Command, Run};
 
 #[derive(Parser)]
-#[command(name = "bashrs", about = "Shell utilities")]
+#[command(name = "bashrs", about = "Rust-based bashrc")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
-#[derive(Subcommand)]
-enum Command {
-    /// Print a greeting
-    Hello {
-        #[arg(default_value = "World")]
-        name: String,
-    },
-    /// Print export statement for HISTTIMEFORMAT
-    Histfmt {
-        #[arg(default_value = "%F_%T  ")]
-        fmt: String,
-    },
-}
-
 fn main() {
-    match Cli::parse().command {
-        Command::Hello { name }  => println!("Hello, {}!", name),
-        Command::Histfmt { fmt } => println!("export HISTTIMEFORMAT=\"{}\"", fmt),
-    }
+    Cli::parse().command.run();
 }
