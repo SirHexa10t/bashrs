@@ -1,20 +1,11 @@
-
 [package]
 name = "bashrs"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "bashrs"
-path = "src/main.rs"
-
-[[bin]]
-name = "generate_sourceable"
-path = "src/bin/generate_sourceable.rs"
+[workspace]
+members = ["macros"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-strum = "0.28.0"
-strum_macros = "0.28.0"
-serde = { version = "1.0.228", features = ["derive"] }
-enum_dispatch = "0.3.13"
+bashrs-macros = { path = "macros" }
