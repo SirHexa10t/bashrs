@@ -31,6 +31,8 @@ use syn::{
 /// - `#[unprefixed]` — expose it under its bare name only (no prefix).
 /// - `#[prefixed] #[unprefixed]` — expose it under both names.
 /// - `#[name("cmd")]` — give it this exact name, overriding the prefix logic.
+/// - `#[alias("cmd")]` — add a visible alias (repeatable); e.g. `recho` gains `echor`,
+///   so the command also completes after typing `echo`.
 /// - `#[after("cmd")]` — append `&& cmd` to the generated shell wrapper, e.g.
 ///   `#[after("exec bash")]` to restart the shell after the command runs.
 ///
@@ -118,31 +120,31 @@ fn expand(args: CategoryArgs, module: ItemMod) -> syn::Result<TokenStream2> {
         }
 
         let arg_ty = command_arg_type(&func)?;
-        let CommandAttrs { docs, prefixed, unprefixed, after, name: custom_name } =
+        let CommandAttrs { docs, prefixed, unprefixed, after, name: custom_name, aliases } =
             take_command_attrs(&mut func.attrs)?;
 
         let variant = format_ident!("{}", to_pascal_case(&fn_name));
         let fn_ident = func.sig.ident.clone();
 
-        // An explicit `#[name("…")]` wins outright. Otherwise the command is prefixed
-        // by default; `#[unprefixed]` drops the prefix, and `#[prefixed] #[unprefixed]`
-        // together expose both the prefixed name and a bare alias.
+        // An explicit `#[name("…")]` wins outright. Otherwise the command is prefixed by
+        // default; `#[unprefixed]` drops the prefix, and `#[prefixed] #[unprefixed]`
+        // together expose the prefixed name plus the bare name as a visible alias.
+        // `#[alias("…")]` adds further visible aliases in any case.
         let emit_prefixed = prefixed || !unprefixed;
-        let (name, command_attr) = match custom_name {
-            Some(name) => {
-                let attr = quote!(#[command(name = #name)]);
-                (name, attr)
-            }
+        let mut visible_aliases = aliases;
+        let name = match custom_name {
+            Some(name) => name,
             None if emit_prefixed && unprefixed => {
-                let name = format!("{prefix}{fn_name}");
-                let attr = quote!(#[command(name = #name, visible_alias = #fn_name)]);
-                (name, attr)
+                visible_aliases.insert(0, fn_name.clone());
+                format!("{prefix}{fn_name}")
             }
-            None => {
-                let name = if emit_prefixed { format!("{prefix}{fn_name}") } else { fn_name.clone() };
-                let attr = quote!(#[command(name = #name)]);
-                (name, attr)
-            }
+            None if emit_prefixed => format!("{prefix}{fn_name}"),
+            None => fn_name.clone(),
+        };
+        let command_attr = if visible_aliases.is_empty() {
+            quote!(#[command(name = #name)])
+        } else {
+            quote!(#[command(name = #name, visible_aliases = [#(#visible_aliases),*])])
         };
 
         if let Some(after) = after {
@@ -224,14 +226,22 @@ struct CommandAttrs {
     after: Option<String>,
     /// `#[name("…")]` — an explicit clap name, overriding the prefix/bare logic.
     name: Option<String>,
+    /// `#[alias("…")]` — extra visible aliases (repeatable).
+    aliases: Vec<String>,
 }
 
 /// Split a command function's attributes into [`CommandAttrs`]. The `prefixed` /
-/// `unprefixed` / `after` helper attributes are consumed (not re-emitted);
-/// everything else (including docs) stays on the function.
+/// `unprefixed` / `after` / `name` / `alias` helper attributes are consumed (not
+/// re-emitted); everything else (including docs) stays on the function.
 fn take_command_attrs(attrs: &mut Vec<Attribute>) -> syn::Result<CommandAttrs> {
-    let mut parsed =
-        CommandAttrs { docs: Vec::new(), prefixed: false, unprefixed: false, after: None, name: None };
+    let mut parsed = CommandAttrs {
+        docs: Vec::new(),
+        prefixed: false,
+        unprefixed: false,
+        after: None,
+        name: None,
+        aliases: Vec::new(),
+    };
     let mut kept = Vec::new();
     for attr in std::mem::take(attrs) {
         if attr.path().is_ident("doc") {
@@ -245,6 +255,8 @@ fn take_command_attrs(attrs: &mut Vec<Attribute>) -> syn::Result<CommandAttrs> {
             parsed.after = Some(attr.parse_args::<syn::LitStr>()?.value());
         } else if attr.path().is_ident("name") {
             parsed.name = Some(attr.parse_args::<syn::LitStr>()?.value());
+        } else if attr.path().is_ident("alias") {
+            parsed.aliases.push(attr.parse_args::<syn::LitStr>()?.value());
         } else {
             kept.push(attr);
         }

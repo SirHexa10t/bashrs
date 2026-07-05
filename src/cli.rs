@@ -4,12 +4,12 @@
 //! builds the sourced shell file (`wrappers`).
 
 use clap::{Parser, Subcommand};
+use crate::categories::autogen_styles::StyleCommand;
 use crate::categories::bashrs::BashrsCommand;
 use crate::categories::comfy_repos::ComfyReposCommand;
 use crate::categories::filesystem::FilesystemCommand;
 use crate::categories::media::MediaCommand;
 use crate::categories::packages::PackagesCommand;
-use crate::categories::style::StyleCommand;
 use crate::shell_conf::{keybinds, session};
 
 /// Exit code a command returns to ask its generated wrapper to run its
