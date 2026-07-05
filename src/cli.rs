@@ -4,12 +4,13 @@
 //! builds the sourced shell file (`wrappers`).
 
 use clap::{Parser, Subcommand};
-use crate::categories::autogen_styles::StyleCommand;
+use crate::categories::autogen_styles::StylizedEchoCommand;
 use crate::categories::bashrs::BashrsCommand;
 use crate::categories::comfy_repos::ComfyReposCommand;
 use crate::categories::filesystem::FilesystemCommand;
 use crate::categories::media::MediaCommand;
 use crate::categories::packages::PackagesCommand;
+use crate::categories::styles::StyleCommand;
 use crate::shell_conf::{keybinds, session};
 
 /// Exit code a command returns to ask its generated wrapper to run its
@@ -39,8 +40,12 @@ pub enum Command {
     ComfyRepos(ComfyReposCommand),
     #[command(flatten)]
     Packages(PackagesCommand),
+    // Two enums, one logical `style` category: hand-written commands (`errcho`) and the
+    // generated `recho` matrix. Both flatten to bare top-level commands.
     #[command(flatten)]
     Style(StyleCommand),
+    #[command(flatten)]
+    StylizedEcho(StylizedEchoCommand),
     /// Emit shell function wrappers for every command (used by COMPILE.sh).
     #[command(hide = true)]
     Generate,
@@ -55,6 +60,7 @@ impl Command {
             Command::ComfyRepos(cmd) => cmd.run(),
             Command::Packages(cmd) => cmd.run(),
             Command::Style(cmd) => cmd.run(),
+            Command::StylizedEcho(cmd) => cmd.run(),
             Command::Generate => print!("{}", wrappers()),
         }
     }
@@ -68,7 +74,10 @@ fn category_commands() -> [(&'static str, clap::Command); 6] {
         ("filesystem", FilesystemCommand::augment_subcommands(clap::Command::new("filesystem"))),
         ("media", MediaCommand::augment_subcommands(clap::Command::new("media"))),
         ("packages", PackagesCommand::augment_subcommands(clap::Command::new("packages"))),
-        ("style", StyleCommand::augment_subcommands(clap::Command::new("style"))),
+        // One `style` group spanning both style enums: hand-written + generated.
+        ("style", StylizedEchoCommand::augment_subcommands(
+            StyleCommand::augment_subcommands(clap::Command::new("style")),
+        )),
         ("comfy_repos", ComfyReposCommand::augment_subcommands(clap::Command::new("comfy_repos"))),
     ]
 }
@@ -82,6 +91,7 @@ fn wrapper_suffix(name: &str) -> Option<&'static str> {
         .or_else(|| MediaCommand::wrapper_suffix(name))
         .or_else(|| PackagesCommand::wrapper_suffix(name))
         .or_else(|| StyleCommand::wrapper_suffix(name))
+        .or_else(|| StylizedEchoCommand::wrapper_suffix(name))
         .or_else(|| ComfyReposCommand::wrapper_suffix(name))
 }
 
@@ -200,9 +210,12 @@ mod tests {
 
     #[test]
     fn style_commands_are_bare_verbs() {
-        // Style commands are intentionally unprefixed (short, memorable echo verbs),
-        // never `style_`-prefixed — the inverse of the usual standard, by design.
-        for name in command_names::<StyleCommand>() {
+        // Style commands — both the hand-written `StyleCommand` and the generated
+        // `StylizedEchoCommand` — are intentionally unprefixed: short, memorable echo
+        // verbs, never `style_`-prefixed. The inverse of the usual standard, by design.
+        let names =
+            command_names::<StyleCommand>().into_iter().chain(command_names::<StylizedEchoCommand>());
+        for name in names {
             assert!(!name.starts_with("style_"), "style command `{name}` should be bare, not prefixed");
         }
     }

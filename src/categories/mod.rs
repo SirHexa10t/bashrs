@@ -7,3 +7,6 @@ pub mod comfy_repos;
 pub mod filesystem;
 pub mod media;
 pub mod packages;
+// Data, not a command category: the style vocabulary, shared with `build.rs` via `include!`.
+pub(crate) mod style_vocab;
+pub mod styles;

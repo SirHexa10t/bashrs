@@ -1,35 +1,26 @@
-//! Colored echo with scoped nesting. A nested color/style restores the enclosing
-//! one when it ends (rather than clearing to the terminal default), and every span
-//! starts from a clean slate so styles don't compound — see `_scoped`. The `recho`
-//! family are bare, memorable verbs (never `style_`-prefixed).
+//! The stylized-echo engine and the generated `recho` command matrix
+//! (`StylizedEchoCommand`). A nested color/style restores the enclosing one when it ends
+//! (rather than clearing to the terminal default), and every span starts from a clean
+//! slate so styles don't compound — see `_scoped`. The `recho` family are bare,
+//! memorable verbs (never `style_`-prefixed).
 //!
 //! Each command names its style by a `[weight, underline, color]` triple; `_wrap`
-//! resolves it against the `WEIGHTS`/`UNDERLINES`/`COLORS` maps.
+//! resolves it against the vocabulary in [`crate::categories::style_vocab`].
 //!
-//! Only the region between the `GENERATED-STYLE-MATRIX` markers is generated —
-//! regenerate it after editing the lists in `tests/style_matrix.rs` with:
-//!   `cargo test --test style_matrix regenerate -- --ignored`
-//! Everything outside the markers (the `errcho` command, `EchoArgs`, the helpers, the
-//! tests) is hand-written and untouched by regeneration. Add one-off manual styles
-//! there — e.g. alongside `errcho` — never inside the markers.
+//! Only the region between the `GENERATED-STYLE-MATRIX` markers is generated — `build.rs`
+//! rewrites it from `style_vocab.rs` during the build (when either changes), so it's never
+//! edited by hand. The engine around it (`_wrap`/`_scoped`, `EchoArgs`, `RESET`) is
+//! hand-written. Hand-written *commands* that build on this engine live in
+//! [`crate::categories::styles`] (e.g. `errcho`), not here.
 
-#[bashrs_macros::category(command = StyleCommand, prefix = "style_")]
+#[bashrs_macros::category(command = StylizedEchoCommand, prefix = "style_")]
 mod commands {
     use clap::Args;
+    use crate::categories::style_vocab::{COLORS, UNDERLINES, WEIGHTS};
 
     const RESET: &str = "\x1b[0m";
 
-    /// echo in bold red, to stderr
-    #[unprefixed]
-    pub fn errcho(args: EchoArgs) {
-        eprintln!("{}", _scoped(&_wrap(["bo", "", "r"]), &args.words.join(" ")));
-    }
-
     // GENERATED-STYLE-MATRIX-START
-    // STYLIZED_ECHO_COMMANDS — generated; do not edit (regenerate via COMPILE.sh).
-    const WEIGHTS: &[(&str, &str)] = &[("bo", "1"), ("da", "2")];  // bold / dark
-    const UNDERLINES: &[(&str, &str)] = &[("", ""), ("u", "4")];  // unchanged / underlined
-    const COLORS: &[(&str, &str)] = &[("", ""), ("r", "31"), ("g", "32"), ("b", "34"), ("c", "36"), ("y", "33"), ("or", "38;5;208"), ("w", "37")];  // red / green / blue / cyan / yellow / orange / white
 
     /// echo in bold
     #[unprefixed]
@@ -199,15 +190,15 @@ mod commands {
         pub words: Vec<String>,
     }
 
-    /// The SGR sub-code mapped to `key` in `map` (a `&[(criterion, code)]`), or `""`.
-    fn _lookup(map: &[(&'static str, &'static str)], key: &str) -> &'static str {
-        map.iter().find(|(k, _)| *k == key).map_or("", |(_, v)| *v)
+    /// The SGR sub-code mapped to `key` in `map` (a `&[(criterion, code, word)]`), or `""`.
+    fn _lookup(map: &[(&'static str, &'static str, &'static str)], key: &str) -> &'static str {
+        map.iter().find(|(k, _, _)| *k == key).map_or("", |(_, v, _)| *v)
     }
 
     /// Resolve a `[weight, underline, color]` triple to its full SGR escape by looking
     /// each criterion up in its map and joining the non-empty codes with `;`. e.g.
     /// `["bo", "u", "r"]` → `"\x1b[1;4;31m"`, `["bo", "", ""]` → `"\x1b[1m"`.
-    fn _wrap(criteria: [&str; 3]) -> String {
+    pub(crate) fn _wrap(criteria: [&str; 3]) -> String {
         let [w, u, c] = criteria;
         let sgr = [_lookup(WEIGHTS, w), _lookup(UNDERLINES, u), _lookup(COLORS, c)]
             .into_iter()
@@ -231,7 +222,7 @@ mod commands {
     /// ended), and leave *opening* resets (a reset immediately followed by an SGR) alone.
     /// Both are ordinary ANSI — harmless when not re-processed — so the output renders the
     /// same in a terminal, a pipe, a file, or another `recho`.
-    fn _scoped(codes: &str, text: &str) -> String {
+    pub(crate) fn _scoped(codes: &str, text: &str) -> String {
         let mut out = format!("{RESET}{codes}"); // open: clean start + this style
         let mut rest = text;
         while let Some(i) = rest.find(RESET) {
