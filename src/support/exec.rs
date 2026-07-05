@@ -43,6 +43,28 @@ where
         .is_ok_and(|status| status.success())
 }
 
+/// Run `program` with `args`, capturing stdout for post-processing; the program's own
+/// stderr passes straight through to the user. Returns `Some(stdout)` on success, or
+/// `None` on a non-zero exit or a spawn failure (the latter with a diagnostic).
+pub(crate) fn capture_stdout<I, S>(program: &str, args: I) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    match Command::new(program).args(args).output() {
+        Ok(out) => {
+            if !out.stderr.is_empty() {
+                eprint!("{}", String::from_utf8_lossy(&out.stderr));
+            }
+            out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        }
+        Err(err) => {
+            eprintln!("could not run {program}: {err}");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +85,12 @@ mod tests {
         assert!(succeeds_quietly("true", &[] as &[&str]));
         assert!(!succeeds_quietly("false", &[] as &[&str]));
         assert!(!succeeds_quietly("bashrs_no_such_program_xyz", &[] as &[&str]));
+    }
+
+    #[test]
+    fn capture_stdout_returns_output_on_success_and_none_on_failure() {
+        assert_eq!(capture_stdout("echo", ["hello"]).as_deref(), Some("hello\n"));
+        assert_eq!(capture_stdout("false", &[] as &[&str]), None);
+        assert_eq!(capture_stdout("bashrs_no_such_program_xyz", &[] as &[&str]), None);
     }
 }
