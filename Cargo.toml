@@ -9,3 +9,4 @@ members = ["macros"]
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 bashrs-macros = { path = "macros" }
+table_formatter = { git = "https://github.com/SirHexa10t/table_formatter.git", branch = "main" }

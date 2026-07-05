@@ -1,7 +1,9 @@
+pub mod comfy_repos;
 pub mod filesystem;
 pub mod media;
 
 use clap::{Parser, Subcommand};
+use comfy_repos::ComfyReposCommand;
 use filesystem::FilesystemCommand;
 use media::MediaCommand;
 
@@ -20,6 +22,8 @@ pub enum Command {
     Filesystem(FilesystemCommand),
     #[command(flatten)]
     Media(MediaCommand),
+    #[command(flatten)]
+    ComfyRepos(ComfyReposCommand),
     /// Emit shell function wrappers for every command (used by COMPILE.sh).
     #[command(hide = true)]
     Generate,
@@ -30,6 +34,7 @@ impl Command {
         match self {
             Command::Filesystem(cmd) => cmd.run(),
             Command::Media(cmd) => cmd.run(),
+            Command::ComfyRepos(cmd) => cmd.run(),
             Command::Generate => print!("{}", wrappers()),
         }
     }
@@ -37,10 +42,11 @@ impl Command {
 
 /// The command categories, each paired with the label used to group them in the
 /// generated `functions.sh`. One row per category — never per command.
-fn category_commands() -> [(&'static str, clap::Command); 2] {
+fn category_commands() -> [(&'static str, clap::Command); 3] {
     [
         ("filesystem", FilesystemCommand::augment_subcommands(clap::Command::new("filesystem"))),
         ("media", MediaCommand::augment_subcommands(clap::Command::new("media"))),
+        ("comfy_repos", ComfyReposCommand::augment_subcommands(clap::Command::new("comfy_repos"))),
     ]
 }
 
