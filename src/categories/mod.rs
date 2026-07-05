@@ -1,11 +1,21 @@
+pub mod bashrs;
 pub mod comfy_repos;
 pub mod filesystem;
+pub mod keybinds;
 pub mod media;
+pub mod session;
 
 use clap::{Parser, Subcommand};
+use bashrs::BashrsCommand;
 use comfy_repos::ComfyReposCommand;
 use filesystem::FilesystemCommand;
 use media::MediaCommand;
+
+/// Exit code a command returns to ask its generated wrapper to run its
+/// `#[after]` action (e.g. start a fresh shell). It's distinct from success (0)
+/// and failure (non-zero), so clap's `--help`/`-h` — which exit 0 — never
+/// trigger it. Kept trivial in shell (`[ "$?" -eq N ]`) to parse on any bash.
+pub const RELOAD_EXIT_CODE: i32 = 97;
 
 #[derive(Parser)]
 #[command(name = "bashrs", about = "Rust-based bashrc")]
@@ -18,6 +28,8 @@ pub struct Cli {
 /// directly (e.g. `bashrs lss`), matching the shell functions we generate.
 #[derive(Subcommand)]
 pub enum Command {
+    #[command(flatten)]
+    Bashrs(BashrsCommand),
     #[command(flatten)]
     Filesystem(FilesystemCommand),
     #[command(flatten)]
@@ -32,6 +44,7 @@ pub enum Command {
 impl Command {
     pub fn run(self) {
         match self {
+            Command::Bashrs(cmd) => cmd.run(),
             Command::Filesystem(cmd) => cmd.run(),
             Command::Media(cmd) => cmd.run(),
             Command::ComfyRepos(cmd) => cmd.run(),
@@ -41,16 +54,27 @@ impl Command {
 }
 
 /// The command categories, each paired with the label used to group them in the
-/// generated `functions.sh`. One row per category — never per command.
-fn category_commands() -> [(&'static str, clap::Command); 3] {
+/// generated `sourcefile.sh`. One row per category — never per command.
+fn category_commands() -> [(&'static str, clap::Command); 4] {
     [
+        ("bashrs", BashrsCommand::augment_subcommands(clap::Command::new("bashrs"))),
         ("filesystem", FilesystemCommand::augment_subcommands(clap::Command::new("filesystem"))),
         ("media", MediaCommand::augment_subcommands(clap::Command::new("media"))),
         ("comfy_repos", ComfyReposCommand::augment_subcommands(clap::Command::new("comfy_repos"))),
     ]
 }
 
-/// Build the shell function definitions sourced from `~/.bashrs/functions.sh`.
+/// The shell appended (after `&&`) to a command's wrapper — e.g. to restart the
+/// shell after a command that changes the environment. Command names are unique
+/// across categories (clap flattening requires it), so the first match wins.
+fn wrapper_suffix(name: &str) -> Option<&'static str> {
+    BashrsCommand::wrapper_suffix(name)
+        .or_else(|| FilesystemCommand::wrapper_suffix(name))
+        .or_else(|| MediaCommand::wrapper_suffix(name))
+        .or_else(|| ComfyReposCommand::wrapper_suffix(name))
+}
+
+/// Build the shell function definitions sourced from `~/.bashrs/sourcefile.sh`.
 ///
 /// Definitions are grouped by category, each under a comment header. Every
 /// wrapper — including unprefixed aliases — dispatches to the command's *real* name,
@@ -69,13 +93,30 @@ fn wrappers() -> String {
                 continue; // skip any command marked internal
             }
             let real = sub.get_name();
+            // Run the suffix (e.g. `session_new`) only when the command signals a
+            // reload by exiting RELOAD_EXIT_CODE. A real success does; clap's
+            // `--help` (exit 0) and any failure (non-zero) do not.
+            let suffix = wrapper_suffix(real)
+                .map(|s| format!("; [ \"$?\" -eq {RELOAD_EXIT_CODE} ] && {s}"))
+                .unwrap_or_default();
             for shell_name in std::iter::once(real).chain(sub.get_visible_aliases()) {
-                lines += &format!("{shell_name}() {{ {BIN} {real} \"$@\"; }}\n");
+                lines += &format!("{shell_name}() {{ {BIN} {real} \"$@\"{suffix}; }}\n");
             }
         }
         if !lines.is_empty() {
             body += &format!("\n# {label}\n{lines}");
         }
+    }
+
+    // Session functions + keybinds: raw shell run when sourcefile.sh is sourced.
+    body += &format!("\n# session\n{}", session::functions());
+    let binds: String = keybinds::bindings()
+        .iter()
+        .map(|(key, func)| format!("    bind '\"{key}\": \"{func}\\n\"'\n"))
+        .collect();
+    if !binds.is_empty() {
+        // `bind` is a bash readline builtin; zsh (which also sources this) has none.
+        body += &format!("\n# keybinds (bash only)\nif [ -n \"$BASH_VERSION\" ]; then\n{binds}fi\n");
     }
 
     let mut out = String::from(
@@ -139,6 +180,11 @@ mod tests {
         has("conv() { \"$HOME/.bashrs/bashrs\" media_conv \"$@\"; }"); // unprefixed alias ->media_conv
         has("media_metadata() { \"$HOME/.bashrs/bashrs\" media_metadata \"$@\"; }");
         has("media_hmerge_imgs() { \"$HOME/.bashrs/bashrs\" media_hmerge_imgs \"$@\"; }");
+        // bashrs_compile starts a fresh session only when compile signals a reload (exit code)
+        has(&format!(
+            "bashrs_compile() {{ \"$HOME/.bashrs/bashrs\" bashrs_compile \"$@\"; [ \"$?\" -eq {RELOAD_EXIT_CODE} ] && session_new; }}"
+        ));
+        has("bashrs_sourcefile() { \"$HOME/.bashrs/bashrs\" bashrs_sourcefile \"$@\"; }");
     }
 
     #[test]
@@ -146,6 +192,14 @@ mod tests {
         // `conv` is a shell-only convenience; it must invoke `media_conv`, not
         // `conv`, so it works regardless of whether clap treats `conv` as valid.
         assert!(wrappers().contains("conv() { \"$HOME/.bashrs/bashrs\" media_conv \"$@\"; }"));
+    }
+
+    #[test]
+    fn wrappers_include_session_function_and_bash_guarded_keybind() {
+        let script = wrappers();
+        assert!(script.contains("session_new() { exec bash; }"), "session_new missing");
+        assert!(script.contains(r#"bind '"\en": "session_new\n"'"#), "ALT+N keybind missing");
+        assert!(script.contains("if [ -n \"$BASH_VERSION\" ]; then"), "keybinds should be bash-guarded");
     }
 
     #[test]

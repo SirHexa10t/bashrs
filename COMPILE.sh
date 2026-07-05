@@ -14,11 +14,17 @@ command -v cargo >/dev/null 2>&1 || die "cargo not found in PATH; install the Ru
 
 BASHRS_HOME="$HOME/.bashrs"
 BIN="$BASHRS_HOME/bashrs"
-FUNCTIONS="$BASHRS_HOME/functions.sh"
+SOURCEFILE="$BASHRS_HOME/sourcefile.sh"
 # Kept literal (single-quoted): expanded when the rc file is sourced, not now.
-SRC_PATH='$HOME/.bashrs/functions.sh'
+SRC_PATH='$HOME/.bashrs/sourcefile.sh'
 
-# --- 1. Build ---------------------------------------------------------------
+# --- 1. Update dependencies, then build -------------------------------------
+echo "cargo update: refreshing ALL crates to their latest compatible versions"
+echo "  (this also pulls the latest 'main' of git dependencies, e.g. table_formatter)."
+echo "  If a resulting build is unstable, comment out the 'cargo update' in COMPILE.sh"
+echo "  and restore the committed lock with:"
+echo "      git checkout -- Cargo.lock"
+cargo update  # comment this out to use older (stable) crate versions; make sure that your lock file is reverted to its last stable configuration
 cargo build --release
 
 # --- 2. Install the binary --------------------------------------------------
@@ -32,8 +38,8 @@ install -m 755 target/release/bashrs "$BIN"    # overwrite just the binary, keep
 echo "Installed $BIN"
 
 # --- 3. Generate the wrappers from the freshly installed binary -------------
-"$BIN" generate > "$FUNCTIONS"
-echo "Generated $FUNCTIONS"
+"$BIN" generate > "$SOURCEFILE"
+echo "Generated $SOURCEFILE"
 
 # --- 4. Source the wrappers from each rc file that exists -------------------
 # Idempotent-by-marker: the block is bracketed by markers, so a re-run finds it
@@ -67,4 +73,4 @@ if [ ! -e "$HOME/.bashrc" ] && [ ! -e "$HOME/.zshrc" ]; then
 fi
 
 echo
-echo "Done. Open a new shell, or run:  . \"$FUNCTIONS\""
+echo "Done. Open a new shell, or run:  . \"$SOURCEFILE\""

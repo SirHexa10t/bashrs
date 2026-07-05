@@ -30,6 +30,8 @@ use syn::{
 /// attributes adjust that, per command:
 /// - `#[unprefixed]` — expose it under its bare name only (no prefix).
 /// - `#[prefixed] #[unprefixed]` — expose it under both names.
+/// - `#[after("cmd")]` — append `&& cmd` to the generated shell wrapper, e.g.
+///   `#[after("exec bash")]` to restart the shell after the command runs.
 ///
 /// ```ignore
 /// #[category(command = MediaCommand, prefix = "media_")]
@@ -100,6 +102,7 @@ fn expand(args: CategoryArgs, module: ItemMod) -> syn::Result<TokenStream2> {
     let mut kept = Vec::new();
     let mut variants = Vec::new();
     let mut arms = Vec::new();
+    let mut suffixes: Vec<(String, String)> = Vec::new();
 
     for item in items {
         let Item::Fn(mut func) = item else {
@@ -114,7 +117,7 @@ fn expand(args: CategoryArgs, module: ItemMod) -> syn::Result<TokenStream2> {
         }
 
         let arg_ty = command_arg_type(&func)?;
-        let (docs, prefixed, unprefixed) = take_command_attrs(&mut func.attrs);
+        let CommandAttrs { docs, prefixed, unprefixed, after } = take_command_attrs(&mut func.attrs)?;
 
         let variant = format_ident!("{}", to_pascal_case(&fn_name));
         let fn_ident = func.sig.ident.clone();
@@ -129,6 +132,10 @@ fn expand(args: CategoryArgs, module: ItemMod) -> syn::Result<TokenStream2> {
             quote!(#[command(name = #name)])
         };
 
+        if let Some(after) = after {
+            suffixes.push((name.clone(), after));
+        }
+
         variants.push(quote! {
             #(#docs)*
             #command_attr
@@ -137,6 +144,21 @@ fn expand(args: CategoryArgs, module: ItemMod) -> syn::Result<TokenStream2> {
         arms.push(quote!(#command::#variant(args) => #fn_ident(args),));
         kept.push(quote!(#func));
     }
+
+    // Per-command shell suffixes (from `#[after("…")]`), looked up by clap name.
+    let wrapper_suffix = if suffixes.is_empty() {
+        quote!(pub fn wrapper_suffix(_name: &str) -> Option<&'static str> { None })
+    } else {
+        let suffix_arms = suffixes.iter().map(|(cmd_name, after)| quote!(#cmd_name => Some(#after),));
+        quote! {
+            pub fn wrapper_suffix(name: &str) -> Option<&'static str> {
+                match name {
+                    #(#suffix_arms)*
+                    _ => None,
+                }
+            }
+        }
+    };
 
     Ok(quote! {
         #(#kept)*
@@ -152,6 +174,9 @@ fn expand(args: CategoryArgs, module: ItemMod) -> syn::Result<TokenStream2> {
                     #(#arms)*
                 }
             }
+
+            /// Shell appended (after `&&`) to a command's generated wrapper.
+            #wrapper_suffix
         }
     })
 }
@@ -174,28 +199,40 @@ fn command_arg_type(func: &ItemFn) -> syn::Result<Type> {
     }
 }
 
-/// Split a command function's attributes into: the doc comments to copy onto
-/// the generated variant, and the `#[prefixed]` / `#[unprefixed]` opt-ins. The
-/// two opt-ins are consumed (not re-emitted); everything else stays on the fn.
-fn take_command_attrs(attrs: &mut Vec<Attribute>) -> (Vec<Attribute>, bool, bool) {
-    let mut docs = Vec::new();
-    let mut prefixed = false;
-    let mut unprefixed = false;
-    attrs.retain(|attr| {
+/// The helper attributes extracted from a command function.
+struct CommandAttrs {
+    /// `#[doc]` comments, copied onto the generated variant (kept on the fn too).
+    docs: Vec<Attribute>,
+    /// `#[prefixed]` — keep the prefixed name (alongside a bare one).
+    prefixed: bool,
+    /// `#[unprefixed]` — expose the bare (prefix-free) name.
+    unprefixed: bool,
+    /// `#[after("…")]` — shell appended (after `&&`) to the command's wrapper.
+    after: Option<String>,
+}
+
+/// Split a command function's attributes into [`CommandAttrs`]. The `prefixed` /
+/// `unprefixed` / `after` helper attributes are consumed (not re-emitted);
+/// everything else (including docs) stays on the function.
+fn take_command_attrs(attrs: &mut Vec<Attribute>) -> syn::Result<CommandAttrs> {
+    let mut parsed = CommandAttrs { docs: Vec::new(), prefixed: false, unprefixed: false, after: None };
+    let mut kept = Vec::new();
+    for attr in std::mem::take(attrs) {
         if attr.path().is_ident("doc") {
-            docs.push(attr.clone());
-            true
+            parsed.docs.push(attr.clone());
+            kept.push(attr);
         } else if attr.path().is_ident("prefixed") {
-            prefixed = true;
-            false // strip: helper attribute, not a real one
+            parsed.prefixed = true;
         } else if attr.path().is_ident("unprefixed") {
-            unprefixed = true;
-            false
+            parsed.unprefixed = true;
+        } else if attr.path().is_ident("after") {
+            parsed.after = Some(attr.parse_args::<syn::LitStr>()?.value());
         } else {
-            true
+            kept.push(attr);
         }
-    });
-    (docs, prefixed, unprefixed)
+    }
+    *attrs = kept;
+    Ok(parsed)
 }
 
 /// `hmerge_imgs` -> `HmergeImgs`.
