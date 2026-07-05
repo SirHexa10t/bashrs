@@ -1,6 +1,6 @@
 #[bashrs_macros::category(command = MediaCommand, prefix = "media_")]
 mod commands {
-    use crate::categories::exec::run_reporting;
+    use crate::support::exec::run_reporting;
     use clap::Args;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};

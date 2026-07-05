@@ -1,7 +1,7 @@
 //! Running external programs with consistent success/failure reporting.
 //!
-//! Shared by the categories that shell out (e.g. [`super::media`],
-//! [`super::packages`]) so the run-and-report wording lives in exactly one place.
+//! Shared by the categories that shell out (e.g. [`crate::categories::media`],
+//! [`crate::categories::packages`]) so the run-and-report wording lives in one place.
 
 use std::ffi::OsStr;
 use std::process::{Command, Stdio};

@@ -1,4 +1,4 @@
-use bashrs::categories::Cli;
+use bashrs::cli::Cli;
 use clap::Parser;
 
 fn main() {

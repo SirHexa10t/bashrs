@@ -2,7 +2,7 @@
 
 #[bashrs_macros::category(command = BashrsCommand, prefix = "bashrs_")]
 mod commands {
-    use crate::categories::args::NoArgs;
+    use crate::support::args::NoArgs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -25,7 +25,7 @@ mod commands {
         };
         match Command::new("bash").arg(&script).current_dir(project).status() {
             // Signal the wrapper to start a fresh session — only on a real success.
-            Ok(status) if status.success() => std::process::exit(crate::categories::RELOAD_EXIT_CODE),
+            Ok(status) if status.success() => std::process::exit(crate::cli::RELOAD_EXIT_CODE),
             Ok(status) => {
                 eprintln!("bashrs_compile: COMPILE.sh exited with status: {status}");
                 std::process::exit(1);

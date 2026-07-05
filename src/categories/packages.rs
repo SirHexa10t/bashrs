@@ -2,8 +2,8 @@
 
 #[bashrs_macros::category(command = PackagesCommand, prefix = "packages_")]
 mod commands {
-    use crate::categories::args::NoArgs;
-    use crate::categories::exec::{run_reporting, succeeds_quietly};
+    use crate::support::args::NoArgs;
+    use crate::support::exec::{run_reporting, succeeds_quietly};
 
     /// Update and upgrade every package manager present on the system
     #[prefixed]

@@ -1,5 +1,5 @@
 //! Readline keybind → shell-function mappings, resolved into `bind` lines in
-//! `sourcefile.sh` by [`super`]'s generator. Each entry maps a readline key
+//! `sourcefile.sh` by the [`crate::cli`] generator. Each entry maps a readline key
 //! sequence to a shell function (defined elsewhere, e.g. in [`super::session`]).
 
 /// `(readline key sequence, shell function to run)` pairs.
