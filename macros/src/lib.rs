@@ -26,10 +26,11 @@ use syn::{
 /// `command = ...`) plus an inherent `run(self)` that dispatches to the
 /// functions, and hoists the module's contents into the surrounding scope.
 ///
-/// A command's clap name is `<prefix><fn-name>` by default. Two helper
-/// attributes adjust that, per command:
+/// A command's clap name is `<prefix><fn-name>` by default. Helper attributes
+/// adjust that, per command:
 /// - `#[unprefixed]` — expose it under its bare name only (no prefix).
 /// - `#[prefixed] #[unprefixed]` — expose it under both names.
+/// - `#[name("cmd")]` — give it this exact name, overriding the prefix logic.
 /// - `#[after("cmd")]` — append `&& cmd` to the generated shell wrapper, e.g.
 ///   `#[after("exec bash")]` to restart the shell after the command runs.
 ///
@@ -117,19 +118,31 @@ fn expand(args: CategoryArgs, module: ItemMod) -> syn::Result<TokenStream2> {
         }
 
         let arg_ty = command_arg_type(&func)?;
-        let CommandAttrs { docs, prefixed, unprefixed, after } = take_command_attrs(&mut func.attrs)?;
+        let CommandAttrs { docs, prefixed, unprefixed, after, name: custom_name } =
+            take_command_attrs(&mut func.attrs)?;
 
         let variant = format_ident!("{}", to_pascal_case(&fn_name));
         let fn_ident = func.sig.ident.clone();
 
-        // Prefixed by default; `#[unprefixed]` drops it unless `#[prefixed]` also
-        // asks to keep it (in which case both names are exposed).
+        // An explicit `#[name("…")]` wins outright. Otherwise the command is prefixed
+        // by default; `#[unprefixed]` drops the prefix, and `#[prefixed] #[unprefixed]`
+        // together expose both the prefixed name and a bare alias.
         let emit_prefixed = prefixed || !unprefixed;
-        let name = if emit_prefixed { format!("{prefix}{fn_name}") } else { fn_name.clone() };
-        let command_attr = if emit_prefixed && unprefixed {
-            quote!(#[command(name = #name, visible_alias = #fn_name)])
-        } else {
-            quote!(#[command(name = #name)])
+        let (name, command_attr) = match custom_name {
+            Some(name) => {
+                let attr = quote!(#[command(name = #name)]);
+                (name, attr)
+            }
+            None if emit_prefixed && unprefixed => {
+                let name = format!("{prefix}{fn_name}");
+                let attr = quote!(#[command(name = #name, visible_alias = #fn_name)]);
+                (name, attr)
+            }
+            None => {
+                let name = if emit_prefixed { format!("{prefix}{fn_name}") } else { fn_name.clone() };
+                let attr = quote!(#[command(name = #name)]);
+                (name, attr)
+            }
         };
 
         if let Some(after) = after {
@@ -209,13 +222,16 @@ struct CommandAttrs {
     unprefixed: bool,
     /// `#[after("…")]` — shell appended (after `&&`) to the command's wrapper.
     after: Option<String>,
+    /// `#[name("…")]` — an explicit clap name, overriding the prefix/bare logic.
+    name: Option<String>,
 }
 
 /// Split a command function's attributes into [`CommandAttrs`]. The `prefixed` /
 /// `unprefixed` / `after` helper attributes are consumed (not re-emitted);
 /// everything else (including docs) stays on the function.
 fn take_command_attrs(attrs: &mut Vec<Attribute>) -> syn::Result<CommandAttrs> {
-    let mut parsed = CommandAttrs { docs: Vec::new(), prefixed: false, unprefixed: false, after: None };
+    let mut parsed =
+        CommandAttrs { docs: Vec::new(), prefixed: false, unprefixed: false, after: None, name: None };
     let mut kept = Vec::new();
     for attr in std::mem::take(attrs) {
         if attr.path().is_ident("doc") {
@@ -227,6 +243,8 @@ fn take_command_attrs(attrs: &mut Vec<Attribute>) -> syn::Result<CommandAttrs> {
             parsed.unprefixed = true;
         } else if attr.path().is_ident("after") {
             parsed.after = Some(attr.parse_args::<syn::LitStr>()?.value());
+        } else if attr.path().is_ident("name") {
+            parsed.name = Some(attr.parse_args::<syn::LitStr>()?.value());
         } else {
             kept.push(attr);
         }

@@ -1,20 +1,16 @@
 #[bashrs_macros::category(command = MediaCommand, prefix = "media_")]
 mod commands {
+    use crate::categories::exec::run_reporting;
     use clap::Args;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, ExitStatus};
 
-    // --- media_conv (+ unprefixed alias `conv`) ------------------------------------
+    // --- media_conv -----------------------------------------------------------
 
     /// Convert a media file using ffmpeg
-    #[prefixed]
-    #[unprefixed]
     pub fn conv(args: ConvArgs) {
-        match _run("ffmpeg", &_conv_argv(&args)) {
-            Ok(status) if status.success() => println!("Done: {}", args.output.display()),
-            Ok(status) => eprintln!("ffmpeg exited with status: {status}"),
-            Err(err) => eprintln!("Failed to run ffmpeg: {err}"),
+        if run_reporting("ffmpeg", _conv_argv(&args)) {
+            _report_saved(args.output);
         }
     }
 
@@ -51,11 +47,7 @@ mod commands {
 
     /// Get metadata of an audio/video/image file
     pub fn metadata(args: MetadataArgs) {
-        match _run("ffprobe", &_metadata_argv(&args)) {
-            Ok(status) if status.success() => {} // ffprobe already printed the report
-            Ok(status) => eprintln!("ffprobe failed with status: {status}"),
-            Err(err) => eprintln!("Failed to run ffprobe: {err}"),
-        }
+        run_reporting("ffprobe", _metadata_argv(&args)); // ffprobe prints the report itself
     }
 
     #[derive(Args)]
@@ -86,13 +78,8 @@ mod commands {
     pub fn hmerge_imgs(args: HmergeImgsArgs) {
         let HmergeImgsArgs { output, overwrite, inputs } = args;
         let output = output.unwrap_or_else(|| _default_merge_output(&inputs));
-        match _run("ffmpeg", &_hmerge_argv(&inputs, &output, overwrite)) {
-            Ok(status) if status.success() => {
-                let path = std::fs::canonicalize(&output).unwrap_or(output);
-                println!("Saved merged image: {}", path.display());
-            }
-            Ok(status) => eprintln!("ffmpeg failed with status: {status}"),
-            Err(err) => eprintln!("Failed to run ffmpeg: {err}"),
+        if run_reporting("ffmpeg", _hmerge_argv(&inputs, &output, overwrite)) {
+            _report_saved(output);
         }
     }
 
@@ -134,11 +121,12 @@ mod commands {
         argv
     }
 
-    // --- shared helper --------------------------------------------------------
+    // --- helper ---------------------------------------------------------------
 
-    /// Run an external program with the given arguments, inheriting stdio.
-    fn _run(program: &str, argv: &[OsString]) -> std::io::Result<ExitStatus> {
-        Command::new(program).args(argv).status()
+    /// Report a just-written output file by its canonical path.
+    fn _report_saved(path: PathBuf) {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        println!("Saved: {}", path.display());
     }
 
     #[cfg(test)]
