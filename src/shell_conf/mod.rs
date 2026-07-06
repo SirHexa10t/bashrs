@@ -1,6 +1,9 @@
 //! Interactive-shell configuration emitted into `sourcefile.sh` — the mechanics and
-//! settings that shape the shell environment (keybinds, session functions, and later
-//! prompt, history, date-format preferences). Assembled by [`crate::cli`].
+//! settings that shape the shell environment: keybinds, session functions, and
+//! environment/prompt settings (editor, grep colours, history, prompt). Assembled by
+//! [`crate::cli`].
 
+pub mod environment;
+pub mod greeting;
 pub mod keybinds;
 pub mod session;

@@ -46,6 +46,7 @@ mod commands {
                 if !contents.ends_with('\n') {
                     println!();
                 }
+                println!(); // blank line to set the location note off from the file body
                 println!("# source file: {}", path.display());
             }
             Err(err) => eprintln!("bashrs_sourcefile: cannot read {}: {err}", path.display()),

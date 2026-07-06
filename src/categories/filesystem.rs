@@ -20,10 +20,16 @@ mod commands {
         let mut ls_args: Vec<&str> = LS_FLAGS.to_vec();
         ls_args.extend(args.passthrough.iter().map(String::as_str));
         if let Some(output) = exec::capture_stdout("ls", ls_args) {
-            let targets = _lnk_targets(&args.passthrough);
+            // Only touch the filesystem again to resolve `.lnk` targets if the listing has
+            // one at all — the common case stays a single `ls` and nothing more.
+            let targets =
+                if output.contains(".lnk") { _lnk_targets(&args.passthrough) } else { HashMap::new() };
             for row in _format_listing(&output, &targets) {
                 println!("{row}");
             }
+            // Trailing blank line: some terminals drop the last row when the window is
+            // enlarged after printing; this sidesteps that quirk cheaply.
+            println!();
         }
     }
 
@@ -79,23 +85,27 @@ mod commands {
     }
 
     /// Render the name column. A `.lnk` shortcut is treated as a broken Windows link: the
-    /// name (and its target, when known) go red via `recho`'s style, joined by a plain
-    /// ` (Windows)-> ` marker so it fits `ls`'s aesthetic and reads unambiguously. Any
-    /// other entry keeps `ls`'s own colouring untouched.
+    /// name and its target — or `?` when the target can't be read — go red via `recho`'s
+    /// style, joined by a plain ` (Windows)-> ` marker so it fits `ls`'s aesthetic and
+    /// reads unambiguously. Any other entry keeps `ls`'s own colouring untouched.
     fn _name_cell(name: &str, targets: &HashMap<String, String>) -> String {
+        // Cheap reject first: no `.lnk` substring → not a shortcut, so skip the ANSI strip.
+        // (`ls` colours a name as a single span, so `.lnk` survives contiguously in it.)
+        if !name.contains(".lnk") {
+            return name.to_string();
+        }
         let plain = table_formatter::strip_ansi(name);
         let plain = plain.strip_suffix(|c: char| "*/=>@|".contains(c)).unwrap_or(&plain); // -F indicator
         if !plain.ends_with(".lnk") {
-            return name.to_string();
+            return name.to_string(); // `.lnk` appeared mid-name, not as the extension
         }
         let red = |s: &str| _scoped(&_wrap(["bo", "", "r"]), s);
-        match targets.get(plain) {
-            Some(target) => {
-                let target = target.split_whitespace().collect::<Vec<_>>().join(" ");
-                format!("{} (Windows)-> {}", red(plain), red(&target))
-            }
-            None => format!("{} (Windows)->", red(plain)),
-        }
+        // `?` stands in when the shortcut's target can't be read (unparseable / uncorrelated).
+        let target = match targets.get(plain) {
+            Some(t) => t.split_whitespace().collect::<Vec<_>>().join(" "),
+            None => "?".to_string(),
+        };
+        format!("{} (Windows)-> {}", red(plain), red(&target))
     }
 
     // ——— `.lnk` targets (I/O + parsing) ——————————————————————————————————
@@ -252,9 +262,10 @@ mod commands {
         }
 
         #[test]
-        fn name_cell_flags_a_lnk_without_a_target_when_unresolved() {
+        fn name_cell_flags_a_lnk_with_a_question_mark_when_unresolved() {
             let cell = _name_cell("mystery.lnk", &HashMap::new());
-            assert!(cell.trim_end().ends_with("(Windows)->"), "expected marker, no target: {cell}");
+            assert!(cell.contains("(Windows)-> "), "marker missing: {cell}");
+            assert!(cell.contains('?'), "unresolved target should show `?`: {cell}");
             assert!(cell.contains("\x1b[1;31m"), "should be bold red: {cell}");
         }
 

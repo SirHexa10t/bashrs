@@ -11,7 +11,7 @@ use crate::categories::filesystem::FilesystemCommand;
 use crate::categories::media::MediaCommand;
 use crate::categories::packages::PackagesCommand;
 use crate::categories::styles::StyleCommand;
-use crate::shell_conf::{keybinds, session};
+use crate::shell_conf::{environment, greeting, keybinds, session};
 
 /// Exit code a command returns to ask its generated wrapper to run its
 /// `#[after]` action (e.g. start a fresh shell). It's distinct from success (0)
@@ -108,7 +108,7 @@ fn wrappers() -> String {
 
     let mut body = String::new();
     for (label, category) in category_commands() {
-        let mut lines = String::new();
+        let mut lines: Vec<String> = Vec::new();
         for sub in category.get_subcommands() {
             if sub.is_hide_set() {
                 continue; // skip any command marked internal
@@ -130,15 +130,24 @@ fn wrappers() -> String {
                 .map(|s| format!("; [ \"$?\" -eq {RELOAD_EXIT_CODE} ] && {s}"))
                 .unwrap_or_default();
             for shell_name in std::iter::once(real).chain(sub.get_visible_aliases()) {
-                lines += &format!("{shell_name}() {{ {BIN} {real} \"$@\"{suffix}; }}{about}\n");
+                lines.push(format!("{shell_name}() {{ {BIN} {real} \"$@\"{suffix}; }}{about}"));
             }
         }
         if !lines.is_empty() {
-            body += &format!("\n# {label}\n{lines}");
+            // Align each category's inline `# …` comments into a column with `table` (the
+            // library function, not the shell wrapper); `trim_end` drops the padding it
+            // adds to comment-less rows.
+            body += &format!("\n# {label}\n");
+            for line in table_formatter::format_table(&lines, 2, None) {
+                body.push_str(line.trim_end());
+                body.push('\n');
+            }
         }
     }
 
-    // Session functions + keybinds: raw shell run when sourcefile.sh is sourced.
+    // Environment settings, session functions, keybinds: raw shell run when
+    // sourcefile.sh is sourced.
+    body += &format!("\n# environment\n{}", environment::settings());
     body += &format!("\n# session\n{}", session::functions());
     let binds: String = keybinds::bindings()
         .iter()
@@ -148,6 +157,9 @@ fn wrappers() -> String {
         // `bind` is a bash readline builtin; zsh (which also sources this) has none.
         body += &format!("\n# keybinds (bash only)\nif [ -n \"$BASH_VERSION\" ]; then\n{binds}fi\n");
     }
+
+    // A load greeting, last — after the `gecho`/`boecho` wrappers it calls are defined.
+    body += &format!("\n# greeting\n{}\n", greeting::line());
 
     let mut out = String::from(
         "#!/usr/bin/env bash\n\
@@ -247,7 +259,22 @@ mod tests {
         let script = wrappers();
         assert!(script.contains("session_new() { exec bash; }"), "session_new missing");
         assert!(script.contains(r#"bind '"\en": "session_new\n"'"#), "ALT+N keybind missing");
+        assert!(script.contains(r#"bind '"\eh": "bashrs_sourcefile\n"'"#), "ALT+H keybind missing");
+        assert!(script.contains(r#"bind '"\eq": "bashrs_compile\n"'"#), "ALT+Q keybind missing");
         assert!(script.contains("if [ -n \"$BASH_VERSION\" ]; then"), "keybinds should be bash-guarded");
+    }
+
+    #[test]
+    fn wrappers_include_environment_settings() {
+        let script = wrappers();
+        assert!(script.contains("\n# environment\n"), "environment section missing");
+        assert!(script.contains("export GREP_COLORS='mt=7;31'"), "GREP_COLORS export missing");
+        assert!(script.contains("export PS1=") && script.contains("(UTC)"), "PS1 export missing");
+    }
+
+    #[test]
+    fn wrappers_end_with_the_load_greeting() {
+        assert!(wrappers().contains("gecho \"Loaded Bashrs!"), "load greeting missing");
     }
 
     #[test]
@@ -282,10 +309,12 @@ mod tests {
 
     #[test]
     fn wrappers_carry_each_command_description_as_an_inline_comment() {
-        // The command's clap `about` trails its wrapper as a `# ...` comment.
-        assert!(wrappers().contains(
-            "media_metadata() { \"$HOME/.bashrs/bashrs\" media_metadata \"$@\"; }  # Get metadata of an audio/video/image file"
-        ));
+        // The command's clap `about` trails its wrapper as a `# ...` comment. Comments are
+        // aligned into a column, so the wrapper and its comment are no longer adjacent —
+        // assert each is present rather than expecting them side by side.
+        let script = wrappers();
+        assert!(script.contains("media_metadata() { \"$HOME/.bashrs/bashrs\" media_metadata \"$@\"; }"));
+        assert!(script.contains("# Get metadata of an audio/video/image file"));
     }
 
     /// Guards the small per-category list in `category_commands` against drift:
