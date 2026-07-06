@@ -68,7 +68,7 @@ mod commands {
                     .map(|line| _row(line, targets)),
             )
             .collect();
-        table_formatter::format_table(&rows, TABLE_SEPARATOR, None)
+        table_formatter::format_table(&rows, TABLE_SEPARATOR, TABLE_SEPARATOR, None)
     }
 
     /// One listing row: the first [`META_COLS`] whitespace fields tab-delimited, then the

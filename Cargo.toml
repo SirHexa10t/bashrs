@@ -10,3 +10,5 @@ members = ["macros"]
 clap = { version = "4", features = ["derive"] }
 bashrs-macros = { path = "macros" }
 table_formatter = { git = "https://github.com/SirHexa10t/table_formatter.git", branch = "main" }
+synoptic = "2"
+libc = "0.2"

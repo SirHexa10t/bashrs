@@ -3,6 +3,7 @@
 #[bashrs_macros::category(command = BashrsCommand, prefix = "bashrs_")]
 mod commands {
     use crate::support::args::NoArgs;
+    use crate::support::syntax;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -42,8 +43,10 @@ mod commands {
         let path = _sourcefile_path();
         match std::fs::read_to_string(&path) {
             Ok(contents) => {
-                print!("{contents}"); // cat: emit the file verbatim
-                if !contents.ends_with('\n') {
+                // Syntax-highlight the shell as we print it.
+                let shown = syntax::highlight(&contents, "sh");
+                print!("{shown}");
+                if !shown.ends_with('\n') {
                     println!();
                 }
                 println!(); // blank line to set the location note off from the file body

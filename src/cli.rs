@@ -144,7 +144,7 @@ fn wrappers() -> String {
             // library function, not the shell wrapper); `trim_end` drops the padding it
             // adds to comment-less rows.
             body += &format!("\n# {label}\n");
-            for line in table_formatter::format_table(&lines, 2, None) {
+            for line in table_formatter::format_table(&lines, 2, 2, None) {
                 body.push_str(line.trim_end());
                 body.push('\n');
             }

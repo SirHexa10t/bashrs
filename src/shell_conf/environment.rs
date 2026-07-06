@@ -33,14 +33,24 @@ const EXPORTS: &[Export] = &[
     },
 ];
 
-/// Render the [`EXPORTS`] table into `export` lines.
+/// Render the [`EXPORTS`] table into `export` lines, aligning the trailing `#` comments with
+/// the shared [`table_formatter`] helper. A 3-space code→comment delimiter plus a split
+/// threshold of 3 let it align these without splitting a value like `HISTTIMEFORMAT="%F_%T  "`
+/// on its interior double space (the default threshold of 2 would).
 pub fn settings() -> String {
-    EXPORTS
+    let lines: Vec<String> = EXPORTS
         .iter()
         .map(|e| {
-            let comment = if e.comment.is_empty() { String::new() } else { format!("  # {}", e.comment) };
-            format!("export {}={}{comment}\n", e.var, e.value)
+            if e.comment.is_empty() {
+                format!("export {}={}", e.var, e.value)
+            } else {
+                format!("export {}={}   # {}", e.var, e.value, e.comment)
+            }
         })
+        .collect();
+    table_formatter::format_table(&lines, 2, 3, None)
+        .iter()
+        .map(|line| format!("{}\n", line.trim_end()))
         .collect()
 }
 
@@ -51,10 +61,17 @@ mod tests {
     #[test]
     fn renders_the_active_exports() {
         let s = settings();
-        assert!(s.contains("export GREP_COLORS='mt=7;31'  # sets grep marking"));
+        assert!(s.contains("export GREP_COLORS='mt=7;31'"));
         assert!(s.contains("export HISTTIMEFORMAT=") && s.contains("%F_%T"));
         assert!(s.contains("Makes \"history\" command")); // comment quotes survive
         assert!(s.contains("export PS1=") && s.contains("(UTC)"));
+    }
+
+    #[test]
+    fn comments_are_aligned_into_a_column() {
+        let columns: Vec<usize> = settings().lines().filter_map(|line| line.find("  # ")).collect();
+        assert!(columns.len() >= 2, "expected several commented exports");
+        assert!(columns.windows(2).all(|w| w[0] == w[1]), "comment columns not aligned: {columns:?}");
     }
 
     #[test]
