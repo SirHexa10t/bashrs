@@ -23,4 +23,5 @@ pub(crate) const COLORS: &[(&str, &str, &str)] = &[
     ("y", "33", "yellow"),
     ("or", "38;5;208", "orange"),
     ("w", "37", "white"),
+    ("m", "35", "magenta"),
 ];

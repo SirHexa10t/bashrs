@@ -9,39 +9,40 @@ use std::io::IsTerminal;
 
 use grep::printer::{ColorSpecs, StandardBuilder, UserColorSpec};
 use grep::regex::{RegexMatcher, RegexMatcherBuilder};
-use grep::searcher::SearcherBuilder;
+use grep::searcher::{Searcher, SearcherBuilder};
 use termcolor::{ColorChoice, StandardStream};
 
 /// Print the lines of `text` matching `pattern` — literal and case-insensitive, like `grep -iF` —
-/// colouring matches, with `context` lines around each (0 = none). Backs `hg` and the `g`/`g<N>`
-/// family.
-pub(crate) fn filter(pattern: &str, text: &str, context: usize) {
-    match RegexMatcherBuilder::new().case_insensitive(true).build(&escape_literal(pattern)) {
-        Ok(matcher) => search(&matcher, text, context, false),
-        Err(err) => eprintln!("g: could not build matcher: {err}"),
-    }
+/// colouring matches, with `context` lines around each (0 = none). With `line_number`, each line is
+/// prefixed with its number (`grep -n`). Backs `hg` and the `g`/`g<N>` family.
+pub(crate) fn filter(pattern: &str, text: &str, context: usize, line_number: bool) {
+    let matcher = match RegexMatcherBuilder::new().case_insensitive(true).build(&escape_literal(pattern)) {
+        Ok(matcher) => matcher,
+        Err(err) => return eprintln!("g: could not build matcher: {err}"),
+    };
+    let mut searcher = SearcherBuilder::new()
+        .line_number(line_number)
+        .before_context(context)
+        .after_context(context)
+        .build();
+    search(&matcher, text, &mut searcher);
 }
 
 /// Print *every* line of `text`, colouring matches of the regex `pattern` — the highlight-don't-
 /// filter behaviour of `keyword_highlight` (was `grep -E --color "pattern|$"`). Case-sensitive,
 /// matching the original.
 pub(crate) fn highlight(pattern: &str, text: &str) {
-    match RegexMatcherBuilder::new().build(pattern) {
-        Ok(matcher) => search(&matcher, text, 0, true),
-        Err(err) => eprintln!("keyword_highlight: invalid regex: {err}"),
-    }
+    let matcher = match RegexMatcherBuilder::new().build(pattern) {
+        Ok(matcher) => matcher,
+        Err(err) => return eprintln!("keyword_highlight: invalid regex: {err}"),
+    };
+    let mut searcher = SearcherBuilder::new().passthru(true).line_number(false).build();
+    search(&matcher, text, &mut searcher);
 }
 
-/// Run `matcher` over `text` and print results like `grep --color=auto` — coloured on a terminal,
-/// plain when piped. `context` lines surround each match; in `passthru` mode the non-matching
-/// lines are printed too.
-fn search(matcher: &RegexMatcher, text: &str, context: usize, passthru: bool) {
-    let mut searcher = SearcherBuilder::new()
-        .line_number(false)
-        .passthru(passthru)
-        .before_context(context)
-        .after_context(context)
-        .build();
+/// Run `searcher` over `text` and print its results like `grep --color=auto` — coloured on a
+/// terminal, plain when piped.
+fn search(matcher: &RegexMatcher, text: &str, searcher: &mut Searcher) {
     // `--color=auto`: colour matches only when stdout is a terminal, plain text when piped.
     let color = if std::io::stdout().is_terminal() { ColorChoice::Always } else { ColorChoice::Never };
     let mut printer = StandardBuilder::new()
@@ -68,7 +69,7 @@ fn match_color() -> ColorSpecs {
 /// Escape regex metacharacters so PATTERN matches literally (`-F`). Mirrors `regex::escape`
 /// without the `regex` facade crate, which would fatten the shared regex build `bashrs` links via
 /// `synoptic`.
-fn escape_literal(pattern: &str) -> String {
+pub(crate) fn escape_literal(pattern: &str) -> String {
     const META: &[char] = &[
         '\\', '.', '+', '*', '?', '(', ')', '|', '[', ']', '{', '}', '^', '$', '#', '&', '-', '~',
     ];

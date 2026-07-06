@@ -9,13 +9,14 @@ mod commands {
     use std::collections::HashMap;
     use std::path::Path;
 
-    use crate::categories::autogen_styles::{_scoped, _wrap};
+    use crate::categories::autogen_styles::{_header, _scoped, _wrap};
     use crate::support::exec;
     use clap::Args;
 
     /// Custom `ls` (like `ll`): a long, all-files listing aligned into a table. Extra
     /// arguments pass straight through to `ls` — e.g. `lll -S` sorts by size.
     #[unprefixed]
+    #[trailing_newline]
     pub fn lll(args: LllArgs) {
         let mut ls_args: Vec<&str> = LS_FLAGS.to_vec();
         ls_args.extend(args.passthrough.iter().map(String::as_str));
@@ -27,9 +28,6 @@ mod commands {
             for row in _format_listing(&output, &targets) {
                 println!("{row}");
             }
-            // Trailing blank line: some terminals drop the last row when the window is
-            // enlarged after printing; this sidesteps that quirk cheaply.
-            println!();
         }
     }
 
@@ -59,7 +57,7 @@ mod commands {
     /// Turn raw `ls -l` output into aligned rows under a bold-blue header, flagging any
     /// `.lnk` entry (see [`_name_cell`]). Pure given `targets`, so it's unit-tested.
     fn _format_listing(ls_output: &str, targets: &HashMap<String, String>) -> Vec<String> {
-        let header = _scoped(&_wrap(["bo", "", "b"]), &HEADER.join("\t"));
+        let header = _header(&HEADER.join("\t"));
         let rows: Vec<String> = std::iter::once(header)
             .chain(
                 ls_output

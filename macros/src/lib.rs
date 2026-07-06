@@ -38,6 +38,8 @@ use syn::{
 /// - `#[piped("cmd")]` — prepend `cmd |` to the generated wrapper, feeding `cmd`'s output in
 ///   as the command's stdin, e.g. `#[piped("history")]` to search the shell history (a
 ///   builtin only the shell can produce).
+/// - `#[trailing_newline]` — print a blank line after the command runs, sparing the last row
+///   from terminals that drop it when the window is enlarged.
 ///
 /// ```ignore
 /// #[category(command = MediaCommand, prefix = "media_")]
@@ -124,8 +126,16 @@ fn expand(args: CategoryArgs, module: ItemMod) -> syn::Result<TokenStream2> {
         }
 
         let arg_ty = command_arg_type(&func)?;
-        let CommandAttrs { docs, prefixed, unprefixed, after, piped, name: custom_name, aliases } =
-            take_command_attrs(&mut func.attrs)?;
+        let CommandAttrs {
+            docs,
+            prefixed,
+            unprefixed,
+            after,
+            piped,
+            name: custom_name,
+            aliases,
+            trailing_newline,
+        } = take_command_attrs(&mut func.attrs)?;
 
         let variant = format_ident!("{}", to_pascal_case(&fn_name));
         let fn_ident = func.sig.ident.clone();
@@ -163,7 +173,12 @@ fn expand(args: CategoryArgs, module: ItemMod) -> syn::Result<TokenStream2> {
             #command_attr
             #variant(#arg_ty)
         });
-        arms.push(quote!(#command::#variant(args) => #fn_ident(args),));
+        let call = if trailing_newline {
+            quote!({ #fn_ident(args); ::std::println!(); })
+        } else {
+            quote!(#fn_ident(args))
+        };
+        arms.push(quote!(#command::#variant(args) => #call,));
         kept.push(quote!(#func));
     }
 
@@ -255,6 +270,8 @@ struct CommandAttrs {
     name: Option<String>,
     /// `#[alias("…")]` — extra visible aliases (repeatable).
     aliases: Vec<String>,
+    /// `#[trailing_newline]` — print a blank line after the command, to spare the last row.
+    trailing_newline: bool,
 }
 
 /// Split a command function's attributes into [`CommandAttrs`]. The `prefixed` /
@@ -269,6 +286,7 @@ fn take_command_attrs(attrs: &mut Vec<Attribute>) -> syn::Result<CommandAttrs> {
         piped: None,
         name: None,
         aliases: Vec::new(),
+        trailing_newline: false,
     };
     let mut kept = Vec::new();
     for attr in std::mem::take(attrs) {
@@ -287,6 +305,8 @@ fn take_command_attrs(attrs: &mut Vec<Attribute>) -> syn::Result<CommandAttrs> {
             parsed.name = Some(attr.parse_args::<syn::LitStr>()?.value());
         } else if attr.path().is_ident("alias") {
             parsed.aliases.push(attr.parse_args::<syn::LitStr>()?.value());
+        } else if attr.path().is_ident("trailing_newline") {
+            parsed.trailing_newline = true;
         } else {
             kept.push(attr);
         }

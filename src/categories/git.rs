@@ -7,14 +7,11 @@ mod commands {
     use clap::Args;
 
     /// A pretty, one-line commit graph across all branches
+    #[trailing_newline]
     pub fn tree(args: TreeArgs) {
         let mut git = vec!["log", "--all", "--graph", "--decorate", "--abbrev-commit", TREE_FORMAT];
         git.extend(args.rest.iter().map(String::as_str));
         exec::run_reporting("git", git);
-        // Trailing blank line (as with `lll`): spares the last row when the terminal is
-        // enlarged afterward. `tformat:` ends `git log`'s output in a newline, so this one
-        // adds the blank line — unconditional, since it's just a display nicety.
-        println!();
     }
 
     /// Extra arguments passed straight to `git log` (e.g. `-20`, or `-- <path>`).

@@ -281,8 +281,8 @@ mod tests {
 
     #[test]
     fn lookup_commands_follow_naming_standard() {
-        // `hg` mirrors the classic `history | grep` alias — a bare, memorable exception.
-        assert_prefixed(&command_names::<LookupCommand>(), "look_", &["hg"]);
+        // `hg` (history grep) and `gg` (recursive tree grep) are bare, memorable exceptions.
+        assert_prefixed(&command_names::<LookupCommand>(), "look_", &["hg", "gg"]);
     }
 
     #[test]
@@ -326,6 +326,7 @@ mod tests {
         has("hg() { history | \"$HOME/.bashrs/bashrs\" hg \"$@\"; }"); // #[piped]: history fed in
         has("g() { \"$HOME/.bashrs/bashrs\" g \"$@\"; }"); // generated g-family (bare)
         has("g3() { \"$HOME/.bashrs/bashrs\" g3 \"$@\"; }");
+        has("gg() { \"$HOME/.bashrs/bashrs\" gg \"$@\"; }"); // recursive tree grep (bare)
     }
 
     #[test]

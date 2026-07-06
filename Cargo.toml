@@ -15,4 +15,5 @@ libc = "0.2"
 toml = "0.8"
 serde_json = "1"
 grep = "0.4"          # ripgrep's search engine, run in-process by the lookup/style search commands
+ignore = "0.4"        # ripgrep's parallel .gitignore-aware directory walker — the `gg` tree search
 termcolor = "1"       # colour selection (ColorChoice) for grep's Standard printer

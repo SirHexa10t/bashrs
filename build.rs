@@ -73,7 +73,7 @@ fn lookup_matrix() -> String {
                 format!("Case-insensitive literal search, showing {ctx} lines of context around each match")
             };
             format!(
-                "    /// {desc}\n    #[unprefixed]\n    pub fn {name}(args: GrepArgs) {{ _grep(&args.pattern, {ctx}, args.source.as_deref()); }}"
+                "    /// {desc}\n    #[unprefixed]\n    pub fn {name}(args: GrepArgs) {{ _grep(&args.pattern, {ctx}, args.source.as_deref(), args.line_number); }}"
             )
         })
         .collect::<Vec<_>>()

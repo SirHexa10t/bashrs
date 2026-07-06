@@ -9,7 +9,7 @@
 //!
 //! Only the region between the `GENERATED-STYLE-MATRIX` markers is generated — `build.rs`
 //! rewrites it from `style_vocab.rs` during the build (when either changes), so it's never
-//! edited by hand. The engine around it (`_wrap`/`_scoped`, `EchoArgs`, `RESET`) is
+//! edited by hand. The engine around it (`_wrap`/`_scoped`/`_header`, `EchoArgs`, `RESET`) is
 //! hand-written. Hand-written *commands* that build on this engine live in
 //! [`crate::categories::styles`] (e.g. `errcho`), not here.
 
@@ -62,6 +62,11 @@ mod commands {
     #[alias("echow")]
     pub fn wecho(args: EchoArgs) { _styled_echo(["bo", "", "w"], &args); }
 
+    /// echo in bold magenta
+    #[unprefixed]
+    #[alias("echom")]
+    pub fn mecho(args: EchoArgs) { _styled_echo(["bo", "", "m"], &args); }
+
     /// echo in bold underlined
     #[unprefixed]
     #[alias("echou")]
@@ -101,6 +106,11 @@ mod commands {
     #[unprefixed]
     #[alias("echouw")]
     pub fn uwecho(args: EchoArgs) { _styled_echo(["bo", "u", "w"], &args); }
+
+    /// echo in bold underlined magenta
+    #[unprefixed]
+    #[alias("echoum")]
+    pub fn umecho(args: EchoArgs) { _styled_echo(["bo", "u", "m"], &args); }
 
     /// echo in dark
     #[unprefixed]
@@ -142,6 +152,11 @@ mod commands {
     #[alias("echodaw")]
     pub fn dawecho(args: EchoArgs) { _styled_echo(["da", "", "w"], &args); }
 
+    /// echo in dark magenta
+    #[unprefixed]
+    #[alias("echodam")]
+    pub fn damecho(args: EchoArgs) { _styled_echo(["da", "", "m"], &args); }
+
     /// echo in dark underlined
     #[unprefixed]
     #[alias("echodau")]
@@ -181,6 +196,11 @@ mod commands {
     #[unprefixed]
     #[alias("echodauw")]
     pub fn dauwecho(args: EchoArgs) { _styled_echo(["da", "u", "w"], &args); }
+
+    /// echo in dark underlined magenta
+    #[unprefixed]
+    #[alias("echodaum")]
+    pub fn daumecho(args: EchoArgs) { _styled_echo(["da", "u", "m"], &args); }
     // GENERATED-STYLE-MATRIX-END
 
     /// Words to print, joined with spaces (like `echo`).
@@ -236,6 +256,12 @@ mod commands {
         out.push_str(rest);
         out.push_str(RESET); // close: lone reset
         out
+    }
+
+    /// Style `text` in the shared bold-blue "header" style — `lll`'s column row and `gg`'s section
+    /// titles both use it, so the style is defined once and resolved through `_wrap` like the rest.
+    pub(crate) fn _header(text: &str) -> String {
+        _scoped(&_wrap(["bo", "", "b"]), text)
     }
 
     #[cfg(test)]
