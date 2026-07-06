@@ -4,11 +4,13 @@
 //! builds the sourced shell file (`wrappers`).
 
 use clap::{Parser, Subcommand};
+use crate::categories::autogen_lookup::GrepCommand;
 use crate::categories::autogen_styles::StylizedEchoCommand;
 use crate::categories::bashrs::BashrsCommand;
 use crate::categories::comfy_repos::ComfyReposCommand;
 use crate::categories::filesystem::FilesystemCommand;
 use crate::categories::git::GitCommand;
+use crate::categories::lookup::LookupCommand;
 use crate::categories::media::MediaCommand;
 use crate::categories::packages::PackagesCommand;
 use crate::categories::project::ProjectCommand;
@@ -46,6 +48,10 @@ pub enum Command {
     Packages(PackagesCommand),
     #[command(flatten)]
     Project(ProjectCommand),
+    #[command(flatten)]
+    Lookup(LookupCommand),
+    #[command(flatten)]
+    Grep(GrepCommand),
     // Two enums, one logical `style` category: hand-written commands (`errcho`) and the
     // generated `recho` matrix. Both flatten to bare top-level commands.
     #[command(flatten)]
@@ -67,6 +73,8 @@ impl Command {
             Command::ComfyRepos(cmd) => cmd.run(),
             Command::Packages(cmd) => cmd.run(),
             Command::Project(cmd) => cmd.run(),
+            Command::Lookup(cmd) => cmd.run(),
+            Command::Grep(cmd) => cmd.run(),
             Command::Style(cmd) => cmd.run(),
             Command::StylizedEcho(cmd) => cmd.run(),
             Command::Generate => print!("{}", wrappers()),
@@ -76,7 +84,7 @@ impl Command {
 
 /// The command categories, each paired with the label used to group them in the
 /// generated `sourcefile.sh`. One row per category — never per command.
-fn category_commands() -> [(&'static str, clap::Command); 8] {
+fn category_commands() -> [(&'static str, clap::Command); 9] {
     [
         ("bashrs", BashrsCommand::augment_subcommands(clap::Command::new("bashrs"))),
         ("filesystem", FilesystemCommand::augment_subcommands(clap::Command::new("filesystem"))),
@@ -84,6 +92,10 @@ fn category_commands() -> [(&'static str, clap::Command); 8] {
         ("media", MediaCommand::augment_subcommands(clap::Command::new("media"))),
         ("packages", PackagesCommand::augment_subcommands(clap::Command::new("packages"))),
         ("project", ProjectCommand::augment_subcommands(clap::Command::new("project"))),
+        // One `lookup` group: `hg` (history search) plus the generated g-family.
+        ("lookup", GrepCommand::augment_subcommands(
+            LookupCommand::augment_subcommands(clap::Command::new("lookup")),
+        )),
         // One `style` group spanning both style enums: hand-written + generated.
         ("style", StylizedEchoCommand::augment_subcommands(
             StyleCommand::augment_subcommands(clap::Command::new("style")),
@@ -102,9 +114,28 @@ fn wrapper_suffix(name: &str) -> Option<&'static str> {
         .or_else(|| MediaCommand::wrapper_suffix(name))
         .or_else(|| PackagesCommand::wrapper_suffix(name))
         .or_else(|| ProjectCommand::wrapper_suffix(name))
+        .or_else(|| LookupCommand::wrapper_suffix(name))
+        .or_else(|| GrepCommand::wrapper_suffix(name))
         .or_else(|| StyleCommand::wrapper_suffix(name))
         .or_else(|| StylizedEchoCommand::wrapper_suffix(name))
         .or_else(|| ComfyReposCommand::wrapper_suffix(name))
+}
+
+/// The shell piped into a command's wrapper (ahead of the binary) — e.g. `hg` searches the
+/// shell history, which only the shell itself can produce, so its wrapper runs `history` and
+/// pipes it in. First match wins, as with [`wrapper_suffix`].
+fn wrapper_prefix(name: &str) -> Option<&'static str> {
+    BashrsCommand::wrapper_prefix(name)
+        .or_else(|| FilesystemCommand::wrapper_prefix(name))
+        .or_else(|| GitCommand::wrapper_prefix(name))
+        .or_else(|| MediaCommand::wrapper_prefix(name))
+        .or_else(|| PackagesCommand::wrapper_prefix(name))
+        .or_else(|| ProjectCommand::wrapper_prefix(name))
+        .or_else(|| LookupCommand::wrapper_prefix(name))
+        .or_else(|| GrepCommand::wrapper_prefix(name))
+        .or_else(|| StyleCommand::wrapper_prefix(name))
+        .or_else(|| StylizedEchoCommand::wrapper_prefix(name))
+        .or_else(|| ComfyReposCommand::wrapper_prefix(name))
 }
 
 /// Build the shell function definitions sourced from `~/.bashrs/sourcefile.sh`.
@@ -141,8 +172,11 @@ fn wrappers() -> String {
             let suffix = wrapper_suffix(real)
                 .map(|s| format!("; [ \"$?\" -eq {RELOAD_EXIT_CODE} ] && {s}"))
                 .unwrap_or_default();
+            // A command that consumes a builtin's output (e.g. `hg` ← `history`) has it piped
+            // in ahead of the binary; the shell must produce it, since we can't.
+            let prefix = wrapper_prefix(real).map(|cmd| format!("{cmd} | ")).unwrap_or_default();
             for shell_name in std::iter::once(real).chain(sub.get_visible_aliases()) {
-                lines.push(format!("{shell_name}() {{ {BIN} {real} \"$@\"{suffix}; }}{about}"));
+                lines.push(format!("{shell_name}() {{ {prefix}{BIN} {real} \"$@\"{suffix}; }}{about}"));
             }
         }
         if !lines.is_empty() {
@@ -246,6 +280,20 @@ mod tests {
     }
 
     #[test]
+    fn lookup_commands_follow_naming_standard() {
+        // `hg` mirrors the classic `history | grep` alias — a bare, memorable exception.
+        assert_prefixed(&command_names::<LookupCommand>(), "look_", &["hg"]);
+    }
+
+    #[test]
+    fn grep_family_are_bare_verbs() {
+        // The generated `g`/`g3`/… shortcuts are intentionally bare, like the style echoes.
+        for name in command_names::<GrepCommand>() {
+            assert!(!name.starts_with("look_"), "grep command `{name}` should be bare, not prefixed");
+        }
+    }
+
+    #[test]
     fn style_commands_are_bare_verbs() {
         // Style commands — both the hand-written `StyleCommand` and the generated
         // `StylizedEchoCommand` — are intentionally unprefixed: short, memorable echo
@@ -275,6 +323,9 @@ mod tests {
         ));
         has("bashrs_sourcefile() { \"$HOME/.bashrs/bashrs\" bashrs_sourcefile \"$@\"; }");
         has("recho() { \"$HOME/.bashrs/bashrs\" recho \"$@\"; }"); // style: bare, unprefixed
+        has("hg() { history | \"$HOME/.bashrs/bashrs\" hg \"$@\"; }"); // #[piped]: history fed in
+        has("g() { \"$HOME/.bashrs/bashrs\" g \"$@\"; }"); // generated g-family (bare)
+        has("g3() { \"$HOME/.bashrs/bashrs\" g3 \"$@\"; }");
     }
 
     #[test]

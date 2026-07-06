@@ -1,14 +1,14 @@
-//! Hand-written style commands — the `StyleCommand` category: one-off styling verbs (like
-//! `errcho`) and a `synoptic`-backed `code_highlight`, none part of the generated `recho`
-//! matrix. Echo verbs build on the stylized-echo engine (`_wrap`/`_scoped`, `EchoArgs`) in
-//! [`crate::categories::autogen_styles`]; `code_highlight` reads via
-//! [`crate::support::input`] and colours via [`crate::support::syntax`]. Add manual style
-//! commands here — `build.rs` regenerates the matrix separately and never touches this file.
+//! Hand-written style commands — the `StyleCommand` category: one-off styling verbs
+//! (`errcho`), a `synoptic`-backed `code_highlight`, and a `grep`-crate-backed `keyword_highlight`,
+//! none part of the generated `recho` matrix. Echo verbs build on the stylized-echo engine
+//! (`_wrap`/`_scoped`, `EchoArgs`) in [`crate::categories::autogen_styles`]; `code_highlight`
+//! colours via [`crate::support::syntax`]. Add manual style commands here — `build.rs`
+//! regenerates the matrix separately and never touches this file.
 
 #[bashrs_macros::category(command = StyleCommand, prefix = "style_")]
 mod commands {
     use crate::categories::autogen_styles::{EchoArgs, _scoped, _wrap};
-    use crate::support::{input, syntax};
+    use crate::support::{input, streamgrep, syntax};
     use clap::Args;
     use std::path::Path;
 
@@ -41,6 +41,27 @@ mod commands {
         /// `source` is a path; required otherwise.
         #[arg(short, long)]
         lang: Option<String>,
+    }
+
+    /// Highlight every match of PATTERN in the input, keeping all lines (like `grep --color`)
+    #[unprefixed]
+    pub fn keyword_highlight(args: KeywordHighlightArgs) {
+        let text = match input::read_input(args.source.as_deref()) {
+            Ok(text) => text,
+            Err(err) => return eprintln!("keyword_highlight: {err}"),
+        };
+        // Print every line, colouring only the matches — the grep crate's passthru mode does this
+        // directly (no `pattern|$` trick, and no external `grep`).
+        streamgrep::highlight(&args.pattern, &text);
+    }
+
+    /// The term to highlight, and where to read the text.
+    #[derive(Args)]
+    pub struct KeywordHighlightArgs {
+        /// Regex whose matches are highlighted.
+        pattern: String,
+        /// Text to search: a file path, inline text, or omitted to read stdin.
+        source: Option<String>,
     }
 
     /// The extension to highlight as: `--lang` if given, else a `source` file's extension.

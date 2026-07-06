@@ -35,6 +35,9 @@ use syn::{
 ///   so the command also completes after typing `echo`.
 /// - `#[after("cmd")]` — append `&& cmd` to the generated shell wrapper, e.g.
 ///   `#[after("exec bash")]` to restart the shell after the command runs.
+/// - `#[piped("cmd")]` — prepend `cmd |` to the generated wrapper, feeding `cmd`'s output in
+///   as the command's stdin, e.g. `#[piped("history")]` to search the shell history (a
+///   builtin only the shell can produce).
 ///
 /// ```ignore
 /// #[category(command = MediaCommand, prefix = "media_")]
@@ -106,6 +109,7 @@ fn expand(args: CategoryArgs, module: ItemMod) -> syn::Result<TokenStream2> {
     let mut variants = Vec::new();
     let mut arms = Vec::new();
     let mut suffixes: Vec<(String, String)> = Vec::new();
+    let mut prefixes: Vec<(String, String)> = Vec::new();
 
     for item in items {
         let Item::Fn(mut func) = item else {
@@ -120,7 +124,7 @@ fn expand(args: CategoryArgs, module: ItemMod) -> syn::Result<TokenStream2> {
         }
 
         let arg_ty = command_arg_type(&func)?;
-        let CommandAttrs { docs, prefixed, unprefixed, after, name: custom_name, aliases } =
+        let CommandAttrs { docs, prefixed, unprefixed, after, piped, name: custom_name, aliases } =
             take_command_attrs(&mut func.attrs)?;
 
         let variant = format_ident!("{}", to_pascal_case(&fn_name));
@@ -150,6 +154,9 @@ fn expand(args: CategoryArgs, module: ItemMod) -> syn::Result<TokenStream2> {
         if let Some(after) = after {
             suffixes.push((name.clone(), after));
         }
+        if let Some(piped) = piped {
+            prefixes.push((name.clone(), piped));
+        }
 
         variants.push(quote! {
             #(#docs)*
@@ -175,6 +182,21 @@ fn expand(args: CategoryArgs, module: ItemMod) -> syn::Result<TokenStream2> {
         }
     };
 
+    // Per-command shell input pipes (from `#[piped("…")]`), looked up by clap name.
+    let wrapper_prefix = if prefixes.is_empty() {
+        quote!(pub fn wrapper_prefix(_name: &str) -> Option<&'static str> { None })
+    } else {
+        let prefix_arms = prefixes.iter().map(|(cmd_name, piped)| quote!(#cmd_name => Some(#piped),));
+        quote! {
+            pub fn wrapper_prefix(name: &str) -> Option<&'static str> {
+                match name {
+                    #(#prefix_arms)*
+                    _ => None,
+                }
+            }
+        }
+    };
+
     Ok(quote! {
         #(#kept)*
 
@@ -192,6 +214,9 @@ fn expand(args: CategoryArgs, module: ItemMod) -> syn::Result<TokenStream2> {
 
             /// Shell appended (after `&&`) to a command's generated wrapper.
             #wrapper_suffix
+
+            /// Command piped into a command's generated wrapper (from `#[piped("…")]`).
+            #wrapper_prefix
         }
     })
 }
@@ -224,6 +249,8 @@ struct CommandAttrs {
     unprefixed: bool,
     /// `#[after("…")]` — shell appended (after `&&`) to the command's wrapper.
     after: Option<String>,
+    /// `#[piped("…")]` — a command piped into the wrapper's stdin.
+    piped: Option<String>,
     /// `#[name("…")]` — an explicit clap name, overriding the prefix/bare logic.
     name: Option<String>,
     /// `#[alias("…")]` — extra visible aliases (repeatable).
@@ -239,6 +266,7 @@ fn take_command_attrs(attrs: &mut Vec<Attribute>) -> syn::Result<CommandAttrs> {
         prefixed: false,
         unprefixed: false,
         after: None,
+        piped: None,
         name: None,
         aliases: Vec::new(),
     };
@@ -253,6 +281,8 @@ fn take_command_attrs(attrs: &mut Vec<Attribute>) -> syn::Result<CommandAttrs> {
             parsed.unprefixed = true;
         } else if attr.path().is_ident("after") {
             parsed.after = Some(attr.parse_args::<syn::LitStr>()?.value());
+        } else if attr.path().is_ident("piped") {
+            parsed.piped = Some(attr.parse_args::<syn::LitStr>()?.value());
         } else if attr.path().is_ident("name") {
             parsed.name = Some(attr.parse_args::<syn::LitStr>()?.value());
         } else if attr.path().is_ident("alias") {
