@@ -5,6 +5,7 @@ pub mod autogen_styles;
 pub mod bashrs;
 pub mod comfy_repos;
 pub mod filesystem;
+pub mod git;
 pub mod media;
 pub mod packages;
 // Data, not a command category: the style vocabulary, shared with `build.rs` via `include!`.

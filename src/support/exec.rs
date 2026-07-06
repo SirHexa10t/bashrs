@@ -1,7 +1,8 @@
-//! Running external programs with consistent success/failure reporting.
+//! Running external programs with consistent output and status handling.
 //!
 //! Shared by the categories that shell out (e.g. [`crate::categories::media`],
-//! [`crate::categories::packages`]) so the run-and-report wording lives in one place.
+//! [`crate::categories::packages`], [`crate::categories::git`]) so the run / report /
+//! capture logic lives in one place.
 
 use std::ffi::OsStr;
 use std::process::{Command, Stdio};
@@ -65,6 +66,19 @@ where
     }
 }
 
+/// Run `program` with `args`, inheriting stdio; the exit status is ignored — for commands
+/// run to show output or for a side effect, where a non-zero exit isn't a failure (e.g.
+/// `ssh -T git@github.com`, which always exits 1). A spawn error is still reported.
+pub(crate) fn run<I, S>(program: &str, args: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    if let Err(err) = Command::new(program).args(args).status() {
+        eprintln!("could not run {program}: {err}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +106,12 @@ mod tests {
         assert_eq!(capture_stdout("echo", ["hello"]).as_deref(), Some("hello\n"));
         assert_eq!(capture_stdout("false", &[] as &[&str]), None);
         assert_eq!(capture_stdout("bashrs_no_such_program_xyz", &[] as &[&str]), None);
+    }
+
+    #[test]
+    fn run_ignores_exit_status_without_panicking() {
+        run("true", &[] as &[&str]);
+        run("false", &[] as &[&str]); // non-zero exit ignored: no report, no panic
+        run("bashrs_no_such_program_xyz", &[] as &[&str]); // spawn error: reported, no panic
     }
 }

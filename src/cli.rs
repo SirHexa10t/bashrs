@@ -8,6 +8,7 @@ use crate::categories::autogen_styles::StylizedEchoCommand;
 use crate::categories::bashrs::BashrsCommand;
 use crate::categories::comfy_repos::ComfyReposCommand;
 use crate::categories::filesystem::FilesystemCommand;
+use crate::categories::git::GitCommand;
 use crate::categories::media::MediaCommand;
 use crate::categories::packages::PackagesCommand;
 use crate::categories::styles::StyleCommand;
@@ -35,6 +36,8 @@ pub enum Command {
     #[command(flatten)]
     Filesystem(FilesystemCommand),
     #[command(flatten)]
+    Git(GitCommand),
+    #[command(flatten)]
     Media(MediaCommand),
     #[command(flatten)]
     ComfyRepos(ComfyReposCommand),
@@ -56,6 +59,7 @@ impl Command {
         match self {
             Command::Bashrs(cmd) => cmd.run(),
             Command::Filesystem(cmd) => cmd.run(),
+            Command::Git(cmd) => cmd.run(),
             Command::Media(cmd) => cmd.run(),
             Command::ComfyRepos(cmd) => cmd.run(),
             Command::Packages(cmd) => cmd.run(),
@@ -68,10 +72,11 @@ impl Command {
 
 /// The command categories, each paired with the label used to group them in the
 /// generated `sourcefile.sh`. One row per category — never per command.
-fn category_commands() -> [(&'static str, clap::Command); 6] {
+fn category_commands() -> [(&'static str, clap::Command); 7] {
     [
         ("bashrs", BashrsCommand::augment_subcommands(clap::Command::new("bashrs"))),
         ("filesystem", FilesystemCommand::augment_subcommands(clap::Command::new("filesystem"))),
+        ("git", GitCommand::augment_subcommands(clap::Command::new("git"))),
         ("media", MediaCommand::augment_subcommands(clap::Command::new("media"))),
         ("packages", PackagesCommand::augment_subcommands(clap::Command::new("packages"))),
         // One `style` group spanning both style enums: hand-written + generated.
@@ -88,6 +93,7 @@ fn category_commands() -> [(&'static str, clap::Command); 6] {
 fn wrapper_suffix(name: &str) -> Option<&'static str> {
     BashrsCommand::wrapper_suffix(name)
         .or_else(|| FilesystemCommand::wrapper_suffix(name))
+        .or_else(|| GitCommand::wrapper_suffix(name))
         .or_else(|| MediaCommand::wrapper_suffix(name))
         .or_else(|| PackagesCommand::wrapper_suffix(name))
         .or_else(|| StyleCommand::wrapper_suffix(name))
@@ -153,9 +159,10 @@ fn wrappers() -> String {
         .iter()
         .map(|(key, func)| format!("    bind '\"{key}\": \"{func}\\n\"'\n"))
         .collect();
-    if !binds.is_empty() {
+    let desktop = keybinds::desktop_restart();
+    if !binds.is_empty() || !desktop.is_empty() {
         // `bind` is a bash readline builtin; zsh (which also sources this) has none.
-        body += &format!("\n# keybinds (bash only)\nif [ -n \"$BASH_VERSION\" ]; then\n{binds}fi\n");
+        body += &format!("\n# keybinds (bash only)\nif [ -n \"$BASH_VERSION\" ]; then\n{binds}{desktop}fi\n");
     }
 
     // A load greeting, last — after the `gecho`/`boecho` wrappers it calls are defined.
@@ -211,6 +218,11 @@ mod tests {
     }
 
     #[test]
+    fn git_commands_follow_naming_standard() {
+        assert_prefixed(&command_names::<GitCommand>(), "git_", &[]);
+    }
+
+    #[test]
     fn media_commands_follow_naming_standard() {
         assert_prefixed(&command_names::<MediaCommand>(), "media_", &[]);
     }
@@ -261,6 +273,7 @@ mod tests {
         assert!(script.contains(r#"bind '"\en": "session_new\n"'"#), "ALT+N keybind missing");
         assert!(script.contains(r#"bind '"\eh": "bashrs_sourcefile\n"'"#), "ALT+H keybind missing");
         assert!(script.contains(r#"bind '"\eq": "bashrs_compile\n"'"#), "ALT+Q keybind missing");
+        assert!(script.contains("if pgrep -x cinnamon >/dev/null; then bind"), "ALT+L desktop-restart missing");
         assert!(script.contains("if [ -n \"$BASH_VERSION\" ]; then"), "keybinds should be bash-guarded");
     }
 
