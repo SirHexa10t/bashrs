@@ -11,6 +11,7 @@ use crate::categories::filesystem::FilesystemCommand;
 use crate::categories::git::GitCommand;
 use crate::categories::media::MediaCommand;
 use crate::categories::packages::PackagesCommand;
+use crate::categories::project::ProjectCommand;
 use crate::categories::styles::StyleCommand;
 use crate::shell_conf::{environment, greeting, keybinds, session};
 
@@ -43,6 +44,8 @@ pub enum Command {
     ComfyRepos(ComfyReposCommand),
     #[command(flatten)]
     Packages(PackagesCommand),
+    #[command(flatten)]
+    Project(ProjectCommand),
     // Two enums, one logical `style` category: hand-written commands (`errcho`) and the
     // generated `recho` matrix. Both flatten to bare top-level commands.
     #[command(flatten)]
@@ -63,6 +66,7 @@ impl Command {
             Command::Media(cmd) => cmd.run(),
             Command::ComfyRepos(cmd) => cmd.run(),
             Command::Packages(cmd) => cmd.run(),
+            Command::Project(cmd) => cmd.run(),
             Command::Style(cmd) => cmd.run(),
             Command::StylizedEcho(cmd) => cmd.run(),
             Command::Generate => print!("{}", wrappers()),
@@ -72,13 +76,14 @@ impl Command {
 
 /// The command categories, each paired with the label used to group them in the
 /// generated `sourcefile.sh`. One row per category — never per command.
-fn category_commands() -> [(&'static str, clap::Command); 7] {
+fn category_commands() -> [(&'static str, clap::Command); 8] {
     [
         ("bashrs", BashrsCommand::augment_subcommands(clap::Command::new("bashrs"))),
         ("filesystem", FilesystemCommand::augment_subcommands(clap::Command::new("filesystem"))),
         ("git", GitCommand::augment_subcommands(clap::Command::new("git"))),
         ("media", MediaCommand::augment_subcommands(clap::Command::new("media"))),
         ("packages", PackagesCommand::augment_subcommands(clap::Command::new("packages"))),
+        ("project", ProjectCommand::augment_subcommands(clap::Command::new("project"))),
         // One `style` group spanning both style enums: hand-written + generated.
         ("style", StylizedEchoCommand::augment_subcommands(
             StyleCommand::augment_subcommands(clap::Command::new("style")),
@@ -96,6 +101,7 @@ fn wrapper_suffix(name: &str) -> Option<&'static str> {
         .or_else(|| GitCommand::wrapper_suffix(name))
         .or_else(|| MediaCommand::wrapper_suffix(name))
         .or_else(|| PackagesCommand::wrapper_suffix(name))
+        .or_else(|| ProjectCommand::wrapper_suffix(name))
         .or_else(|| StyleCommand::wrapper_suffix(name))
         .or_else(|| StylizedEchoCommand::wrapper_suffix(name))
         .or_else(|| ComfyReposCommand::wrapper_suffix(name))
@@ -232,6 +238,11 @@ mod tests {
         // `upup` is prefixed (with a bare `upup` alias); `UPUP` is a deliberate
         // custom name (the loud "update everything"). Everything else is prefixed.
         assert_prefixed(&command_names::<PackagesCommand>(), "packages_", &["UPUP"]);
+    }
+
+    #[test]
+    fn project_commands_follow_naming_standard() {
+        assert_prefixed(&command_names::<ProjectCommand>(), "pro_", &[]);
     }
 
     #[test]
