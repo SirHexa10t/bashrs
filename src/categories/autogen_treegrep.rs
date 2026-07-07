@@ -41,6 +41,16 @@ mod commands {
     pub fn gg10(args: GgArgs) { _gg(args, 10); }
     // GENERATED-TREEGREP-END
 
+    /// Recursive search with `--delve` always on — also looks inside binaries we can decode (video
+    /// subtitle tracks, `.torrent` text). The loud, all-caps sibling of `gg`, à la `UPUP`.
+    #[name("GG")]
+    #[trailing_newline]
+    pub fn gg_delve(args: GgArgs) {
+        // Force `--delve`; it's a plain bool, so setting it when the caller already passed it is a
+        // harmless no-op.
+        _gg(GgArgs { delve: true, ..args }, 0);
+    }
+
     /// Recursive, case-insensitive search across filenames and file contents (skips binaries).
     /// Shared by the whole `gg` family; each variant differs only in its context size.
     #[derive(Args)]
@@ -63,6 +73,10 @@ mod commands {
         /// Don't prefix matches with line numbers (they're on by default for `gg`).
         #[arg(long)]
         no_line_number: bool,
+        /// Also search inside files normally skipped as binary, by decoding known formats
+        /// (video subtitle tracks, `.torrent` text).
+        #[arg(long)]
+        delve: bool,
     }
 
     /// Build options from the shared `gg` args plus the chosen `context` (lines around each match),
@@ -75,7 +89,8 @@ mod commands {
         } else {
             Some(args.text_limit)
         };
-        let opts = treegrep::Options { text_limit, line_number: !args.no_line_number, context };
+        let opts =
+            treegrep::Options { text_limit, line_number: !args.no_line_number, context, delve: args.delve };
         let roots = [std::path::PathBuf::from(&args.directory)];
         let denied = treegrep::search(&args.expressions, &roots, &opts);
         _offer_root_rescan(&args.expressions, &denied, &opts);

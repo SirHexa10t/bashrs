@@ -341,6 +341,7 @@ mod tests {
         has("g() { \"$HOME/.bashrs/bashrs\" g \"$@\"; }"); // generated g-family (bare)
         has("g3() { \"$HOME/.bashrs/bashrs\" g3 \"$@\"; }");
         has("gg() { \"$HOME/.bashrs/bashrs\" gg \"$@\"; }"); // recursive tree grep (bare)
+        has("GG() { \"$HOME/.bashrs/bashrs\" GG \"$@\"; }"); // gg with --delve forced, à la UPUP
     }
 
     #[test]

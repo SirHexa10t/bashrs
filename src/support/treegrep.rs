@@ -23,6 +23,7 @@ use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use termcolor::{Buffer, BufferWriter, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
+use crate::support::delve;
 use crate::support::doc_style::_header;
 use crate::support::streamgrep;
 
@@ -33,6 +34,9 @@ pub struct Options {
     pub line_number: bool,
     /// Lines of context to show around each file-content match (0 = none).
     pub context: usize,
+    /// Also search *inside* files normally skipped as binary, by decoding known formats — subtitle
+    /// tracks, torrent text (`--delve`; see [`crate::support::delve`]).
+    pub delve: bool,
 }
 
 /// Recursively search `roots` for `expressions` (literal, case-insensitive, OR'd): print matching
@@ -150,7 +154,14 @@ fn search_contents(
 ) -> bool {
     let bufwtr = BufferWriter::stdout(if color { ColorChoice::Always } else { ColorChoice::Never });
     let found = AtomicBool::new(false);
-    let ctx = Ctx { matcher, bufwtr: &bufwtr, text_limit: opts.text_limit, found: &found, denied };
+    let ctx = Ctx {
+        matcher,
+        bufwtr: &bufwtr,
+        text_limit: opts.text_limit,
+        found: &found,
+        denied,
+        delve: opts.delve,
+    };
     let line_number = opts.line_number;
     let context = opts.context;
 
@@ -177,6 +188,7 @@ struct Ctx<'a> {
     text_limit: Option<u64>,
     found: &'a AtomicBool,
     denied: &'a Mutex<BTreeSet<PathBuf>>,
+    delve: bool,
 }
 
 /// A searcher that skips binary files (NUL detection) and numbers lines when asked.
@@ -206,6 +218,15 @@ fn scan_file(entry: &DirEntry, searcher: &mut Searcher, buffer: &mut Buffer, ctx
         return;
     }
     buffer.clear();
+    // In `--delve` mode, a binary format we understand (subtitle tracks, torrent text) is decoded
+    // and *that* is searched; files with no decoder fall through to the normal (raw) search.
+    if ctx.delve {
+        if let Some(text) = delve::extract(entry.path()) {
+            delve_search(&text, entry.path(), buffer, ctx);
+            flush(buffer, ctx);
+            return;
+        }
+    }
     {
         let mut printer = StandardBuilder::new()
             .color_specs(content_color())
@@ -219,6 +240,24 @@ fn scan_file(entry: &DirEntry, searcher: &mut Searcher, buffer: &mut Buffer, ctx
             }
         }
     } // printer dropped → the &mut borrow of `buffer` ends
+    flush(buffer, ctx);
+}
+
+/// Search text decoded by [`delve`] for one file, printing matches as `path:text` — no line numbers,
+/// since the decoded lines don't line up with lines in the original binary file.
+fn delve_search(text: &[u8], path: &Path, buffer: &mut Buffer, ctx: &Ctx) {
+    let mut searcher =
+        SearcherBuilder::new().binary_detection(BinaryDetection::none()).line_number(false).build();
+    let mut printer = StandardBuilder::new()
+        .color_specs(content_color())
+        .heading(false)
+        .max_columns(ctx.text_limit)
+        .build(&mut *buffer);
+    let _ = searcher.search_slice(ctx.matcher, text, printer.sink_with_path(ctx.matcher, path));
+}
+
+/// Flush a completed file's buffer to stdout atomically, recording that something matched.
+fn flush(buffer: &Buffer, ctx: &Ctx) {
     if !buffer.as_slice().is_empty() {
         ctx.found.store(true, Ordering::Relaxed);
         let _ = ctx.bufwtr.print(buffer);

@@ -26,6 +26,8 @@ pub(crate) struct GgElevatedRescan {
     text_limit: Option<u64>,
     #[arg(long = "no-number")]
     no_number: bool,
+    #[arg(long)]
+    delve: bool,
     /// Directories are walked recursively; files are searched directly.
     paths: Vec<PathBuf>,
 }
@@ -54,6 +56,9 @@ impl GgElevatedRescan {
         if !opts.line_number {
             cmd.arg("--no-number");
         }
+        if opts.delve {
+            cmd.arg("--delve");
+        }
         for expr in expressions {
             cmd.arg("--expr").arg(expr);
         }
@@ -69,6 +74,7 @@ impl GgElevatedRescan {
             text_limit: self.text_limit,
             line_number: !self.no_number,
             context: self.context,
+            delve: self.delve,
         };
         treegrep::search(&self.expressions, &self.paths, &opts);
     }
