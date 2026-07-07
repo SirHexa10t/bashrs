@@ -66,7 +66,7 @@ mod commands {
     }
 
     /// Build options from the shared `gg` args plus the chosen `context` (lines around each match),
-    /// then run the recursive search.
+    /// run the recursive search, then offer a root re-scan of anything that was unreadable.
     fn _gg(args: GgArgs, context: usize) {
         let text_limit = if args.unlimited {
             None
@@ -75,12 +75,63 @@ mod commands {
         } else {
             Some(args.text_limit)
         };
-        let opts = treegrep::Options {
-            dir: args.directory,
-            text_limit,
-            line_number: !args.no_line_number,
-            context,
+        let opts = treegrep::Options { text_limit, line_number: !args.no_line_number, context };
+        let roots = [std::path::PathBuf::from(&args.directory)];
+        let denied = treegrep::search(&args.expressions, &roots, &opts);
+        _offer_root_rescan(&args.expressions, &denied, &opts);
+    }
+
+    /// If some paths were unreadable and we're interactive, offer to re-scan just those as root by
+    /// re-exec'ing ourselves under `sudo`, scoped to the denied paths (no dedup needed — they turned
+    /// up nothing on the first pass). Non-interactive runs just note what was skipped.
+    fn _offer_root_rescan(
+        expressions: &[String],
+        denied: &std::collections::BTreeSet<std::path::PathBuf>,
+        opts: &treegrep::Options,
+    ) {
+        use std::io::{IsTerminal, Write};
+        if denied.is_empty() {
+            return;
+        }
+        if !std::io::stdin().is_terminal() {
+            eprintln!("\n{} path(s) skipped (permission denied); run interactively to re-scan as root.", denied.len());
+            return;
+        }
+        eprintln!("\n{} path(s) were unreadable (permission denied):", denied.len());
+        // Cap the list so a huge count can't scroll the count/prompt off-screen: show up to 10, or
+        // the first 9 plus a summary line when there are more.
+        let shown = if denied.len() > 10 { 9 } else { denied.len() };
+        for path in denied.iter().take(shown) {
+            eprintln!("  {}", path.display());
+        }
+        if denied.len() > shown {
+            eprintln!("  [{} more paths omitted]", denied.len() - shown);
+        }
+        eprint!("Re-scan them as root? [y/N] ");
+        let _ = std::io::stderr().flush();
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err() || !answer.trim().eq_ignore_ascii_case("y") {
+            return;
+        }
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(err) => return eprintln!("gg: can't locate myself to re-run under sudo: {err}"),
         };
-        treegrep::search(&args.expressions, &opts);
+        // `sudo <exe> gg-sudo --context N [--text-limit N] [--no-number] --expr E … <denied paths>`
+        let mut cmd = std::process::Command::new("sudo");
+        cmd.arg(exe).arg("gg-sudo").arg("--context").arg(opts.context.to_string());
+        if let Some(limit) = opts.text_limit {
+            cmd.arg("--text-limit").arg(limit.to_string());
+        }
+        if !opts.line_number {
+            cmd.arg("--no-number");
+        }
+        for expr in expressions {
+            cmd.arg("--expr").arg(expr);
+        }
+        cmd.args(denied);
+        let _ = cmd.status();
+        // Revoke the cached sudo timestamp so the elevation can't carry over to a later command.
+        let _ = std::process::Command::new("sudo").arg("-k").status();
     }
 }

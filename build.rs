@@ -1,5 +1,5 @@
 //! Regenerates the styled-echo command matrix in `src/categories/autogen_styles.rs` from
-//! the vocabulary in `src/support/style_vocab.rs`, as part of the build.
+//! the vocabulary in `src/support/generative_constants.rs`, as part of the build.
 //!
 //! Only the text between the `GENERATED-STYLE-MATRIX` markers is rewritten, and only when
 //! it would actually change. `rerun-if-changed` scopes this to edits of the vocabulary,
@@ -9,22 +9,19 @@
 
 use std::{env, fs, path::Path};
 
-include!("src/support/style_vocab.rs");
-include!("src/support/lookup_vocab.rs");
-include!("src/support/treegrep_vocab.rs");
+include!("src/support/generative_constants.rs");
+
+const CONSTANTS: &str = "src/support/generative_constants.rs";
 
 const AUTOGEN: &str = "src/categories/autogen_styles.rs";
-const VOCAB: &str = "src/support/style_vocab.rs";
 const START: &str = "    // GENERATED-STYLE-MATRIX-START";
 const END: &str = "    // GENERATED-STYLE-MATRIX-END";
 
 const AUTOGEN_LOOKUP: &str = "src/categories/autogen_lookup.rs";
-const LOOKUP_VOCAB: &str = "src/support/lookup_vocab.rs";
 const LOOKUP_START: &str = "    // GENERATED-LOOKUP-GREP-START";
 const LOOKUP_END: &str = "    // GENERATED-LOOKUP-GREP-END";
 
 const AUTOGEN_TREEGREP: &str = "src/categories/autogen_treegrep.rs";
-const TREEGREP_VOCAB: &str = "src/support/treegrep_vocab.rs";
 const TREEGREP_START: &str = "    // GENERATED-TREEGREP-START";
 const TREEGREP_END: &str = "    // GENERATED-TREEGREP-END";
 
@@ -131,7 +128,7 @@ fn regenerate(manifest: &str, file: &str, splice: impl Fn(&str) -> String) {
 
 fn main() {
     // Re-run only when a vocabulary, a generated file, or this script changes.
-    for file in [VOCAB, AUTOGEN, LOOKUP_VOCAB, AUTOGEN_LOOKUP, TREEGREP_VOCAB, AUTOGEN_TREEGREP, "build.rs"] {
+    for file in [CONSTANTS, AUTOGEN, AUTOGEN_LOOKUP, AUTOGEN_TREEGREP, "build.rs"] {
         println!("cargo:rerun-if-changed={file}");
     }
 

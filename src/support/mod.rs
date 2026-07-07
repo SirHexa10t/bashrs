@@ -9,7 +9,8 @@ pub mod doc_style;
 pub mod exec;
 pub mod input;
 pub mod streamgrep;
-// Data, not a helper module: the style vocabulary, shared with `build.rs` via `include!`.
-// (`lookup_vocab` / `treegrep_vocab` sit here too but are build-time-only — `include!`d, not modules.)
-pub(crate) mod style_vocab;
+// Data, not a helper module: every build-time-generation constant (style vocab + search contexts),
+// merged into one file and shared with `build.rs` via `include!`. Only the style vocab is also read
+// at runtime (by `doc_style`); the context lists are build-time-only.
+pub(crate) mod generative_constants;
 pub mod treegrep;

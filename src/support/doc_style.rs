@@ -8,7 +8,7 @@
 //! [`_scoped`]. A style is named by a `[weight, underline, color]` triple, resolved against the
 //! vocabulary in [`crate::support::style_vocab`] by [`_wrap`].
 
-use crate::support::style_vocab::{COLORS, UNDERLINES, WEIGHTS};
+use crate::support::generative_constants::{COLORS, UNDERLINES, WEIGHTS};
 
 /// Ends a styled span, restoring the terminal to its default.
 pub(crate) const RESET: &str = "\x1b[0m";

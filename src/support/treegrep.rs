@@ -2,8 +2,8 @@
 //! tree with ripgrep's `ignore` walker and searches each file with the `grep` crate: first matching
 //! **filenames**, then matching **contents** (`path:line:text`). Binary files are skipped (NUL
 //! detection); over-long lines are omitted (`text_limit`, for minified/dumped text). Paths that
-//! can't be read for permissions are collected and reported — an opt-in root re-scan of just those
-//! is the planned follow-up.
+//! can't be read for permissions are collected and returned, so the caller can offer a root re-scan
+//! (re-exec under sudo) scoped to just those paths.
 //!
 //! Two passes on purpose: the filenames pass reads no file *contents* (only directory metadata), so
 //! it's cheap, and running it first gives the "names, then contents" ordering while content matches
@@ -26,9 +26,8 @@ use termcolor::{Buffer, BufferWriter, Color, ColorChoice, ColorSpec, StandardStr
 use crate::support::doc_style::_header;
 use crate::support::streamgrep;
 
-/// Options mapped from the `gg` flags.
+/// Options mapped from the `gg` flags (the search roots are passed to [`search`] separately).
 pub struct Options {
-    pub dir: String,
     /// Omit matches on lines longer than this many bytes; `None` = no limit.
     pub text_limit: Option<u64>,
     pub line_number: bool,
@@ -36,27 +35,34 @@ pub struct Options {
     pub context: usize,
 }
 
-/// Search `dir` recursively for `expressions` (literal, case-insensitive, OR'd): print matching
+/// Recursively search `roots` for `expressions` (literal, case-insensitive, OR'd): print matching
 /// filenames, then matching file contents. Everything goes to stdout; diagnostics to stderr.
-pub(crate) fn search(expressions: &[String], opts: &Options) {
+/// Returns the paths that couldn't be read for permissions, so the caller can offer a root re-scan.
+pub(crate) fn search(expressions: &[String], roots: &[PathBuf], opts: &Options) -> BTreeSet<PathBuf> {
     let matcher = match build_matcher(expressions) {
         Ok(matcher) => matcher,
-        Err(err) => return eprintln!("gg: invalid expression: {err}"),
+        Err(err) => {
+            eprintln!("gg: invalid expression: {err}");
+            return BTreeSet::new();
+        }
     };
+    if roots.is_empty() {
+        return BTreeSet::new();
+    }
     let color = std::io::stdout().is_terminal();
     let denied: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
     section("matching filenames", color);
-    let names = search_filenames(&matcher, opts, &denied);
+    let names = search_filenames(&matcher, roots, &denied);
     print_filenames(&names, &matcher, color);
 
     section("matching file contents", color);
-    let found_contents = search_contents(&matcher, opts, color, &denied);
+    let found_contents = search_contents(&matcher, roots, opts, color, &denied);
 
     if names.is_empty() && !found_contents {
         eprintln!("NO RESULTS FOUND");
     }
-    report_denied(&denied.into_inner().unwrap_or_default());
+    denied.into_inner().unwrap_or_default()
 }
 
 /// Compile the expressions into one case-insensitive, literal (escaped) alternation.
@@ -72,11 +78,11 @@ fn build_matcher(expressions: &[String]) -> Result<RegexMatcher, grep::regex::Er
 /// Phase 1 — every entry (file or directory) whose *name* matches. Reads no file contents.
 fn search_filenames(
     matcher: &RegexMatcher,
-    opts: &Options,
+    roots: &[PathBuf],
     denied: &Mutex<BTreeSet<PathBuf>>,
 ) -> Vec<PathBuf> {
     let hits: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-    walk(&opts.dir).build_parallel().run(|| {
+    walk(roots).build_parallel().run(|| {
         let hits = &hits;
         Box::new(move |result| {
             name_hit(result, matcher, hits, denied);
@@ -137,6 +143,7 @@ fn print_filenames(names: &[PathBuf], matcher: &RegexMatcher, color: bool) {
 /// Returns whether anything matched.
 fn search_contents(
     matcher: &RegexMatcher,
+    roots: &[PathBuf],
     opts: &Options,
     color: bool,
     denied: &Mutex<BTreeSet<PathBuf>>,
@@ -147,7 +154,7 @@ fn search_contents(
     let line_number = opts.line_number;
     let context = opts.context;
 
-    walk(&opts.dir).build_parallel().run(|| {
+    walk(roots).build_parallel().run(|| {
         let ctx = &ctx;
         let mut searcher = build_searcher(line_number, context);
         let mut buffer = ctx.bufwtr.buffer();
@@ -220,8 +227,11 @@ fn scan_file(entry: &DirEntry, searcher: &mut Searcher, buffer: &mut Buffer, ctx
 
 /// A walker configured to search *everything* — hidden and ignored files included (matching the
 /// old `find`/`grep -r`), unlike ripgrep's gitignore-aware default.
-fn walk(dir: &str) -> WalkBuilder {
-    let mut builder = WalkBuilder::new(dir);
+fn walk(roots: &[PathBuf]) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(&roots[0]);
+    for root in &roots[1..] {
+        builder.add(root);
+    }
     builder.standard_filters(false);
     builder
 }
@@ -253,16 +263,4 @@ fn error_path(err: &ignore::Error) -> Option<&Path> {
 fn section(title: &str, color: bool) {
     let line = format!("{title}:");
     println!("\n{}", if color { _header(&line) } else { line });
-}
-
-/// List the paths skipped for permissions — the input the planned root re-scan will consume.
-fn report_denied(denied: &BTreeSet<PathBuf>) {
-    if denied.is_empty() {
-        return;
-    }
-    eprintln!("\n{} path(s) skipped (permission denied):", denied.len());
-    for path in denied {
-        eprintln!("  {}", path.display());
-    }
-    eprintln!("(re-running these as root isn't wired up yet)");
 }
