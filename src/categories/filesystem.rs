@@ -9,7 +9,7 @@ mod commands {
     use std::collections::HashMap;
     use std::path::Path;
 
-    use crate::categories::autogen_styles::{_header, _scoped, _wrap};
+    use crate::support::doc_style::{_header, _scoped, _wrap};
     use crate::support::exec;
     use clap::Args;
 

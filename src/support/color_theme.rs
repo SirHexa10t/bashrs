@@ -2,6 +2,8 @@
 //! `code_highlight` style command and by `bashrs_sourcefile` (which colours the shell it
 //! prints), so both go through one palette.
 
+use crate::support::doc_style::{escape, RESET};
+
 /// Colour `code` as language `ext` (a file extension synoptic knows — `rs`, `sh`, `py`, …),
 /// returning the ANSI-coloured text with each line newline-terminated. An extension synoptic
 /// doesn't recognise comes back uncoloured (still one newline per line), never an error.
@@ -29,7 +31,7 @@ pub(crate) fn highlight(code: &str, ext: &str) -> String {
 /// Wrap `text` in the ANSI colour for a synoptic token `kind`; unknown kinds stay plain.
 fn paint(kind: &str, text: &str) -> String {
     match PALETTE.iter().find(|(k, _)| *k == kind) {
-        Some((_, code)) => format!("\x1b[{code}m{text}\x1b[0m"),
+        Some(entry) => format!("{}{text}{RESET}", escape(entry.1)),
         None => text.to_owned(),
     }
 }

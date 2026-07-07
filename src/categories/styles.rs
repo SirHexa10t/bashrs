@@ -1,14 +1,15 @@
 //! Hand-written style commands — the `StyleCommand` category: one-off styling verbs
 //! (`errcho`), a `synoptic`-backed `code_highlight`, and a `grep`-crate-backed `keyword_highlight`,
 //! none part of the generated `recho` matrix. Echo verbs build on the stylized-echo engine
-//! (`_wrap`/`_scoped`, `EchoArgs`) in [`crate::categories::autogen_styles`]; `code_highlight`
-//! colours via [`crate::support::syntax`]. Add manual style commands here — `build.rs`
+//! (`_wrap`/`_scoped` in [`crate::support::doc_style`], `EchoArgs` from `autogen_styles`); `code_highlight`
+//! colours via [`crate::support::color_theme`]. Add manual style commands here — `build.rs`
 //! regenerates the matrix separately and never touches this file.
 
 #[bashrs_macros::category(command = StyleCommand, prefix = "style_")]
 mod commands {
-    use crate::categories::autogen_styles::{EchoArgs, _scoped, _wrap};
-    use crate::support::{input, streamgrep, syntax};
+    use crate::categories::autogen_styles::EchoArgs;
+    use crate::support::doc_style::{_scoped, _wrap};
+    use crate::support::{color_theme, input, streamgrep};
     use clap::Args;
     use std::path::Path;
 
@@ -28,7 +29,7 @@ mod commands {
         let Some(ext) = _language(&args) else {
             return eprintln!("code_highlight: pass a language with --lang (e.g. --lang rs) unless the input is a file");
         };
-        print!("{}", syntax::highlight(&code, &ext));
+        print!("{}", color_theme::highlight(&code, &ext));
     }
 
     /// Code to highlight (inline text, a file path, or omitted to read stdin), plus the

@@ -6,6 +6,7 @@
 use clap::{Parser, Subcommand};
 use crate::categories::autogen_lookup::GrepCommand;
 use crate::categories::autogen_styles::StylizedEchoCommand;
+use crate::categories::autogen_treegrep::GgCommand;
 use crate::categories::bashrs::BashrsCommand;
 use crate::categories::comfy_repos::ComfyReposCommand;
 use crate::categories::filesystem::FilesystemCommand;
@@ -52,6 +53,8 @@ pub enum Command {
     Lookup(LookupCommand),
     #[command(flatten)]
     Grep(GrepCommand),
+    #[command(flatten)]
+    Treegrep(GgCommand),
     // Two enums, one logical `style` category: hand-written commands (`errcho`) and the
     // generated `recho` matrix. Both flatten to bare top-level commands.
     #[command(flatten)]
@@ -75,6 +78,7 @@ impl Command {
             Command::Project(cmd) => cmd.run(),
             Command::Lookup(cmd) => cmd.run(),
             Command::Grep(cmd) => cmd.run(),
+            Command::Treegrep(cmd) => cmd.run(),
             Command::Style(cmd) => cmd.run(),
             Command::StylizedEcho(cmd) => cmd.run(),
             Command::Generate => print!("{}", wrappers()),
@@ -93,9 +97,9 @@ fn category_commands() -> [(&'static str, clap::Command); 9] {
         ("packages", PackagesCommand::augment_subcommands(clap::Command::new("packages"))),
         ("project", ProjectCommand::augment_subcommands(clap::Command::new("project"))),
         // One `lookup` group: `hg` (history search) plus the generated g-family.
-        ("lookup", GrepCommand::augment_subcommands(
+        ("lookup", GgCommand::augment_subcommands(GrepCommand::augment_subcommands(
             LookupCommand::augment_subcommands(clap::Command::new("lookup")),
-        )),
+        ))),
         // One `style` group spanning both style enums: hand-written + generated.
         ("style", StylizedEchoCommand::augment_subcommands(
             StyleCommand::augment_subcommands(clap::Command::new("style")),
@@ -116,6 +120,7 @@ fn wrapper_suffix(name: &str) -> Option<&'static str> {
         .or_else(|| ProjectCommand::wrapper_suffix(name))
         .or_else(|| LookupCommand::wrapper_suffix(name))
         .or_else(|| GrepCommand::wrapper_suffix(name))
+        .or_else(|| GgCommand::wrapper_suffix(name))
         .or_else(|| StyleCommand::wrapper_suffix(name))
         .or_else(|| StylizedEchoCommand::wrapper_suffix(name))
         .or_else(|| ComfyReposCommand::wrapper_suffix(name))
@@ -133,6 +138,7 @@ fn wrapper_prefix(name: &str) -> Option<&'static str> {
         .or_else(|| ProjectCommand::wrapper_prefix(name))
         .or_else(|| LookupCommand::wrapper_prefix(name))
         .or_else(|| GrepCommand::wrapper_prefix(name))
+        .or_else(|| GgCommand::wrapper_prefix(name))
         .or_else(|| StyleCommand::wrapper_prefix(name))
         .or_else(|| StylizedEchoCommand::wrapper_prefix(name))
         .or_else(|| ComfyReposCommand::wrapper_prefix(name))
@@ -281,8 +287,8 @@ mod tests {
 
     #[test]
     fn lookup_commands_follow_naming_standard() {
-        // `hg` (history grep) and `gg` (recursive tree grep) are bare, memorable exceptions.
-        assert_prefixed(&command_names::<LookupCommand>(), "look_", &["hg", "gg"]);
+        // `hg` mirrors the classic `history | grep` alias — a bare, memorable exception.
+        assert_prefixed(&command_names::<LookupCommand>(), "look_", &["hg"]);
     }
 
     #[test]
@@ -290,6 +296,14 @@ mod tests {
         // The generated `g`/`g3`/… shortcuts are intentionally bare, like the style echoes.
         for name in command_names::<GrepCommand>() {
             assert!(!name.starts_with("look_"), "grep command `{name}` should be bare, not prefixed");
+        }
+    }
+
+    #[test]
+    fn gg_family_are_bare_verbs() {
+        // The generated `gg`/`gg2`/… recursive-search shortcuts are intentionally bare too.
+        for name in command_names::<GgCommand>() {
+            assert!(!name.starts_with("look_"), "gg command `{name}` should be bare, not prefixed");
         }
     }
 

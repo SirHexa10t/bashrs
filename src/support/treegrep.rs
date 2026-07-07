@@ -23,7 +23,7 @@ use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use termcolor::{Buffer, BufferWriter, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
-use crate::categories::autogen_styles::_header;
+use crate::support::doc_style::_header;
 use crate::support::streamgrep;
 
 /// Options mapped from the `gg` flags.
@@ -32,6 +32,8 @@ pub struct Options {
     /// Omit matches on lines longer than this many bytes; `None` = no limit.
     pub text_limit: Option<u64>,
     pub line_number: bool,
+    /// Lines of context to show around each file-content match (0 = none).
+    pub context: usize,
 }
 
 /// Search `dir` recursively for `expressions` (literal, case-insensitive, OR'd): print matching
@@ -143,10 +145,11 @@ fn search_contents(
     let found = AtomicBool::new(false);
     let ctx = Ctx { matcher, bufwtr: &bufwtr, text_limit: opts.text_limit, found: &found, denied };
     let line_number = opts.line_number;
+    let context = opts.context;
 
     walk(&opts.dir).build_parallel().run(|| {
         let ctx = &ctx;
-        let mut searcher = build_searcher(line_number);
+        let mut searcher = build_searcher(line_number, context);
         let mut buffer = ctx.bufwtr.buffer();
         Box::new(move |result| {
             match result {
@@ -170,10 +173,12 @@ struct Ctx<'a> {
 }
 
 /// A searcher that skips binary files (NUL detection) and numbers lines when asked.
-fn build_searcher(line_number: bool) -> Searcher {
+fn build_searcher(line_number: bool, context: usize) -> Searcher {
     SearcherBuilder::new()
         .binary_detection(BinaryDetection::quit(b'\x00'))
         .line_number(line_number)
+        .before_context(context)
+        .after_context(context)
         .build()
 }
 

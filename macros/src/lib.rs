@@ -173,6 +173,9 @@ fn expand(args: CategoryArgs, module: ItemMod) -> syn::Result<TokenStream2> {
             #command_attr
             #variant(#arg_ty)
         });
+        // `#[trailing_newline]` prints a blank line after the command runs: some terminals drop
+        // the last printed row when the window is enlarged afterward, so the extra line takes that
+        // hit instead of the command's real final line of output.
         let call = if trailing_newline {
             quote!({ #fn_ident(args); ::std::println!(); })
         } else {

@@ -3,7 +3,7 @@
 #[bashrs_macros::category(command = BashrsCommand, prefix = "bashrs_")]
 mod commands {
     use crate::support::args::NoArgs;
-    use crate::support::syntax;
+    use crate::support::color_theme;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -44,7 +44,7 @@ mod commands {
         match std::fs::read_to_string(&path) {
             Ok(contents) => {
                 // Syntax-highlight the shell as we print it.
-                let shown = syntax::highlight(&contents, "sh");
+                let shown = color_theme::highlight(&contents, "sh");
                 print!("{shown}");
                 if !shown.ends_with('\n') {
                     println!();

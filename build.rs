@@ -1,5 +1,5 @@
 //! Regenerates the styled-echo command matrix in `src/categories/autogen_styles.rs` from
-//! the vocabulary in `src/categories/style_vocab.rs`, as part of the build.
+//! the vocabulary in `src/support/style_vocab.rs`, as part of the build.
 //!
 //! Only the text between the `GENERATED-STYLE-MATRIX` markers is rewritten, and only when
 //! it would actually change. `rerun-if-changed` scopes this to edits of the vocabulary,
@@ -9,18 +9,24 @@
 
 use std::{env, fs, path::Path};
 
-include!("src/categories/style_vocab.rs");
-include!("src/categories/lookup_vocab.rs");
+include!("src/support/style_vocab.rs");
+include!("src/support/lookup_vocab.rs");
+include!("src/support/treegrep_vocab.rs");
 
 const AUTOGEN: &str = "src/categories/autogen_styles.rs";
-const VOCAB: &str = "src/categories/style_vocab.rs";
+const VOCAB: &str = "src/support/style_vocab.rs";
 const START: &str = "    // GENERATED-STYLE-MATRIX-START";
 const END: &str = "    // GENERATED-STYLE-MATRIX-END";
 
 const AUTOGEN_LOOKUP: &str = "src/categories/autogen_lookup.rs";
-const LOOKUP_VOCAB: &str = "src/categories/lookup_vocab.rs";
+const LOOKUP_VOCAB: &str = "src/support/lookup_vocab.rs";
 const LOOKUP_START: &str = "    // GENERATED-LOOKUP-GREP-START";
 const LOOKUP_END: &str = "    // GENERATED-LOOKUP-GREP-END";
+
+const AUTOGEN_TREEGREP: &str = "src/categories/autogen_treegrep.rs";
+const TREEGREP_VOCAB: &str = "src/support/treegrep_vocab.rs";
+const TREEGREP_START: &str = "    // GENERATED-TREEGREP-START";
+const TREEGREP_END: &str = "    // GENERATED-TREEGREP-END";
 
 /// A criterion key contributes to a function name as itself — except bold, which is silent
 /// (so `["bo","","r"]` is `recho`, not `borecho`).
@@ -87,6 +93,32 @@ fn expected_lookup(current: &str) -> String {
     format!("{}\n\n{}\n{}", &current[..start], lookup_matrix(), &current[end..])
 }
 
+/// The generated `gg`-family: one bare `pub fn` per context size in [`GG_CONTEXTS`] (`gg`, `gg3`, …).
+fn treegrep_matrix() -> String {
+    GG_CONTEXTS
+        .iter()
+        .map(|&ctx| {
+            let name = if ctx == 0 { "gg".to_string() } else { format!("gg{ctx}") };
+            let desc = if ctx == 0 {
+                "Recursively search a directory for expression(s) — filenames, then file contents".to_string()
+            } else {
+                format!("Recursive search, showing {ctx} lines of context around each file-content match")
+            };
+            format!(
+                "    /// {desc}\n    #[unprefixed]\n    #[trailing_newline]\n    pub fn {name}(args: GgArgs) {{ _gg(args, {ctx}); }}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// `autogen_treegrep.rs` with its generated region replaced by the current `gg` family.
+fn expected_treegrep(current: &str) -> String {
+    let start = current.find(TREEGREP_START).expect("START marker missing from autogen_treegrep.rs") + TREEGREP_START.len();
+    let end = current.find(TREEGREP_END).expect("END marker missing from autogen_treegrep.rs");
+    format!("{}\n\n{}\n{}", &current[..start], treegrep_matrix(), &current[end..])
+}
+
 /// Rewrite `file`'s generated region (computed by `splice`) in place, only when it changes.
 fn regenerate(manifest: &str, file: &str, splice: impl Fn(&str) -> String) {
     let path = Path::new(manifest).join(file);
@@ -99,11 +131,12 @@ fn regenerate(manifest: &str, file: &str, splice: impl Fn(&str) -> String) {
 
 fn main() {
     // Re-run only when a vocabulary, a generated file, or this script changes.
-    for file in [VOCAB, AUTOGEN, LOOKUP_VOCAB, AUTOGEN_LOOKUP, "build.rs"] {
+    for file in [VOCAB, AUTOGEN, LOOKUP_VOCAB, AUTOGEN_LOOKUP, TREEGREP_VOCAB, AUTOGEN_TREEGREP, "build.rs"] {
         println!("cargo:rerun-if-changed={file}");
     }
 
     let manifest = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
     regenerate(&manifest, AUTOGEN, expected);
     regenerate(&manifest, AUTOGEN_LOOKUP, expected_lookup);
+    regenerate(&manifest, AUTOGEN_TREEGREP, expected_treegrep);
 }
