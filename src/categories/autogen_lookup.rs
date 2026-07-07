@@ -1,67 +1,79 @@
-//! The grep engine and the generated `g`-family of search shortcuts (`GrepCommand`) — bare,
-//! memorable verbs (`g`, `g3`, …) that filter their input with the `grep` crate in-process (see
-//! [`crate::support::streamgrep`]). The number in a name is how many lines of context to show
-//! around each match.
+//! The generated search-shortcut families of the `lookup` category — bare, memorable verbs, each
+//! its own `#[category]` block and clap command enum:
 //!
-//! Only the region between the `GENERATED-LOOKUP-GREP` markers is generated — `build.rs`
-//! rewrites it from `generative_constants.rs` during the build (when either changes), so it's
-//! never edited by hand. The engine around it (`_grep`, `GrepArgs`) is hand-written. The
-//! history-search command sharing the same in-process grep lives in
-//! [`crate::categories::lookup`] (`hg`).
+//! - the `g`-family (`GrepCommand`): `g`, `g3`, … — grep over a single stream.
+//! - the `gg`-family (`GgCommand`): `gg`, `gg2`, … — the recursive parallel tree search.
+//!
+//! Each block is nothing but its generated shim region (between the `GENERATED-*` markers, rewritten
+//! by `build.rs` from `generative_constants.rs`) plus the imports those shims need — so this file is
+//! never edited by hand. Every shim just forwards its parsed args to a runner in
+//! [`crate::categories::lookup`] (`_grep` / `_gg`); the argument structs live in
+//! [`crate::support::args`], and the hand-written `GG` command sits beside the runners in
+//! [`crate::categories::lookup`].
 
 #[bashrs_macros::category(command = GrepCommand, prefix = "look_")]
-mod commands {
-    use crate::support::{input, streamgrep};
-    use clap::Args;
+mod grep_commands {
+    use crate::categories::lookup::_grep;
+    use crate::support::args::GrepArgs;
 
     // GENERATED-LOOKUP-GREP-START
 
     /// Case-insensitive literal search (no regex), colouring matches
     #[unprefixed]
-    pub fn g(args: GrepArgs) { _grep(&args.pattern, 0, args.source.as_deref(), args.line_number); }
+    pub fn g(args: GrepArgs) { _grep(&args, 0); }
 
     /// Case-insensitive literal search, showing 2 lines of context around each match
     #[unprefixed]
-    pub fn g2(args: GrepArgs) { _grep(&args.pattern, 2, args.source.as_deref(), args.line_number); }
+    pub fn g2(args: GrepArgs) { _grep(&args, 2); }
 
     /// Case-insensitive literal search, showing 3 lines of context around each match
     #[unprefixed]
-    pub fn g3(args: GrepArgs) { _grep(&args.pattern, 3, args.source.as_deref(), args.line_number); }
+    pub fn g3(args: GrepArgs) { _grep(&args, 3); }
 
     /// Case-insensitive literal search, showing 5 lines of context around each match
     #[unprefixed]
-    pub fn g5(args: GrepArgs) { _grep(&args.pattern, 5, args.source.as_deref(), args.line_number); }
+    pub fn g5(args: GrepArgs) { _grep(&args, 5); }
 
     /// Case-insensitive literal search, showing 8 lines of context around each match
     #[unprefixed]
-    pub fn g8(args: GrepArgs) { _grep(&args.pattern, 8, args.source.as_deref(), args.line_number); }
+    pub fn g8(args: GrepArgs) { _grep(&args, 8); }
 
     /// Case-insensitive literal search, showing 25 lines of context around each match
     #[unprefixed]
-    pub fn g25(args: GrepArgs) { _grep(&args.pattern, 25, args.source.as_deref(), args.line_number); }
+    pub fn g25(args: GrepArgs) { _grep(&args, 25); }
     // GENERATED-LOOKUP-GREP-END
+}
 
-    /// The term to match plus where to read the text — shared by the whole `g` family.
-    #[derive(Args)]
-    pub struct GrepArgs {
-        /// Term to match (case-insensitive, literal — no regex).
-        pattern: String,
-        /// Text to search: a file path, inline text, or omitted to read stdin.
-        source: Option<String>,
-        /// Show line numbers, like `grep -n`.
-        #[arg(short = 'n', long)]
-        line_number: bool,
-    }
+#[bashrs_macros::category(command = GgCommand, prefix = "look_")]
+mod tree_commands {
+    use crate::categories::lookup::_gg;
+    use crate::support::args::GgArgs;
 
-    /// Read the input, then filter it with `grep -iF` semantics (literal, case-insensitive) and
-    /// `context` lines around each match (0 = none), using the `grep` crate in-process. With
-    /// `line_number`, prefix each line with its number (`grep -n`). Matches are coloured only when
-    /// writing to a terminal, like `--color=auto`.
-    fn _grep(pattern: &str, context: u32, source: Option<&str>, line_number: bool) {
-        let text = match input::read_input(source) {
-            Ok(text) => text,
-            Err(err) => return eprintln!("g: {err}"),
-        };
-        streamgrep::filter(pattern, &text, context as usize, line_number);
-    }
+    // GENERATED-TREEGREP-START
+
+    /// Recursively search a directory for expression(s) — filenames, then file contents
+    #[unprefixed]
+    #[trailing_newline]
+    pub fn gg(args: GgArgs) { _gg(&args, 0); }
+
+    /// Recursive search, showing 2 lines of context around each file-content match
+    #[unprefixed]
+    #[trailing_newline]
+    pub fn gg2(args: GgArgs) { _gg(&args, 2); }
+
+    /// Recursive search, showing 3 lines of context around each file-content match
+    #[unprefixed]
+    #[trailing_newline]
+    pub fn gg3(args: GgArgs) { _gg(&args, 3); }
+
+    /// Recursive search, showing 5 lines of context around each file-content match
+    #[unprefixed]
+    #[trailing_newline]
+    pub fn gg5(args: GgArgs) { _gg(&args, 5); }
+
+    /// Recursive search, showing 10 lines of context around each file-content match
+    #[unprefixed]
+    #[trailing_newline]
+    pub fn gg10(args: GgArgs) { _gg(&args, 10); }
+    // GENERATED-TREEGREP-END
 }

@@ -4,9 +4,8 @@
 //! builds the sourced shell file (`wrappers`).
 
 use clap::{Parser, Subcommand};
-use crate::categories::autogen_lookup::GrepCommand;
+use crate::categories::autogen_lookup::{GgCommand, GrepCommand};
 use crate::categories::autogen_styles::StylizedEchoCommand;
-use crate::categories::autogen_treegrep::GgCommand;
 use crate::categories::bashrs::BashrsCommand;
 use crate::categories::comfy_repos::ComfyReposCommand;
 use crate::categories::filesystem::FilesystemCommand;
@@ -287,8 +286,9 @@ mod tests {
 
     #[test]
     fn lookup_commands_follow_naming_standard() {
-        // `hg` mirrors the classic `history | grep` alias — a bare, memorable exception.
-        assert_prefixed(&command_names::<LookupCommand>(), "look_", &["hg"]);
+        // `hg` mirrors the classic `history | grep` alias; `GG` is the loud all-caps sibling of `gg`
+        // (recursive search with `--delve` forced), à la `UPUP` — both bare, memorable exceptions.
+        assert_prefixed(&command_names::<LookupCommand>(), "look_", &["hg", "GG"]);
     }
 
     #[test]

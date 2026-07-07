@@ -21,7 +21,8 @@ const AUTOGEN_LOOKUP: &str = "src/categories/autogen_lookup.rs";
 const LOOKUP_START: &str = "    // GENERATED-LOOKUP-GREP-START";
 const LOOKUP_END: &str = "    // GENERATED-LOOKUP-GREP-END";
 
-const AUTOGEN_TREEGREP: &str = "src/categories/autogen_treegrep.rs";
+// The `gg`-family region lives in the same file as the `g`-family (`AUTOGEN_LOOKUP`), in its own
+// `#[category]` block; the two regions are spliced independently in `main`.
 const TREEGREP_START: &str = "    // GENERATED-TREEGREP-START";
 const TREEGREP_END: &str = "    // GENERATED-TREEGREP-END";
 
@@ -76,7 +77,7 @@ fn lookup_matrix() -> String {
                 format!("Case-insensitive literal search, showing {ctx} lines of context around each match")
             };
             format!(
-                "    /// {desc}\n    #[unprefixed]\n    pub fn {name}(args: GrepArgs) {{ _grep(&args.pattern, {ctx}, args.source.as_deref(), args.line_number); }}"
+                "    /// {desc}\n    #[unprefixed]\n    pub fn {name}(args: GrepArgs) {{ _grep(&args, {ctx}); }}"
             )
         })
         .collect::<Vec<_>>()
@@ -102,17 +103,17 @@ fn treegrep_matrix() -> String {
                 format!("Recursive search, showing {ctx} lines of context around each file-content match")
             };
             format!(
-                "    /// {desc}\n    #[unprefixed]\n    #[trailing_newline]\n    pub fn {name}(args: GgArgs) {{ _gg(args, {ctx}); }}"
+                "    /// {desc}\n    #[unprefixed]\n    #[trailing_newline]\n    pub fn {name}(args: GgArgs) {{ _gg(&args, {ctx}); }}"
             )
         })
         .collect::<Vec<_>>()
         .join("\n\n")
 }
 
-/// `autogen_treegrep.rs` with its generated region replaced by the current `gg` family.
+/// `autogen_lookup.rs` with its `gg`-family region replaced by the current `gg` family.
 fn expected_treegrep(current: &str) -> String {
-    let start = current.find(TREEGREP_START).expect("START marker missing from autogen_treegrep.rs") + TREEGREP_START.len();
-    let end = current.find(TREEGREP_END).expect("END marker missing from autogen_treegrep.rs");
+    let start = current.find(TREEGREP_START).expect("START marker missing from autogen_lookup.rs") + TREEGREP_START.len();
+    let end = current.find(TREEGREP_END).expect("END marker missing from autogen_lookup.rs");
     format!("{}\n\n{}\n{}", &current[..start], treegrep_matrix(), &current[end..])
 }
 
@@ -128,12 +129,13 @@ fn regenerate(manifest: &str, file: &str, splice: impl Fn(&str) -> String) {
 
 fn main() {
     // Re-run only when a vocabulary, a generated file, or this script changes.
-    for file in [CONSTANTS, AUTOGEN, AUTOGEN_LOOKUP, AUTOGEN_TREEGREP, "build.rs"] {
+    for file in [CONSTANTS, AUTOGEN, AUTOGEN_LOOKUP, "build.rs"] {
         println!("cargo:rerun-if-changed={file}");
     }
 
     let manifest = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
     regenerate(&manifest, AUTOGEN, expected);
     regenerate(&manifest, AUTOGEN_LOOKUP, expected_lookup);
-    regenerate(&manifest, AUTOGEN_TREEGREP, expected_treegrep);
+    // Same file, second region: the `gg`-family block alongside the `g`-family above.
+    regenerate(&manifest, AUTOGEN_LOOKUP, expected_treegrep);
 }

@@ -6,9 +6,12 @@
 //!
 //! - `.torrent` — bencode: the human-readable string values (name, file paths, tracker URLs),
 //!   skipping the binary `pieces` SHA-1 blob.
-//! - `.mkv`/`.mka`/`.webm` — Matroska: the text subtitle tracks (`S_TEXT/*`), extracted by walking
-//!   the EBML tree and *seeking past* video/audio payloads — so a multi-GB file is read in
+//! - `.mkv`/`.mka`/`.mks`/`.webm` — Matroska: the text subtitle tracks (`S_TEXT/*`), extracted by
+//!   walking the EBML tree and *seeking past* video/audio payloads — so a multi-GB file is read in
 //!   milliseconds (only the tiny subtitle blocks are actually read), not in full.
+//! - `.mp4`/`.m4v`/`.mov` — ISO-BMFF: text subtitle tracks (tx3g/QuickTime text, WebVTT, TTML),
+//!   located via the `moov` sample tables (progressive) or `moof`/`traf`/`trun` fragments
+//!   (fragmented) and read from `mdat`.
 
 use std::fs::File;
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
@@ -21,13 +24,16 @@ use std::path::Path;
 pub(crate) fn extract(path: &Path) -> Option<Vec<u8>> {
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "torrent" => Some(std::fs::read(path).map(|bytes| bencode_text(&bytes)).unwrap_or_default()),
-        "mkv" | "mka" | "webm" => Some(
+        "mkv" | "mka" | "mks" | "webm" => Some(
             File::open(path)
                 .map(|f| io::BufReader::with_capacity(128 * 1024, f))
                 .ok()
                 .and_then(|r| matroska_subtitles(r).ok())
                 .unwrap_or_default(),
         ),
+        "mp4" | "m4v" | "mov" => {
+            Some(File::open(path).ok().and_then(|f| mp4_subtitles(f).ok()).unwrap_or_default())
+        }
         _ => None,
     }
 }
@@ -309,6 +315,431 @@ fn read_subtitle_frame<R: Read>(r: &mut R, rest: u64, out: &mut Vec<u8>) -> io::
     Ok(())
 }
 
+// ---- MP4 / ISO-BMFF (.mp4/.m4v/.mov) --------------------------------------------------------
+
+/// Read up to `buf.len()` bytes (fewer only at EOF); returns the count read.
+fn fill<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..])? {
+            0 => break,
+            k => n += k,
+        }
+    }
+    Ok(n)
+}
+
+/// A box header: `(fourcc, content_start, content_end, next_box_pos)`.
+type BoxHeader = ([u8; 4], u64, u64, u64);
+
+/// The box at `pos` within a container ending at `end`, or `None` when there's no room for another
+/// box. Handles 32-bit sizes, 64-bit (`size == 1`), and extends-to-end (`size == 0`).
+fn next_box<R: Read + Seek>(r: &mut R, pos: u64, end: u64) -> io::Result<Option<BoxHeader>> {
+    if pos + 8 > end {
+        return Ok(None);
+    }
+    r.seek(SeekFrom::Start(pos))?;
+    let mut hdr = [0u8; 8];
+    if fill(r, &mut hdr)? < 8 {
+        return Ok(None);
+    }
+    let fourcc = [hdr[4], hdr[5], hdr[6], hdr[7]];
+    let (total, header) = match u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) {
+        1 => {
+            let mut ext = [0u8; 8];
+            r.read_exact(&mut ext)?;
+            (u64::from_be_bytes(ext), 16)
+        }
+        0 => (end - pos, 8),
+        s => (u64::from(s), 8),
+    };
+    if total < header {
+        return Ok(None);
+    }
+    let content_start = pos + header;
+    Ok(Some((fourcc, content_start, (pos + total).min(end), pos + total)))
+}
+
+/// The content range of the first child box of type `want` within `[start, end)`.
+fn find_box<R: Read + Seek>(r: &mut R, start: u64, end: u64, want: &[u8; 4]) -> io::Result<Option<(u64, u64)>> {
+    let mut pos = start;
+    while let Some((fourcc, cs, ce, next)) = next_box(r, pos, end)? {
+        if &fourcc == want {
+            return Ok(Some((cs, ce)));
+        }
+        if next <= pos {
+            break;
+        }
+        pos = next;
+    }
+    Ok(None)
+}
+
+/// Extract text from every text/subtitle track of an ISO-BMFF (MP4/MOV) file. Reads each `trak`'s
+/// codec + sample tables and pulls its samples from `mdat` (progressive files); then, for
+/// *fragmented* files (where `moov`'s tables are empty), also picks up samples from the `moof`
+/// fragments across the file. Only the (tiny, few) subtitle samples are read — never the media data.
+fn mp4_subtitles<R: Read + Seek>(mut r: R) -> io::Result<Vec<u8>> {
+    let file_end = r.seek(SeekFrom::End(0))?;
+    let mut out = Vec::new();
+    let Some((moov_start, moov_end)) = find_box(&mut r, 0, file_end, b"moov")? else {
+        return Ok(out);
+    };
+    // Read each text track: extract its progressive samples now, and remember its `(track_id,
+    // codec)` so its samples can also be found in any movie fragments below.
+    let mut text_tracks: Vec<(u32, [u8; 4])> = Vec::new();
+    let mut pos = moov_start;
+    while let Some((fourcc, cs, ce, next)) = next_box(&mut r, pos, moov_end)? {
+        if &fourcc == b"trak" {
+            if let Some(track) = read_trak(&mut r, cs, ce, &mut out)? {
+                text_tracks.push(track);
+            }
+        }
+        if next <= pos {
+            break;
+        }
+        pos = next;
+    }
+    // Fragmented MP4: samples live in `moof` fragments across the file, not the `moov` tables. This
+    // top-level scan seeks past `mdat` (never reads it), so it costs nothing for progressive files.
+    if !text_tracks.is_empty() {
+        let mut pos = 0;
+        while let Some((fourcc, cs, ce, next)) = next_box(&mut r, pos, file_end)? {
+            if &fourcc == b"moof" {
+                read_moof(&mut r, pos, cs, ce, &text_tracks, &mut out)?;
+            }
+            if next <= pos {
+                break;
+            }
+            pos = next;
+        }
+    }
+    Ok(out)
+}
+
+/// If this `trak` is a text/subtitle track, extract its progressive sample text and return its
+/// `(track_id, codec)` so fragments for the same track can be matched later. `None` otherwise.
+fn read_trak<R: Read + Seek>(r: &mut R, start: u64, end: u64, out: &mut Vec<u8>) -> io::Result<Option<(u32, [u8; 4])>> {
+    let Some((mdia_s, mdia_e)) = find_box(r, start, end, b"mdia")? else { return Ok(None) };
+    if !is_text_handler(r, mdia_s, mdia_e)? {
+        return Ok(None);
+    }
+    let track_id = read_track_id(r, start, end)?;
+    let Some((minf_s, minf_e)) = find_box(r, mdia_s, mdia_e, b"minf")? else { return Ok(None) };
+    let Some((stbl_s, stbl_e)) = find_box(r, minf_s, minf_e, b"stbl")? else { return Ok(None) };
+    let codec = stsd_codec(r, stbl_s, stbl_e)?;
+    let sizes = read_sample_sizes(r, stbl_s, stbl_e)?;
+    let chunks = read_chunk_offsets(r, stbl_s, stbl_e)?;
+    let stsc = read_sample_to_chunk(r, stbl_s, stbl_e)?;
+    extract_samples(r, &codec, &sizes, &chunks, &stsc, out)?;
+    Ok(Some((track_id, codec)))
+}
+
+/// The track's numeric ID, from `tkhd`.
+fn read_track_id<R: Read + Seek>(r: &mut R, trak_s: u64, trak_e: u64) -> io::Result<u32> {
+    let Some((s, _)) = find_box(r, trak_s, trak_e, b"tkhd")? else { return Ok(0) };
+    r.seek(SeekFrom::Start(s))?;
+    let mut vf = [0u8; 4];
+    if fill(r, &mut vf)? < 4 {
+        return Ok(0);
+    }
+    // track_ID follows [version+flags] and the creation/modification times (8 bytes at v0, 16 at v1).
+    r.seek(SeekFrom::Start(s + 4 + if vf[0] == 1 { 16 } else { 8 }))?;
+    let mut id = [0u8; 4];
+    if r.read_exact(&mut id).is_err() {
+        return Ok(0);
+    }
+    Ok(u32::from_be_bytes(id))
+}
+
+/// Walk a `moof`'s `traf` boxes, extracting subtitle samples for known text tracks.
+fn read_moof<R: Read + Seek>(r: &mut R, moof_start: u64, cs: u64, ce: u64, tracks: &[(u32, [u8; 4])], out: &mut Vec<u8>) -> io::Result<()> {
+    let mut pos = cs;
+    while let Some((fourcc, tcs, tce, next)) = next_box(r, pos, ce)? {
+        if &fourcc == b"traf" {
+            read_traf(r, moof_start, tcs, tce, tracks, out)?;
+        }
+        if next <= pos {
+            break;
+        }
+        pos = next;
+    }
+    Ok(())
+}
+
+/// A `traf`: read its `tfhd` (track id + defaults) and `trun` (sample run); if it belongs to a text
+/// track, read and decode its samples from where the fragment's data lives.
+fn read_traf<R: Read + Seek>(r: &mut R, moof_start: u64, tcs: u64, tce: u64, tracks: &[(u32, [u8; 4])], out: &mut Vec<u8>) -> io::Result<()> {
+    let Some((tfhd_s, _)) = find_box(r, tcs, tce, b"tfhd")? else { return Ok(()) };
+    let (track_id, base, default_size) = read_tfhd(r, moof_start, tfhd_s)?;
+    let Some(&(_, codec)) = tracks.iter().find(|(id, _)| *id == track_id) else { return Ok(()) };
+    let Some((trun_s, trun_e)) = find_box(r, tcs, tce, b"trun")? else { return Ok(()) };
+    let (data_offset, sizes) = read_trun(r, trun_s, trun_e, default_size)?;
+    let mut off = base.wrapping_add(data_offset as u64);
+    for size in sizes {
+        if size <= 256 * 1024 {
+            r.seek(SeekFrom::Start(off))?;
+            let mut buf = vec![0u8; size as usize];
+            if r.read_exact(&mut buf).is_err() {
+                return Ok(());
+            }
+            decode_sample(&codec, &buf, out);
+        }
+        off += size;
+    }
+    Ok(())
+}
+
+/// Parse a `tfhd`: `(track_id, base_data_offset, default_sample_size)`. The base defaults to the
+/// enclosing `moof` (the common "default-base-is-moof" case) unless an explicit base is present.
+fn read_tfhd<R: Read + Seek>(r: &mut R, moof_start: u64, s: u64) -> io::Result<(u32, u64, u64)> {
+    r.seek(SeekFrom::Start(s))?;
+    let mut head = [0u8; 8]; // [version+flags][track_id]
+    if fill(r, &mut head)? < 8 {
+        return Ok((0, moof_start, 0));
+    }
+    let flags = u32::from_be_bytes([0, head[1], head[2], head[3]]);
+    let track_id = u32::from_be_bytes([head[4], head[5], head[6], head[7]]);
+    let (mut base, mut default_size) = (moof_start, 0u64);
+    if flags & 0x00_0001 != 0 {
+        let mut b = [0u8; 8]; // base_data_offset
+        r.read_exact(&mut b)?;
+        base = u64::from_be_bytes(b);
+    }
+    if flags & 0x00_0002 != 0 {
+        skip_u32(r)?; // sample_description_index
+    }
+    if flags & 0x00_0008 != 0 {
+        skip_u32(r)?; // default_sample_duration
+    }
+    if flags & 0x00_0010 != 0 {
+        let mut b = [0u8; 4]; // default_sample_size
+        r.read_exact(&mut b)?;
+        default_size = u64::from(u32::from_be_bytes(b));
+    }
+    Ok((track_id, base, default_size))
+}
+
+/// Parse a `trun`: `(data_offset, per-sample sizes)`. Sizes come from the run, or fall back to
+/// `default_size`; `data_offset` is relative to the fragment's base.
+fn read_trun<R: Read + Seek>(r: &mut R, s: u64, e: u64, default_size: u64) -> io::Result<(i64, Vec<u64>)> {
+    r.seek(SeekFrom::Start(s))?;
+    let mut head = [0u8; 8]; // [version+flags][sample_count]
+    if fill(r, &mut head)? < 8 {
+        return Ok((0, Vec::new()));
+    }
+    let flags = u32::from_be_bytes([0, head[1], head[2], head[3]]);
+    let sample_count = u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize;
+    let mut data_offset = 0i64;
+    if flags & 0x00_0001 != 0 {
+        let mut b = [0u8; 4]; // data_offset (i32)
+        r.read_exact(&mut b)?;
+        data_offset = i64::from(i32::from_be_bytes(b));
+    }
+    if flags & 0x00_0004 != 0 {
+        skip_u32(r)?; // first_sample_flags
+    }
+    let (has_dur, has_size) = (flags & 0x00_0100 != 0, flags & 0x00_0200 != 0);
+    let (has_flags, has_ctime) = (flags & 0x00_0400 != 0, flags & 0x00_0800 != 0);
+    let per_sample = 4 * (u64::from(has_dur) + u64::from(has_size) + u64::from(has_flags) + u64::from(has_ctime));
+    // Bound the count by what fits in the box (and a ceiling) so a bogus count can't run away.
+    let avail = e.saturating_sub(r.stream_position()?);
+    let room = avail.checked_div(per_sample).map_or(sample_count, |n| n as usize);
+    let count = sample_count.min(room).min(1 << 16);
+    let mut sizes = Vec::with_capacity(count);
+    for _ in 0..count {
+        if has_dur {
+            skip_u32(r)?;
+        }
+        let size = if has_size {
+            let mut b = [0u8; 4];
+            r.read_exact(&mut b)?;
+            u64::from(u32::from_be_bytes(b))
+        } else {
+            default_size
+        };
+        if has_flags {
+            skip_u32(r)?;
+        }
+        if has_ctime {
+            skip_u32(r)?;
+        }
+        sizes.push(size);
+    }
+    Ok((data_offset, sizes))
+}
+
+/// Read and discard a big-endian `u32`.
+fn skip_u32<R: Read>(r: &mut R) -> io::Result<()> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)
+}
+
+/// Whether the track's `hdlr` names a text/subtitle handler (`text`/`sbtl`/`subt`).
+fn is_text_handler<R: Read + Seek>(r: &mut R, mdia_s: u64, mdia_e: u64) -> io::Result<bool> {
+    let Some((s, e)) = find_box(r, mdia_s, mdia_e, b"hdlr")? else { return Ok(false) };
+    if e - s < 12 {
+        return Ok(false);
+    }
+    r.seek(SeekFrom::Start(s))?;
+    let mut b = [0u8; 12]; // [version+flags][pre_defined][handler_type]
+    r.read_exact(&mut b)?;
+    Ok(matches!(&b[8..12], b"text" | b"sbtl" | b"subt"))
+}
+
+/// The codec fourCC of the first sample entry in `stsd`.
+fn stsd_codec<R: Read + Seek>(r: &mut R, stbl_s: u64, stbl_e: u64) -> io::Result<[u8; 4]> {
+    let Some((s, e)) = find_box(r, stbl_s, stbl_e, b"stsd")? else { return Ok([0; 4]) };
+    if e - s < 16 {
+        return Ok([0; 4]);
+    }
+    r.seek(SeekFrom::Start(s + 12))?; // past [version+flags][entry_count][entry size]
+    let mut fourcc = [0u8; 4];
+    r.read_exact(&mut fourcc)?;
+    Ok(fourcc)
+}
+
+/// Per-sample byte sizes, from `stsz` (a single shared size, or one per sample).
+fn read_sample_sizes<R: Read + Seek>(r: &mut R, stbl_s: u64, stbl_e: u64) -> io::Result<Vec<u64>> {
+    let Some((s, e)) = find_box(r, stbl_s, stbl_e, b"stsz")? else { return Ok(Vec::new()) };
+    r.seek(SeekFrom::Start(s))?;
+    let mut head = [0u8; 12]; // [version+flags][sample_size][sample_count]
+    if fill(r, &mut head)? < 12 {
+        return Ok(Vec::new());
+    }
+    let count = u32::from_be_bytes([head[8], head[9], head[10], head[11]]) as usize;
+    match u32::from_be_bytes([head[4], head[5], head[6], head[7]]) {
+        0 => read_u32s(r, e.saturating_sub(s + 12), count).map(|v| v.into_iter().map(u64::from).collect()),
+        shared => Ok(vec![u64::from(shared); count]),
+    }
+}
+
+/// Chunk file offsets, from `stco` (32-bit) or `co64` (64-bit).
+fn read_chunk_offsets<R: Read + Seek>(r: &mut R, stbl_s: u64, stbl_e: u64) -> io::Result<Vec<u64>> {
+    if let Some((s, e)) = find_box(r, stbl_s, stbl_e, b"stco")? {
+        r.seek(SeekFrom::Start(s + 4))?;
+        let count = read_u32s(r, 4, 1)?.first().copied().unwrap_or(0) as usize;
+        Ok(read_u32s(r, e.saturating_sub(s + 8), count)?.into_iter().map(u64::from).collect())
+    } else if let Some((s, e)) = find_box(r, stbl_s, stbl_e, b"co64")? {
+        r.seek(SeekFrom::Start(s + 4))?;
+        let count = read_u32s(r, 4, 1)?.first().copied().unwrap_or(0) as usize;
+        let count = count.min((e.saturating_sub(s + 8) / 8) as usize);
+        let mut offs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut b = [0u8; 8];
+            r.read_exact(&mut b)?;
+            offs.push(u64::from_be_bytes(b));
+        }
+        Ok(offs)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// `stsc` entries reduced to `(first_chunk, samples_per_chunk)`.
+fn read_sample_to_chunk<R: Read + Seek>(r: &mut R, stbl_s: u64, stbl_e: u64) -> io::Result<Vec<(u32, u32)>> {
+    let Some((s, e)) = find_box(r, stbl_s, stbl_e, b"stsc")? else { return Ok(Vec::new()) };
+    r.seek(SeekFrom::Start(s + 4))?;
+    let count = read_u32s(r, 4, 1)?.first().copied().unwrap_or(0) as usize;
+    let count = count.min((e.saturating_sub(s + 8) / 12) as usize);
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let f = read_u32s(r, 12, 3)?;
+        entries.push((*f.first().unwrap_or(&0), *f.get(1).unwrap_or(&0)));
+    }
+    Ok(entries)
+}
+
+/// Read up to `count` big-endian `u32`s, bounded by `avail` bytes so a bogus count can't over-read.
+fn read_u32s<R: Read>(r: &mut R, avail: u64, count: usize) -> io::Result<Vec<u32>> {
+    let count = count.min((avail / 4) as usize);
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut b = [0u8; 4];
+        r.read_exact(&mut b)?;
+        out.push(u32::from_be_bytes(b));
+    }
+    Ok(out)
+}
+
+/// Reconstruct each sample's file offset (its chunk's offset plus the preceding samples in that
+/// chunk), read it, and decode its text. Skips implausibly large samples (not subtitle text).
+fn extract_samples<R: Read + Seek>(
+    r: &mut R,
+    codec: &[u8; 4],
+    sizes: &[u64],
+    chunks: &[u64],
+    stsc: &[(u32, u32)],
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    let mut sample = 0usize;
+    for (i, &chunk_off) in chunks.iter().enumerate() {
+        let chunk = i as u32 + 1; // chunks are 1-based in `stsc`
+        let per_chunk = stsc.iter().rev().find(|(first, _)| *first <= chunk).map_or(0, |&(_, n)| n);
+        let mut off = chunk_off;
+        for _ in 0..per_chunk {
+            let Some(&size) = sizes.get(sample) else { return Ok(()) };
+            sample += 1;
+            if size <= 256 * 1024 {
+                r.seek(SeekFrom::Start(off))?;
+                let mut buf = vec![0u8; size as usize];
+                if r.read_exact(&mut buf).is_err() {
+                    return Ok(());
+                }
+                decode_sample(codec, &buf, out);
+            }
+            off += size;
+        }
+    }
+    Ok(())
+}
+
+/// Decode one subtitle sample's text, per codec.
+fn decode_sample(codec: &[u8; 4], sample: &[u8], out: &mut Vec<u8>) {
+    match codec {
+        // tx3g / QuickTime text: `[u16 text length][UTF-8 text][optional style boxes]`.
+        b"tx3g" | b"text" => {
+            let len = sample.get(..2).map_or(0, |b| usize::from(u16::from_be_bytes([b[0], b[1]])));
+            if let Some(text) = sample.get(2..2 + len) {
+                push_text(out, text);
+            }
+        }
+        // WebVTT: cue boxes; the visible text lives in `payl` boxes.
+        b"wvtt" => push_wvtt_payloads(sample, out),
+        // TTML (`stpp`) and anything else text-ish: take the whole (UTF-8) sample.
+        _ => push_text(out, sample),
+    }
+}
+
+/// Append `bytes` as a trimmed line, if it's non-empty UTF-8.
+fn push_text(out: &mut Vec<u8>, bytes: &[u8]) {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        let text = text.trim();
+        if !text.is_empty() {
+            out.extend_from_slice(text.as_bytes());
+            out.push(b'\n');
+        }
+    }
+}
+
+/// Walk a WebVTT sample's boxes, appending each `payl` (cue payload); descends into `vttc` cues.
+fn push_wvtt_payloads(sample: &[u8], out: &mut Vec<u8>) {
+    let mut pos = 0;
+    while pos + 8 <= sample.len() {
+        let size = u32::from_be_bytes([sample[pos], sample[pos + 1], sample[pos + 2], sample[pos + 3]]) as usize;
+        if size < 8 {
+            break;
+        }
+        let end = (pos + size).min(sample.len());
+        match &sample[pos + 4..pos + 8] {
+            b"vttc" => push_wvtt_payloads(&sample[pos + 8..end], out),
+            b"payl" => push_text(out, &sample[pos + 8..end]),
+            _ => {}
+        }
+        pos += size;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +800,75 @@ mod tests {
 
         let out = matroska_subtitles(io::Cursor::new(segment)).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "hi there\n");
+    }
+
+    #[test]
+    fn mp4_extracts_a_tx3g_sample() {
+        fn mp4box(fourcc: &[u8; 4], content: &[u8]) -> Vec<u8> {
+            let mut v = (u32::try_from(8 + content.len()).unwrap()).to_be_bytes().to_vec();
+            v.extend_from_slice(fourcc);
+            v.extend_from_slice(content);
+            v
+        }
+        // moov { trak { mdia { hdlr[handler=text] minf { stbl { stsd[tx3g] stsz stco stsc } } } } },
+        // and an mdat whose single tx3g sample `[u16 len=6]["hi mp4"]` sits at file offset 8 (mdat
+        // is written first, so `stco` can point straight at it).
+        let hdlr = mp4box(b"hdlr", &[&[0u8; 8][..], b"text", &[0u8; 13]].concat()); // handler_type at [8..12]
+        let stsd = mp4box(b"stsd", &[&[0, 0, 0, 0, 0, 0, 0, 1][..], &mp4box(b"tx3g", &[0u8; 8])].concat());
+        let stsz = mp4box(b"stsz", &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 8]); // shared=0, count=1, size=8
+        let stco = mp4box(b"stco", &[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 8]); // count=1, offset=8
+        let stsc = mp4box(b"stsc", &[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]);
+        let stbl = mp4box(b"stbl", &[stsd, stsz, stco, stsc].concat());
+        let mdia = mp4box(b"mdia", &[hdlr, mp4box(b"minf", &stbl)].concat());
+        let moov = mp4box(b"moov", &mp4box(b"trak", &mdia));
+        let mdat = mp4box(b"mdat", &[&[0u8, 6][..], b"hi mp4"].concat());
+        let out = mp4_subtitles(io::Cursor::new([mdat, moov].concat())).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "hi mp4\n");
+    }
+
+    #[test]
+    fn mp4_extracts_a_fragmented_tx3g_sample() {
+        fn mp4box(fourcc: &[u8; 4], content: &[u8]) -> Vec<u8> {
+            let mut v = u32::try_from(8 + content.len()).unwrap().to_be_bytes().to_vec();
+            v.extend_from_slice(fourcc);
+            v.extend_from_slice(content);
+            v
+        }
+        // Fragmented MP4: `moov` defines track 1 (text/tx3g) with EMPTY sample tables; the sample
+        // lives in a `moof` fragment. `mdat` is written first, so `tfhd`'s explicit base_data_offset
+        // can point straight at it (offset 8) without a chicken-and-egg size computation.
+        let tkhd = mp4box(b"tkhd", &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]); // v0; track_id=1 at [12]
+        let hdlr = mp4box(b"hdlr", &[&[0u8; 8][..], b"text", &[0u8; 13]].concat());
+        let stsd = mp4box(b"stsd", &[&[0, 0, 0, 0, 0, 0, 0, 1][..], &mp4box(b"tx3g", &[0u8; 8])].concat());
+        let empty = mp4box(b"stsz", &[0u8; 12]); // count=0 (fragmented → no progressive samples)
+        let stbl = mp4box(
+            b"stbl",
+            &[stsd, empty, mp4box(b"stco", &[0u8; 8]), mp4box(b"stsc", &[0u8; 8])].concat(),
+        );
+        let mdia = mp4box(b"mdia", &[hdlr, mp4box(b"minf", &stbl)].concat());
+        let moov = mp4box(b"moov", &mp4box(b"trak", &[tkhd, mdia].concat()));
+        // tfhd: flags=0x000001 (base_data_offset present), track_id=1, base=8.
+        let tfhd = mp4box(b"tfhd", &[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 8]);
+        // trun: flags=0x000200 (sample_size present), sample_count=1, sample_size=9.
+        let trun = mp4box(b"trun", &[0, 0, 2, 0, 0, 0, 0, 1, 0, 0, 0, 9]);
+        let moof = mp4box(b"moof", &mp4box(b"traf", &[tfhd, trun].concat()));
+        let mdat = mp4box(b"mdat", &[&[0u8, 7][..], b"hi frag"].concat()); // 9-byte sample at offset 8
+        let out = mp4_subtitles(io::Cursor::new([mdat, moov, moof].concat())).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "hi frag\n");
+    }
+
+    #[test]
+    fn wvtt_payload_text_is_extracted() {
+        // A WebVTT sample is boxes: a `vttc` cue wrapping a `payl` payload holding the cue text.
+        let mut payl = (8u32 + 9).to_be_bytes().to_vec();
+        payl.extend_from_slice(b"payl");
+        payl.extend_from_slice(b"hello cue");
+        let mut vttc = u32::try_from(8 + payl.len()).unwrap().to_be_bytes().to_vec();
+        vttc.extend_from_slice(b"vttc");
+        vttc.extend_from_slice(&payl);
+        let mut out = Vec::new();
+        push_wvtt_payloads(&vttc, &mut out);
+        assert_eq!(String::from_utf8(out).unwrap(), "hello cue\n");
     }
 
     #[test]

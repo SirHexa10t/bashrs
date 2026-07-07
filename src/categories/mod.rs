@@ -3,7 +3,6 @@
 
 pub mod autogen_lookup;
 pub mod autogen_styles;
-pub mod autogen_treegrep;
 pub mod bashrs;
 pub mod comfy_repos;
 pub mod filesystem;

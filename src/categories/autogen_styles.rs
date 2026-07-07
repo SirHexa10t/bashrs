@@ -1,16 +1,17 @@
-//! The stylized-echo command matrix (`StylizedEchoCommand`) — bare, memorable verbs (`recho`,
-//! `becho`, …), never `style_`-prefixed. Each names its style by a `[weight, underline, color]`
-//! triple, printed via the styling engine in [`crate::support::doc_style`].
+//! The generated stylized-echo command matrix (`StylizedEchoCommand`) — bare, memorable verbs
+//! (`recho`, `becho`, …), never `style_`-prefixed. Each names its style by a `[weight, underline,
+//! color]` triple, printed via the styling engine in [`crate::support::doc_style`].
 //!
-//! Only the region between the `GENERATED-STYLE-MATRIX` markers is generated — `build.rs` rewrites
-//! it from `generative_constants.rs` during the build (when either changes), so it's never edited by hand.
-//! `EchoArgs` and `_styled_echo` are hand-written. Hand-written style *commands* that build on the
-//! engine live in [`crate::categories::styles`] (e.g. `errcho`).
+//! The whole matrix between the `GENERATED-STYLE-MATRIX` markers is generated — `build.rs` rewrites
+//! it from `generative_constants.rs` during the build (when either changes), so this file is never
+//! edited by hand. Each shim forwards to [`_styled_echo`](crate::categories::styles::_styled_echo);
+//! `EchoArgs` lives in [`crate::support::args`]. Hand-written style *commands* (e.g. `errcho`) live
+//! in [`crate::categories::styles`].
 
 #[bashrs_macros::category(command = StylizedEchoCommand, prefix = "style_")]
 mod commands {
-    use crate::support::doc_style::{_scoped, _wrap};
-    use clap::Args;
+    use crate::categories::styles::_styled_echo;
+    use crate::support::args::EchoArgs;
 
     // GENERATED-STYLE-MATRIX-START
 
@@ -194,16 +195,4 @@ mod commands {
     #[alias("echodaum")]
     pub fn daumecho(args: EchoArgs) { _styled_echo(["da", "u", "m"], &args); }
     // GENERATED-STYLE-MATRIX-END
-
-    /// Words to print, joined with spaces (like `echo`).
-    #[derive(Args)]
-    pub struct EchoArgs {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        pub words: Vec<String>,
-    }
-
-    /// Print the words scoped in the style named by `criteria` (see [`crate::support::doc_style`]).
-    fn _styled_echo(criteria: [&str; 3], args: &EchoArgs) {
-        println!("{}", _scoped(&_wrap(criteria), &args.words.join(" ")));
-    }
 }

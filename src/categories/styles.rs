@@ -1,13 +1,15 @@
 //! Hand-written style commands — the `StyleCommand` category: one-off styling verbs
 //! (`errcho`), a `synoptic`-backed `code_highlight`, and a `grep`-crate-backed `keyword_highlight`,
 //! none part of the generated `recho` matrix. Echo verbs build on the stylized-echo engine
-//! (`_wrap`/`_scoped` in [`crate::support::doc_style`], `EchoArgs` from `autogen_styles`); `code_highlight`
-//! colours via [`crate::support::color_theme`]. Add manual style commands here — `build.rs`
-//! regenerates the matrix separately and never touches this file.
+//! (`_wrap`/`_scoped` in [`crate::support::doc_style`], `EchoArgs` from [`crate::support::args`]);
+//! `code_highlight` colours via [`crate::support::color_theme`]. This module also owns `_styled_echo`,
+//! the print-in-a-style helper the generated `recho` matrix ([`crate::categories::autogen_styles`])
+//! forwards to. Add manual style commands here — `build.rs` regenerates the matrix separately and
+//! never touches this file.
 
 #[bashrs_macros::category(command = StyleCommand, prefix = "style_")]
 mod commands {
-    use crate::categories::autogen_styles::EchoArgs;
+    use crate::support::args::EchoArgs;
     use crate::support::doc_style::{_scoped, _wrap};
     use crate::support::{color_theme, input, streamgrep};
     use clap::Args;
@@ -76,6 +78,11 @@ mod commands {
         } else {
             None
         }
+    }
+
+    /// Print the words scoped in the style named by `criteria` (see [`crate::support::doc_style`]).
+    pub(crate) fn _styled_echo(criteria: [&str; 3], args: &EchoArgs) {
+        println!("{}", _scoped(&_wrap(criteria), &args.words.join(" ")));
     }
 
     #[cfg(test)]

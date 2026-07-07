@@ -22,8 +22,6 @@ pub(crate) struct GgElevatedRescan {
     expressions: Vec<String>,
     #[arg(long)]
     context: usize,
-    #[arg(long = "text-limit")]
-    text_limit: Option<u64>,
     #[arg(long = "no-number")]
     no_number: bool,
     #[arg(long)]
@@ -46,13 +44,10 @@ impl GgElevatedRescan {
             Ok(exe) => exe,
             Err(err) => return eprintln!("gg: can't locate myself to re-run as root: {err}"),
         };
-        // `<superuser> <exe> gg-elevated-rescan --context N [--text-limit N] [--no-number] --expr E
-        // … <paths>` — exactly the shape this struct parses back.
+        // `<superuser> <exe> gg-elevated-rescan --context N [--no-number] [--delve] --expr E …
+        // <paths>` — exactly the shape this struct parses back.
         let mut cmd = superuser::command();
         cmd.arg(exe).arg(Self::MARKER).arg("--context").arg(opts.context.to_string());
-        if let Some(limit) = opts.text_limit {
-            cmd.arg("--text-limit").arg(limit.to_string());
-        }
         if !opts.line_number {
             cmd.arg("--no-number");
         }
@@ -71,7 +66,6 @@ impl GgElevatedRescan {
     /// Child side: run the parsed re-scan as the now-elevated (root) process.
     fn run(self) {
         let opts = treegrep::Options {
-            text_limit: self.text_limit,
             line_number: !self.no_number,
             context: self.context,
             delve: self.delve,
@@ -105,13 +99,13 @@ mod tests {
         // Mirrors what `GgElevatedRescan::reexec` builds: the marker (consumed as the program name
         // by `parse_from`), gg's tuning flags, then the paths as positionals.
         let cli = GgElevatedRescan::parse_from([
-            GgElevatedRescan::MARKER, "--context", "3", "--text-limit", "500", "--no-number",
+            GgElevatedRescan::MARKER, "--context", "3", "--no-number", "--delve",
             "--expr", "foo", "--expr", "bar", "/a", "/b",
         ]);
         assert_eq!(cli.expressions, ["foo", "bar"]);
         assert_eq!(cli.context, 3);
-        assert_eq!(cli.text_limit, Some(500));
         assert!(cli.no_number);
+        assert!(cli.delve);
         assert_eq!(cli.paths, [PathBuf::from("/a"), PathBuf::from("/b")]);
     }
 }

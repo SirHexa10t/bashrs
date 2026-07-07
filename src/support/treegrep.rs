@@ -1,4 +1,4 @@
-//! Recursive directory search — the engine behind `gg` ([`crate::categories::autogen_treegrep`]). Walks a
+//! Recursive directory search — the engine behind `gg` ([`crate::categories::autogen_lookup`]). Walks a
 //! tree with ripgrep's `ignore` walker and searches each file with the `grep` crate: first matching
 //! **filenames**, then matching **contents** (`path:line:text`). Binary files are skipped (NUL
 //! detection); over-long lines are omitted (`text_limit`, for minified/dumped text). Paths that
@@ -17,9 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use grep::matcher::Matcher;
-use grep::printer::{ColorSpecs, StandardBuilder, UserColorSpec};
 use grep::regex::{RegexMatcher, RegexMatcherBuilder};
-use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder};
+use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use termcolor::{Buffer, BufferWriter, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
@@ -29,8 +28,6 @@ use crate::support::streamgrep;
 
 /// Options mapped from the `gg` flags (the search roots are passed to [`search`] separately).
 pub struct Options {
-    /// Omit matches on lines longer than this many bytes; `None` = no limit.
-    pub text_limit: Option<u64>,
     pub line_number: bool,
     /// Lines of context to show around each file-content match (0 = none).
     pub context: usize,
@@ -154,14 +151,7 @@ fn search_contents(
 ) -> bool {
     let bufwtr = BufferWriter::stdout(if color { ColorChoice::Always } else { ColorChoice::Never });
     let found = AtomicBool::new(false);
-    let ctx = Ctx {
-        matcher,
-        bufwtr: &bufwtr,
-        text_limit: opts.text_limit,
-        found: &found,
-        denied,
-        delve: opts.delve,
-    };
+    let ctx = Ctx { matcher, bufwtr: &bufwtr, found: &found, denied, delve: opts.delve };
     let line_number = opts.line_number;
     let context = opts.context;
 
@@ -185,7 +175,6 @@ fn search_contents(
 struct Ctx<'a> {
     matcher: &'a RegexMatcher,
     bufwtr: &'a BufferWriter,
-    text_limit: Option<u64>,
     found: &'a AtomicBool,
     denied: &'a Mutex<BTreeSet<PathBuf>>,
     delve: bool,
@@ -201,15 +190,119 @@ fn build_searcher(line_number: bool, context: usize) -> Searcher {
         .build()
 }
 
-/// Colours for `gg`'s `path:line:text` output: magenta (purple) paths, yellow line numbers, and
-/// matches black-on-red (the shared highlight). The `grep` printer resolves these `ColorSpecs`.
-fn content_color() -> ColorSpecs {
-    let specs: Vec<UserColorSpec> =
-        ["path:fg:magenta", "line:fg:yellow", "match:bg:red", "match:fg:black"]
-            .iter()
-            .map(|spec| spec.parse().expect("built-in colour spec is valid"))
-            .collect();
-    ColorSpecs::new(&specs)
+/// The longest match/context line `gg` prints in full; anything longer is replaced by [`TOO_LONG`],
+/// so a match inside minified or dumped text can't flood the terminal with one giant line.
+const MAX_LINE: usize = 2000;
+const TOO_LONG: &[u8] = b"<match found, but result was too long to display>";
+
+/// A `grep` sink for `gg`'s output: `path:line:text` for matches, `path-line-text` for context, with
+/// magenta paths, yellow line numbers, and black-on-red match spans — and any line over [`MAX_LINE`]
+/// chars swapped for [`TOO_LONG`]. It writes to a `termcolor` buffer, so colour is emitted only when
+/// that buffer is in colour mode (a terminal); piped output stays plain.
+struct GgSink<'a> {
+    matcher: &'a RegexMatcher,
+    buffer: &'a mut Buffer,
+    path: Vec<u8>,
+    path_color: ColorSpec,
+    line_color: ColorSpec,
+    match_color: ColorSpec,
+}
+
+impl<'a> GgSink<'a> {
+    fn new(matcher: &'a RegexMatcher, buffer: &'a mut Buffer, path: &Path) -> Self {
+        let color = |fg, bg| {
+            let mut spec = ColorSpec::new();
+            spec.set_fg(Some(fg)).set_bg(bg);
+            spec
+        };
+        GgSink {
+            matcher,
+            buffer,
+            path: path.to_string_lossy().into_owned().into_bytes(),
+            path_color: color(Color::Magenta, None),
+            line_color: color(Color::Yellow, None),
+            match_color: color(Color::Black, Some(Color::Red)),
+        }
+    }
+
+    /// Write one line as `path<sep>line<sep>text` (`sep` is `:` for a match, `-` for context). An
+    /// over-long line becomes [`TOO_LONG`]; a match line has its match spans highlighted.
+    fn write_line(&mut self, raw: &[u8], line_number: Option<u64>, is_match: bool) -> io::Result<()> {
+        let sep = if is_match { &b":"[..] } else { &b"-"[..] };
+        field(self.buffer, &self.path_color, &self.path)?;
+        self.buffer.write_all(sep)?;
+        if let Some(n) = line_number {
+            field(self.buffer, &self.line_color, n.to_string().as_bytes())?;
+            self.buffer.write_all(sep)?;
+        }
+        let content = trim_eol(raw);
+        if content.len() > MAX_LINE {
+            self.buffer.write_all(TOO_LONG)?;
+        } else if is_match {
+            self.write_highlighted(content)?;
+        } else {
+            self.buffer.write_all(content)?;
+        }
+        self.buffer.write_all(b"\n")
+    }
+
+    /// Write `content`, colouring each match span black-on-red.
+    fn write_highlighted(&mut self, content: &[u8]) -> io::Result<()> {
+        let mut spans = Vec::new();
+        let _ = self.matcher.find_iter(content, |m| {
+            spans.push((m.start(), m.end()));
+            true
+        });
+        let mut last = 0;
+        for (start, end) in spans {
+            self.buffer.write_all(&content[last..start])?;
+            field(self.buffer, &self.match_color, &content[start..end])?;
+            last = end;
+        }
+        self.buffer.write_all(&content[last..])
+    }
+}
+
+impl Sink for GgSink<'_> {
+    type Error = io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> io::Result<bool> {
+        let mut line_number = mat.line_number();
+        for line in mat.lines() {
+            self.write_line(line, line_number, true)?;
+            line_number = line_number.map(|n| n + 1);
+        }
+        Ok(true)
+    }
+
+    fn context(&mut self, _searcher: &Searcher, ctx: &SinkContext<'_>) -> io::Result<bool> {
+        self.write_line(ctx.bytes(), ctx.line_number(), false)?;
+        Ok(true)
+    }
+
+    fn context_break(&mut self, _searcher: &Searcher) -> io::Result<bool> {
+        self.buffer.write_all(b"--\n")?;
+        Ok(true)
+    }
+}
+
+/// Write `bytes` in `color`, then reset. Colour codes are emitted only if `buf` is in colour mode.
+fn field(buf: &mut Buffer, color: &ColorSpec, bytes: &[u8]) -> io::Result<()> {
+    buf.set_color(color)?;
+    buf.write_all(bytes)?;
+    buf.reset()
+}
+
+/// A line without its trailing `\n` / `\r\n`.
+fn trim_eol(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    if end > 0 && line[end - 1] == b'\n' {
+        end -= 1;
+    }
+    if end > 0 && line[end - 1] == b'\r' {
+        end -= 1;
+    }
+    &line[..end]
 }
 
 /// Search one file into `buffer`, then flush it to stdout atomically.
@@ -228,18 +321,13 @@ fn scan_file(entry: &DirEntry, searcher: &mut Searcher, buffer: &mut Buffer, ctx
         }
     }
     {
-        let mut printer = StandardBuilder::new()
-            .color_specs(content_color())
-            .heading(false)
-            .max_columns(ctx.text_limit)
-            .build(&mut *buffer);
-        let sink = printer.sink_with_path(ctx.matcher, entry.path());
+        let sink = GgSink::new(ctx.matcher, buffer, entry.path());
         if let Err(err) = searcher.search_path(ctx.matcher, entry.path(), sink) {
             if err.kind() == io::ErrorKind::PermissionDenied {
                 ctx.denied.lock().unwrap().insert(entry.path().to_path_buf());
             }
         }
-    } // printer dropped → the &mut borrow of `buffer` ends
+    } // sink dropped → the &mut borrow of `buffer` ends
     flush(buffer, ctx);
 }
 
@@ -248,12 +336,8 @@ fn scan_file(entry: &DirEntry, searcher: &mut Searcher, buffer: &mut Buffer, ctx
 fn delve_search(text: &[u8], path: &Path, buffer: &mut Buffer, ctx: &Ctx) {
     let mut searcher =
         SearcherBuilder::new().binary_detection(BinaryDetection::none()).line_number(false).build();
-    let mut printer = StandardBuilder::new()
-        .color_specs(content_color())
-        .heading(false)
-        .max_columns(ctx.text_limit)
-        .build(&mut *buffer);
-    let _ = searcher.search_slice(ctx.matcher, text, printer.sink_with_path(ctx.matcher, path));
+    let sink = GgSink::new(ctx.matcher, buffer, path);
+    let _ = searcher.search_slice(ctx.matcher, text, sink);
 }
 
 /// Flush a completed file's buffer to stdout atomically, recording that something matched.
