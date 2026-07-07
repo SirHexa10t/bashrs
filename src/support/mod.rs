@@ -9,6 +9,7 @@ pub mod doc_style;
 pub mod exec;
 pub mod input;
 pub mod streamgrep;
+pub mod superuser;
 // Data, not a helper module: every build-time-generation constant (style vocab + search contexts),
 // merged into one file and shared with `build.rs` via `include!`. Only the style vocab is also read
 // at runtime (by `doc_style`); the context lists are build-time-only.

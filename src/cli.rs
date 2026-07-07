@@ -4,7 +4,6 @@
 //! builds the sourced shell file (`wrappers`).
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
 use crate::categories::autogen_lookup::GrepCommand;
 use crate::categories::autogen_styles::StylizedEchoCommand;
 use crate::categories::autogen_treegrep::GgCommand;
@@ -65,30 +64,6 @@ pub enum Command {
     /// Emit shell function wrappers for every command (used by COMPILE.sh).
     #[command(hide = true)]
     Generate,
-    /// Internal: re-scan specific paths as root — used by `gg`'s permission re-scan, not for
-    /// direct use.
-    #[command(hide = true)]
-    GgSudo(GgSudoArgs),
-}
-
-/// Arguments for the hidden `gg-sudo` command (`gg`'s root re-scan): the search terms, the same
-/// tuning as `gg`, and the exact paths to re-search as root.
-#[derive(clap::Args)]
-pub struct GgSudoArgs {
-    /// A search expression (repeated).
-    #[arg(long = "expr")]
-    expressions: Vec<String>,
-    /// Context lines shown around each match.
-    #[arg(long)]
-    context: usize,
-    /// Line-length limit; omitted means unlimited.
-    #[arg(long = "text-limit")]
-    text_limit: Option<u64>,
-    /// Suppress line numbers (on by default).
-    #[arg(long = "no-number")]
-    no_number: bool,
-    /// The exact paths to search (directories walked recursively, files searched directly).
-    paths: Vec<PathBuf>,
 }
 
 impl Command {
@@ -107,14 +82,6 @@ impl Command {
             Command::Style(cmd) => cmd.run(),
             Command::StylizedEcho(cmd) => cmd.run(),
             Command::Generate => print!("{}", wrappers()),
-            Command::GgSudo(args) => {
-                let opts = crate::support::treegrep::Options {
-                    text_limit: args.text_limit,
-                    line_number: !args.no_number,
-                    context: args.context,
-                };
-                crate::support::treegrep::search(&args.expressions, &args.paths, &opts);
-            }
         }
     }
 }

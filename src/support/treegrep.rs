@@ -1,9 +1,9 @@
-//! Recursive directory search — the engine behind `gg` ([`crate::categories::lookup`]). Walks a
+//! Recursive directory search — the engine behind `gg` ([`crate::categories::autogen_treegrep`]). Walks a
 //! tree with ripgrep's `ignore` walker and searches each file with the `grep` crate: first matching
 //! **filenames**, then matching **contents** (`path:line:text`). Binary files are skipped (NUL
 //! detection); over-long lines are omitted (`text_limit`, for minified/dumped text). Paths that
 //! can't be read for permissions are collected and returned, so the caller can offer a root re-scan
-//! (re-exec under sudo) scoped to just those paths.
+//! (re-exec under the superuser command) scoped to just those paths.
 //!
 //! Two passes on purpose: the filenames pass reads no file *contents* (only directory metadata), so
 //! it's cheap, and running it first gives the "names, then contents" ordering while content matches

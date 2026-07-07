@@ -4,8 +4,8 @@
 //! around each match.
 //!
 //! Only the region between the `GENERATED-LOOKUP-GREP` markers is generated — `build.rs`
-//! rewrites it from `lookup_vocab.rs` during the build (when either changes), so it's never
-//! edited by hand. The engine around it (`_grep`, `GrepArgs`) is hand-written. The
+//! rewrites it from `generative_constants.rs` during the build (when either changes), so it's
+//! never edited by hand. The engine around it (`_grep`, `GrepArgs`) is hand-written. The
 //! history-search command sharing the same in-process grep lives in
 //! [`crate::categories::lookup`] (`hg`).
 

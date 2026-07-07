@@ -3,7 +3,7 @@
 //! file-content match). Each runs the parallel tree search in [`crate::support::treegrep`].
 //!
 //! Only the region between the `GENERATED-TREEGREP` markers is generated — `build.rs` rewrites it
-//! from `treegrep_vocab.rs` during the build (when either changes), so it's never edited by hand.
+//! from `generative_constants.rs` during the build (when either changes), so it's never edited by hand.
 //! The engine around it (`_gg`, `GgArgs`) is hand-written. The history-search command lives in
 //! [`crate::categories::lookup`] (`hg`); the stream `g`-family in
 //! [`crate::categories::autogen_lookup`].
@@ -82,7 +82,7 @@ mod commands {
     }
 
     /// If some paths were unreadable and we're interactive, offer to re-scan just those as root by
-    /// re-exec'ing ourselves under `sudo`, scoped to the denied paths (no dedup needed — they turned
+    /// re-exec'ing ourselves under the superuser command, scoped to the denied paths (no dedup — they turned
     /// up nothing on the first pass). Non-interactive runs just note what was skipped.
     fn _offer_root_rescan(
         expressions: &[String],
@@ -113,25 +113,6 @@ mod commands {
         if std::io::stdin().read_line(&mut answer).is_err() || !answer.trim().eq_ignore_ascii_case("y") {
             return;
         }
-        let exe = match std::env::current_exe() {
-            Ok(exe) => exe,
-            Err(err) => return eprintln!("gg: can't locate myself to re-run under sudo: {err}"),
-        };
-        // `sudo <exe> gg-sudo --context N [--text-limit N] [--no-number] --expr E … <denied paths>`
-        let mut cmd = std::process::Command::new("sudo");
-        cmd.arg(exe).arg("gg-sudo").arg("--context").arg(opts.context.to_string());
-        if let Some(limit) = opts.text_limit {
-            cmd.arg("--text-limit").arg(limit.to_string());
-        }
-        if !opts.line_number {
-            cmd.arg("--no-number");
-        }
-        for expr in expressions {
-            cmd.arg("--expr").arg(expr);
-        }
-        cmd.args(denied);
-        let _ = cmd.status();
-        // Revoke the cached sudo timestamp so the elevation can't carry over to a later command.
-        let _ = std::process::Command::new("sudo").arg("-k").status();
+        crate::internal_cli::GgElevatedRescan::reexec(expressions, denied, opts);
     }
 }

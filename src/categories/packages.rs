@@ -4,17 +4,19 @@
 mod commands {
     use crate::support::args::NoArgs;
     use crate::support::exec::{run_reporting, succeeds_quietly};
+    use crate::support::superuser::{self, CMD};
 
     /// Update and upgrade every package manager present on the system
     #[prefixed]
     #[unprefixed]
     pub fn upup(_args: NoArgs) {
         _upgrade(MANAGERS);
+        superuser::revoke(); // drop the elevation the package steps just earned
     }
 
     /// Update the development toolchains (rustup, uv, ...) that are installed
     pub fn update_toolchains(_args: NoArgs) {
-        _upgrade(TOOLCHAINS);
+        _upgrade(TOOLCHAINS); // toolchains self-update as the user; none elevate, so nothing to revoke
     }
 
     /// Update everything: package managers, then dev toolchains
@@ -39,18 +41,19 @@ mod commands {
     struct Manager {
         /// Binary looked up on `PATH` to detect it.
         probe: &'static str,
-        /// Extra capability check (a `"program arg .."` command); the tool is skipped
+        /// Extra capability check (a `["program", "arg", ..]` word-list); the tool is skipped
         /// unless it succeeds. E.g. `nix profile` needs flakes enabled.
-        precheck: Option<&'static str>,
+        precheck: Option<&'static [&'static str]>,
         /// Others this one makes redundant when both are present (e.g. `yay` wraps
         /// `pacman`), so the superseded one is skipped.
         supersedes: &'static [&'static str],
-        /// Update+upgrade commands, run in order. Each is `"program arg .."`, split
-        /// on whitespace — fine here because no token contains a space.
-        steps: &'static [&'static str],
+        /// Update+upgrade commands, run in order. Each is a `["program", "arg", ..]` word-list;
+        /// a step whose first word is [`CMD`] runs under the superuser (see [`superuser`]), which
+        /// is how a step opts into elevation without naming the escalation tool itself.
+        steps: &'static [&'static [&'static str]],
         /// Command listing what's installed, for `print`. `None` for toolchains,
         /// which have no meaningful package list.
-        list: Option<&'static str>,
+        list: Option<&'static [&'static str]>,
     }
 
     // Only `precheck`/`supersedes`/`list` are taken from here via `..DEFAULTS`; every
@@ -60,19 +63,20 @@ mod commands {
     /// System package managers `upup`/`print` drive; add a row to support another.
     /// `autoremove` steps prune no-longer-needed packages, so upgrades can remove things.
     /// List commands are chosen to emit only packages — no progress/header lines.
+    /// A step beginning with [`CMD`] runs elevated; the escalation tool itself lives in [`superuser`].
     const MANAGERS: &[Manager] = &[
-        Manager { probe: "apt", steps: &["sudo apt update", "sudo apt full-upgrade -y", "sudo apt autoremove -y"], list: Some("dpkg-query -W"), ..DEFAULTS },
-        Manager { probe: "dnf", steps: &["sudo dnf upgrade --refresh -y", "sudo dnf autoremove -y"], list: Some("rpm -qa"), ..DEFAULTS },
-        Manager { probe: "yay", supersedes: &["pacman"], steps: &["yay -Syu --noconfirm"], list: Some("yay -Q"), ..DEFAULTS }, // wraps pacman; invokes sudo itself
-        Manager { probe: "pacman", steps: &["sudo pacman -Syu --noconfirm"], list: Some("pacman -Q"), ..DEFAULTS },
-        Manager { probe: "zypper", steps: &["sudo zypper refresh", "sudo zypper update -y"], list: Some("rpm -qa"), ..DEFAULTS },
-        Manager { probe: "apk", steps: &["sudo apk update", "sudo apk upgrade"], list: Some("apk info"), ..DEFAULTS },
-        Manager { probe: "guix", steps: &["guix pull", "guix upgrade"], list: Some("guix package --list-installed"), ..DEFAULTS },
-        Manager { probe: "nix-env", steps: &["nix-channel --update", "nix-env --upgrade"], list: Some("nix-env -q"), ..DEFAULTS },
-        Manager { probe: "nix", precheck: Some("nix profile list"), steps: &["nix profile upgrade"], list: Some("nix profile list"), ..DEFAULTS }, // new-style flake profiles
-        Manager { probe: "snap", steps: &["sudo snap refresh"], list: Some("snap list"), ..DEFAULTS },
-        Manager { probe: "flatpak", steps: &["flatpak upgrade --assumeyes"], list: Some("flatpak list"), ..DEFAULTS },
-        Manager { probe: "brew", steps: &["brew update", "brew upgrade"], list: Some("brew list"), ..DEFAULTS }, // brew refuses to run under sudo
+        Manager { probe: "apt", steps: &[&[CMD, "apt", "update"], &[CMD, "apt", "full-upgrade", "-y"], &[CMD, "apt", "autoremove", "-y"]], list: Some(&["dpkg-query", "-W"]), ..DEFAULTS },
+        Manager { probe: "dnf", steps: &[&[CMD, "dnf", "upgrade", "--refresh", "-y"], &[CMD, "dnf", "autoremove", "-y"]], list: Some(&["rpm", "-qa"]), ..DEFAULTS },
+        Manager { probe: "yay", supersedes: &["pacman"], steps: &[&["yay", "-Syu", "--noconfirm"]], list: Some(&["yay", "-Q"]), ..DEFAULTS }, // wraps pacman; invokes the superuser command itself
+        Manager { probe: "pacman", steps: &[&[CMD, "pacman", "-Syu", "--noconfirm"]], list: Some(&["pacman", "-Q"]), ..DEFAULTS },
+        Manager { probe: "zypper", steps: &[&[CMD, "zypper", "refresh"], &[CMD, "zypper", "update", "-y"]], list: Some(&["rpm", "-qa"]), ..DEFAULTS },
+        Manager { probe: "apk", steps: &[&[CMD, "apk", "update"], &[CMD, "apk", "upgrade"]], list: Some(&["apk", "info"]), ..DEFAULTS },
+        Manager { probe: "guix", steps: &[&["guix", "pull"], &["guix", "upgrade"]], list: Some(&["guix", "package", "--list-installed"]), ..DEFAULTS },
+        Manager { probe: "nix-env", steps: &[&["nix-channel", "--update"], &["nix-env", "--upgrade"]], list: Some(&["nix-env", "-q"]), ..DEFAULTS },
+        Manager { probe: "nix", precheck: Some(&["nix", "profile", "list"]), steps: &[&["nix", "profile", "upgrade"]], list: Some(&["nix", "profile", "list"]), ..DEFAULTS }, // new-style flake profiles
+        Manager { probe: "snap", steps: &[&[CMD, "snap", "refresh"]], list: Some(&["snap", "list"]), ..DEFAULTS },
+        Manager { probe: "flatpak", steps: &[&["flatpak", "upgrade", "--assumeyes"]], list: Some(&["flatpak", "list"]), ..DEFAULTS },
+        Manager { probe: "brew", steps: &[&["brew", "update"], &["brew", "upgrade"]], list: Some(&["brew", "list"]), ..DEFAULTS }, // brew refuses to run as root
     ];
 
     /// Dev toolchains `update_toolchains` drives. Each `steps` self-updates the tool
@@ -81,13 +85,13 @@ mod commands {
     /// here, harmlessly, since steps report-and-continue). Shell-sourced version
     /// managers (nvm, sdkman, asdf, pyenv, ...) aren't `PATH` binaries and are out of scope.
     const TOOLCHAINS: &[Manager] = &[
-        Manager { probe: "rustup", steps: &["rustup update"], ..DEFAULTS },
-        Manager { probe: "ghcup", steps: &["ghcup upgrade"], ..DEFAULTS },
-        Manager { probe: "uv", steps: &["uv self update"], ..DEFAULTS },
-        Manager { probe: "poetry", steps: &["poetry self update"], ..DEFAULTS },
-        Manager { probe: "pnpm", steps: &["pnpm self-update"], ..DEFAULTS },
-        Manager { probe: "stack", steps: &["stack upgrade"], ..DEFAULTS },
-        Manager { probe: "cpanm", steps: &["cpanm --self-upgrade"], ..DEFAULTS },
+        Manager { probe: "rustup", steps: &[&["rustup", "update"]], ..DEFAULTS },
+        Manager { probe: "ghcup", steps: &[&["ghcup", "upgrade"]], ..DEFAULTS },
+        Manager { probe: "uv", steps: &[&["uv", "self", "update"]], ..DEFAULTS },
+        Manager { probe: "poetry", steps: &[&["poetry", "self", "update"]], ..DEFAULTS },
+        Manager { probe: "pnpm", steps: &[&["pnpm", "self-update"]], ..DEFAULTS },
+        Manager { probe: "stack", steps: &[&["stack", "upgrade"]], ..DEFAULTS },
+        Manager { probe: "cpanm", steps: &[&["cpanm", "--self-upgrade"]], ..DEFAULTS },
     ];
 
     /// Detect, then run each active tool's `steps` under a header. Shared by `upup`
@@ -125,28 +129,26 @@ mod commands {
         })
     }
 
-    /// Split a `"program arg .."` line and run it, inheriting stdio and reporting failure.
-    fn _run_line(line: &str) {
-        let mut parts = line.split_whitespace();
-        if let Some(program) = parts.next() {
-            run_reporting(program, parts);
+    /// Run a `["program", "arg", ..]` word-list — the first word is the command, the rest its
+    /// args — inheriting stdio and reporting failure. A list beginning with [`CMD`] runs elevated.
+    fn _run_line(words: &[&str]) {
+        if let Some((&program, args)) = words.split_first() {
+            run_reporting(program, args);
         }
     }
 
-    /// Split a `"program arg .."` line and run it with output suppressed; true on success.
-    fn _run_quietly(line: &str) -> bool {
-        let mut parts = line.split_whitespace();
-        match parts.next() {
-            Some(program) => succeeds_quietly(program, parts),
+    /// Run a word-list with output suppressed; true on success (false if empty).
+    fn _run_quietly(words: &[&str]) -> bool {
+        match words.split_first() {
+            Some((&program, args)) => succeeds_quietly(program, args),
             None => false,
         }
     }
 
-    /// Run a listing command and print its output indented under the tool header.
-    fn _print_listing(line: &str) {
-        let mut parts = line.split_whitespace();
-        let Some(program) = parts.next() else { return };
-        match std::process::Command::new(program).args(parts).output() {
+    /// Run a listing word-list and print its output indented under the tool header.
+    fn _print_listing(words: &[&str]) {
+        let Some((&program, args)) = words.split_first() else { return };
+        match std::process::Command::new(program).args(args).output() {
             Ok(output) => {
                 for entry in String::from_utf8_lossy(&output.stdout).lines() {
                     println!("  {entry}");
@@ -161,17 +163,17 @@ mod commands {
         use super::*;
 
         fn assert_table_integrity(table: &[Manager]) {
-            // upup/update_toolchains/print take the first whitespace token as the
-            // program, so every step and list command must have one; `supersedes`
-            // must reference a tool that actually exists in the same table.
+            // upup/update_toolchains/print take the first word as the program, so every step and
+            // list command must be a non-empty word-list; `supersedes` must reference a tool that
+            // actually exists in the same table.
             let probes: Vec<&str> = table.iter().map(|m| m.probe).collect();
             for tool in table {
                 assert!(!tool.steps.is_empty(), "{}: needs at least one step", tool.probe);
                 for step in tool.steps {
-                    assert!(step.split_whitespace().next().is_some(), "{}: blank step", tool.probe);
+                    assert!(!step.is_empty(), "{}: blank step", tool.probe);
                 }
                 if let Some(list) = tool.list {
-                    assert!(list.split_whitespace().next().is_some(), "{}: blank list command", tool.probe);
+                    assert!(!list.is_empty(), "{}: blank list command", tool.probe);
                 }
                 for superseded in tool.supersedes {
                     assert!(probes.contains(superseded), "{}: supersedes unknown `{superseded}`", tool.probe);

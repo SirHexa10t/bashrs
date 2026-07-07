@@ -6,7 +6,7 @@
 //! A nested colour/style restores the enclosing one when it ends (rather than clearing to the
 //! terminal default), and every span starts from a clean slate so styles don't compound — see
 //! [`_scoped`]. A style is named by a `[weight, underline, color]` triple, resolved against the
-//! vocabulary in [`crate::support::style_vocab`] by [`_wrap`].
+//! vocabulary in [`crate::support::generative_constants`] by [`_wrap`].
 
 use crate::support::generative_constants::{COLORS, UNDERLINES, WEIGHTS};
 

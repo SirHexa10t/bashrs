@@ -3,7 +3,7 @@
 //! triple, printed via the styling engine in [`crate::support::doc_style`].
 //!
 //! Only the region between the `GENERATED-STYLE-MATRIX` markers is generated — `build.rs` rewrites
-//! it from `style_vocab.rs` during the build (when either changes), so it's never edited by hand.
+//! it from `generative_constants.rs` during the build (when either changes), so it's never edited by hand.
 //! `EchoArgs` and `_styled_echo` are hand-written. Hand-written style *commands* that build on the
 //! engine live in [`crate::categories::styles`] (e.g. `errcho`).
 
