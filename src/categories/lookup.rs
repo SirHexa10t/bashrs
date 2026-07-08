@@ -112,6 +112,10 @@ mod commands {
         let roots = [PathBuf::from(&args.directory)];
         let denied = treegrep::search(&args.expressions, &roots, &opts);
         _offer_root_rescan(&args.expressions, &denied, &opts);
+        // Printed once, after both passes have sorted their sections into the file.
+        if let Some(path) = &opts.save {
+            eprintln!("\noutput copied in-order to {}", path.display());
+        }
     }
 
     /// If some paths were unreadable and we're interactive, offer to re-scan just those as root by

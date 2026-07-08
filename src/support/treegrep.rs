@@ -69,9 +69,10 @@ pub(crate) fn search(expressions: &[String], roots: &[PathBuf], opts: &Options) 
         },
         None => None,
     };
-    // Colour and the section headings suit the interactive terminal; `--save` writes a plain,
-    // heading-free result stream — which is also what keeps the end-of-run sort clean.
-    let color = save.is_none() && std::io::stdout().is_terminal();
+    // Colour follows the usual `--color=auto` rule even under `--save`: the terminal copy is coloured
+    // and `SaveSink::record` strips the escapes so the saved file stays plain. Section headings are
+    // still suppressed while saving (below), keeping the saved result stream uncluttered and sortable.
+    let color = std::io::stdout().is_terminal();
     let denied: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
     if save.is_none() {
@@ -120,13 +121,15 @@ impl SaveSink {
         Ok(SaveSink { file: Mutex::new(file), start, blocks: Mutex::new(Vec::new()) })
     }
 
-    /// Append one file's block live and keep it for the final sort. Empty blocks are skipped.
+    /// Append one file's block live and keep it for the final sort. The terminal copy keeps its
+    /// colour; here the ANSI escapes are stripped so the saved file is plain text. Empty blocks skip.
     fn record(&self, path: &Path, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-        let _ = self.file.lock().unwrap().write_all(bytes);
-        self.blocks.lock().unwrap().push((path.to_path_buf(), bytes.to_vec()));
+        let plain = strip_ansi(bytes);
+        let _ = self.file.lock().unwrap().write_all(&plain);
+        self.blocks.lock().unwrap().push((path.to_path_buf(), plain));
     }
 
     /// Replace the live (arrival-order) blocks appended since [`open`] with the same blocks ordered
@@ -142,6 +145,31 @@ impl SaveSink {
         }
         file.flush()
     }
+}
+
+/// Strip ANSI colour escapes — `termcolor`'s SGR sequences — from `bytes`, so the terminal keeps its
+/// colour while the saved file stays plain text. Drops every CSI sequence (`ESC [` … final byte); on
+/// this Linux-only tool `termcolor` emits nothing else.
+///
+/// Hand-rolled rather than `console::strip_ansi_codes` (already in-tree via `table_formatter`): that
+/// takes `&str`, but our buffer can hold non-UTF-8 match bytes — the case `g`/`gg` are byte-oriented
+/// for — which the required lossy UTF-8 conversion would corrupt.
+fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'[') {
+            i += 2;
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                i += 1;
+            }
+            i += 1; // consume the final byte (e.g. `m`)
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Compile the expressions into one case-insensitive alternation — literal (escaped) by default, or
@@ -529,5 +557,14 @@ mod tests {
         // Two matches on one line: the span-splitting in `write_highlighted` must reproduce the
         // line exactly (colour stripped here), with nothing dropped or duplicated at the boundaries.
         assert_eq!(gg_output("aa", b"aa bb aa cc\n", false, 0), "f:aa bb aa cc\n");
+    }
+
+    #[test]
+    fn strip_ansi_drops_colour_escapes_only() {
+        // `--save` keeps colour on screen but stores plain text: a coloured `path:line:text` line
+        // reduces to the plain text, while text with no escapes comes back untouched.
+        let coloured = b"\x1b[35mf\x1b[0m:\x1b[33m2\x1b[0m:a \x1b[30m\x1b[41mmatch\x1b[0m here\n";
+        assert_eq!(strip_ansi(coloured), b"f:2:a match here\n".to_vec());
+        assert_eq!(strip_ansi(b"plain, no escapes"), b"plain, no escapes".to_vec());
     }
 }

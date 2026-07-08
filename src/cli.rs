@@ -15,7 +15,7 @@ use crate::categories::media::MediaCommand;
 use crate::categories::packages::PackagesCommand;
 use crate::categories::project::ProjectCommand;
 use crate::categories::styles::StyleCommand;
-use crate::shell_conf::{environment, greeting, keybinds, session};
+use crate::shell_conf::{environment, greeting, keybinds, session, stainless};
 
 /// Exit code a command returns to ask its generated wrapper to run its
 /// `#[after]` action (e.g. start a fresh shell). It's distinct from success (0)
@@ -194,6 +194,12 @@ fn wrappers() -> String {
                 body.push('\n');
             }
         }
+    }
+
+    // Non-Rust companion repos (cloned by the `stainless_sync` bin), aliased to their launchers.
+    let comfy = stainless::aliases();
+    if !comfy.is_empty() {
+        body += &format!("\n# comfy / external tools\n{comfy}");
     }
 
     // Environment settings, session functions, keybinds: raw shell run when
