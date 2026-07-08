@@ -331,3 +331,147 @@ fn to_pascal_case(s: &str) -> String {
         })
         .collect()
 }
+
+/// Turn a function into a `sudo` self-re-exec routine — the parent/child round-trip that the
+/// `internal_cli` module used to spell out by hand. Applied to a free function whose parameters are
+/// the data to forward to the elevated run, it emits a sibling unit struct named in PascalCase after
+/// the function, with two `pub(crate)` methods:
+/// - `reexec(…)` — the *parent* side: spawn `<superuser> <self> <marker> <args-as-flags>`, then revoke.
+/// - `try_handle() -> bool` — the *child* side: if `argv[1]` is the marker, parse the flags back with
+///   `clap` and run the function as root; returns whether it handled the invocation.
+///
+/// The marker is the function name, kebab-cased. Each parameter becomes a `--flag`: a `bool` is a
+/// switch, a `Vec<T>` repeats once per element, any other type takes a value.
+///
+/// ```ignore
+/// #[elevated]
+/// fn gg_elevated_rescan(expressions: Vec<String>, paths: Vec<PathBuf>, context: usize, delve: bool, no_number: bool) {
+///     treegrep::search(&expressions, &paths, &treegrep::Options { line_number: !no_number, context, delve });
+/// }
+/// // generates `GgElevatedRescan`, with:
+/// //   GgElevatedRescan::reexec(&exprs, &paths, ctx, delve, no_number)   // parent, from `gg`
+/// //   GgElevatedRescan::try_handle()                                    // child, from the entry point
+/// ```
+#[proc_macro_attribute]
+pub fn elevated(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let func = parse_macro_input!(item as ItemFn);
+    expand_elevated(func).unwrap_or_else(syn::Error::into_compile_error).into()
+}
+
+/// The last path-segment identifier of a type, e.g. `std::path::PathBuf` → `PathBuf`.
+fn type_ident(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Path(tp) => tp.path.segments.last().map(|s| s.ident.to_string()),
+        _ => None,
+    }
+}
+
+/// The `T` of a `Vec<T>`, if `ty` is one.
+fn vec_element(ty: &Type) -> Option<Type> {
+    let Type::Path(tp) = ty else { return None };
+    let seg = tp.path.segments.last()?;
+    if seg.ident != "Vec" {
+        return None;
+    }
+    match &seg.arguments {
+        syn::PathArguments::AngleBracketed(ab) => match ab.args.first()? {
+            syn::GenericArgument::Type(inner) => Some(inner.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether values of this type go straight to `Command::arg` (they're `AsRef<OsStr>`), or need a
+/// `to_string` first (a number, say).
+fn is_osstr(ty: &Type) -> bool {
+    matches!(type_ident(ty).as_deref(), Some("String" | "PathBuf" | "OsString"))
+}
+
+fn expand_elevated(func: ItemFn) -> syn::Result<TokenStream2> {
+    let fn_ident = func.sig.ident.clone();
+    let command = format_ident!("{}", to_pascal_case(&fn_ident.to_string()));
+    let args_ty = format_ident!("{command}Args");
+    let marker = fn_ident.to_string().replace('_', "-");
+
+    let mut fields = Vec::new(); // clap parser fields (child side)
+    let mut params = Vec::new(); // reexec signature (parent side)
+    let mut pushes = Vec::new(); // reexec body: build the argv
+    let mut forwards = Vec::new(); // try_handle: parsed fields passed to the function
+
+    for input in &func.sig.inputs {
+        let FnArg::Typed(PatType { pat, ty, .. }) = input else {
+            return Err(syn::Error::new_spanned(input, "an #[elevated] function cannot take `self`"));
+        };
+        let syn::Pat::Ident(binding) = &**pat else {
+            return Err(syn::Error::new_spanned(pat, "#[elevated] parameters must be plain identifiers"));
+        };
+        let name = &binding.ident;
+        let flag = format!("--{}", name.to_string().replace('_', "-"));
+
+        fields.push(quote!(#[arg(long)] #name: #ty));
+        forwards.push(quote!(parsed.#name));
+
+        // Each parameter becomes a `--flag`: a `bool` is a switch, a `Vec<T>` repeats, and any
+        // other value is passed as text — directly if it's `AsRef<OsStr>`, else via `to_string`.
+        if type_ident(ty).as_deref() == Some("bool") {
+            params.push(quote!(#name: bool));
+            pushes.push(quote!(if #name { cmd.arg(#flag); }));
+        } else if let Some(inner) = vec_element(ty) {
+            params.push(quote!(#name: &[#inner]));
+            let value = if is_osstr(&inner) { quote!(__v) } else { quote!(__v.to_string()) };
+            pushes.push(quote!(for __v in #name { cmd.arg(#flag).arg(#value); }));
+        } else if is_osstr(ty) {
+            params.push(quote!(#name: &#ty));
+            pushes.push(quote!(cmd.arg(#flag).arg(#name);));
+        } else {
+            params.push(quote!(#name: #ty));
+            pushes.push(quote!(cmd.arg(#flag).arg(#name.to_string());));
+        }
+    }
+
+    Ok(quote! {
+        #func
+
+        #[derive(::clap::Parser)]
+        struct #args_ty {
+            #(#fields,)*
+        }
+
+        /// The `sudo` self-re-exec round-trip for the routine above, generated by `#[elevated]`.
+        pub(crate) struct #command;
+
+        impl #command {
+            const MARKER: &'static str = #marker;
+
+            /// Parent side: re-exec this binary under the superuser, forwarding each argument as the
+            /// flag(s) the child parses back, then drop the elevation.
+            pub(crate) fn reexec(#(#params),*) {
+                let exe = match ::std::env::current_exe() {
+                    ::core::result::Result::Ok(exe) => exe,
+                    ::core::result::Result::Err(err) => {
+                        return ::std::eprintln!("cannot locate self to re-run as root: {}", err)
+                    }
+                };
+                let mut cmd = crate::support::superuser::command();
+                cmd.arg(exe).arg(Self::MARKER);
+                #(#pushes)*
+                let _ = cmd.status();
+                crate::support::superuser::revoke();
+            }
+
+            /// Child side: if this process is the elevated re-exec (its `argv[1]` is the marker),
+            /// parse the forwarded flags and run the routine as root. Returns whether it did.
+            pub(crate) fn try_handle() -> bool {
+                match ::std::env::args_os().nth(1).and_then(|a| a.into_string().ok()).as_deref() {
+                    ::core::option::Option::Some(Self::MARKER) => {
+                        let parsed = <#args_ty as ::clap::Parser>::parse_from(::std::env::args_os().skip(1));
+                        #fn_ident(#(#forwards),*);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+        }
+    })
+}
