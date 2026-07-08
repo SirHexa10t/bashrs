@@ -33,8 +33,12 @@ pub(crate) struct SearchFamily {
     pub(crate) contexts: &'static [usize],
     /// Function-name stem (`g` → `g`, `g3`, …).
     pub(crate) stem: &'static str,
-    /// The clap args struct the shims take (a numbered shim pins `context` into it).
+    /// The full clap args struct — what the bare shim takes, and what a numbered shim builds by
+    /// pinning `context` onto its base.
     pub(crate) args: &'static str,
+    /// The reduced args struct the *numbered* shims take: the full set minus the pinned `-C`
+    /// (see `args.rs`), so a pinned variant can't silently accept a context it would ignore.
+    pub(crate) base_args: &'static str,
     /// The `lookup` runner every shim forwards to.
     pub(crate) runner: &'static str,
     /// Helper attributes each shim carries after `#[unprefixed]` (e.g. `#[trailing_newline]`).
@@ -50,6 +54,7 @@ pub(crate) const G_FAMILY: SearchFamily = SearchFamily {
     contexts: &[0, 2, 3, 5, 8, 25],
     stem: "g",
     args: "GrepArgs",
+    base_args: "GrepBase",
     runner: "_grep",
     extra_attrs: "",
     bare_desc: "Case-insensitive search (literal, or regex with -E), colouring matches",
@@ -61,6 +66,7 @@ pub(crate) const GG_FAMILY: SearchFamily = SearchFamily {
     contexts: &[0, 2, 3, 5, 10],
     stem: "gg",
     args: "GgArgs",
+    base_args: "GgBase",
     runner: "_gg",
     extra_attrs: "    #[trailing_newline]\n",
     bare_desc: "Recursively search a directory for expression(s) — filenames, then file contents",

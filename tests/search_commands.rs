@@ -202,6 +202,31 @@ fn ggg_forces_regex_save_and_delve_together() {
 }
 
 #[test]
+fn pinned_variants_reject_their_pinned_flag_but_forced_flags_stay_accepted() {
+    let tree = Tree::build("pinned");
+    // `gg2` pins -C 2; passing -C used to be silently overridden — now it's a parse error.
+    let out = bashrs(&["gg2", "-C", "5", "match", "-d", tree.path()], None, None);
+    assert!(!out.status.success(), "gg2 -C must be rejected");
+    assert!(stderr(&out).contains("unexpected argument"), "{}", stderr(&out));
+    let out = bashrs(&["g2", "-C", "5", "match"], None, Some(b"the match line\n"));
+    assert!(!out.status.success(), "g2 -C must be rejected");
+    // GG/GGG merely HIDE their forced flags — passing one is an accepted no-op.
+    let out = bashrs(&["GG", "--delve", "zzz_no_such_term", "-d", tree.path()], None, None);
+    assert!(out.status.success(), "GG --delve should stay accepted: {}", stderr(&out));
+}
+
+#[test]
+fn complete_flags_answers_per_variant_at_tab_time() {
+    // What the generated `_bashrs_complete` runs on TAB: flags for the exact wrapper name.
+    let gg = stdout(&bashrs(&["complete-flags", "gg"], None, None));
+    assert!(gg.contains("--context") && gg.contains("--delve") && gg.contains("--help"), "{gg}");
+    let gg2 = stdout(&bashrs(&["complete-flags", "gg2"], None, None));
+    assert!(!gg2.contains("--context"), "gg2 must not offer its pinned -C: {gg2}");
+    let ggg = stdout(&bashrs(&["complete-flags", "GGG"], None, None));
+    assert!(!ggg.contains("--delve") && ggg.contains("--context"), "{ggg}");
+}
+
+#[test]
 fn g_family_filters_stdin_with_numbers_context_invert_and_regex() {
     let input: &[u8] = b"above\nthe match line\nbelow\n";
     let numbered = stdout(&bashrs(&["g", "-n", "-C", "1", "match"], None, Some(input)));

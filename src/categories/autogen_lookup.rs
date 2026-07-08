@@ -14,7 +14,7 @@
 #[bashrs_macros::category(command = GrepCommand, prefix = "lookup_")]
 mod grep_commands {
     use crate::categories::lookup::_grep;
-    use crate::support::args::GrepArgs;
+    use crate::support::args::{GrepArgs, GrepBase};
 
     // GENERATED-LOOKUP-GREP-START
 
@@ -24,30 +24,30 @@ mod grep_commands {
 
     /// Case-insensitive search, showing 2 lines of context around each match
     #[unprefixed]
-    pub fn g2(args: GrepArgs) { _grep(&GrepArgs { context: 2, ..args }); }
+    pub fn g2(args: GrepBase) { _grep(&GrepArgs { base: args, context: 2 }); }
 
     /// Case-insensitive search, showing 3 lines of context around each match
     #[unprefixed]
-    pub fn g3(args: GrepArgs) { _grep(&GrepArgs { context: 3, ..args }); }
+    pub fn g3(args: GrepBase) { _grep(&GrepArgs { base: args, context: 3 }); }
 
     /// Case-insensitive search, showing 5 lines of context around each match
     #[unprefixed]
-    pub fn g5(args: GrepArgs) { _grep(&GrepArgs { context: 5, ..args }); }
+    pub fn g5(args: GrepBase) { _grep(&GrepArgs { base: args, context: 5 }); }
 
     /// Case-insensitive search, showing 8 lines of context around each match
     #[unprefixed]
-    pub fn g8(args: GrepArgs) { _grep(&GrepArgs { context: 8, ..args }); }
+    pub fn g8(args: GrepBase) { _grep(&GrepArgs { base: args, context: 8 }); }
 
     /// Case-insensitive search, showing 25 lines of context around each match
     #[unprefixed]
-    pub fn g25(args: GrepArgs) { _grep(&GrepArgs { context: 25, ..args }); }
+    pub fn g25(args: GrepBase) { _grep(&GrepArgs { base: args, context: 25 }); }
     // GENERATED-LOOKUP-GREP-END
 }
 
 #[bashrs_macros::category(command = GgCommand, prefix = "lookup_")]
 mod tree_commands {
     use crate::categories::lookup::_gg;
-    use crate::support::args::GgArgs;
+    use crate::support::args::{GgArgs, GgBase};
 
     // GENERATED-TREEGREP-START
 
@@ -59,21 +59,21 @@ mod tree_commands {
     /// Recursive search, showing 2 lines of context around each file-content match
     #[unprefixed]
     #[trailing_newline]
-    pub fn gg2(args: GgArgs) { _gg(&GgArgs { context: 2, ..args }); }
+    pub fn gg2(args: GgBase) { _gg(&GgArgs { base: args, context: 2 }); }
 
     /// Recursive search, showing 3 lines of context around each file-content match
     #[unprefixed]
     #[trailing_newline]
-    pub fn gg3(args: GgArgs) { _gg(&GgArgs { context: 3, ..args }); }
+    pub fn gg3(args: GgBase) { _gg(&GgArgs { base: args, context: 3 }); }
 
     /// Recursive search, showing 5 lines of context around each file-content match
     #[unprefixed]
     #[trailing_newline]
-    pub fn gg5(args: GgArgs) { _gg(&GgArgs { context: 5, ..args }); }
+    pub fn gg5(args: GgBase) { _gg(&GgArgs { base: args, context: 5 }); }
 
     /// Recursive search, showing 10 lines of context around each file-content match
     #[unprefixed]
     #[trailing_newline]
-    pub fn gg10(args: GgArgs) { _gg(&GgArgs { context: 10, ..args }); }
+    pub fn gg10(args: GgBase) { _gg(&GgArgs { base: args, context: 10 }); }
     // GENERATED-TREEGREP-END
 }

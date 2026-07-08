@@ -1,6 +1,5 @@
 Reimplement the bashrc commands in my other repo
 
-apply 'table' to sourcefile? 
-
 Copy over the TODOs
+
 

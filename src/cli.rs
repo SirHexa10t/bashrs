@@ -3,7 +3,7 @@
 //! [`crate::support`]. It parses and dispatches commands (`Cli` / `Command`) and
 //! builds the sourced shell file (`wrappers`).
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use crate::categories::autogen_lookup::{GgCommand, GrepCommand};
 use crate::categories::autogen_styles::StylizedEchoCommand;
 use crate::categories::bashrs::BashrsCommand;
@@ -63,6 +63,12 @@ pub enum Command {
     /// Emit shell function wrappers for every command (used by COMPILE.sh).
     #[command(hide = true)]
     Generate,
+    /// Print one command's completable flags (asked by the generated completer at TAB-time).
+    #[command(hide = true)]
+    CompleteFlags {
+        /// The shell function name being completed (a command's clap name or visible alias).
+        command: String,
+    },
 }
 
 impl Command {
@@ -81,14 +87,46 @@ impl Command {
             Command::Style(cmd) => cmd.run(),
             Command::StylizedEcho(cmd) => cmd.run(),
             Command::Generate => print!("{}", wrappers()),
+            Command::CompleteFlags { command } => println!("{}", complete_flags(&command)),
         }
     }
+}
+
+/// Flags a command forces on, hidden from its help and completion — still *accepted*, since
+/// passing one is a harmless no-op (it's already on). Keyed by clap name and arg ID (the field
+/// name). The `g<N>`/`gg<N>` variants aren't listed: they REMOVE their pinned `-C` outright by
+/// taking the `*Base` argument structs (see [`crate::support::args`]).
+const HIDDEN_PINNED: &[(&str, &[&str])] = &[
+    ("GG", &["delve"]),
+    ("GGG", &["delve", "save", "regex"]),
+];
+
+/// Hide each [`HIDDEN_PINNED`] flag on its command. Applied everywhere the command tree is built —
+/// parsing ([`parse`]) and generation ([`category_commands`]) — so help, wrappers, and completion
+/// all tell one truth. Commands absent from `cmd` are skipped (each category holds only its own).
+fn hide_pinned(mut cmd: clap::Command) -> clap::Command {
+    for &(name, args) in HIDDEN_PINNED {
+        if cmd.find_subcommand(name).is_none() {
+            continue; // don't let `mut_subcommand` conjure the command into the wrong category
+        }
+        cmd = cmd.mut_subcommand(name, |sub| {
+            args.iter().fold(sub, |sub, arg| sub.mut_arg(*arg, |a| a.hide(true)))
+        });
+    }
+    cmd
+}
+
+/// Parse argv against the adjusted command tree ([`hide_pinned`]) — the binary's normal entry,
+/// called by [`crate::run`] once the re-exec handlers have passed on the invocation.
+pub fn parse() -> Cli {
+    let mut matches = hide_pinned(Cli::command()).get_matches();
+    Cli::from_arg_matches_mut(&mut matches).unwrap_or_else(|err| err.exit())
 }
 
 /// The command categories, each paired with the label used to group them in the
 /// generated `sourcefile.sh`. One row per category — never per command.
 fn category_commands() -> [(&'static str, clap::Command); 9] {
-    [
+    let categories = [
         ("bashrs", BashrsCommand::augment_subcommands(clap::Command::new("bashrs"))),
         ("filesystem", FilesystemCommand::augment_subcommands(clap::Command::new("filesystem"))),
         ("git", GitCommand::augment_subcommands(clap::Command::new("git"))),
@@ -104,7 +142,42 @@ fn category_commands() -> [(&'static str, clap::Command); 9] {
             StyleCommand::augment_subcommands(clap::Command::new("style")),
         )),
         ("comfy_repos", ComfyReposCommand::augment_subcommands(clap::Command::new("comfy_repos"))),
-    ]
+    ];
+    categories.map(|(label, cmd)| (label, hide_pinned(cmd)))
+}
+
+/// Space-separated `-short --long` names of `command`'s arguments (matched by clap name or visible
+/// alias, so `upup` completes like `packages_upup`). Positionals and hidden flags (the pinned ones
+/// — [`HIDDEN_PINNED`]) are omitted; an unknown name yields nothing, so the completer simply offers
+/// no flags. Backs the hidden `complete-flags` command the generated completer calls at TAB-time.
+fn complete_flags(name: &str) -> String {
+    for (_, category) in category_commands() {
+        for sub in category.get_subcommands() {
+            if sub.get_name() != name && !sub.get_visible_aliases().any(|alias| alias == name) {
+                continue;
+            }
+            let mut flags: Vec<String> = Vec::new();
+            for arg in sub.get_arguments() {
+                if arg.is_positional() || arg.is_hide_set() {
+                    continue;
+                }
+                if let Some(short) = arg.get_short() {
+                    flags.push(format!("-{short}"));
+                }
+                if let Some(long) = arg.get_long() {
+                    flags.push(format!("--{long}"));
+                }
+            }
+            // The auto help flag only materializes when clap *builds* a command, which these
+            // introspection copies aren't — add it by hand (no command disables it).
+            if !flags.iter().any(|flag| flag == "--help") {
+                flags.push("-h".into());
+                flags.push("--help".into());
+            }
+            return flags.join(" ");
+        }
+    }
+    String::new()
 }
 
 /// Every category's `(wrapper_suffix, wrapper_prefix)` lookups — one row per category, so adding
@@ -151,6 +224,7 @@ fn wrappers() -> String {
     const BIN: &str = "\"$HOME/.bashrs/bashrs\"";
 
     let mut body = String::new();
+    let mut completion_names: Vec<String> = Vec::new(); // every wrapper + alias, for `complete -F`
     for (label, category) in category_commands() {
         let mut lines: Vec<String> = Vec::new();
         for sub in category.get_subcommands() {
@@ -178,6 +252,7 @@ fn wrappers() -> String {
             let prefix = wrapper_prefix(real).map(|cmd| format!("{cmd} | ")).unwrap_or_default();
             for shell_name in std::iter::once(real).chain(sub.get_visible_aliases()) {
                 lines.push(format!("{shell_name}() {{ {prefix}{BIN} {real} \"$@\"{suffix}; }}{about}"));
+                completion_names.push(shell_name.to_string());
             }
         }
         if !lines.is_empty() {
@@ -211,6 +286,24 @@ fn wrappers() -> String {
         // `bind` is a bash readline builtin; zsh (which also sources this) has none.
         body += &format!("\n# keybinds (bash only)\nif [ -n \"$BASH_VERSION\" ]; then\n{binds}{desktop}fi\n");
     }
+
+    // Flag completion: on TAB after a `-`, ask the binary which flags the command being completed
+    // accepts (`complete-flags`, always in sync with the real CLI); any other word falls back to
+    // filename completion via `-o default`. `complete` is a bash builtin, so zsh skips the block.
+    body += &format!(
+        "\n# completion (bash only)\n\
+         #   Optional flags displayed through tab-completion. Type `-` and follow up with <TAB><TAB>\n\
+         #   e.g. `gg -<TAB><TAB>` lists gg's flags\n\
+         #   e.g. `gg --de<TAB>` fills in `--delve`\n\
+         if [ -n \"$BASH_VERSION\" ]; then\n\
+         \x20   _bashrs_complete() {{\n\
+         \x20       local cur=${{COMP_WORDS[COMP_CWORD]}}\n\
+         \x20       [[ $cur == -* ]] && COMPREPLY=($(compgen -W \"$({BIN} complete-flags \"${{COMP_WORDS[0]}}\")\" -- \"$cur\"))\n\
+         \x20   }}\n\
+         \x20   complete -F _bashrs_complete -o default {}\n\
+         fi\n",
+        completion_names.join(" ")
+    );
 
     // A load greeting, last — after the `gecho`/`boecho` wrappers it calls are defined.
     body += &format!("\n# greeting\n{}\n", greeting::line());
@@ -255,6 +348,71 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+        hide_pinned(Cli::command()).debug_assert(); // the adjusted tree the binary actually parses
+    }
+
+    #[test]
+    fn hidden_pinned_flags_are_real_and_hidden() {
+        // `mut_arg` silently CREATES a missing arg, so a drifted field name would ghost a fresh
+        // hidden arg instead of hiding the real flag — the long/short assertion catches that.
+        let cmd = hide_pinned(Cli::command());
+        for &(name, args) in HIDDEN_PINNED {
+            let sub = cmd.find_subcommand(name).unwrap_or_else(|| panic!("`{name}` not found"));
+            for id in args {
+                let arg = sub
+                    .get_arguments()
+                    .find(|a| a.get_id().as_str() == *id)
+                    .unwrap_or_else(|| panic!("`{name}` has no arg `{id}`"));
+                assert!(arg.is_hide_set(), "`{name}`'s `{id}` should be hidden");
+                assert!(
+                    arg.get_long().is_some() || arg.get_short().is_some(),
+                    "`{name}`'s `{id}` looks like a ghost created by `mut_arg` — the arg ID drifted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn complete_flags_reflect_each_variant() {
+        let has = |flags: &str, want: &str| flags.split(' ').any(|flag| flag == want);
+        let gg = complete_flags("gg");
+        for flag in ["-C", "--context", "--delve", "-E", "-s", "--help"] {
+            assert!(has(&gg, flag), "gg should complete {flag}: {gg}");
+        }
+        // A pinned variant doesn't offer the -C it would refuse…
+        let gg2 = complete_flags("gg2");
+        assert!(!has(&gg2, "-C") && !has(&gg2, "--context"), "gg2 pins -C: {gg2}");
+        assert!(has(&gg2, "--delve"), "the rest of the set stays: {gg2}");
+        // …and GGG doesn't offer the flags it forces (hidden, still accepted).
+        let ggg = complete_flags("GGG");
+        for pinned in ["--delve", "-s", "--save", "-E", "--extended-regexp"] {
+            assert!(!has(&ggg, pinned), "GGG forces {pinned}; it must not be offered: {ggg}");
+        }
+        assert!(has(&ggg, "-C"), "GGG still tunes context: {ggg}");
+        // Aliases resolve to their command; unknown names yield nothing.
+        assert!(has(&complete_flags("upup"), "--help"), "aliases should resolve");
+        assert_eq!(complete_flags("no_such_command"), "");
+    }
+
+    #[test]
+    fn wrappers_register_flag_completion() {
+        let script = wrappers();
+        assert!(script.contains("_bashrs_complete()"), "completer function missing");
+        assert!(
+            script.contains("complete-flags \"${COMP_WORDS[0]}\""),
+            "the completer should ask the binary at TAB-time"
+        );
+        let registration = script
+            .lines()
+            .find(|line| line.trim_start().starts_with("complete -F _bashrs_complete"))
+            .expect("registration line missing");
+        for name in ["gg", "GGG", "hg", "upup", "media_conv", "lll"] {
+            assert!(
+                registration.split_whitespace().any(|word| word == name),
+                "`{name}` not registered for completion: {registration}"
+            );
+        }
+        assert!(script.contains("\n# completion (bash only)\n"), "should be bash-guarded");
     }
 
     #[test]
@@ -380,8 +538,9 @@ mod tests {
     }
 
     #[test]
-    fn wrappers_exclude_the_internal_generate_command() {
+    fn wrappers_exclude_the_internal_commands() {
         assert!(!wrappers().contains("generate() {"));
+        assert!(!wrappers().contains("complete-flags() {"));
     }
 
     #[test]

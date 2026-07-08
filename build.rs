@@ -73,14 +73,16 @@ fn family_matrix(family: &SearchFamily) -> String {
                 let (pre, post) = family.ctx_desc;
                 format!("{pre}{ctx}{post}")
             };
-            let call = if ctx == 0 {
-                format!("{}(&args)", family.runner)
+            // The bare shim takes the full args; a numbered shim takes the base (no `-C` at all)
+            // and pins its context while building the full set.
+            let (args_ty, call) = if ctx == 0 {
+                (family.args, format!("{}(&args)", family.runner))
             } else {
-                format!("{}(&{} {{ context: {ctx}, ..args }})", family.runner, family.args)
+                (family.base_args, format!("{}(&{} {{ base: args, context: {ctx} }})", family.runner, family.args))
             };
             format!(
-                "    /// {desc}\n    #[unprefixed]\n{}    pub fn {name}(args: {}) {{ {call}; }}",
-                family.extra_attrs, family.args
+                "    /// {desc}\n    #[unprefixed]\n{}    pub fn {name}(args: {args_ty}) {{ {call}; }}",
+                family.extra_attrs
             )
         })
         .collect::<Vec<_>>()

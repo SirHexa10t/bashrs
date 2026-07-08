@@ -28,7 +28,7 @@ fn gg_elevated_rescan(expressions: Vec<String>, paths: Vec<PathBuf>, context: us
 
 #[bashrs_macros::category(command = LookupCommand, prefix = "lookup_")]
 mod commands {
-    use crate::support::args::{GgArgs, GrepArgs};
+    use crate::support::args::{GgArgs, GgBase, GrepArgs};
     use crate::support::{input, preferences, streamgrep};
     use clap::Args;
 
@@ -54,9 +54,9 @@ mod commands {
     #[name("GG")]
     #[trailing_newline]
     pub fn gg_delve(args: GgArgs) {
-        // Force `--delve`; it's a plain bool, so setting it when the caller already passed it is a
-        // harmless no-op.
-        _gg(&GgArgs { delve: true, ..args });
+        // Force `--delve`. The flag is hidden from GG's help/completion (see `cli::HIDDEN_PINNED`)
+        // but still accepted; a plain bool, so a caller passing it anyway is a harmless no-op.
+        _gg(&GgArgs { base: GgBase { delve: true, ..args.base }, ..args });
     }
 
     /// `GG` plus the two extras: `--save` (`-s`, leave sorted results in `deep_search_<time>_sorted`)
@@ -64,7 +64,7 @@ mod commands {
     #[name("GGG")]
     #[trailing_newline]
     pub fn ggg(args: GgArgs) {
-        _gg(&GgArgs { delve: true, save: true, regex: true, ..args });
+        _gg(&GgArgs { base: GgBase { delve: true, save: true, regex: true, ..args.base }, ..args });
     }
 
     /// Read the input, then filter it in-process with the `grep` crate — case-insensitive, literal
@@ -72,24 +72,24 @@ mod commands {
     /// `-n` line numbers, and `-v` to keep the non-matching lines instead. Matches are coloured only
     /// when writing to a terminal, like `--color=auto`. Backs the generated `g` family.
     pub(crate) fn _grep(args: &GrepArgs) {
-        let Some(text) = input::bytes_reported("g", args.source.as_deref()) else { return };
+        let Some(text) = input::bytes_reported("g", args.base.source.as_deref()) else { return };
         let opts = streamgrep::Options {
             context: args.context,
-            line_number: args.line_number,
-            regex: args.regex,
-            invert: args.invert,
+            line_number: args.base.line_number,
+            regex: args.base.regex,
+            invert: args.base.invert,
         };
-        streamgrep::filter(&args.pattern, &text, &opts);
+        streamgrep::filter(&args.base.pattern, &text, &opts);
     }
 
     /// Build options from the `gg` args (context comes from `-C`), run the recursive search, then
     /// offer a root re-scan of anything that was unreadable. Backs the generated `gg` family (whose
     /// numbered variants pin `-C`) and the hand-written `GG`.
     pub(crate) fn _gg(args: &GgArgs) {
-        let save = if args.save {
+        let save = if args.base.save {
             let name = format!("deep_search_{}", preferences::datehour_stamp());
             let path = std::env::current_dir().unwrap_or_default().join(name);
-            if let Err(err) = std::fs::write(&path, format!("# search term used: {}\n", args.expressions.join(" "))) {
+            if let Err(err) = std::fs::write(&path, format!("# search term used: {}\n", args.base.expressions.join(" "))) {
                 return eprintln!("gg: cannot create {}: {err}", path.display());
             }
             Some(path)
@@ -97,15 +97,15 @@ mod commands {
             None
         };
         let opts = treegrep::Options {
-            line_number: !args.no_line_number,
+            line_number: !args.base.no_line_number,
             context: args.context,
-            delve: args.delve,
-            regex: args.regex,
+            delve: args.base.delve,
+            regex: args.base.regex,
             save,
         };
-        let roots = [args.directory.clone()];
-        let denied = treegrep::search(&args.expressions, &roots, &opts);
-        _offer_root_rescan(&args.expressions, &denied, &opts);
+        let roots = [args.base.directory.clone()];
+        let denied = treegrep::search(&args.base.expressions, &roots, &opts);
+        _offer_root_rescan(&args.base.expressions, &denied, &opts);
         // Runs once, after both passes have appended their sorted sections to the `_sorted` sibling.
         // The live (arrival-order) file is the crash-safety net: only once the sorted copy verifiably
         // exists is it removed, and the notice points at what remains.

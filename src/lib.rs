@@ -17,5 +17,5 @@ pub fn run() {
     if REEXEC_HANDLERS.iter().any(|handle| handle()) {
         return;
     }
-    <cli::Cli as clap::Parser>::parse().command.run();
+    cli::parse().command.run();
 }
