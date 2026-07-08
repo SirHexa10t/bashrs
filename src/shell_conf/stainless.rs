@@ -39,17 +39,13 @@ const STAINLESS: &[Comfy] = &[Comfy {
 /// module is the general stainless one.
 const CLONE_BASE: &str = ".bashrs/stainless_comfy";
 
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-}
-
 /// `https://…/contAInerized(.git)(/)` → `contAInerized`.
 fn repo_name(repo: &str) -> &str {
     repo.trim_end_matches('/').rsplit('/').next().unwrap_or(repo).trim_end_matches(".git")
 }
 
 fn clone_dir(comfy: &Comfy) -> PathBuf {
-    home().join(CLONE_BASE).join(repo_name(comfy.repo))
+    std::env::home_dir().unwrap_or_default().join(CLONE_BASE).join(repo_name(comfy.repo))
 }
 
 /// The `$HOME`-relative executable path — used verbatim in the alias (portable) and in the `--help`

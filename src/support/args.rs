@@ -1,6 +1,7 @@
 //! Argument structs shared across command categories.
 
 use clap::Args;
+use std::path::PathBuf;
 
 /// An empty argument set, for commands that take no arguments.
 #[derive(Args)]
@@ -37,7 +38,7 @@ pub struct GgArgs {
     pub(crate) expressions: Vec<String>,
     /// Directory to search.
     #[arg(short, long, default_value = ".")]
-    pub(crate) directory: String,
+    pub(crate) directory: PathBuf,
     /// Show N lines of context around each file-content match (like `grep -C`); the `gg<N>`
     /// variants are shorthand for this.
     #[arg(short = 'C', long, default_value_t = 0)]
@@ -52,8 +53,8 @@ pub struct GgArgs {
     /// Treat the expression(s) as regular expressions (à la `grep -E`) rather than literal text.
     #[arg(short = 'E', long = "extended-regexp")]
     pub(crate) regex: bool,
-    /// Also write the results (sorted, plain) to `deep_search_<timestamp>` in the current directory,
-    /// while still printing them to the terminal (`gg --save`).
+    /// Also write the results (plain) to `deep_search_<timestamp>` in the current directory while
+    /// searching, leaving a sorted `deep_search_<timestamp>_sorted` once done (`gg --save`).
     #[arg(short = 's', long = "save")]
     pub(crate) save: bool,
 }

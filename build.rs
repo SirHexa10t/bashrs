@@ -1,9 +1,11 @@
-//! Regenerates the styled-echo command matrix in `src/categories/autogen_styles.rs` from
-//! the vocabulary in `src/support/generative_constants.rs`, as part of the build.
+//! Regenerates the generated command regions — the styled-echo matrix in
+//! `src/categories/autogen_styles.rs` and the `g`/`gg` search families in
+//! `src/categories/autogen_lookup.rs` — from the vocabulary in
+//! `src/support/generative_constants.rs`, as part of the build.
 //!
-//! Only the text between the `GENERATED-STYLE-MATRIX` markers is rewritten, and only when
+//! Only the text between each region's `GENERATED-*` markers is rewritten, and only when
 //! it would actually change. `rerun-if-changed` scopes this to edits of the vocabulary,
-//! this script, or the generated file — so ordinary builds don't re-run it, and there's no
+//! this script, or the generated files — so ordinary builds don't re-run it, and there's no
 //! per-build cost. The vocabulary is the single source of truth: `build.rs` can't link the
 //! crate, so it pulls the same file in textually via `include!`.
 
@@ -13,18 +15,17 @@ include!("src/support/generative_constants.rs");
 
 const CONSTANTS: &str = "src/support/generative_constants.rs";
 
-const AUTOGEN: &str = "src/categories/autogen_styles.rs";
-const START: &str = "    // GENERATED-STYLE-MATRIX-START";
-const END: &str = "    // GENERATED-STYLE-MATRIX-END";
+const AUTOGEN_STYLES: &str = "src/categories/autogen_styles.rs";
+const STYLE_MARKERS: (&str, &str) =
+    ("    // GENERATED-STYLE-MATRIX-START", "    // GENERATED-STYLE-MATRIX-END");
 
 const AUTOGEN_LOOKUP: &str = "src/categories/autogen_lookup.rs";
-const LOOKUP_START: &str = "    // GENERATED-LOOKUP-GREP-START";
-const LOOKUP_END: &str = "    // GENERATED-LOOKUP-GREP-END";
-
-// The `gg`-family region lives in the same file as the `g`-family (`AUTOGEN_LOOKUP`), in its own
-// `#[category]` block; the two regions are spliced independently in `main`.
-const TREEGREP_START: &str = "    // GENERATED-TREEGREP-START";
-const TREEGREP_END: &str = "    // GENERATED-TREEGREP-END";
+// Two regions in the one file — the `g`-family and `gg`-family `#[category]` blocks — each
+// spliced independently in `main`.
+const GREP_MARKERS: (&str, &str) =
+    ("    // GENERATED-LOOKUP-GREP-START", "    // GENERATED-LOOKUP-GREP-END");
+const TREEGREP_MARKERS: (&str, &str) =
+    ("    // GENERATED-TREEGREP-START", "    // GENERATED-TREEGREP-END");
 
 /// A criterion key contributes to a function name as itself — except bold, which is silent
 /// (so `["bo","","r"]` is `recho`, not `borecho`).
@@ -32,8 +33,8 @@ fn name_part(key: &str) -> &str {
     if key == "bo" { "" } else { key }
 }
 
-/// The generated region: one `pub fn` per weight × underline × color.
-fn matrix() -> String {
+/// The generated style region: one `pub fn` per weight × underline × color.
+fn style_matrix() -> String {
     let mut blocks = Vec::new();
     for (wk, _, wh) in WEIGHTS {
         for (uk, _, uh) in UNDERLINES {
@@ -57,71 +58,52 @@ fn matrix() -> String {
     blocks.join("\n\n")
 }
 
-/// `autogen_styles.rs` with its generated region replaced by the current matrix.
-fn expected(current: &str) -> String {
-    let start = current.find(START).expect("START marker missing from autogen_styles.rs") + START.len();
-    let end = current.find(END).expect("END marker missing from autogen_styles.rs");
-    // A blank line sets the generated functions off from the START marker.
-    format!("{}\n\n{}\n{}", &current[..start], matrix(), &current[end..])
-}
-
-/// The generated grep region: one bare `pub fn` per context size in [`CONTEXTS`] (`g`, `g3`, …).
-fn lookup_matrix() -> String {
-    CONTEXTS
+/// Render one search family (`G_FAMILY`/`GG_FAMILY`, defined with the rest of the vocabulary in
+/// `generative_constants.rs`): a bare `pub fn` per context size, forwarding to its runner.
+fn family_matrix(family: &SearchFamily) -> String {
+    family
+        .contexts
         .iter()
         .map(|&ctx| {
-            let name = if ctx == 0 { "g".to_string() } else { format!("g{ctx}") };
+            let name =
+                if ctx == 0 { family.stem.to_string() } else { format!("{}{ctx}", family.stem) };
             let desc = if ctx == 0 {
-                "Case-insensitive search (literal, or regex with -E), colouring matches".to_string()
+                family.bare_desc.to_string()
             } else {
-                format!("Case-insensitive search, showing {ctx} lines of context around each match")
+                let (pre, post) = family.ctx_desc;
+                format!("{pre}{ctx}{post}")
             };
-            // Bare `g` takes its context from the `-C` flag; the numbered variants pin it.
-            let call = if ctx == 0 { "_grep(&args)".to_string() } else { format!("_grep(&GrepArgs {{ context: {ctx}, ..args }})") };
-            format!("    /// {desc}\n    #[unprefixed]\n    pub fn {name}(args: GrepArgs) {{ {call}; }}")
+            let call = if ctx == 0 {
+                format!("{}(&args)", family.runner)
+            } else {
+                format!("{}(&{} {{ context: {ctx}, ..args }})", family.runner, family.args)
+            };
+            format!(
+                "    /// {desc}\n    #[unprefixed]\n{}    pub fn {name}(args: {}) {{ {call}; }}",
+                family.extra_attrs, family.args
+            )
         })
         .collect::<Vec<_>>()
         .join("\n\n")
 }
 
-/// `autogen_lookup.rs` with its generated region replaced by the current grep family.
-fn expected_lookup(current: &str) -> String {
-    let start = current.find(LOOKUP_START).expect("START marker missing from autogen_lookup.rs") + LOOKUP_START.len();
-    let end = current.find(LOOKUP_END).expect("END marker missing from autogen_lookup.rs");
-    format!("{}\n\n{}\n{}", &current[..start], lookup_matrix(), &current[end..])
+/// `current` with the region between `markers` replaced by `generated` (a blank line sets the
+/// generated code off from the START marker).
+fn splice(current: &str, markers: (&str, &str), generated: &str, file: &str) -> String {
+    let (start_marker, end_marker) = markers;
+    let start = current
+        .find(start_marker)
+        .unwrap_or_else(|| panic!("START marker missing from {file}"))
+        + start_marker.len();
+    let end = current.find(end_marker).unwrap_or_else(|| panic!("END marker missing from {file}"));
+    format!("{}\n\n{}\n{}", &current[..start], generated, &current[end..])
 }
 
-/// The generated `gg`-family: one bare `pub fn` per context size in [`GG_CONTEXTS`] (`gg`, `gg3`, …).
-fn treegrep_matrix() -> String {
-    GG_CONTEXTS
-        .iter()
-        .map(|&ctx| {
-            let name = if ctx == 0 { "gg".to_string() } else { format!("gg{ctx}") };
-            let desc = if ctx == 0 {
-                "Recursively search a directory for expression(s) — filenames, then file contents".to_string()
-            } else {
-                format!("Recursive search, showing {ctx} lines of context around each file-content match")
-            };
-            // Bare `gg` takes its context from the `-C` flag; the numbered variants pin it.
-            let call = if ctx == 0 { "_gg(&args)".to_string() } else { format!("_gg(&GgArgs {{ context: {ctx}, ..args }})") };
-            format!("    /// {desc}\n    #[unprefixed]\n    #[trailing_newline]\n    pub fn {name}(args: GgArgs) {{ {call}; }}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
-/// `autogen_lookup.rs` with its `gg`-family region replaced by the current `gg` family.
-fn expected_treegrep(current: &str) -> String {
-    let start = current.find(TREEGREP_START).expect("START marker missing from autogen_lookup.rs") + TREEGREP_START.len();
-    let end = current.find(TREEGREP_END).expect("END marker missing from autogen_lookup.rs");
-    format!("{}\n\n{}\n{}", &current[..start], treegrep_matrix(), &current[end..])
-}
-
-/// Rewrite `file`'s generated region (computed by `splice`) in place, only when it changes.
-fn regenerate(manifest: &str, file: &str, splice: impl Fn(&str) -> String) {
+/// Rewrite `file`'s generated region (computed by `regen`) in place, only when it changes.
+fn regenerate(manifest: &str, file: &str, regen: impl Fn(&str) -> String) {
     let path = Path::new(manifest).join(file);
     let current = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {file}: {e}"));
-    let want = splice(&current);
+    let want = regen(&current);
     if want != current {
         fs::write(&path, want).unwrap_or_else(|e| panic!("write {file}: {e}"));
     }
@@ -129,13 +111,18 @@ fn regenerate(manifest: &str, file: &str, splice: impl Fn(&str) -> String) {
 
 fn main() {
     // Re-run only when a vocabulary, a generated file, or this script changes.
-    for file in [CONSTANTS, AUTOGEN, AUTOGEN_LOOKUP, "build.rs"] {
+    for file in [CONSTANTS, AUTOGEN_STYLES, AUTOGEN_LOOKUP, "build.rs"] {
         println!("cargo:rerun-if-changed={file}");
     }
 
     let manifest = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
-    regenerate(&manifest, AUTOGEN, expected);
-    regenerate(&manifest, AUTOGEN_LOOKUP, expected_lookup);
-    // Same file, second region: the `gg`-family block alongside the `g`-family above.
-    regenerate(&manifest, AUTOGEN_LOOKUP, expected_treegrep);
+    regenerate(&manifest, AUTOGEN_STYLES, |cur| {
+        splice(cur, STYLE_MARKERS, &style_matrix(), AUTOGEN_STYLES)
+    });
+    regenerate(&manifest, AUTOGEN_LOOKUP, |cur| {
+        splice(cur, GREP_MARKERS, &family_matrix(&G_FAMILY), AUTOGEN_LOOKUP)
+    });
+    regenerate(&manifest, AUTOGEN_LOOKUP, |cur| {
+        splice(cur, TREEGREP_MARKERS, &family_matrix(&GG_FAMILY), AUTOGEN_LOOKUP)
+    });
 }

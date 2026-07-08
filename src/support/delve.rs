@@ -329,6 +329,14 @@ fn fill<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     Ok(n)
 }
 
+/// The `N` bytes at `pos`, or `None` when the stream ends first — the shared seek-and-read-exactly
+/// opening of the box parsers below. Leaves the reader positioned just past the bytes.
+fn read_at<const N: usize, R: Read + Seek>(r: &mut R, pos: u64) -> io::Result<Option<[u8; N]>> {
+    r.seek(SeekFrom::Start(pos))?;
+    let mut buf = [0u8; N];
+    Ok((fill(r, &mut buf)? == N).then_some(buf))
+}
+
 /// A box header: `(fourcc, content_start, content_end, next_box_pos)`.
 type BoxHeader = ([u8; 4], u64, u64, u64);
 
@@ -338,11 +346,7 @@ fn next_box<R: Read + Seek>(r: &mut R, pos: u64, end: u64) -> io::Result<Option<
     if pos + 8 > end {
         return Ok(None);
     }
-    r.seek(SeekFrom::Start(pos))?;
-    let mut hdr = [0u8; 8];
-    if fill(r, &mut hdr)? < 8 {
-        return Ok(None);
-    }
+    let Some(hdr) = read_at::<8, _>(r, pos)? else { return Ok(None) };
     let fourcc = [hdr[4], hdr[5], hdr[6], hdr[7]];
     let (total, header) = match u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) {
         1 => {
@@ -438,17 +442,9 @@ fn read_trak<R: Read + Seek>(r: &mut R, start: u64, end: u64, out: &mut Vec<u8>)
 /// The track's numeric ID, from `tkhd`.
 fn read_track_id<R: Read + Seek>(r: &mut R, trak_s: u64, trak_e: u64) -> io::Result<u32> {
     let Some((s, _)) = find_box(r, trak_s, trak_e, b"tkhd")? else { return Ok(0) };
-    r.seek(SeekFrom::Start(s))?;
-    let mut vf = [0u8; 4];
-    if fill(r, &mut vf)? < 4 {
-        return Ok(0);
-    }
+    let Some(vf) = read_at::<4, _>(r, s)? else { return Ok(0) };
     // track_ID follows [version+flags] and the creation/modification times (8 bytes at v0, 16 at v1).
-    r.seek(SeekFrom::Start(s + 4 + if vf[0] == 1 { 16 } else { 8 }))?;
-    let mut id = [0u8; 4];
-    if r.read_exact(&mut id).is_err() {
-        return Ok(0);
-    }
+    let Some(id) = read_at::<4, _>(r, s + 4 + if vf[0] == 1 { 16 } else { 8 })? else { return Ok(0) };
     Ok(u32::from_be_bytes(id))
 }
 
@@ -493,11 +489,8 @@ fn read_traf<R: Read + Seek>(r: &mut R, moof_start: u64, tcs: u64, tce: u64, tra
 /// Parse a `tfhd`: `(track_id, base_data_offset, default_sample_size)`. The base defaults to the
 /// enclosing `moof` (the common "default-base-is-moof" case) unless an explicit base is present.
 fn read_tfhd<R: Read + Seek>(r: &mut R, moof_start: u64, s: u64) -> io::Result<(u32, u64, u64)> {
-    r.seek(SeekFrom::Start(s))?;
-    let mut head = [0u8; 8]; // [version+flags][track_id]
-    if fill(r, &mut head)? < 8 {
-        return Ok((0, moof_start, 0));
-    }
+    // head = [version+flags][track_id]
+    let Some(head) = read_at::<8, _>(r, s)? else { return Ok((0, moof_start, 0)) };
     let flags = u32::from_be_bytes([0, head[1], head[2], head[3]]);
     let track_id = u32::from_be_bytes([head[4], head[5], head[6], head[7]]);
     let (mut base, mut default_size) = (moof_start, 0u64);
@@ -523,11 +516,8 @@ fn read_tfhd<R: Read + Seek>(r: &mut R, moof_start: u64, s: u64) -> io::Result<(
 /// Parse a `trun`: `(data_offset, per-sample sizes)`. Sizes come from the run, or fall back to
 /// `default_size`; `data_offset` is relative to the fragment's base.
 fn read_trun<R: Read + Seek>(r: &mut R, s: u64, e: u64, default_size: u64) -> io::Result<(i64, Vec<u64>)> {
-    r.seek(SeekFrom::Start(s))?;
-    let mut head = [0u8; 8]; // [version+flags][sample_count]
-    if fill(r, &mut head)? < 8 {
-        return Ok((0, Vec::new()));
-    }
+    // head = [version+flags][sample_count]
+    let Some(head) = read_at::<8, _>(r, s)? else { return Ok((0, Vec::new())) };
     let flags = u32::from_be_bytes([0, head[1], head[2], head[3]]);
     let sample_count = u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize;
     let mut data_offset = 0i64;
@@ -581,9 +571,8 @@ fn is_text_handler<R: Read + Seek>(r: &mut R, mdia_s: u64, mdia_e: u64) -> io::R
     if e - s < 12 {
         return Ok(false);
     }
-    r.seek(SeekFrom::Start(s))?;
-    let mut b = [0u8; 12]; // [version+flags][pre_defined][handler_type]
-    r.read_exact(&mut b)?;
+    // b = [version+flags][pre_defined][handler_type]
+    let Some(b) = read_at::<12, _>(r, s)? else { return Ok(false) };
     Ok(matches!(&b[8..12], b"text" | b"sbtl" | b"subt"))
 }
 
@@ -593,20 +582,15 @@ fn stsd_codec<R: Read + Seek>(r: &mut R, stbl_s: u64, stbl_e: u64) -> io::Result
     if e - s < 16 {
         return Ok([0; 4]);
     }
-    r.seek(SeekFrom::Start(s + 12))?; // past [version+flags][entry_count][entry size]
-    let mut fourcc = [0u8; 4];
-    r.read_exact(&mut fourcc)?;
-    Ok(fourcc)
+    // s + 12 skips [version+flags][entry_count][entry size].
+    Ok(read_at::<4, _>(r, s + 12)?.unwrap_or([0; 4]))
 }
 
 /// Per-sample byte sizes, from `stsz` (a single shared size, or one per sample).
 fn read_sample_sizes<R: Read + Seek>(r: &mut R, stbl_s: u64, stbl_e: u64) -> io::Result<Vec<u64>> {
     let Some((s, e)) = find_box(r, stbl_s, stbl_e, b"stsz")? else { return Ok(Vec::new()) };
-    r.seek(SeekFrom::Start(s))?;
-    let mut head = [0u8; 12]; // [version+flags][sample_size][sample_count]
-    if fill(r, &mut head)? < 12 {
-        return Ok(Vec::new());
-    }
+    // head = [version+flags][sample_size][sample_count]
+    let Some(head) = read_at::<12, _>(r, s)? else { return Ok(Vec::new()) };
     let count = u32::from_be_bytes([head[8], head[9], head[10], head[11]]) as usize;
     match u32::from_be_bytes([head[4], head[5], head[6], head[7]]) {
         0 => read_u32s(r, e.saturating_sub(s + 12), count).map(|v| v.into_iter().map(u64::from).collect()),

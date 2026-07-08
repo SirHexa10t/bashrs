@@ -8,7 +8,7 @@
 //! by `build.rs` from `generative_constants.rs`) plus the imports those shims need — so this file is
 //! never edited by hand. Every shim just forwards its parsed args to a runner in
 //! [`crate::categories::lookup`] (`_grep` / `_gg`); the argument structs live in
-//! [`crate::support::args`], and the hand-written `GG` command sits beside the runners in
+//! [`crate::support::args`], and the hand-written `GG`/`GGG` commands sit beside the runners in
 //! [`crate::categories::lookup`].
 
 #[bashrs_macros::category(command = GrepCommand, prefix = "lookup_")]

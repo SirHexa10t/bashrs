@@ -49,10 +49,7 @@ mod commands {
     /// Highlight every match of PATTERN in the input, keeping all lines (like `grep --color`)
     #[unprefixed]
     pub fn keyword_highlight(args: KeywordHighlightArgs) {
-        let text = match input::read_input_bytes(args.source.as_deref()) {
-            Ok(text) => text,
-            Err(err) => return eprintln!("keyword_highlight: {err}"),
-        };
+        let Some(text) = input::bytes_reported("keyword_highlight", args.source.as_deref()) else { return };
         // Print every line, colouring only the matches — the grep crate's passthru mode does this
         // directly (no `pattern|$` trick, and no external `grep`).
         streamgrep::highlight(&args.pattern, &text);

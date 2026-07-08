@@ -3,7 +3,7 @@
 #[bashrs_macros::category(command = PackagesCommand, prefix = "packages_")]
 mod commands {
     use crate::support::args::NoArgs;
-    use crate::support::exec::{run_reporting, succeeds_quietly};
+    use crate::support::exec::{capture_stdout, run_reporting, succeeds_quietly};
     use crate::support::superuser::{self, CMD};
 
     /// Update and upgrade every package manager present on the system
@@ -145,16 +145,15 @@ mod commands {
         }
     }
 
-    /// Run a listing word-list and print its output indented under the tool header.
+    /// Run a listing word-list and print its output indented under the tool header. Goes through
+    /// [`exec::capture_stdout`], so a failing list command shows its stderr and prints no partial
+    /// listing, rather than failing silently.
     fn _print_listing(words: &[&str]) {
         let Some((&program, args)) = words.split_first() else { return };
-        match std::process::Command::new(program).args(args).output() {
-            Ok(output) => {
-                for entry in String::from_utf8_lossy(&output.stdout).lines() {
-                    println!("  {entry}");
-                }
+        if let Some(listing) = capture_stdout(program, args) {
+            for entry in listing.lines() {
+                println!("  {entry}");
             }
-            Err(err) => eprintln!("  could not run {program}: {err}"),
         }
     }
 

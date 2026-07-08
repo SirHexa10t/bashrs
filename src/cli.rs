@@ -107,40 +107,36 @@ fn category_commands() -> [(&'static str, clap::Command); 9] {
     ]
 }
 
+/// Every category's `(wrapper_suffix, wrapper_prefix)` lookups — one row per category, so adding
+/// a category is one line here instead of an edit to each lookup. Command names are unique across
+/// categories (clap flattening requires it), so the first match wins.
+type WrapperLookup = fn(&str) -> Option<&'static str>;
+const WRAPPER_HOOKS: &[(WrapperLookup, WrapperLookup)] = &[
+    (BashrsCommand::wrapper_suffix, BashrsCommand::wrapper_prefix),
+    (FilesystemCommand::wrapper_suffix, FilesystemCommand::wrapper_prefix),
+    (GitCommand::wrapper_suffix, GitCommand::wrapper_prefix),
+    (MediaCommand::wrapper_suffix, MediaCommand::wrapper_prefix),
+    (PackagesCommand::wrapper_suffix, PackagesCommand::wrapper_prefix),
+    (ProjectCommand::wrapper_suffix, ProjectCommand::wrapper_prefix),
+    (LookupCommand::wrapper_suffix, LookupCommand::wrapper_prefix),
+    (GrepCommand::wrapper_suffix, GrepCommand::wrapper_prefix),
+    (GgCommand::wrapper_suffix, GgCommand::wrapper_prefix),
+    (StyleCommand::wrapper_suffix, StyleCommand::wrapper_prefix),
+    (StylizedEchoCommand::wrapper_suffix, StylizedEchoCommand::wrapper_prefix),
+    (ComfyReposCommand::wrapper_suffix, ComfyReposCommand::wrapper_prefix),
+];
+
 /// The shell appended (after `&&`) to a command's wrapper — e.g. to restart the
-/// shell after a command that changes the environment. Command names are unique
-/// across categories (clap flattening requires it), so the first match wins.
+/// shell after a command that changes the environment.
 fn wrapper_suffix(name: &str) -> Option<&'static str> {
-    BashrsCommand::wrapper_suffix(name)
-        .or_else(|| FilesystemCommand::wrapper_suffix(name))
-        .or_else(|| GitCommand::wrapper_suffix(name))
-        .or_else(|| MediaCommand::wrapper_suffix(name))
-        .or_else(|| PackagesCommand::wrapper_suffix(name))
-        .or_else(|| ProjectCommand::wrapper_suffix(name))
-        .or_else(|| LookupCommand::wrapper_suffix(name))
-        .or_else(|| GrepCommand::wrapper_suffix(name))
-        .or_else(|| GgCommand::wrapper_suffix(name))
-        .or_else(|| StyleCommand::wrapper_suffix(name))
-        .or_else(|| StylizedEchoCommand::wrapper_suffix(name))
-        .or_else(|| ComfyReposCommand::wrapper_suffix(name))
+    WRAPPER_HOOKS.iter().find_map(|(suffix, _)| suffix(name))
 }
 
 /// The shell piped into a command's wrapper (ahead of the binary) — e.g. `hg` searches the
 /// shell history, which only the shell itself can produce, so its wrapper runs `history` and
-/// pipes it in. First match wins, as with [`wrapper_suffix`].
+/// pipes it in.
 fn wrapper_prefix(name: &str) -> Option<&'static str> {
-    BashrsCommand::wrapper_prefix(name)
-        .or_else(|| FilesystemCommand::wrapper_prefix(name))
-        .or_else(|| GitCommand::wrapper_prefix(name))
-        .or_else(|| MediaCommand::wrapper_prefix(name))
-        .or_else(|| PackagesCommand::wrapper_prefix(name))
-        .or_else(|| ProjectCommand::wrapper_prefix(name))
-        .or_else(|| LookupCommand::wrapper_prefix(name))
-        .or_else(|| GrepCommand::wrapper_prefix(name))
-        .or_else(|| GgCommand::wrapper_prefix(name))
-        .or_else(|| StyleCommand::wrapper_prefix(name))
-        .or_else(|| StylizedEchoCommand::wrapper_prefix(name))
-        .or_else(|| ComfyReposCommand::wrapper_prefix(name))
+    WRAPPER_HOOKS.iter().find_map(|(_, prefix)| prefix(name))
 }
 
 /// Build the shell function definitions sourced from `~/.bashrs/sourcefile.sh`.
@@ -293,9 +289,9 @@ mod tests {
     #[test]
     fn lookup_commands_follow_naming_standard() {
         // `hg` mirrors the classic `history | grep` alias; `GG` is the loud all-caps sibling of `gg`
-        // (recursive search with `--delve` forced), and `GGES` is `GG` with `--save`/`-E` too — all
+        // (recursive search with `--delve` forced), and `GGG` is `GG` with `--save`/`-E` too — all
         // bare, memorable exceptions à la `UPUP`.
-        assert_prefixed(&command_names::<LookupCommand>(), "lookup_", &["hg", "GG", "GGES"]);
+        assert_prefixed(&command_names::<LookupCommand>(), "lookup_", &["hg", "GG", "GGG"]);
     }
 
     #[test]
@@ -386,6 +382,13 @@ mod tests {
     #[test]
     fn wrappers_exclude_the_internal_generate_command() {
         assert!(!wrappers().contains("generate() {"));
+    }
+
+    #[test]
+    fn wrappers_include_the_stainless_aliases() {
+        // The alias is emitted whether or not the repo has been cloned yet; only the trailing
+        // `--help` comment varies with the environment, so assert just the alias line's stable head.
+        assert!(wrappers().contains("ai() { \"$HOME/pydev/bin/python3\""), "stainless `ai` alias missing");
     }
 
     #[test]

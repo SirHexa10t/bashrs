@@ -1,16 +1,17 @@
 //! In-process stream grep on ripgrep's `grep` crate — the engine behind the search commands
 //! `hg`, the `g`/`g<N>` family ([`crate::categories::autogen_lookup`]), and `keyword_highlight`
-//! ([`crate::categories::styles`]). Those filter a *single* stream (piped input, a file, or inline
-//! text), so this is about self-containment — no shelling out to system `grep` — not speed: on one
-//! stream the crate and GNU grep are on par (the crate's edge is the parallel directory walk,
-//! which these commands don't do).
-
-use std::io::IsTerminal;
+//! ([`crate::categories::styles`]); the matcher builder here ([`build_matcher`]) is also shared with
+//! the recursive [`treegrep`](crate::support::treegrep). The commands here filter a *single* stream
+//! (piped input, a file, or inline text), so this is about self-containment — no shelling out to
+//! system `grep` — not speed: on one stream the crate and GNU grep are on par (the crate's edge is
+//! the parallel directory walk, which these commands don't do).
 
 use grep::printer::{ColorSpecs, StandardBuilder, UserColorSpec};
 use grep::regex::{RegexMatcher, RegexMatcherBuilder};
 use grep::searcher::{Searcher, SearcherBuilder};
-use termcolor::{ColorChoice, StandardStream, WriteColor};
+use termcolor::{StandardStream, WriteColor};
+
+use crate::support::shell;
 
 /// How a single-stream search runs — the `g` knobs, mirroring [`crate::support::treegrep::Options`]
 /// on the recursive side. `Default` is a plain literal search with no context or line numbers, which
@@ -38,9 +39,7 @@ pub(crate) fn filter(pattern: &str, text: &[u8], opts: &Options) {
 /// The body of [`filter`], parameterised over the output sink so tests can capture it into an
 /// in-memory buffer (production passes [`stdout`]).
 fn filter_into<W: WriteColor>(pattern: &str, text: &[u8], opts: &Options, wtr: W) {
-    // Literal by default (escape metacharacters), or the pattern used as a regex when `regex` is set (`-E`).
-    let compiled = if opts.regex { pattern.to_owned() } else { escape_literal(pattern) };
-    let matcher = match RegexMatcherBuilder::new().case_insensitive(true).build(&compiled) {
+    let matcher = match build_matcher(&[pattern], opts.regex) {
         Ok(matcher) => matcher,
         Err(err) => return eprintln!("g: could not build matcher: {err}"),
     };
@@ -74,10 +73,9 @@ fn search<W: WriteColor>(matcher: &RegexMatcher, text: &[u8], searcher: &mut Sea
     }
 }
 
-/// Stdout as a `--color=auto` sink: coloured matches when it's a terminal, plain text when piped.
+/// Stdout as a `--color=auto` sink (the policy lives in [`shell::stdout_color`]).
 fn stdout() -> StandardStream {
-    let color = if std::io::stdout().is_terminal() { ColorChoice::Always } else { ColorChoice::Never };
-    StandardStream::stdout(color)
+    StandardStream::stdout(shell::stdout_color())
 }
 
 /// Colour matches black-on-red: a red *background* with black text, not red text. A filled block
@@ -91,6 +89,18 @@ fn match_color() -> ColorSpecs {
         .map(|spec| spec.parse().expect("built-in colour spec is valid"))
         .collect();
     ColorSpecs::new(&specs)
+}
+
+/// Compile `expressions` into one case-insensitive alternation — literal (escaped) by default, or
+/// each treated as a regular expression when `regex` is set (`-E`), isolated as `(?:…)` so the
+/// alternation can't bleed between them. The one matcher builder behind the `g` and `gg` families.
+pub(crate) fn build_matcher(expressions: &[&str], regex: bool) -> Result<RegexMatcher, grep::regex::Error> {
+    let pattern = expressions
+        .iter()
+        .map(|expr| if regex { format!("(?:{expr})") } else { escape_literal(expr) })
+        .collect::<Vec<_>>()
+        .join("|");
+    RegexMatcherBuilder::new().case_insensitive(true).build(&pattern)
 }
 
 /// Escape regex metacharacters so PATTERN matches literally (`-F`). Mirrors `regex::escape`

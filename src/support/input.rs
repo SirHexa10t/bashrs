@@ -28,6 +28,18 @@ pub(crate) fn read_input_bytes(arg: Option<&str>) -> io::Result<Vec<u8>> {
     }
 }
 
+/// [`read_input_bytes`], with a failure reported to stderr under the command's name — the shared
+/// "read the input or report and bail" opening of the search commands (`None` = already reported).
+pub(crate) fn bytes_reported(command: &str, arg: Option<&str>) -> Option<Vec<u8>> {
+    match read_input_bytes(arg) {
+        Ok(bytes) => Some(bytes),
+        Err(err) => {
+            eprintln!("{command}: {err}");
+            None
+        }
+    }
+}
+
 /// [`read_input_bytes`] decoded as UTF-8 — for consumers that need text (e.g. syntax highlighting),
 /// where a non-UTF-8 stream is a genuine error rather than something to scan byte-wise.
 pub(crate) fn read_input(arg: Option<&str>) -> io::Result<String> {

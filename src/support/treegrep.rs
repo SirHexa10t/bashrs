@@ -1,9 +1,12 @@
-//! Recursive directory search — the engine behind `gg` ([`crate::categories::autogen_lookup`]). Walks a
-//! tree with ripgrep's `ignore` walker and searches each file with the `grep` crate: first matching
-//! **filenames**, then matching **contents** (`path:line:text`). Binary files are skipped (NUL
-//! detection); over-long lines are omitted (`text_limit`, for minified/dumped text). Paths that
-//! can't be read for permissions are collected and returned, so the caller can offer a root re-scan
-//! (re-exec under the superuser command) scoped to just those paths.
+//! Recursive directory search — the engine behind the `gg` family ([`crate::categories::autogen_lookup`])
+//! and its `GG`/`GGG` variants. Walks a tree with ripgrep's `ignore` walker and searches each file
+//! with the `grep` crate: first matching **filenames**, then matching **contents** (`path:line:text`),
+//! the expressions compiled by [`streamgrep`]'s shared matcher builder (literal, or regexes under
+//! `-E`). Binary files are skipped (NUL detection); over-long lines are swapped for a placeholder
+//! (`MAX_LINE`, for minified/dumped text); under `--save`, results also stream into a live file, with
+//! a path-sorted `_sorted` sibling left on completion (`SaveSink`). Paths that can't be read for
+//! permissions are collected and returned, so the caller can offer a root re-scan (re-exec under the
+//! superuser command) scoped to just those paths.
 //!
 //! Two passes on purpose: the filenames pass reads no file *contents* (only directory metadata), so
 //! it's cheap, and running it first gives the "names, then contents" ordering while content matches
@@ -12,19 +15,20 @@
 
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
-use std::io::{self, IsTerminal, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use grep::matcher::Matcher;
-use grep::regex::{RegexMatcher, RegexMatcherBuilder};
+use grep::regex::RegexMatcher;
 use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use termcolor::{Buffer, BufferWriter, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
 use crate::support::delve;
 use crate::support::doc_style::_header;
+use crate::support::shell;
 use crate::support::streamgrep;
 
 /// Options mapped from the `gg` flags (the search roots are passed to [`search`] separately).
@@ -37,16 +41,19 @@ pub struct Options {
     pub delve: bool,
     /// Treat the expression(s) as regular expressions instead of literal text (`-E`).
     pub regex: bool,
-    /// When set, tee results (plain) into this file and sort it on completion (`gg --save`).
+    /// When set, tee results (plain) into this live file and leave a sorted `_sorted` sibling
+    /// ([`sorted_path`]) on completion (`gg --save`).
     pub save: Option<PathBuf>,
 }
 
 /// Recursively search `roots` for `expressions` (literal or `-E` regex, case-insensitive, OR'd):
 /// print matching filenames, then matching file contents. Output goes to stdout — and, under
-/// `--save`, a plain sorted copy to `opts.save` too; diagnostics to stderr. Returns the paths that
-/// couldn't be read for permissions, so the caller can offer a root re-scan.
+/// `--save`, plain to the `opts.save` live file as it arrives, with a path-sorted copy appended to
+/// its `_sorted` sibling on completion; diagnostics to stderr. Returns the paths that couldn't be
+/// read for permissions, so the caller can offer a root re-scan.
 pub(crate) fn search(expressions: &[String], roots: &[PathBuf], opts: &Options) -> BTreeSet<PathBuf> {
-    let matcher = match build_matcher(expressions, opts.regex) {
+    let exprs: Vec<&str> = expressions.iter().map(String::as_str).collect();
+    let matcher = match streamgrep::build_matcher(&exprs, opts.regex) {
         Ok(matcher) => matcher,
         Err(err) => {
             eprintln!("gg: invalid expression: {err}");
@@ -72,7 +79,7 @@ pub(crate) fn search(expressions: &[String], roots: &[PathBuf], opts: &Options) 
     // Colour follows the usual `--color=auto` rule even under `--save`: the terminal copy is coloured
     // and `SaveSink::record` strips the escapes so the saved file stays plain. Section headings are
     // still suppressed while saving (below), keeping the saved result stream uncluttered and sortable.
-    let color = std::io::stdout().is_terminal();
+    let color = shell::stdout_color();
     let denied: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
     if save.is_none() {
@@ -97,14 +104,19 @@ pub(crate) fn search(expressions: &[String], roots: &[PathBuf], opts: &Options) 
     denied.into_inner().unwrap_or_default()
 }
 
-/// The file side of `gg --save`: appends each result block live (so a crash mid-search still leaves
-/// partial results on disk) and remembers every block, so the whole set can be re-sorted by path
-/// once the search finishes. A search owns only the section it appended (tracked from
-/// [`SaveSink::open`]), so the main pass and the root re-scan each sort their own contribution — no
-/// cross-process re-parsing of `path:line:text`.
+/// The file side of `gg --save`. Each result block is appended to the live file as it arrives (so a
+/// crash mid-search still leaves everything on disk) and remembered; when the pass finishes, its
+/// blocks are appended — sorted by path — to a `_sorted` sibling ([`sorted_path`]). The live file is
+/// never rewritten, only appended: it's the crash-safety net, deleted by the caller once the sorted
+/// file is complete. A pass owns only its own section (everything from `start`), so the main pass
+/// and the root re-scan each sort their own contribution — no cross-process re-parsing of
+/// `path:line:text`.
 struct SaveSink {
-    file: Mutex<File>,
-    /// Offset where this pass's output begins; everything from here is rewritten, sorted.
+    /// The live (arrival-order) file, append-only.
+    live: Mutex<File>,
+    /// The live file's path — to locate the `_sorted` sibling and seed it with the header.
+    path: PathBuf,
+    /// Offset where this pass's output begins; everything before it belongs to earlier passes.
     start: u64,
     /// Each appended block as `(path, bytes)`. A file's matches arrive as one already-line-ordered
     /// block, so ordering the blocks by path gives path-then-line for free.
@@ -114,37 +126,55 @@ struct SaveSink {
 impl SaveSink {
     /// Open `path` for appending, noting where this pass's output will start.
     fn open(path: &Path) -> io::Result<Self> {
-        // Not `append(true)`: that would force every write to EOF and defeat `finish`'s seek + rewrite.
-        // `truncate(false)` keeps the header / earlier pass already in the file (this pass appends).
-        let mut file = OpenOptions::new().write(true).truncate(false).create(true).open(path)?;
-        let start = file.seek(SeekFrom::End(0))?;
-        Ok(SaveSink { file: Mutex::new(file), start, blocks: Mutex::new(Vec::new()) })
+        let file = OpenOptions::new().append(true).create(true).open(path)?;
+        let start = file.metadata()?.len();
+        Ok(SaveSink {
+            live: Mutex::new(file),
+            path: path.to_path_buf(),
+            start,
+            blocks: Mutex::new(Vec::new()),
+        })
     }
 
-    /// Append one file's block live and keep it for the final sort. The terminal copy keeps its
-    /// colour; here the ANSI escapes are stripped so the saved file is plain text. Empty blocks skip.
+    /// Append one file's block to the live file and keep it for the final sort. The terminal copy
+    /// keeps its colour; here the ANSI escapes are stripped so the saved file is plain text. Empty
+    /// blocks skip.
     fn record(&self, path: &Path, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
         let plain = strip_ansi(bytes);
-        let _ = self.file.lock().unwrap().write_all(&plain);
+        let _ = self.live.lock().unwrap().write_all(&plain);
         self.blocks.lock().unwrap().push((path.to_path_buf(), plain));
     }
 
-    /// Replace the live (arrival-order) blocks appended since [`open`] with the same blocks ordered
-    /// by path — stably, so a path's name-match line stays above its content matches.
+    /// Append this pass's blocks — ordered by path, stably, so a path's name-match line stays above
+    /// its content matches — to the `_sorted` sibling. The first pass creates that file, seeded with
+    /// everything before its own section (the header); a later pass (the root re-scan) finds the
+    /// earlier sorted output already there and just appends. The live file is left untouched, so no
+    /// moment exists where results are only in memory.
     fn finish(&self) -> io::Result<()> {
         let mut blocks = std::mem::take(&mut *self.blocks.lock().unwrap());
         blocks.sort_by(|(a, _), (b, _)| a.cmp(b));
-        let mut file = self.file.lock().unwrap();
-        file.set_len(self.start)?;
-        file.seek(SeekFrom::Start(self.start))?;
-        for (_, bytes) in &blocks {
-            file.write_all(bytes)?;
+        let sorted = sorted_path(&self.path);
+        let seed = !sorted.exists();
+        let mut out = OpenOptions::new().append(true).create(true).open(&sorted)?;
+        if seed {
+            io::copy(&mut File::open(&self.path)?.take(self.start), &mut out)?;
         }
-        file.flush()
+        for (_, bytes) in &blocks {
+            out.write_all(bytes)?;
+        }
+        out.flush()
     }
+}
+
+/// The `_sorted` sibling of a `--save` live file — the sorted final artifact [`SaveSink::finish`]
+/// writes (and the caller's notice points at, after removing the live file).
+pub(crate) fn sorted_path(live: &Path) -> PathBuf {
+    let mut name = live.file_name().unwrap_or_default().to_os_string();
+    name.push("_sorted");
+    live.with_file_name(name)
 }
 
 /// Strip ANSI colour escapes — `termcolor`'s SGR sequences — from `bytes`, so the terminal keeps its
@@ -170,18 +200,6 @@ fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
         }
     }
     out
-}
-
-/// Compile the expressions into one case-insensitive alternation — literal (escaped) by default, or
-/// each treated as a regular expression when `regex` is set (`-E`). Case-insensitivity is kept
-/// either way, matching the rest of the `gg`/`g` family.
-fn build_matcher(expressions: &[String], regex: bool) -> Result<RegexMatcher, grep::regex::Error> {
-    let pattern = expressions
-        .iter()
-        .map(|expr| if regex { format!("(?:{expr})") } else { streamgrep::escape_literal(expr) })
-        .collect::<Vec<_>>()
-        .join("|");
-    RegexMatcherBuilder::new().case_insensitive(true).build(&pattern)
 }
 
 /// Phase 1 — every entry (file or directory) whose *name* matches. Reads no file contents.
@@ -223,27 +241,13 @@ fn name_hit(
 }
 
 /// Print matching paths, colouring the matched span (black-on-red, on a terminal).
-fn print_filenames(names: &[PathBuf], matcher: &RegexMatcher, color: bool, save: Option<&SaveSink>) {
-    let mut out = StandardStream::stdout(if color { ColorChoice::Always } else { ColorChoice::Never });
-    let mut spec = ColorSpec::new();
-    spec.set_fg(Some(Color::Black)).set_bg(Some(Color::Red));
+fn print_filenames(names: &[PathBuf], matcher: &RegexMatcher, color: ColorChoice, save: Option<&SaveSink>) {
+    let mut out = StandardStream::stdout(color);
+    let match_style = match_spec();
     for path in names {
         let text = path.to_string_lossy();
         let bytes = text.as_bytes();
-        let mut ranges = Vec::new();
-        let _ = matcher.find_iter(bytes, |m| {
-            ranges.push((m.start(), m.end()));
-            true
-        });
-        let mut last = 0;
-        for (start, end) in ranges {
-            let _ = out.write_all(&bytes[last..start]);
-            let _ = out.set_color(&spec);
-            let _ = out.write_all(&bytes[start..end]);
-            let _ = out.reset();
-            last = end;
-        }
-        let _ = out.write_all(&bytes[last..]);
+        let _ = write_spans(&mut out, matcher, bytes, &match_style);
         let _ = out.write_all(b"\n");
         // Under `--save`, a name match is a one-line block keyed by its path (plain — no colour).
         if let Some(save) = save {
@@ -260,11 +264,11 @@ fn search_contents(
     matcher: &RegexMatcher,
     roots: &[PathBuf],
     opts: &Options,
-    color: bool,
+    color: ColorChoice,
     denied: &Mutex<BTreeSet<PathBuf>>,
     save: Option<&SaveSink>,
 ) -> bool {
-    let bufwtr = BufferWriter::stdout(if color { ColorChoice::Always } else { ColorChoice::Never });
+    let bufwtr = BufferWriter::stdout(color);
     let found = AtomicBool::new(false);
     let ctx = Ctx { matcher, bufwtr: &bufwtr, found: &found, denied, delve: opts.delve, save };
     let line_number = opts.line_number;
@@ -326,18 +330,13 @@ struct GgSink<'a> {
 
 impl<'a> GgSink<'a> {
     fn new(matcher: &'a RegexMatcher, buffer: &'a mut Buffer, path: &Path) -> Self {
-        let color = |fg, bg| {
-            let mut spec = ColorSpec::new();
-            spec.set_fg(Some(fg)).set_bg(bg);
-            spec
-        };
         GgSink {
             matcher,
             buffer,
             path: path.to_string_lossy().into_owned().into_bytes(),
-            path_color: color(Color::Magenta, None),
-            line_color: color(Color::Yellow, None),
-            match_color: color(Color::Black, Some(Color::Red)),
+            path_color: spec(Color::Magenta, None),
+            line_color: spec(Color::Yellow, None),
+            match_color: match_spec(),
         }
     }
 
@@ -355,28 +354,13 @@ impl<'a> GgSink<'a> {
         if content.len() > MAX_LINE {
             self.buffer.write_all(TOO_LONG)?;
         } else if is_match {
-            self.write_highlighted(content)?;
+            write_spans(self.buffer, self.matcher, content, &self.match_color)?;
         } else {
             self.buffer.write_all(content)?;
         }
         self.buffer.write_all(b"\n")
     }
 
-    /// Write `content`, colouring each match span black-on-red.
-    fn write_highlighted(&mut self, content: &[u8]) -> io::Result<()> {
-        let mut spans = Vec::new();
-        let _ = self.matcher.find_iter(content, |m| {
-            spans.push((m.start(), m.end()));
-            true
-        });
-        let mut last = 0;
-        for (start, end) in spans {
-            self.buffer.write_all(&content[last..start])?;
-            field(self.buffer, &self.match_color, &content[start..end])?;
-            last = end;
-        }
-        self.buffer.write_all(&content[last..])
-    }
 }
 
 impl Sink for GgSink<'_> {
@@ -402,11 +386,41 @@ impl Sink for GgSink<'_> {
     }
 }
 
-/// Write `bytes` in `color`, then reset. Colour codes are emitted only if `buf` is in colour mode.
-fn field(buf: &mut Buffer, color: &ColorSpec, bytes: &[u8]) -> io::Result<()> {
-    buf.set_color(color)?;
-    buf.write_all(bytes)?;
-    buf.reset()
+/// A `ColorSpec` with the given foreground (and optional background).
+fn spec(fg: Color, bg: Option<Color>) -> ColorSpec {
+    let mut spec = ColorSpec::new();
+    spec.set_fg(Some(fg)).set_bg(bg);
+    spec
+}
+
+/// The black-on-red match style, shared by the filename listing and the content sink (and mirrored
+/// by `g`'s printer colours in [`streamgrep`]).
+fn match_spec() -> ColorSpec {
+    spec(Color::Black, Some(Color::Red))
+}
+
+/// Write `bytes` in `color`, then reset. Colour codes are emitted only if `out` is in colour mode.
+fn field(out: &mut impl WriteColor, color: &ColorSpec, bytes: &[u8]) -> io::Result<()> {
+    out.set_color(color)?;
+    out.write_all(bytes)?;
+    out.reset()
+}
+
+/// Write `bytes` with each of `matcher`'s match spans coloured `spec` — the one span-splitting loop
+/// behind both the filename listing and the match-line highlighting.
+fn write_spans(out: &mut impl WriteColor, matcher: &RegexMatcher, bytes: &[u8], spec: &ColorSpec) -> io::Result<()> {
+    let mut spans = Vec::new();
+    let _ = matcher.find_iter(bytes, |m| {
+        spans.push((m.start(), m.end()));
+        true
+    });
+    let mut last = 0;
+    for (start, end) in spans {
+        out.write_all(&bytes[last..start])?;
+        field(out, spec, &bytes[start..end])?;
+        last = end;
+    }
+    out.write_all(&bytes[last..])
 }
 
 /// A line without its trailing `\n` / `\r\n`.
@@ -508,9 +522,9 @@ fn error_path(err: &ignore::Error) -> Option<&Path> {
 }
 
 /// Print a section header — the shared bold-blue "header" style on a terminal, plain when piped.
-fn section(title: &str, color: bool) {
+fn section(title: &str, color: ColorChoice) {
     let line = format!("{title}:");
-    println!("\n{}", if color { _header(&line) } else { line });
+    println!("\n{}", if color == ColorChoice::Always { _header(&line) } else { line });
 }
 
 #[cfg(test)]
@@ -566,5 +580,37 @@ mod tests {
         let coloured = b"\x1b[35mf\x1b[0m:\x1b[33m2\x1b[0m:a \x1b[30m\x1b[41mmatch\x1b[0m here\n";
         assert_eq!(strip_ansi(coloured), b"f:2:a match here\n".to_vec());
         assert_eq!(strip_ansi(b"plain, no escapes"), b"plain, no escapes".to_vec());
+    }
+
+    #[test]
+    fn save_sink_logs_live_then_leaves_a_sorted_sibling() {
+        let live = std::env::temp_dir().join(format!("bashrs_save_sink_{}", std::process::id()));
+        let sorted = sorted_path(&live);
+        assert!(sorted.to_string_lossy().ends_with("_sorted"), "sibling name: {sorted:?}");
+        let _ = std::fs::remove_file(&sorted); // a stale sibling would corrupt the seed check
+        // First pass: the live file starts with the header `_gg` writes; blocks arrive out of order.
+        std::fs::write(&live, "# search term used: x\n").unwrap();
+        let first = SaveSink::open(&live).unwrap();
+        first.record(Path::new("/z"), b"\x1b[35m/z\x1b[0m:1:zed\n"); // coloured, like a real block
+        first.record(Path::new("/a"), b"/a:1:first\n/a:2:second\n");
+        first.record(Path::new("/m"), b""); // an empty block is skipped entirely
+        first.finish().unwrap();
+        // Second pass (the root re-scan): appends to the same live file, sorts only its own section.
+        let second = SaveSink::open(&live).unwrap();
+        second.record(Path::new("/root/b"), b"/root/b:1:late\n");
+        second.record(Path::new("/root/a"), b"/root/a:1:early\n");
+        second.finish().unwrap();
+        // The live file is a pure arrival-order log (ANSI stripped), never rewritten…
+        assert_eq!(
+            std::fs::read_to_string(&live).unwrap(),
+            "# search term used: x\n/z:1:zed\n/a:1:first\n/a:2:second\n/root/b:1:late\n/root/a:1:early\n",
+        );
+        // …while the `_sorted` sibling holds the header, then each pass's section sorted by path.
+        assert_eq!(
+            std::fs::read_to_string(&sorted).unwrap(),
+            "# search term used: x\n/a:1:first\n/a:2:second\n/z:1:zed\n/root/a:1:early\n/root/b:1:late\n",
+        );
+        let _ = std::fs::remove_file(&live);
+        let _ = std::fs::remove_file(&sorted);
     }
 }
