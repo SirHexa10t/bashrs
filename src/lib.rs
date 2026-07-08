@@ -3,13 +3,18 @@ pub mod cli;
 pub mod shell_conf;
 pub mod support;
 
-/// Binary entry point. `gg`'s permission-denied recovery re-execs the binary under `sudo` to
-/// re-scan the unreadable paths as root; that root process lands here first — recognised by its
-/// `argv` marker and handled before clap (it's an internal re-run, not a user command), via the
-/// `#[elevated]`-generated [`GgElevatedRescan`](crate::categories::lookup::GgElevatedRescan). Any
-/// ordinary invocation falls through to the parsed-and-dispatched CLI.
+use crate::categories::lookup::GgElevatedRescan;
+
+/// The binary's internal self-invocations: the `sudo` re-execs that `#[elevated]` routines spawn to
+/// run part of themselves as root. Each routine's `try_handle` — which claims the run iff its marker
+/// leads `argv` — is listed here; [`run`] offers the process to them before the user CLI parses.
+/// Adding an `#[elevated]` routine adds one entry; nothing else changes.
+const REEXEC_HANDLERS: &[fn() -> bool] = &[GgElevatedRescan::try_handle];
+
+/// Binary entry point. An internal re-exec handles itself and stops here; every other invocation is
+/// a real command, parsed and dispatched normally.
 pub fn run() {
-    if crate::categories::lookup::GgElevatedRescan::try_handle() {
+    if REEXEC_HANDLERS.iter().any(|handle| handle()) {
         return;
     }
     <cli::Cli as clap::Parser>::parse().command.run();

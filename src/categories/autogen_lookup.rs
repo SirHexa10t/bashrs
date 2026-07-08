@@ -11,7 +11,7 @@
 //! [`crate::support::args`], and the hand-written `GG` command sits beside the runners in
 //! [`crate::categories::lookup`].
 
-#[bashrs_macros::category(command = GrepCommand, prefix = "look_")]
+#[bashrs_macros::category(command = GrepCommand, prefix = "lookup_")]
 mod grep_commands {
     use crate::categories::lookup::_grep;
     use crate::support::args::GrepArgs;
@@ -44,7 +44,7 @@ mod grep_commands {
     // GENERATED-LOOKUP-GREP-END
 }
 
-#[bashrs_macros::category(command = GgCommand, prefix = "look_")]
+#[bashrs_macros::category(command = GgCommand, prefix = "lookup_")]
 mod tree_commands {
     use crate::categories::lookup::_gg;
     use crate::support::args::GgArgs;

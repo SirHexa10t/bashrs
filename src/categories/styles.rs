@@ -49,7 +49,7 @@ mod commands {
     /// Highlight every match of PATTERN in the input, keeping all lines (like `grep --color`)
     #[unprefixed]
     pub fn keyword_highlight(args: KeywordHighlightArgs) {
-        let text = match input::read_input(args.source.as_deref()) {
+        let text = match input::read_input_bytes(args.source.as_deref()) {
             Ok(text) => text,
             Err(err) => return eprintln!("keyword_highlight: {err}"),
         };

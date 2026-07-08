@@ -892,12 +892,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "reads the local multi-GB videofile.mkv test fixture; run explicitly"]
-    fn matroska_extracts_subtitles_from_the_test_file() {
-        let t0 = std::time::Instant::now();
-        let text = matroska_subtitles(io::BufReader::new(File::open("videofile.mkv").unwrap())).unwrap();
+    fn matroska_extracts_a_text_subtitle_from_a_real_file() {
+        // A ~120-byte slice of a real Matroska file — its EBML header, `S_TEXT/UTF8` subtitle track,
+        // and one real cue — reconstructed from a 9.77 GB source with the bulk A/V dropped.
+        let bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/phm.mkv"));
+        let text = matroska_subtitles(io::Cursor::new(&bytes[..])).unwrap();
         let text = String::from_utf8_lossy(&text);
-        eprintln!("extracted {} bytes of subtitles in {:?}", text.len(), t0.elapsed());
-        assert!(text.contains("So don't take it personally"));
+        assert!(text.contains("So don't take it personally"), "{text:?}");
     }
 }

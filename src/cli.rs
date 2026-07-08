@@ -288,14 +288,14 @@ mod tests {
     fn lookup_commands_follow_naming_standard() {
         // `hg` mirrors the classic `history | grep` alias; `GG` is the loud all-caps sibling of `gg`
         // (recursive search with `--delve` forced), à la `UPUP` — both bare, memorable exceptions.
-        assert_prefixed(&command_names::<LookupCommand>(), "look_", &["hg", "GG"]);
+        assert_prefixed(&command_names::<LookupCommand>(), "lookup_", &["hg", "GG"]);
     }
 
     #[test]
     fn grep_family_are_bare_verbs() {
         // The generated `g`/`g3`/… shortcuts are intentionally bare, like the style echoes.
         for name in command_names::<GrepCommand>() {
-            assert!(!name.starts_with("look_"), "grep command `{name}` should be bare, not prefixed");
+            assert!(!name.starts_with("lookup_"), "grep command `{name}` should be bare, not prefixed");
         }
     }
 
@@ -303,7 +303,7 @@ mod tests {
     fn gg_family_are_bare_verbs() {
         // The generated `gg`/`gg2`/… recursive-search shortcuts are intentionally bare too.
         for name in command_names::<GgCommand>() {
-            assert!(!name.starts_with("look_"), "gg command `{name}` should be bare, not prefixed");
+            assert!(!name.starts_with("lookup_"), "gg command `{name}` should be bare, not prefixed");
         }
     }
 

@@ -387,3 +387,50 @@ fn section(title: &str, color: bool) {
     let line = format!("{title}:");
     println!("\n{}", if color { _header(&line) } else { line });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::support::shell::captured;
+
+    /// Run `gg`'s real sink over `text` (matching `pattern`) and return the captured output —
+    /// colour stripped, so assertions read as the plain `path<sep>line<sep>text` lines.
+    fn gg_output(pattern: &str, text: &[u8], line_numbers: bool, context: usize) -> String {
+        let matcher = grep::regex::RegexMatcherBuilder::new().build(pattern).unwrap();
+        let mut searcher = build_searcher(line_numbers, context);
+        captured(|buf| {
+            let sink = GgSink::new(&matcher, buf, Path::new("f"));
+            searcher.search_slice(&matcher, text, sink).unwrap();
+        })
+    }
+
+    #[test]
+    fn formats_a_match_as_path_line_text() {
+        // Only the matching line is emitted, as `path:line:text`.
+        assert_eq!(gg_output("match", b"first\nsecond match\n", true, 0), "f:2:second match\n");
+    }
+
+    #[test]
+    fn context_lines_use_a_dash_separator() {
+        // Match on line 2 with one line of context each side: the match is `path:line:`, the
+        // surrounding context is `path-line-`.
+        let out = gg_output("match", b"above\nthe match\nbelow\n", true, 1);
+        assert_eq!(out, "f-1-above\nf:2:the match\nf-3-below\n");
+    }
+
+    #[test]
+    fn an_over_long_line_becomes_the_placeholder() {
+        // A match line longer than `MAX_LINE` is swapped for `TOO_LONG`, so a hit inside minified or
+        // dumped text can't flood the terminal with one giant line.
+        let line = format!("match{}", "x".repeat(MAX_LINE));
+        let out = gg_output("match", format!("{line}\n").as_bytes(), false, 0);
+        assert_eq!(out, format!("f:{}\n", std::str::from_utf8(TOO_LONG).unwrap()));
+    }
+
+    #[test]
+    fn every_segment_of_a_multi_match_line_is_written() {
+        // Two matches on one line: the span-splitting in `write_highlighted` must reproduce the
+        // line exactly (colour stripped here), with nothing dropped or duplicated at the boundaries.
+        assert_eq!(gg_output("aa", b"aa bb aa cc\n", false, 0), "f:aa bb aa cc\n");
+    }
+}
