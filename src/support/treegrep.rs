@@ -11,7 +11,8 @@
 //! *everything* — hidden and .gitignored files included.
 
 use std::collections::BTreeSet;
-use std::io::{self, IsTerminal, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, IsTerminal, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -34,13 +35,18 @@ pub struct Options {
     /// Also search *inside* files normally skipped as binary, by decoding known formats — subtitle
     /// tracks, torrent text (`--delve`; see [`crate::support::delve`]).
     pub delve: bool,
+    /// Treat the expression(s) as regular expressions instead of literal text (`-E`).
+    pub regex: bool,
+    /// When set, tee results (plain) into this file and sort it on completion (`gg --save`).
+    pub save: Option<PathBuf>,
 }
 
-/// Recursively search `roots` for `expressions` (literal, case-insensitive, OR'd): print matching
-/// filenames, then matching file contents. Everything goes to stdout; diagnostics to stderr.
-/// Returns the paths that couldn't be read for permissions, so the caller can offer a root re-scan.
+/// Recursively search `roots` for `expressions` (literal or `-E` regex, case-insensitive, OR'd):
+/// print matching filenames, then matching file contents. Output goes to stdout — and, under
+/// `--save`, a plain sorted copy to `opts.save` too; diagnostics to stderr. Returns the paths that
+/// couldn't be read for permissions, so the caller can offer a root re-scan.
 pub(crate) fn search(expressions: &[String], roots: &[PathBuf], opts: &Options) -> BTreeSet<PathBuf> {
-    let matcher = match build_matcher(expressions) {
+    let matcher = match build_matcher(expressions, opts.regex) {
         Ok(matcher) => matcher,
         Err(err) => {
             eprintln!("gg: invalid expression: {err}");
@@ -50,27 +56,101 @@ pub(crate) fn search(expressions: &[String], roots: &[PathBuf], opts: &Options) 
     if roots.is_empty() {
         return BTreeSet::new();
     }
-    let color = std::io::stdout().is_terminal();
+    // `--save` tees results (plain) into a file as well as the terminal. Opening it appends to what's
+    // already there — the header for the first pass, the first pass's results for the root re-scan —
+    // so both passes share the one file.
+    let save = match opts.save.as_deref() {
+        Some(path) => match SaveSink::open(path) {
+            Ok(sink) => Some(sink),
+            Err(err) => {
+                eprintln!("gg: cannot write to {} ({err}); continuing without --save", path.display());
+                None
+            }
+        },
+        None => None,
+    };
+    // Colour and the section headings suit the interactive terminal; `--save` writes a plain,
+    // heading-free result stream — which is also what keeps the end-of-run sort clean.
+    let color = save.is_none() && std::io::stdout().is_terminal();
     let denied: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
-    section("matching filenames", color);
+    if save.is_none() {
+        section("matching filenames", color);
+    }
     let names = search_filenames(&matcher, roots, &denied);
-    print_filenames(&names, &matcher, color);
+    print_filenames(&names, &matcher, color, save.as_ref());
 
-    section("matching file contents", color);
-    let found_contents = search_contents(&matcher, roots, opts, color, &denied);
+    if save.is_none() {
+        section("matching file contents", color);
+    }
+    let found_contents = search_contents(&matcher, roots, opts, color, &denied, save.as_ref());
 
     if names.is_empty() && !found_contents {
         eprintln!("NO RESULTS FOUND");
     }
+    if let Some(save) = &save {
+        if let Err(err) = save.finish() {
+            eprintln!("gg: could not sort the saved results: {err}");
+        }
+    }
     denied.into_inner().unwrap_or_default()
 }
 
-/// Compile the expressions into one case-insensitive, literal (escaped) alternation.
-fn build_matcher(expressions: &[String]) -> Result<RegexMatcher, grep::regex::Error> {
+/// The file side of `gg --save`: appends each result block live (so a crash mid-search still leaves
+/// partial results on disk) and remembers every block, so the whole set can be re-sorted by path
+/// once the search finishes. A search owns only the section it appended (tracked from
+/// [`SaveSink::open`]), so the main pass and the root re-scan each sort their own contribution — no
+/// cross-process re-parsing of `path:line:text`.
+struct SaveSink {
+    file: Mutex<File>,
+    /// Offset where this pass's output begins; everything from here is rewritten, sorted.
+    start: u64,
+    /// Each appended block as `(path, bytes)`. A file's matches arrive as one already-line-ordered
+    /// block, so ordering the blocks by path gives path-then-line for free.
+    blocks: Mutex<Vec<(PathBuf, Vec<u8>)>>,
+}
+
+impl SaveSink {
+    /// Open `path` for appending, noting where this pass's output will start.
+    fn open(path: &Path) -> io::Result<Self> {
+        // Not `append(true)`: that would force every write to EOF and defeat `finish`'s seek + rewrite.
+        // `truncate(false)` keeps the header / earlier pass already in the file (this pass appends).
+        let mut file = OpenOptions::new().write(true).truncate(false).create(true).open(path)?;
+        let start = file.seek(SeekFrom::End(0))?;
+        Ok(SaveSink { file: Mutex::new(file), start, blocks: Mutex::new(Vec::new()) })
+    }
+
+    /// Append one file's block live and keep it for the final sort. Empty blocks are skipped.
+    fn record(&self, path: &Path, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let _ = self.file.lock().unwrap().write_all(bytes);
+        self.blocks.lock().unwrap().push((path.to_path_buf(), bytes.to_vec()));
+    }
+
+    /// Replace the live (arrival-order) blocks appended since [`open`] with the same blocks ordered
+    /// by path — stably, so a path's name-match line stays above its content matches.
+    fn finish(&self) -> io::Result<()> {
+        let mut blocks = std::mem::take(&mut *self.blocks.lock().unwrap());
+        blocks.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let mut file = self.file.lock().unwrap();
+        file.set_len(self.start)?;
+        file.seek(SeekFrom::Start(self.start))?;
+        for (_, bytes) in &blocks {
+            file.write_all(bytes)?;
+        }
+        file.flush()
+    }
+}
+
+/// Compile the expressions into one case-insensitive alternation — literal (escaped) by default, or
+/// each treated as a regular expression when `regex` is set (`-E`). Case-insensitivity is kept
+/// either way, matching the rest of the `gg`/`g` family.
+fn build_matcher(expressions: &[String], regex: bool) -> Result<RegexMatcher, grep::regex::Error> {
     let pattern = expressions
         .iter()
-        .map(|expr| streamgrep::escape_literal(expr))
+        .map(|expr| if regex { format!("(?:{expr})") } else { streamgrep::escape_literal(expr) })
         .collect::<Vec<_>>()
         .join("|");
     RegexMatcherBuilder::new().case_insensitive(true).build(&pattern)
@@ -115,7 +195,7 @@ fn name_hit(
 }
 
 /// Print matching paths, colouring the matched span (black-on-red, on a terminal).
-fn print_filenames(names: &[PathBuf], matcher: &RegexMatcher, color: bool) {
+fn print_filenames(names: &[PathBuf], matcher: &RegexMatcher, color: bool, save: Option<&SaveSink>) {
     let mut out = StandardStream::stdout(if color { ColorChoice::Always } else { ColorChoice::Never });
     let mut spec = ColorSpec::new();
     spec.set_fg(Some(Color::Black)).set_bg(Some(Color::Red));
@@ -137,6 +217,12 @@ fn print_filenames(names: &[PathBuf], matcher: &RegexMatcher, color: bool) {
         }
         let _ = out.write_all(&bytes[last..]);
         let _ = out.write_all(b"\n");
+        // Under `--save`, a name match is a one-line block keyed by its path (plain — no colour).
+        if let Some(save) = save {
+            let mut line = bytes.to_vec();
+            line.push(b'\n');
+            save.record(path, &line);
+        }
     }
 }
 
@@ -148,10 +234,11 @@ fn search_contents(
     opts: &Options,
     color: bool,
     denied: &Mutex<BTreeSet<PathBuf>>,
+    save: Option<&SaveSink>,
 ) -> bool {
     let bufwtr = BufferWriter::stdout(if color { ColorChoice::Always } else { ColorChoice::Never });
     let found = AtomicBool::new(false);
-    let ctx = Ctx { matcher, bufwtr: &bufwtr, found: &found, denied, delve: opts.delve };
+    let ctx = Ctx { matcher, bufwtr: &bufwtr, found: &found, denied, delve: opts.delve, save };
     let line_number = opts.line_number;
     let context = opts.context;
 
@@ -178,6 +265,7 @@ struct Ctx<'a> {
     found: &'a AtomicBool,
     denied: &'a Mutex<BTreeSet<PathBuf>>,
     delve: bool,
+    save: Option<&'a SaveSink>,
 }
 
 /// A searcher that skips binary files (NUL detection) and numbers lines when asked.
@@ -316,7 +404,7 @@ fn scan_file(entry: &DirEntry, searcher: &mut Searcher, buffer: &mut Buffer, ctx
     if ctx.delve {
         if let Some(text) = delve::extract(entry.path()) {
             delve_search(&text, entry.path(), buffer, ctx);
-            flush(buffer, ctx);
+            emit(entry.path(), buffer, ctx);
             return;
         }
     }
@@ -328,7 +416,7 @@ fn scan_file(entry: &DirEntry, searcher: &mut Searcher, buffer: &mut Buffer, ctx
             }
         }
     } // sink dropped → the &mut borrow of `buffer` ends
-    flush(buffer, ctx);
+    emit(entry.path(), buffer, ctx);
 }
 
 /// Search text decoded by [`delve`] for one file, printing matches as `path:text` — no line numbers,
@@ -338,6 +426,15 @@ fn delve_search(text: &[u8], path: &Path, buffer: &mut Buffer, ctx: &Ctx) {
         SearcherBuilder::new().binary_detection(BinaryDetection::none()).line_number(false).build();
     let sink = GgSink::new(ctx.matcher, buffer, path);
     let _ = searcher.search_slice(ctx.matcher, text, sink);
+}
+
+/// Send a completed file's buffer to the terminal and — under `--save` — to the save file plus the
+/// sort set. The single funnel for both the delve and raw-search paths.
+fn emit(path: &Path, buffer: &Buffer, ctx: &Ctx) {
+    flush(buffer, ctx);
+    if let Some(save) = ctx.save {
+        save.record(path, buffer.as_slice());
+    }
 }
 
 /// Flush a completed file's buffer to stdout atomically, recording that something matched.

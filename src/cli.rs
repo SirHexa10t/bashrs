@@ -287,8 +287,9 @@ mod tests {
     #[test]
     fn lookup_commands_follow_naming_standard() {
         // `hg` mirrors the classic `history | grep` alias; `GG` is the loud all-caps sibling of `gg`
-        // (recursive search with `--delve` forced), à la `UPUP` — both bare, memorable exceptions.
-        assert_prefixed(&command_names::<LookupCommand>(), "lookup_", &["hg", "GG"]);
+        // (recursive search with `--delve` forced), and `GGES` is `GG` with `--save`/`-E` too — all
+        // bare, memorable exceptions à la `UPUP`.
+        assert_prefixed(&command_names::<LookupCommand>(), "lookup_", &["hg", "GG", "GGES"]);
     }
 
     #[test]

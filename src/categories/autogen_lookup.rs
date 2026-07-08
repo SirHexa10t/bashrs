@@ -18,29 +18,29 @@ mod grep_commands {
 
     // GENERATED-LOOKUP-GREP-START
 
-    /// Case-insensitive literal search (no regex), colouring matches
+    /// Case-insensitive search (literal, or regex with -E), colouring matches
     #[unprefixed]
-    pub fn g(args: GrepArgs) { _grep(&args, 0); }
+    pub fn g(args: GrepArgs) { _grep(&args); }
 
-    /// Case-insensitive literal search, showing 2 lines of context around each match
+    /// Case-insensitive search, showing 2 lines of context around each match
     #[unprefixed]
-    pub fn g2(args: GrepArgs) { _grep(&args, 2); }
+    pub fn g2(args: GrepArgs) { _grep(&GrepArgs { context: 2, ..args }); }
 
-    /// Case-insensitive literal search, showing 3 lines of context around each match
+    /// Case-insensitive search, showing 3 lines of context around each match
     #[unprefixed]
-    pub fn g3(args: GrepArgs) { _grep(&args, 3); }
+    pub fn g3(args: GrepArgs) { _grep(&GrepArgs { context: 3, ..args }); }
 
-    /// Case-insensitive literal search, showing 5 lines of context around each match
+    /// Case-insensitive search, showing 5 lines of context around each match
     #[unprefixed]
-    pub fn g5(args: GrepArgs) { _grep(&args, 5); }
+    pub fn g5(args: GrepArgs) { _grep(&GrepArgs { context: 5, ..args }); }
 
-    /// Case-insensitive literal search, showing 8 lines of context around each match
+    /// Case-insensitive search, showing 8 lines of context around each match
     #[unprefixed]
-    pub fn g8(args: GrepArgs) { _grep(&args, 8); }
+    pub fn g8(args: GrepArgs) { _grep(&GrepArgs { context: 8, ..args }); }
 
-    /// Case-insensitive literal search, showing 25 lines of context around each match
+    /// Case-insensitive search, showing 25 lines of context around each match
     #[unprefixed]
-    pub fn g25(args: GrepArgs) { _grep(&args, 25); }
+    pub fn g25(args: GrepArgs) { _grep(&GrepArgs { context: 25, ..args }); }
     // GENERATED-LOOKUP-GREP-END
 }
 
@@ -54,26 +54,26 @@ mod tree_commands {
     /// Recursively search a directory for expression(s) — filenames, then file contents
     #[unprefixed]
     #[trailing_newline]
-    pub fn gg(args: GgArgs) { _gg(&args, 0); }
+    pub fn gg(args: GgArgs) { _gg(&args); }
 
     /// Recursive search, showing 2 lines of context around each file-content match
     #[unprefixed]
     #[trailing_newline]
-    pub fn gg2(args: GgArgs) { _gg(&args, 2); }
+    pub fn gg2(args: GgArgs) { _gg(&GgArgs { context: 2, ..args }); }
 
     /// Recursive search, showing 3 lines of context around each file-content match
     #[unprefixed]
     #[trailing_newline]
-    pub fn gg3(args: GgArgs) { _gg(&args, 3); }
+    pub fn gg3(args: GgArgs) { _gg(&GgArgs { context: 3, ..args }); }
 
     /// Recursive search, showing 5 lines of context around each file-content match
     #[unprefixed]
     #[trailing_newline]
-    pub fn gg5(args: GgArgs) { _gg(&args, 5); }
+    pub fn gg5(args: GgArgs) { _gg(&GgArgs { context: 5, ..args }); }
 
     /// Recursive search, showing 10 lines of context around each file-content match
     #[unprefixed]
     #[trailing_newline]
-    pub fn gg10(args: GgArgs) { _gg(&args, 10); }
+    pub fn gg10(args: GgArgs) { _gg(&GgArgs { context: 10, ..args }); }
     // GENERATED-TREEGREP-END
 }

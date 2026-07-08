@@ -388,6 +388,17 @@ fn is_osstr(ty: &Type) -> bool {
     matches!(type_ident(ty).as_deref(), Some("String" | "PathBuf" | "OsString"))
 }
 
+/// The borrowed form of an `AsRef<OsStr>` scalar to take in `reexec` — `&Path` not `&PathBuf`, `&str`
+/// not `&String` — so the generated signature stays clippy-clean (`clippy::ptr_arg`).
+fn osstr_ref(ty: &Type) -> TokenStream2 {
+    match type_ident(ty).as_deref() {
+        Some("String") => quote!(&str),
+        Some("PathBuf") => quote!(&::std::path::Path),
+        Some("OsString") => quote!(&::std::ffi::OsStr),
+        _ => quote!(&#ty),
+    }
+}
+
 fn expand_elevated(func: ItemFn) -> syn::Result<TokenStream2> {
     let fn_ident = func.sig.ident.clone();
     let command = format_ident!("{}", to_pascal_case(&fn_ident.to_string()));
@@ -422,7 +433,8 @@ fn expand_elevated(func: ItemFn) -> syn::Result<TokenStream2> {
             let value = if is_osstr(&inner) { quote!(__v) } else { quote!(__v.to_string()) };
             pushes.push(quote!(for __v in #name { cmd.arg(#flag).arg(#value); }));
         } else if is_osstr(ty) {
-            params.push(quote!(#name: &#ty));
+            let borrowed = osstr_ref(ty);
+            params.push(quote!(#name: #borrowed));
             pushes.push(quote!(cmd.arg(#flag).arg(#name);));
         } else {
             params.push(quote!(#name: #ty));

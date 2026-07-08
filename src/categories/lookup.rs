@@ -11,22 +11,25 @@
 // hoists that module's contents up to here, so one import of each serves both the module and
 // `gg_elevated_rescan`.
 use crate::support::treegrep;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Re-scan `paths` as root — the elevated half of `gg`'s permission-denied recovery.
 /// `#[elevated]` wraps this in a `sudo` self-re-exec round-trip: it generates `GgElevatedRescan`,
 /// whose `reexec(…)` (parent, called from `_offer_root_rescan`) spawns `sudo <self> gg-elevated-rescan …`
 /// and whose `try_handle()` (child, called from [`crate::run`]) parses that back and runs this.
 #[bashrs_macros::elevated]
-fn gg_elevated_rescan(expressions: Vec<String>, paths: Vec<PathBuf>, context: usize, delve: bool, no_number: bool) {
-    let opts = treegrep::Options { line_number: !no_number, context, delve };
+fn gg_elevated_rescan(expressions: Vec<String>, paths: Vec<PathBuf>, context: usize, delve: bool, no_number: bool, regex: bool, save: PathBuf) {
+    // `save` is the shared `--save` file (empty when the run isn't saving); the root pass appends and
+    // sorts its own section into it.
+    let save = (!save.as_os_str().is_empty()).then_some(save);
+    let opts = treegrep::Options { line_number: !no_number, context, delve, regex, save };
     treegrep::search(&expressions, &paths, &opts);
 }
 
 #[bashrs_macros::category(command = LookupCommand, prefix = "lookup_")]
 mod commands {
     use crate::support::args::{GgArgs, GrepArgs};
-    use crate::support::{input, streamgrep};
+    use crate::support::{input, preferences, streamgrep};
     use clap::Args;
 
     /// Search your shell history (case-insensitive, literal) — like `history | grep -iF`
@@ -39,7 +42,7 @@ mod commands {
             Ok(text) => text,
             Err(err) => return eprintln!("hg: {err}"),
         };
-        streamgrep::filter(&args.pattern, &text, 0, false);
+        streamgrep::filter(&args.pattern, &text, &streamgrep::Options::default());
     }
 
     /// The term to find in your shell history.
@@ -56,26 +59,56 @@ mod commands {
     pub fn gg_delve(args: GgArgs) {
         // Force `--delve`; it's a plain bool, so setting it when the caller already passed it is a
         // harmless no-op.
-        _gg(&GgArgs { delve: true, ..args }, 0);
+        _gg(&GgArgs { delve: true, ..args });
+    }
+
+    /// `GG` plus the two extras: `--save` (`-s`, write sorted results to `deep_search_<time>`) and
+    /// regex (`-E`). The everything-on, all-caps deep search.
+    #[name("GGES")]
+    #[trailing_newline]
+    pub fn gges(args: GgArgs) {
+        _gg(&GgArgs { delve: true, save: true, regex: true, ..args });
     }
 
     /// Read the input, then filter it with `grep -iF` semantics (literal, case-insensitive) and
     /// `context` lines around each match (0 = none), using the `grep` crate in-process. With
     /// `line_number`, prefix each line with its number (`grep -n`). Matches are coloured only when
     /// writing to a terminal, like `--color=auto`. Backs the generated `g` family.
-    pub(crate) fn _grep(args: &GrepArgs, context: usize) {
+    pub(crate) fn _grep(args: &GrepArgs) {
         let text = match input::read_input_bytes(args.source.as_deref()) {
             Ok(text) => text,
             Err(err) => return eprintln!("g: {err}"),
         };
-        streamgrep::filter(&args.pattern, &text, context, args.line_number);
+        let opts = streamgrep::Options {
+            context: args.context,
+            line_number: args.line_number,
+            regex: args.regex,
+            invert: args.invert,
+        };
+        streamgrep::filter(&args.pattern, &text, &opts);
     }
 
-    /// Build options from the shared `gg` args plus the chosen `context` (lines around each match),
-    /// run the recursive search, then offer a root re-scan of anything that was unreadable. Backs
-    /// the generated `gg` family and the hand-written `GG`.
-    pub(crate) fn _gg(args: &GgArgs, context: usize) {
-        let opts = treegrep::Options { line_number: !args.no_line_number, context, delve: args.delve };
+    /// Build options from the `gg` args (context comes from `-C`), run the recursive search, then
+    /// offer a root re-scan of anything that was unreadable. Backs the generated `gg` family (whose
+    /// numbered variants pin `-C`) and the hand-written `GG`.
+    pub(crate) fn _gg(args: &GgArgs) {
+        let save = if args.save {
+            let name = format!("deep_search_{}", preferences::datehour_stamp());
+            let path = std::env::current_dir().unwrap_or_default().join(name);
+            if let Err(err) = std::fs::write(&path, format!("# search term used: {}\n", args.expressions.join(" "))) {
+                return eprintln!("gg: cannot create {}: {err}", path.display());
+            }
+            Some(path)
+        } else {
+            None
+        };
+        let opts = treegrep::Options {
+            line_number: !args.no_line_number,
+            context: args.context,
+            delve: args.delve,
+            regex: args.regex,
+            save,
+        };
         let roots = [PathBuf::from(&args.directory)];
         let denied = treegrep::search(&args.expressions, &roots, &opts);
         _offer_root_rescan(&args.expressions, &denied, &opts);
@@ -116,7 +149,8 @@ mod commands {
         // `#[elevated]` on `gg_elevated_rescan` generated `GgElevatedRescan`; hand its parent side the
         // tuning and the exact denied paths (as a slice).
         let paths: Vec<PathBuf> = denied.iter().cloned().collect();
-        GgElevatedRescan::reexec(expressions, &paths, opts.context, opts.delve, !opts.line_number);
+        let save = opts.save.as_deref().unwrap_or(Path::new(""));
+        GgElevatedRescan::reexec(expressions, &paths, opts.context, opts.delve, !opts.line_number, opts.regex, save);
     }
 }
 
@@ -133,11 +167,13 @@ mod tests {
             "gg-elevated-rescan",
             "--expressions", "foo", "--expressions", "bar",
             "--paths", "/a", "--paths", "/b",
-            "--context", "3", "--delve", "--no-number",
+            "--context", "3", "--delve", "--no-number", "--regex",
+            "--save", "/tmp/deep_search_x",
         ]);
         assert_eq!(parsed.expressions, ["foo", "bar"]);
         assert_eq!(parsed.paths, [PathBuf::from("/a"), PathBuf::from("/b")]);
         assert_eq!(parsed.context, 3);
-        assert!(parsed.delve && parsed.no_number);
+        assert!(parsed.delve && parsed.no_number && parsed.regex);
+        assert_eq!(parsed.save, PathBuf::from("/tmp/deep_search_x"));
     }
 }

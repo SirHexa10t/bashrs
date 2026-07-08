@@ -72,13 +72,13 @@ fn lookup_matrix() -> String {
         .map(|&ctx| {
             let name = if ctx == 0 { "g".to_string() } else { format!("g{ctx}") };
             let desc = if ctx == 0 {
-                "Case-insensitive literal search (no regex), colouring matches".to_string()
+                "Case-insensitive search (literal, or regex with -E), colouring matches".to_string()
             } else {
-                format!("Case-insensitive literal search, showing {ctx} lines of context around each match")
+                format!("Case-insensitive search, showing {ctx} lines of context around each match")
             };
-            format!(
-                "    /// {desc}\n    #[unprefixed]\n    pub fn {name}(args: GrepArgs) {{ _grep(&args, {ctx}); }}"
-            )
+            // Bare `g` takes its context from the `-C` flag; the numbered variants pin it.
+            let call = if ctx == 0 { "_grep(&args)".to_string() } else { format!("_grep(&GrepArgs {{ context: {ctx}, ..args }})") };
+            format!("    /// {desc}\n    #[unprefixed]\n    pub fn {name}(args: GrepArgs) {{ {call}; }}")
         })
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -102,9 +102,9 @@ fn treegrep_matrix() -> String {
             } else {
                 format!("Recursive search, showing {ctx} lines of context around each file-content match")
             };
-            format!(
-                "    /// {desc}\n    #[unprefixed]\n    #[trailing_newline]\n    pub fn {name}(args: GgArgs) {{ _gg(&args, {ctx}); }}"
-            )
+            // Bare `gg` takes its context from the `-C` flag; the numbered variants pin it.
+            let call = if ctx == 0 { "_gg(&args)".to_string() } else { format!("_gg(&GgArgs {{ context: {ctx}, ..args }})") };
+            format!("    /// {desc}\n    #[unprefixed]\n    #[trailing_newline]\n    pub fn {name}(args: GgArgs) {{ {call}; }}")
         })
         .collect::<Vec<_>>()
         .join("\n\n")

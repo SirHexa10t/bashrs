@@ -12,24 +12,43 @@ use grep::regex::{RegexMatcher, RegexMatcherBuilder};
 use grep::searcher::{Searcher, SearcherBuilder};
 use termcolor::{ColorChoice, StandardStream, WriteColor};
 
+/// How a single-stream search runs — the `g` knobs, mirroring [`crate::support::treegrep::Options`]
+/// on the recursive side. `Default` is a plain literal search with no context or line numbers, which
+/// is exactly what `hg` wants.
+#[derive(Default)]
+pub(crate) struct Options {
+    /// Lines of context around each match (0 = none), like `grep -C`.
+    pub context: usize,
+    /// Prefix each printed line with its number (`grep -n`).
+    pub line_number: bool,
+    /// Treat the pattern as a regex rather than literal text (`grep -E`).
+    pub regex: bool,
+    /// Print the *non*-matching lines instead (`grep -v`).
+    pub invert: bool,
+}
+
 /// Print the lines of `text` matching `pattern` — literal and case-insensitive, like `grep -iF` —
-/// colouring matches, with `context` lines around each (0 = none). With `line_number`, each line is
-/// prefixed with its number (`grep -n`). Backs `hg` and the `g`/`g<N>` family.
-pub(crate) fn filter(pattern: &str, text: &[u8], context: usize, line_number: bool) {
-    filter_into(pattern, text, context, line_number, stdout());
+/// colouring matches. `opts` carries the `grep`-style knobs: `context` lines around each match
+/// (`-C`), `line_number` prefixes (`-n`), `regex` matching (`-E`), and `invert` to print the
+/// non-matching lines instead (`-v`). Backs `hg` and the `g`/`g<N>` family.
+pub(crate) fn filter(pattern: &str, text: &[u8], opts: &Options) {
+    filter_into(pattern, text, opts, stdout());
 }
 
 /// The body of [`filter`], parameterised over the output sink so tests can capture it into an
 /// in-memory buffer (production passes [`stdout`]).
-fn filter_into<W: WriteColor>(pattern: &str, text: &[u8], context: usize, line_number: bool, wtr: W) {
-    let matcher = match RegexMatcherBuilder::new().case_insensitive(true).build(&escape_literal(pattern)) {
+fn filter_into<W: WriteColor>(pattern: &str, text: &[u8], opts: &Options, wtr: W) {
+    // Literal by default (escape metacharacters), or the pattern used as a regex when `regex` is set (`-E`).
+    let compiled = if opts.regex { pattern.to_owned() } else { escape_literal(pattern) };
+    let matcher = match RegexMatcherBuilder::new().case_insensitive(true).build(&compiled) {
         Ok(matcher) => matcher,
         Err(err) => return eprintln!("g: could not build matcher: {err}"),
     };
     let mut searcher = SearcherBuilder::new()
-        .line_number(line_number)
-        .before_context(context)
-        .after_context(context)
+        .line_number(opts.line_number)
+        .invert_match(opts.invert)
+        .before_context(opts.context)
+        .after_context(opts.context)
         .build();
     search(&matcher, text, &mut searcher, wtr);
 }
@@ -102,10 +121,20 @@ mod tests {
         // before: both `<match` lines are still found, the stream isn't rejected, and the
         // non-matching line is dropped — GNU-grep behaviour on a mixed text/binary stream.
         let out = captured(|w| {
-            filter_into("<match", b"a <match one\n\xff\xfe junk\nb <match two\n", 0, false, w)
+            filter_into("<match", b"a <match one\n\xff\xfe junk\nb <match two\n", &Options::default(), w)
         });
         assert!(out.contains("a <match one"), "first match missing: {out:?}");
         assert!(out.contains("b <match two"), "second match missing: {out:?}");
         assert!(!out.contains("junk"), "non-matching line leaked: {out:?}");
+    }
+
+    #[test]
+    fn invert_match_keeps_only_the_non_matching_lines() {
+        // `-v`: the lines *without* the pattern survive; the matching ones are dropped.
+        let out = captured(|w| {
+            filter_into("keep", b"keep me\ndrop this\nkeep again\n", &Options { invert: true, ..Default::default() }, w)
+        });
+        assert!(out.contains("drop this"), "non-matching line missing: {out:?}");
+        assert!(!out.contains("keep me") && !out.contains("keep again"), "matching line leaked: {out:?}");
     }
 }

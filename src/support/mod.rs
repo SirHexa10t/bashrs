@@ -2,7 +2,8 @@
 //! colour theme ([`color_theme`]), the styling engine ([`doc_style`]), an external-process runner
 //! ([`exec`]), text-input resolution ([`input`]), an in-process stream grep ([`streamgrep`]), a
 //! recursive tree grep ([`treegrep`]), binary-format decoders for `gg --delve` ([`delve`]), output
-//! capture into a string ([`shell`]), and privilege escalation ([`superuser`]).
+//! capture into a string ([`shell`]), filename-stamp formatting ([`preferences`]), and privilege
+//! escalation ([`superuser`]).
 
 pub mod args;
 pub mod color_theme;
@@ -10,6 +11,7 @@ pub mod delve;
 pub mod doc_style;
 pub mod exec;
 pub mod input;
+pub mod preferences;
 pub mod shell;
 pub mod streamgrep;
 pub mod superuser;
