@@ -872,6 +872,26 @@ mod tests {
     }
 
     #[test]
+    fn mp4_extracts_fragmented_wvtt_cues() {
+        // A real fragmented WebVTT stream (Sintel), trimmed to its `moov` init plus the first two
+        // `moof`/`mdat` fragments — so this covers the multi-fragment scan on real muxer output.
+        let bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sintel-wvtt.mp4"));
+        let text = String::from_utf8(mp4_subtitles(io::Cursor::new(&bytes[..])).unwrap()).unwrap();
+        assert!(text.contains("This blade has a dark past."), "fragment 1 cue missing: {text:?}");
+        assert!(text.contains("It has shed much innocent blood."), "fragment 2 cue missing: {text:?}");
+    }
+
+    #[test]
+    fn mp4_extracts_fragmented_stpp_ttml() {
+        // A real fragmented TTML stream (Tears of Steel). The source segment's sample was an empty
+        // `<tt/>`, so a real cue was spliced into its `mdat` for a meaningful assertion; `stpp`
+        // decoding returns the whole TTML document, so we match the cue text within it.
+        let bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tears-of-steel-stpp.mp4"));
+        let text = String::from_utf8(mp4_subtitles(io::Cursor::new(&bytes[..])).unwrap()).unwrap();
+        assert!(text.contains("A storm approaches."), "stpp cue missing: {text:?}");
+    }
+
+    #[test]
     #[ignore = "reads the local multi-GB videofile.mkv test fixture; run explicitly"]
     fn matroska_extracts_subtitles_from_the_test_file() {
         let t0 = std::time::Instant::now();

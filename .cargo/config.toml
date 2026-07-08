@@ -1,0 +1,6 @@
+# Lint the whole workspace — both crates, every target including tests and examples (a bare
+# `cargo clippy` skips test code). Keeps clippy coverage of tests a committed, one-command project
+# standard rather than a per-machine habit. Run: `cargo lint`.
+# Append `-- -D warnings` (here, or in CI) to turn it from a report into a hard gate.
+[alias]
+lint = "clippy --workspace --all-targets"
