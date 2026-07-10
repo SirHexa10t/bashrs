@@ -99,6 +99,7 @@ impl Command {
 const HIDDEN_PINNED: &[(&str, &[&str])] = &[
     ("GG", &["delve"]),
     ("GGG", &["delve", "save", "regex"]),
+    ("backup_find_bitrot", &["eager_checksum"]),
 ];
 
 /// Hide each [`HIDDEN_PINNED`] flag on its command. Applied everywhere the command tree is built —
@@ -396,6 +397,10 @@ mod tests {
             assert!(!has(&ggg, pinned), "GGG forces {pinned}; it must not be offered: {ggg}");
         }
         assert!(has(&ggg, "-C"), "GGG still tunes context: {ggg}");
+        // A pinned upstream flag is hidden the same way: bitrot-finding forces --eager-checksum.
+        let bitrot = complete_flags("backup_find_bitrot");
+        assert!(!has(&bitrot, "--eager-checksum"), "forced flag must not be offered: {bitrot}");
+        assert!(has(&bitrot, "--from"), "the rest of the upstream set stays: {bitrot}");
         // Aliases resolve to their command; unknown names yield nothing.
         assert!(has(&complete_flags("upup"), "--help"), "aliases should resolve");
         assert_eq!(complete_flags("no_such_command"), "");
@@ -452,6 +457,18 @@ mod tests {
     }
 
     #[test]
+    fn comfy_commands_follow_naming_standard() {
+        // External tools keep their own upstream name (`table`) or a task-named family — all
+        // unprefixed by design (`backup_*` flattens filesync's subcommands into
+        // directly-completable commands).
+        assert_prefixed(
+            &command_names::<ComfyReposCommand>(),
+            "comfy_",
+            &["table", "backup_diff", "backup_sync", "backup_find_bitrot"],
+        );
+    }
+
+    #[test]
     fn lookup_commands_follow_naming_standard() {
         // `hg` mirrors the classic `history | grep` alias; `GG` is the loud all-caps sibling of `gg`
         // (recursive search with `--delve` forced), and `GGG` is `GG` with `--save`/`-E` too — all
@@ -499,6 +516,8 @@ mod tests {
         has("packages_print() { \"$HOME/.bashrs/bashrs\" packages_print \"$@\"; }"); // prefixed only
         has("packages_update_toolchains() { \"$HOME/.bashrs/bashrs\" packages_update_toolchains \"$@\"; }"); // prefixed only
         has("UPUP() { \"$HOME/.bashrs/bashrs\" UPUP \"$@\"; }"); // custom-named: update everything
+        has("backup_diff() { \"$HOME/.bashrs/bashrs\" backup_diff \"$@\"; }"); // comfy: flattened filesync subcommand
+        has("backup_find_bitrot() { \"$HOME/.bashrs/bashrs\" backup_find_bitrot \"$@\"; }"); // comfy: pinned variant
         // bashrs_compile starts a fresh session only when compile signals a reload (exit code)
         has(&format!(
             "bashrs_compile() {{ \"$HOME/.bashrs/bashrs\" bashrs_compile \"$@\"; [ \"$?\" -eq {RELOAD_EXIT_CODE} ] && session_new; }}"
