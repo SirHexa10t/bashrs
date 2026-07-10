@@ -257,11 +257,18 @@ fn wrappers() -> String {
         }
         if !lines.is_empty() {
             // Align each category's inline `# …` comments into a column with `table` (the
-            // library function, not the shell wrapper); `trim_end` drops the padding it
-            // adds to comment-less rows.
+            // library function, not the shell wrapper); `trim_trailing` drops the padding it
+            // adds to comment-less rows. The fallback is unreachable: only `sort` can error,
+            // and it's off.
             body += &format!("\n# {label}\n");
-            for line in table_formatter::format_table(&lines, 2, 2, None) {
-                body.push_str(line.trim_end());
+            let opts = table_formatter::FormatOptions {
+                separator: 2,
+                threshold: 2,
+                trim_trailing: true,
+                ..Default::default()
+            };
+            for line in table_formatter::format_table(&lines, &opts).unwrap_or(lines) {
+                body.push_str(&line);
                 body.push('\n');
             }
         }
@@ -376,7 +383,7 @@ mod tests {
     fn complete_flags_reflect_each_variant() {
         let has = |flags: &str, want: &str| flags.split(' ').any(|flag| flag == want);
         let gg = complete_flags("gg");
-        for flag in ["-C", "--context", "--delve", "-E", "-s", "--help"] {
+        for flag in ["-C", "--context", "--delve", "-E", "-e", "--regexp", "-s", "--help"] {
             assert!(has(&gg, flag), "gg should complete {flag}: {gg}");
         }
         // A pinned variant doesn't offer the -C it would refuse…

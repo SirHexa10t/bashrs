@@ -52,8 +52,7 @@ pub struct Options {
 /// its `_sorted` sibling on completion; diagnostics to stderr. Returns the paths that couldn't be
 /// read for permissions, so the caller can offer a root re-scan.
 pub(crate) fn search(expressions: &[String], roots: &[PathBuf], opts: &Options) -> BTreeSet<PathBuf> {
-    let exprs: Vec<&str> = expressions.iter().map(String::as_str).collect();
-    let matcher = match streamgrep::build_matcher(&exprs, opts.regex) {
+    let matcher = match streamgrep::build_matcher(expressions, opts.regex) {
         Ok(matcher) => matcher,
         Err(err) => {
             eprintln!("gg: invalid expression: {err}");
@@ -181,9 +180,9 @@ pub(crate) fn sorted_path(live: &Path) -> PathBuf {
 /// colour while the saved file stays plain text. Drops every CSI sequence (`ESC [` … final byte); on
 /// this Linux-only tool `termcolor` emits nothing else.
 ///
-/// Hand-rolled rather than `console::strip_ansi_codes` (already in-tree via `table_formatter`): that
-/// takes `&str`, but our buffer can hold non-UTF-8 match bytes — the case `g`/`gg` are byte-oriented
-/// for — which the required lossy UTF-8 conversion would corrupt.
+/// Hand-rolled rather than `console::strip_ansi_codes` (a dependency already — `lll`'s `.lnk`
+/// detection uses it): that takes `&str`, but our buffer can hold non-UTF-8 match bytes — the case
+/// `g`/`gg` are byte-oriented for — which the required lossy UTF-8 conversion would corrupt.
 fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

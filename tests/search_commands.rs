@@ -227,6 +227,30 @@ fn complete_flags_answers_per_variant_at_tab_time() {
 }
 
 #[test]
+fn dash_leading_terms_search_via_the_e_flag() {
+    let tree = Tree::build("eflag");
+    fs::write(tree.root.join("flags.txt"), "rsync --backup-dir=/mnt daily\n").unwrap();
+    // gg: `-e` protects the dash-leading expression; positional and `-e` terms are OR'd.
+    let text = stdout(&bashrs(&["gg", "-e", "--backup-dir", "-d", tree.path()], None, None));
+    assert!(text.contains("flags.txt:1:rsync --backup-dir"), "{text}");
+    let both = stdout(&bashrs(&["gg", "nested", "-e", "--backup-dir", "-d", tree.path()], None, None));
+    assert!(both.contains("flags.txt") && both.contains("nested.log"), "{both}");
+    // g: with `-e`, the first positional becomes the INPUT (grep semantics)…
+    let file = tree.root.join("flags.txt");
+    let g = stdout(&bashrs(&["g", "-e", "--backup-dir", file.to_str().unwrap()], None, None));
+    assert!(g.contains("--backup-dir=/mnt"), "{g}");
+    // …repeated `-e` terms are OR'd…
+    let multi = stdout(&bashrs(&["g", "-e", "alpha", "-e", "gamma"], None, Some(b"alpha\nbeta\ngamma\n")));
+    assert!(multi.contains("alpha") && multi.contains("gamma") && !multi.contains("beta"), "{multi}");
+    // …and two positionals alongside `-e` can't both be inputs.
+    let err = bashrs(&["g", "-e", "x", "a.txt", "b.txt"], None, None);
+    assert!(stderr(&err).contains("at most one input"), "{}", stderr(&err));
+    // hg joins the party.
+    let hg = stdout(&bashrs(&["hg", "-e", "--backup-dir"], None, Some(b"  501  ls\n  502  rsync --backup-dir=/m x\n")));
+    assert!(hg.contains("rsync") && !hg.contains("501"), "{hg}");
+}
+
+#[test]
 fn g_family_filters_stdin_with_numbers_context_invert_and_regex() {
     let input: &[u8] = b"above\nthe match line\nbelow\n";
     let numbered = stdout(&bashrs(&["g", "-n", "-C", "1", "match"], None, Some(input)));

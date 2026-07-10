@@ -12,10 +12,15 @@ pub struct NoArgs {}
 /// silently overridden).
 #[derive(Args)]
 pub struct GrepBase {
-    /// Term to match (case-insensitive; literal by default, or a regex with `-E`).
-    pub(crate) pattern: String,
+    /// Term to match (case-insensitive; literal by default, or a regex with `-E`). When `-e` is
+    /// used, this positional becomes the input instead (grep semantics).
+    #[arg(required_unless_present = "regexp")]
+    pub(crate) pattern: Option<String>,
     /// Text to search: a file path, inline text, or omitted to read stdin.
     pub(crate) source: Option<String>,
+    /// Term(s) to match, like `grep -e` — protects a term starting with `-`; repeatable (OR'd).
+    #[arg(short = 'e', long = "regexp", value_name = "PATTERN", allow_hyphen_values = true)]
+    pub(crate) regexp: Vec<String>,
     /// Show line numbers, like `grep -n`.
     #[arg(short = 'n', long)]
     pub(crate) line_number: bool,
@@ -43,9 +48,14 @@ pub struct GrepArgs {
 /// silently overridden).
 #[derive(Args)]
 pub struct GgBase {
-    /// Expression(s) to search for (literal, case-insensitive; multiple are OR'd together).
-    #[arg(required = true)]
+    /// Expression(s) to search for (case-insensitive; multiple are OR'd together). One starting
+    /// with `-`? Use `-e`, or put it after `--`.
+    #[arg(required_unless_present = "regexp")]
     pub(crate) expressions: Vec<String>,
+    /// Extra expression(s) to search for, like `grep -e` — protects an expression starting with
+    /// `-`; repeatable, OR'd with the positional ones.
+    #[arg(short = 'e', long = "regexp", value_name = "EXPRESSION", allow_hyphen_values = true)]
+    pub(crate) regexp: Vec<String>,
     /// Directory to search.
     #[arg(short, long, default_value = ".")]
     pub(crate) directory: PathBuf,

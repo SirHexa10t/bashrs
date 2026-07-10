@@ -28,18 +28,19 @@ pub(crate) struct Options {
     pub invert: bool,
 }
 
-/// Print the lines of `text` matching `pattern` — literal and case-insensitive, like `grep -iF` —
-/// colouring matches. `opts` carries the `grep`-style knobs: `context` lines around each match
-/// (`-C`), `line_number` prefixes (`-n`), `regex` matching (`-E`), and `invert` to print the
-/// non-matching lines instead (`-v`). Backs `hg` and the `g`/`g<N>` family.
-pub(crate) fn filter(pattern: &str, text: &[u8], opts: &Options) {
-    filter_into(pattern, text, opts, stdout());
+/// Print the lines of `text` matching any of `patterns` — literal and case-insensitive, like
+/// `grep -iF`, with several patterns OR'd like repeated `grep -e` — colouring matches. `opts`
+/// carries the `grep`-style knobs: `context` lines around each match (`-C`), `line_number`
+/// prefixes (`-n`), `regex` matching (`-E`), and `invert` to print the non-matching lines instead
+/// (`-v`). Backs `hg` and the `g`/`g<N>` family.
+pub(crate) fn filter(patterns: &[String], text: &[u8], opts: &Options) {
+    filter_into(patterns, text, opts, stdout());
 }
 
 /// The body of [`filter`], parameterised over the output sink so tests can capture it into an
 /// in-memory buffer (production passes [`stdout`]).
-fn filter_into<W: WriteColor>(pattern: &str, text: &[u8], opts: &Options, wtr: W) {
-    let matcher = match build_matcher(&[pattern], opts.regex) {
+fn filter_into<W: WriteColor>(patterns: &[String], text: &[u8], opts: &Options, wtr: W) {
+    let matcher = match build_matcher(patterns, opts.regex) {
         Ok(matcher) => matcher,
         Err(err) => return eprintln!("g: could not build matcher: {err}"),
     };
@@ -94,7 +95,7 @@ fn match_color() -> ColorSpecs {
 /// Compile `expressions` into one case-insensitive alternation — literal (escaped) by default, or
 /// each treated as a regular expression when `regex` is set (`-E`), isolated as `(?:…)` so the
 /// alternation can't bleed between them. The one matcher builder behind the `g` and `gg` families.
-pub(crate) fn build_matcher(expressions: &[&str], regex: bool) -> Result<RegexMatcher, grep::regex::Error> {
+pub(crate) fn build_matcher(expressions: &[String], regex: bool) -> Result<RegexMatcher, grep::regex::Error> {
     let pattern = expressions
         .iter()
         .map(|expr| if regex { format!("(?:{expr})") } else { escape_literal(expr) })
@@ -131,7 +132,7 @@ mod tests {
         // before: both `<match` lines are still found, the stream isn't rejected, and the
         // non-matching line is dropped — GNU-grep behaviour on a mixed text/binary stream.
         let out = captured(|w| {
-            filter_into("<match", b"a <match one\n\xff\xfe junk\nb <match two\n", &Options::default(), w)
+            filter_into(&["<match".into()], b"a <match one\n\xff\xfe junk\nb <match two\n", &Options::default(), w)
         });
         assert!(out.contains("a <match one"), "first match missing: {out:?}");
         assert!(out.contains("b <match two"), "second match missing: {out:?}");
@@ -142,9 +143,19 @@ mod tests {
     fn invert_match_keeps_only_the_non_matching_lines() {
         // `-v`: the lines *without* the pattern survive; the matching ones are dropped.
         let out = captured(|w| {
-            filter_into("keep", b"keep me\ndrop this\nkeep again\n", &Options { invert: true, ..Default::default() }, w)
+            filter_into(&["keep".into()], b"keep me\ndrop this\nkeep again\n", &Options { invert: true, ..Default::default() }, w)
         });
         assert!(out.contains("drop this"), "non-matching line missing: {out:?}");
         assert!(!out.contains("keep me") && !out.contains("keep again"), "matching line leaked: {out:?}");
+    }
+
+    #[test]
+    fn multiple_patterns_are_ored() {
+        // Repeated `-e` terms all match — the single alternation `build_matcher` compiles.
+        let out = captured(|w| {
+            filter_into(&["alpha".into(), "gamma".into()], b"alpha\nbeta\ngamma\n", &Options::default(), w)
+        });
+        assert!(out.contains("alpha") && out.contains("gamma"), "{out:?}");
+        assert!(!out.contains("beta"), "{out:?}");
     }
 }

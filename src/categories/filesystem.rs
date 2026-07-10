@@ -66,7 +66,13 @@ mod commands {
                     .map(|line| _row(line, targets)),
             )
             .collect();
-        table_formatter::format_table(&rows, TABLE_SEPARATOR, TABLE_SEPARATOR, None)
+        // The fallback is unreachable: only `sort` can error, and it's off.
+        let opts = table_formatter::FormatOptions {
+            separator: TABLE_SEPARATOR,
+            threshold: TABLE_SEPARATOR,
+            ..Default::default()
+        };
+        table_formatter::format_table(&rows, &opts).unwrap_or(rows)
     }
 
     /// One listing row: the first [`META_COLS`] whitespace fields tab-delimited, then the
@@ -92,7 +98,7 @@ mod commands {
         if !name.contains(".lnk") {
             return name.to_string();
         }
-        let plain = table_formatter::strip_ansi(name);
+        let plain = console::strip_ansi_codes(name);
         let plain = plain.strip_suffix(|c: char| "*/=>@|".contains(c)).unwrap_or(&plain); // -F indicator
         if !plain.ends_with(".lnk") {
             return name.to_string(); // `.lnk` appeared mid-name, not as the extension

@@ -39,14 +39,20 @@ mod commands {
         // The wrapper pipes `history` — a bash builtin only the shell itself can produce —
         // into our stdin; we read that stream and filter it in-process.
         let Some(text) = input::bytes_reported("hg", None) else { return };
-        streamgrep::filter(&args.pattern, &text, &streamgrep::Options::default());
+        let patterns: Vec<String> = args.pattern.into_iter().chain(args.regexp).collect();
+        streamgrep::filter(&patterns, &text, &streamgrep::Options::default());
     }
 
     /// The term to find in your shell history.
     #[derive(Args)]
     pub struct HgArgs {
         /// Term to match (case-insensitive, literal — no regex).
-        pattern: String,
+        #[arg(required_unless_present = "regexp")]
+        pattern: Option<String>,
+        /// Term(s) to match, like `grep -e` — protects a term starting with `-` (e.g. a flag you
+        /// once passed); repeatable (OR'd).
+        #[arg(short = 'e', long = "regexp", value_name = "PATTERN", allow_hyphen_values = true)]
+        regexp: Vec<String>,
     }
 
     /// Recursive search with `--delve` always on — also looks inside binaries we can decode (video
@@ -72,24 +78,37 @@ mod commands {
     /// `-n` line numbers, and `-v` to keep the non-matching lines instead. Matches are coloured only
     /// when writing to a terminal, like `--color=auto`. Backs the generated `g` family.
     pub(crate) fn _grep(args: &GrepArgs) {
-        let Some(text) = input::bytes_reported("g", args.base.source.as_deref()) else { return };
+        // grep's `-e` semantics: with any `-e`, the positionals stop being patterns — the first
+        // one (if given) is the input instead, so `g -e --flag notes.txt` reads notes.txt.
+        let (patterns, source) = if args.base.regexp.is_empty() {
+            (args.base.pattern.clone().into_iter().collect(), args.base.source.clone())
+        } else if args.base.source.is_some() {
+            return eprintln!("g: with -e, pass at most one input (a file, inline text, or stdin)");
+        } else {
+            (args.base.regexp.clone(), args.base.pattern.clone())
+        };
+        let Some(text) = input::bytes_reported("g", source.as_deref()) else { return };
         let opts = streamgrep::Options {
             context: args.context,
             line_number: args.base.line_number,
             regex: args.base.regex,
             invert: args.base.invert,
         };
-        streamgrep::filter(&args.base.pattern, &text, &opts);
+        streamgrep::filter(&patterns, &text, &opts);
     }
 
     /// Build options from the `gg` args (context comes from `-C`), run the recursive search, then
     /// offer a root re-scan of anything that was unreadable. Backs the generated `gg` family (whose
     /// numbered variants pin `-C`) and the hand-written `GG`.
     pub(crate) fn _gg(args: &GgArgs) {
+        // The full expression list: positional ones plus any `-e` (grep-style, protecting
+        // expressions that start with `-`), all OR'd downstream.
+        let expressions: Vec<String> =
+            args.base.expressions.iter().chain(&args.base.regexp).cloned().collect();
         let save = if args.base.save {
             let name = format!("deep_search_{}", preferences::datehour_stamp());
             let path = std::env::current_dir().unwrap_or_default().join(name);
-            if let Err(err) = std::fs::write(&path, format!("# search term used: {}\n", args.base.expressions.join(" "))) {
+            if let Err(err) = std::fs::write(&path, format!("# search term used: {}\n", expressions.join(" "))) {
                 return eprintln!("gg: cannot create {}: {err}", path.display());
             }
             Some(path)
@@ -104,8 +123,8 @@ mod commands {
             save,
         };
         let roots = [args.base.directory.clone()];
-        let denied = treegrep::search(&args.base.expressions, &roots, &opts);
-        _offer_root_rescan(&args.base.expressions, &denied, &opts);
+        let denied = treegrep::search(&expressions, &roots, &opts);
+        _offer_root_rescan(&expressions, &denied, &opts);
         // Runs once, after both passes have appended their sorted sections to the `_sorted` sibling.
         // The live (arrival-order) file is the crash-safety net: only once the sorted copy verifiably
         // exists is it removed, and the notice points at what remains.

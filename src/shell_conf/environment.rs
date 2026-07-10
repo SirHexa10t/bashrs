@@ -48,9 +48,17 @@ pub fn settings() -> String {
             }
         })
         .collect();
-    table_formatter::format_table(&lines, 2, 3, None)
+    // The fallback is unreachable: only `sort` can error, and it's off.
+    let opts = table_formatter::FormatOptions {
+        separator: 2,
+        threshold: 3,
+        trim_trailing: true,
+        ..Default::default()
+    };
+    table_formatter::format_table(&lines, &opts)
+        .unwrap_or(lines)
         .iter()
-        .map(|line| format!("{}\n", line.trim_end()))
+        .map(|line| format!("{line}\n"))
         .collect()
 }
 
