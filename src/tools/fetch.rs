@@ -16,10 +16,11 @@ use crate::tools::{bin_dir, root, Acquire, Group, Tool, TOOLS};
 /// The per-bundle marker recording which published archive it came from.
 const SOURCE_MARKER: &str = ".source_url";
 
-/// SIDE EFFECTS — bundle the tools, keeping each current per its acquisition mode. By default only
-/// the tools the system lacks are bundled; setting `[tools] always_bundle` in the configuration
-/// bundles everything, so the project controls its tool versions rather than depending on however
-/// current the user's system happens to be.
+/// SIDE EFFECTS — bundle the tools, keeping each current per its acquisition mode. The
+/// `[tools] always_bundle_languages` / `always_bundle_utilities` settings decide, per group,
+/// whether to bundle even what the system already provides (languages default to yes — bashrs
+/// runs on them, so the project controlling their versions is the reliable default) or only
+/// what the system lacks (the utilities' default).
 pub fn sync() {
     let bundle_languages = config_file::always_bundle_languages();
     let bundle_utilities = config_file::always_bundle_utilities();
@@ -108,11 +109,13 @@ fn uv_managed(args: &[&str]) -> bool {
     matches!(run, Ok(status) if status.success())
 }
 
-/// Symlink each of `tool`'s bundled binaries into `~/.bashrs/tools/bin` (refreshing stale links);
-/// silently skips binaries that aren't bundled.
+/// Symlink each of `tool`'s bundled binaries into `~/.bashrs/tools/bin` (refreshing stale links).
+/// A binary that isn't bundled gets no shim — and any leftover one is pruned, so deleting a
+/// bundle by hand doesn't strand a dangling symlink on PATH.
 fn ensure_shims(tool: &Tool) {
     for (name, rel) in tool.bins {
         if !root().join(tool.dir).join(rel).exists() {
+            let _ = std::fs::remove_file(bin_dir().join(name));
             continue;
         }
         let target = Path::new("..").join(tool.dir).join(rel);

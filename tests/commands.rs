@@ -62,21 +62,22 @@ fn bashrs_configure_creates_the_config_from_the_template_and_opens_it() {
 }
 
 #[test]
-fn py_evaluates_an_expression_on_the_resolved_python() {
-    // Quoted or word-split, the expression lands in python's print().
-    let out = bashrs(&["py", "2**10"], &[]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1024");
-    let words = bashrs(&["py", "'a'", "*", "3"], &[]);
-    assert_eq!(String::from_utf8_lossy(&words.stdout).trim(), "aaa");
+fn media_convert_refuses_to_convert_a_file_onto_itself() {
+    // The guard fires on the resolved paths alone — before ffmpeg, before any filesystem access.
+    let out = bashrs(&["media_convert", "clip.mp4", "mp4"], &[]);
+    assert!(!out.status.success(), "self-conversion must fail");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("the output is the input itself"));
 }
 
 #[test]
-fn py_reports_python_errors_instead_of_pretending() {
-    let out = bashrs(&["py", "1/0"], &[]);
-    assert!(!out.status.success() || !out.stderr.is_empty(), "a python error must surface");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("ZeroDivisionError"),
-        "{}", String::from_utf8_lossy(&out.stderr));
+fn media_commands_propagate_failure_as_a_nonzero_exit() {
+    // Deterministic with or without ffmpeg installed: a missing input fails either way, and the
+    // command must pass that on (ffmpeg keeps warnings out of its exit status, so a clean run
+    // with ignorable warnings still exits 0).
+    let convert = bashrs(&["media_convert", "/no/such/clip.mp4", "/tmp/bashrs_never_written.mkv"], &[]);
+    assert!(!convert.status.success(), "a failed conversion must exit non-zero");
+    let metadata = bashrs(&["media_metadata", "/no/such/clip.mp4"], &[]);
+    assert!(!metadata.status.success(), "an unreadable file must exit non-zero");
 }
 
 /// Compile-time guard that the fixture path stays valid if this file grows path-dependent tests.

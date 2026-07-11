@@ -15,16 +15,29 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_reporting_code(program, args) == 0
+}
+
+/// Like [`run_reporting`], but yields the child's exit code so a wrapped tool's own status can be
+/// passed through: 0 on success, the child's code on failure. Spawn errors and signal deaths —
+/// which carry no code — report and yield 1 (a signal that kills the child usually reaches this
+/// process too, so that fallback is all but unreachable).
+pub(crate) fn run_reporting_code<P, I, S>(program: P, args: I) -> i32
+where
+    P: AsRef<OsStr>,
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let program = program.as_ref();
     match Command::new(program).args(args).status() {
-        Ok(status) if status.success() => true,
+        Ok(status) if status.success() => 0,
         Ok(status) => {
             eprintln!("{} failed with status: {status}", program.to_string_lossy());
-            false
+            status.code().unwrap_or(1)
         }
         Err(err) => {
             eprintln!("could not run {}: {err}", program.to_string_lossy());
-            false
+            1
         }
     }
 }
@@ -112,6 +125,13 @@ mod tests {
     #[test]
     fn run_reporting_reports_a_missing_program_as_failure() {
         assert!(!run_reporting("bashrs_no_such_program_xyz", &[] as &[&str]));
+    }
+
+    #[test]
+    fn run_reporting_code_passes_the_childs_exit_code_through() {
+        assert_eq!(run_reporting_code("sh", ["-c", "exit 0"]), 0);
+        assert_eq!(run_reporting_code("sh", ["-c", "exit 7"]), 7);
+        assert_eq!(run_reporting_code("bashrs_no_such_program_xyz", &[] as &[&str]), 1);
     }
 
     #[test]

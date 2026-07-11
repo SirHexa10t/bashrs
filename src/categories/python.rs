@@ -5,22 +5,8 @@
 #[bashrs_macros::category(command = PythonCommand, prefix = "py_")]
 mod commands {
     use crate::support::args::NoArgs;
-    use crate::support::exec::run_reporting;
     use crate::tools;
     use clap::Args;
-
-    /// Evaluate a Python expression and print its result — e.g. `py "2**32 / 3"`
-    #[unprefixed]
-    pub fn py(args: PyArgs) {
-        run_reporting(tools::resolve("python3"), ["-c".to_string(), _print_wrapped(&args.expression)]);
-    }
-
-    /// The expression to evaluate (words are joined, so quoting is optional: `py 2 ** 10`).
-    #[derive(Args)]
-    pub struct PyArgs {
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        pub(crate) expression: Vec<String>,
-    }
 
     /// Install python package(s) into bashrs's bundled environment, at their latest (upgrading
     /// if already present) — uv-managed
@@ -53,19 +39,4 @@ mod commands {
         }
     }
 
-    /// The `python3 -c` program for an expression: joined and wrapped in `print(…)`.
-    fn _print_wrapped(expression: &[String]) -> String {
-        format!("print({})", expression.join(" "))
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn print_wrapping_joins_the_words() {
-            assert_eq!(_print_wrapped(&["2".into(), "**".into(), "10".into()]), "print(2 ** 10)");
-            assert_eq!(_print_wrapped(&["'a' * 3".into()]), "print('a' * 3)");
-        }
-    }
 }

@@ -428,7 +428,7 @@ mod tests {
             .lines()
             .find(|line| line.trim_start().starts_with("complete -F _bashrs_complete"))
             .expect("registration line missing");
-        for name in ["gg", "GGG", "hg", "upup", "media_conv", "lll"] {
+        for name in ["gg", "GGG", "hg", "upup", "media_convert", "lll"] {
             assert!(
                 registration.split_whitespace().any(|word| word == name),
                 "`{name}` not registered for completion: {registration}"
@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn python_commands_follow_naming_standard() {
         // `py` is the bare inline evaluator, à la the classic bashrc alias.
-        assert_prefixed(&command_names::<PythonCommand>(), "py_", &["py"]);
+        assert_prefixed(&command_names::<PythonCommand>(), "py_", &[]);
     }
 
     #[test]
@@ -524,9 +524,13 @@ mod tests {
     fn wrappers_cover_every_command_and_alias() {
         let script = wrappers();
         let has = |line: &str| assert!(script.contains(line), "missing wrapper line: {line}");
-        has("media_conv() { \"$HOME/.bashrs/bashrs\" media_conv \"$@\"; }");
+        has("media_convert() { \"$HOME/.bashrs/bashrs\" media_convert \"$@\"; }");
+        has("media_convert_quality() { \"$HOME/.bashrs/bashrs\" media_convert_quality \"$@\"; }");
+        has("media_convert_compact() { \"$HOME/.bashrs/bashrs\" media_convert_compact \"$@\"; }");
+        has("media_trim_start() { \"$HOME/.bashrs/bashrs\" media_trim_start \"$@\"; }");
         has("media_metadata() { \"$HOME/.bashrs/bashrs\" media_metadata \"$@\"; }");
         has("media_hmerge_imgs() { \"$HOME/.bashrs/bashrs\" media_hmerge_imgs \"$@\"; }");
+        has("media_vmerge_imgs() { \"$HOME/.bashrs/bashrs\" media_vmerge_imgs \"$@\"; }");
         has("packages_upup() { \"$HOME/.bashrs/bashrs\" packages_upup \"$@\"; }"); // packages (both)
         has("upup() { \"$HOME/.bashrs/bashrs\" packages_upup \"$@\"; }"); // unprefixed alias -> packages_upup
         has("packages_print() { \"$HOME/.bashrs/bashrs\" packages_print \"$@\"; }"); // prefixed only
@@ -541,7 +545,6 @@ mod tests {
         has("bashrs_sourcefile() { \"$HOME/.bashrs/bashrs\" bashrs_sourcefile \"$@\"; }");
         has("bashrs_configure() { \"$HOME/.bashrs/bashrs\" bashrs_configure \"$@\"; }");
         has("recho() { \"$HOME/.bashrs/bashrs\" recho \"$@\"; }"); // style: bare, unprefixed
-        has("py() { \"$HOME/.bashrs/bashrs\" py \"$@\"; }"); // python: bare inline evaluator
         has("py_install() { \"$HOME/.bashrs/bashrs\" py_install \"$@\"; }"); // python: bundled-env packages
         has("hg() { history | \"$HOME/.bashrs/bashrs\" hg \"$@\"; }"); // #[piped]: history fed in
         has("g() { \"$HOME/.bashrs/bashrs\" g \"$@\"; }"); // generated g-family (bare)

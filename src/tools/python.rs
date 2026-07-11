@@ -106,8 +106,8 @@ fn package_names(freeze: &str) -> Vec<String> {
 
 fn missing_env() -> bool {
     eprintln!(
-        "no bundled python at ~/.bashrs/tools/python — enable `[tools] always_bundle` (ALT+W) and \
-         recompile, or manage packages in your own environment"
+        "no bundled python at ~/.bashrs/tools/python — enable `[tools] always_bundle_languages` \
+         (ALT+W) and recompile, or manage packages in your own environment"
     );
     false
 }
