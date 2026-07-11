@@ -23,6 +23,59 @@ fn bash(script: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// The full generated sourcefile on disk, plus a fake `$HOME` whose `.bashrs/bashrs` exists —
+/// so full-file sourcing tests trip the interactivity guard, not the missing-binary one.
+fn sourcefile_and_home(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = std::env::temp_dir().join(format!("bashrs_guard_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("home/.bashrs")).unwrap();
+    std::fs::write(base.join("home/.bashrs/bashrs"), "").unwrap();
+    let generated =
+        Command::new(env!("CARGO_BIN_EXE_bashrs")).arg("generate").output().expect("generate");
+    let file = base.join("sourcefile.sh");
+    std::fs::write(&file, &generated.stdout).unwrap();
+    (file, base.join("home"))
+}
+
+#[test]
+fn non_interactive_shells_inherit_nothing_at_all() {
+    // scp, `ssh host cmd`, and wrapper scripts source bashrc too. They must see zero output
+    // (stdout corrupts scp) and zero definitions: an OS maintenance script expecting the
+    // system `python3` must never be rerouted onto the bundled one.
+    let (file, home) = sourcefile_and_home("inert");
+    let out = bash(&format!(
+        "HOME='{}'; source '{}'; echo status:$?; \
+         echo \"python3-is:$(type -t python3)\"; echo \"lll-is:$(type -t lll)\"",
+        home.display(),
+        file.display()
+    ));
+    assert!(out.contains("status:0"), "the early return must not look like a failure: {out}");
+    assert!(!out.contains("python3-is:function"), "system python3 must stay untouched: {out}");
+    assert!(!out.contains("lll-is:function"), "no definitions non-interactively: {out}");
+    let silence = bash(&format!("HOME='{}'; source '{}'", home.display(), file.display()));
+    assert_eq!(silence, "", "a non-interactive source must write nothing to stdout");
+    let _ = std::fs::remove_dir_all(file.parent().unwrap());
+}
+
+#[test]
+fn the_sourcefile_arms_fully_in_interactive_shells() {
+    // The counterpart: with `i` in `$-`, everything defines as before.
+    let (file, home) = sourcefile_and_home("armed");
+    let script = format!(
+        "HOME='{}'; source '{}' 2>/dev/null; \
+         type lll >/dev/null 2>&1 && echo defined || echo undefined",
+        home.display(),
+        file.display()
+    );
+    let out = Command::new("bash").args(["--norc", "-i", "-c", &script]).output().expect("bash -i");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("defined"),
+        "interactive shells must get the full surface: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let _ = std::fs::remove_dir_all(file.parent().unwrap());
+}
+
 #[test]
 fn the_python3_function_replaces_earlier_rc_definitions() {
     // A leftover `python3` function from the user's own rc, then the sourcefile sourced last —

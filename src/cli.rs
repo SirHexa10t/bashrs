@@ -317,6 +317,7 @@ fn wrappers() -> String {
     // sourcefile.sh is sourced.
     body += &format!("\n# environment\n{}", environment::settings());
     body += &format!("\n# session\n{}", session::functions());
+
     let binds: String = keybinds::bindings()
         .iter()
         .map(|(key, func)| format!("    bind '\"{key}\": \"{func}\\n\"'\n"))
@@ -358,8 +359,18 @@ fn wrappers() -> String {
          # Regenerate by re-running COMPILE.sh.\n",
     );
     if !body.is_empty() {
+        // Interactive shells only, from the very top: a non-interactive shell that sources rc
+        // files (scp, `ssh host cmd`, wrapper scripts) must inherit NOTHING — not the greeting
+        // (stdout corrupts scp), and above all not the `python3` function, which would silently
+        // reroute an unsuspecting external script (a distro upgrade hook, say) onto the bundled
+        // interpreter. A PS1 probe would work equally well in bash, which sets PS1 in every
+        // interactive shell and even scrubs an inherited one from non-interactive shells
+        // (verified) — but `$-` *is* the interactivity flag, so it stays correct even in shells
+        // that don't maintain PS1's invariant (non-interactive zsh keeps a default PS1).
+        // `return 0` explicitly, so the early-out doesn't parrot the caller's stale status.
+        out += "\ncase $- in *i*) ;; *) return 0 ;; esac  # interactive shells only — non-interactive contexts must inherit nothing\n";
         // Bail early (before defining anything) if the binary isn't present.
-        out += &format!("\n[ -f {BIN} ] || return\n");
+        out += &format!("[ -f {BIN} ] || return\n");
         out += &body;
     }
     out
@@ -602,6 +613,19 @@ mod tests {
         assert!(script.contains("\n# environment\n"), "environment section missing");
         assert!(script.contains("export GREP_COLORS='mt=7;31'"), "GREP_COLORS export missing");
         assert!(script.contains("export PS1=") && script.contains("(UTC)"), "PS1 export missing");
+    }
+
+    #[test]
+    fn the_interactivity_guard_tops_the_file_ahead_of_everything() {
+        // Non-interactive shells must inherit nothing at all — most of all not the `python3`
+        // function, which would reroute external scripts onto the bundled interpreter.
+        let script = wrappers();
+        let guard =
+            script.find("case $- in *i*) ;; *) return 0 ;; esac").expect("interactivity guard missing");
+        assert_eq!(script.matches("case $- in").count(), 1, "exactly one guard");
+        let binary = script.find("[ -f \"$HOME/.bashrs/bashrs\" ] || return").expect("binary guard");
+        let first_definition = script.find("() {").expect("some wrapper");
+        assert!(guard < binary && binary < first_definition, "guards first, cheapest first");
     }
 
     #[test]
