@@ -3,7 +3,7 @@
 #[bashrs_macros::category(command = PackagesCommand, prefix = "packages_")]
 mod commands {
     use crate::support::args::NoArgs;
-    use crate::support::exec::{capture_stdout, run_reporting, succeeds_quietly};
+    use crate::support::exec::{capture_stdout, on_path, run_reporting, succeeds_quietly};
     use crate::support::superuser::{self, CMD};
 
     /// Update and upgrade every package manager present on the system
@@ -108,25 +108,13 @@ mod commands {
     /// The tools in `table` to act on: present on `PATH`, not superseded by another
     /// present tool, and passing their capability precheck (if any).
     fn _active(table: &'static [Manager]) -> Vec<&'static Manager> {
-        let present: Vec<&'static Manager> = table.iter().filter(|m| _on_path(m.probe)).collect();
+        let present: Vec<&'static Manager> = table.iter().filter(|m| on_path(m.probe)).collect();
         present
             .iter()
             .copied()
             .filter(|tool| !present.iter().any(|other| other.supersedes.contains(&tool.probe)))
             .filter(|tool| tool.precheck.is_none_or(_run_quietly))
             .collect()
-    }
-
-    /// Whether `program` is an executable found in any `PATH` directory — a
-    /// dependency-free `command -v` (checks the executable bit, not mere presence).
-    fn _on_path(program: &str) -> bool {
-        use std::os::unix::fs::PermissionsExt;
-        std::env::var_os("PATH").is_some_and(|paths| {
-            std::env::split_paths(&paths).any(|dir| {
-                std::fs::metadata(dir.join(program))
-                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-            })
-        })
     }
 
     /// Run a `["program", "arg", ..]` word-list — the first word is the command, the rest its
@@ -146,7 +134,7 @@ mod commands {
     }
 
     /// Run a listing word-list and print its output indented under the tool header. Goes through
-    /// [`exec::capture_stdout`], so a failing list command shows its stderr and prints no partial
+    /// [`capture_stdout`], so a failing list command shows its stderr and prints no partial
     /// listing, rather than failing silently.
     fn _print_listing(words: &[&str]) {
         let Some((&program, args)) = words.split_first() else { return };
@@ -194,10 +182,5 @@ mod commands {
             }
         }
 
-        #[test]
-        fn on_path_finds_a_ubiquitous_binary_and_rejects_a_bogus_one() {
-            assert!(_on_path("sh"), "expected to find `sh` on PATH");
-            assert!(!_on_path("bashrs_no_such_program_xyz"));
-        }
     }
 }

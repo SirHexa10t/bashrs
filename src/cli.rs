@@ -1,5 +1,5 @@
 //! The command-line interface and `sourcefile.sh` generator — the orchestration
-//! that ties [`crate::categories`] together with [`crate::shell_conf`] and
+//! that ties [`crate::categories`] together with [`crate::conf`], [`crate::tools`], and
 //! [`crate::support`]. It parses and dispatches commands (`Cli` / `Command`) and
 //! builds the sourced shell file (`wrappers`).
 
@@ -14,14 +14,12 @@ use crate::categories::lookup::LookupCommand;
 use crate::categories::media::MediaCommand;
 use crate::categories::packages::PackagesCommand;
 use crate::categories::project::ProjectCommand;
+use crate::categories::python::PythonCommand;
 use crate::categories::styles::StyleCommand;
-use crate::shell_conf::{environment, greeting, keybinds, session, stainless};
-
-/// Exit code a command returns to ask its generated wrapper to run its
-/// `#[after]` action (e.g. start a fresh shell). It's distinct from success (0)
-/// and failure (non-zero), so clap's `--help`/`-h` — which exit 0 — never
-/// trigger it. Kept trivial in shell (`[ "$?" -eq N ]`) to parse on any bash.
-pub const RELOAD_EXIT_CODE: i32 = 97;
+use crate::categories::session;
+use crate::conf::{config_file, environment, greeting, keybinds};
+use crate::conf::RELOAD_EXIT_CODE;
+use crate::tools::{self, stainless};
 
 #[derive(Parser)]
 #[command(name = "bashrs", about = "Rust-based bashrc")]
@@ -48,6 +46,8 @@ pub enum Command {
     Packages(PackagesCommand),
     #[command(flatten)]
     Project(ProjectCommand),
+    #[command(flatten)]
+    Python(PythonCommand),
     #[command(flatten)]
     Lookup(LookupCommand),
     #[command(flatten)]
@@ -81,6 +81,7 @@ impl Command {
             Command::ComfyRepos(cmd) => cmd.run(),
             Command::Packages(cmd) => cmd.run(),
             Command::Project(cmd) => cmd.run(),
+            Command::Python(cmd) => cmd.run(),
             Command::Lookup(cmd) => cmd.run(),
             Command::Grep(cmd) => cmd.run(),
             Command::Treegrep(cmd) => cmd.run(),
@@ -126,7 +127,7 @@ pub fn parse() -> Cli {
 
 /// The command categories, each paired with the label used to group them in the
 /// generated `sourcefile.sh`. One row per category — never per command.
-fn category_commands() -> [(&'static str, clap::Command); 9] {
+fn category_commands() -> [(&'static str, clap::Command); 10] {
     let categories = [
         ("bashrs", BashrsCommand::augment_subcommands(clap::Command::new("bashrs"))),
         ("filesystem", FilesystemCommand::augment_subcommands(clap::Command::new("filesystem"))),
@@ -134,6 +135,7 @@ fn category_commands() -> [(&'static str, clap::Command); 9] {
         ("media", MediaCommand::augment_subcommands(clap::Command::new("media"))),
         ("packages", PackagesCommand::augment_subcommands(clap::Command::new("packages"))),
         ("project", ProjectCommand::augment_subcommands(clap::Command::new("project"))),
+        ("python", PythonCommand::augment_subcommands(clap::Command::new("python"))),
         // One `lookup` group: `hg` (history search) plus the generated g-family.
         ("lookup", GgCommand::augment_subcommands(GrepCommand::augment_subcommands(
             LookupCommand::augment_subcommands(clap::Command::new("lookup")),
@@ -192,6 +194,7 @@ const WRAPPER_HOOKS: &[(WrapperLookup, WrapperLookup)] = &[
     (MediaCommand::wrapper_suffix, MediaCommand::wrapper_prefix),
     (PackagesCommand::wrapper_suffix, PackagesCommand::wrapper_prefix),
     (ProjectCommand::wrapper_suffix, ProjectCommand::wrapper_prefix),
+    (PythonCommand::wrapper_suffix, PythonCommand::wrapper_prefix),
     (LookupCommand::wrapper_suffix, LookupCommand::wrapper_prefix),
     (GrepCommand::wrapper_suffix, GrepCommand::wrapper_prefix),
     (GgCommand::wrapper_suffix, GgCommand::wrapper_prefix),
@@ -281,6 +284,9 @@ fn wrappers() -> String {
         body += &format!("\n# comfy / external tools\n{comfy}");
     }
 
+    // Bundled tools (fetched and kept current by the same bin): their shim dir wins by PATH.
+    body += &format!("\n# bundled tools\n{}", tools::shell_setup());
+
     // Environment settings, session functions, keybinds: raw shell run when
     // sourcefile.sh is sourced.
     body += &format!("\n# environment\n{}", environment::settings());
@@ -313,8 +319,12 @@ fn wrappers() -> String {
         completion_names.join(" ")
     );
 
-    // A load greeting, last — after the `gecho`/`boecho` wrappers it calls are defined.
-    body += &format!("\n# greeting\n{}\n", greeting::line());
+    // A load greeting — after the `gecho`/`boecho` wrappers it calls are defined.
+    body += &format!("\n# greeting\n{}", greeting::line());
+
+    // The very last lines, deliberately: while an archived config sits unmerged, the red nag
+    // (via `errcho`, defined above) is the closest thing to the user's prompt.
+    body += &format!("\n\n# stale-config check\n{}", config_file::stale_config_notice());
 
     let mut out = String::from(
         "#!/usr/bin/env bash\n\
@@ -469,6 +479,12 @@ mod tests {
     }
 
     #[test]
+    fn python_commands_follow_naming_standard() {
+        // `py` is the bare inline evaluator, à la the classic bashrc alias.
+        assert_prefixed(&command_names::<PythonCommand>(), "py_", &["py"]);
+    }
+
+    #[test]
     fn lookup_commands_follow_naming_standard() {
         // `hg` mirrors the classic `history | grep` alias; `GG` is the loud all-caps sibling of `gg`
         // (recursive search with `--delve` forced), and `GGG` is `GG` with `--save`/`-E` too — all
@@ -523,7 +539,10 @@ mod tests {
             "bashrs_compile() {{ \"$HOME/.bashrs/bashrs\" bashrs_compile \"$@\"; [ \"$?\" -eq {RELOAD_EXIT_CODE} ] && session_new; }}"
         ));
         has("bashrs_sourcefile() { \"$HOME/.bashrs/bashrs\" bashrs_sourcefile \"$@\"; }");
+        has("bashrs_configure() { \"$HOME/.bashrs/bashrs\" bashrs_configure \"$@\"; }");
         has("recho() { \"$HOME/.bashrs/bashrs\" recho \"$@\"; }"); // style: bare, unprefixed
+        has("py() { \"$HOME/.bashrs/bashrs\" py \"$@\"; }"); // python: bare inline evaluator
+        has("py_install() { \"$HOME/.bashrs/bashrs\" py_install \"$@\"; }"); // python: bundled-env packages
         has("hg() { history | \"$HOME/.bashrs/bashrs\" hg \"$@\"; }"); // #[piped]: history fed in
         has("g() { \"$HOME/.bashrs/bashrs\" g \"$@\"; }"); // generated g-family (bare)
         has("g3() { \"$HOME/.bashrs/bashrs\" g3 \"$@\"; }");
@@ -537,6 +556,7 @@ mod tests {
         assert!(script.contains("session_new() { exec bash; }"), "session_new missing");
         assert!(script.contains(r#"bind '"\en": "session_new\n"'"#), "ALT+N keybind missing");
         assert!(script.contains(r#"bind '"\eh": "bashrs_sourcefile\n"'"#), "ALT+H keybind missing");
+        assert!(script.contains(r#"bind '"\ew": "bashrs_configure\n"'"#), "ALT+W keybind missing");
         assert!(script.contains(r#"bind '"\eq": "bashrs_compile\n"'"#), "ALT+Q keybind missing");
         assert!(script.contains("if pgrep -x cinnamon >/dev/null; then bind"), "ALT+L desktop-restart missing");
         assert!(script.contains("if [ -n \"$BASH_VERSION\" ]; then"), "keybinds should be bash-guarded");
@@ -573,7 +593,14 @@ mod tests {
     fn wrappers_include_the_stainless_aliases() {
         // The alias is emitted whether or not the repo has been cloned yet; only the trailing
         // `--help` comment varies with the environment, so assert just the alias line's stable head.
-        assert!(wrappers().contains("ai() { \"$HOME/pydev/bin/python3\""), "stainless `ai` alias missing");
+        assert!(wrappers().contains("ai() { python3 \"$HOME/.bashrs/stainless_comfy/"), "stainless `ai` alias missing");
+    }
+
+    #[test]
+    fn wrappers_put_the_bundled_tools_on_path() {
+        let script = wrappers();
+        assert!(script.contains("\n# bundled tools\n"), "section missing");
+        assert!(script.contains("PATH=\"$HOME/.bashrs/tools/bin:$PATH\""), "shim-dir prepend missing");
     }
 
     #[test]

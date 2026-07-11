@@ -37,11 +37,12 @@ mkdir -p "$BASHRS_HOME"                        # no-op if it already exists (dir
 install -m 755 target/release/bashrs "$BIN"    # overwrite just the binary, keep it executable
 echo "Installed $BIN"
 
-# --- 3. Retrieve/update the non-Rust companion repos ------------------------
+# --- 3. Retrieve/update the non-Rust companions -----------------------------
 # stainless_sync was built by the cargo build above; run it straight from target/ (it is
 # deliberately NOT installed under ~/.bashrs). It clones/updates the repos under
-# ~/.bashrs/stainless_comfy so the next step (generate) can alias them and read their --help live.
-# Best-effort: a failure (offline, …) must not abort the compile.
+# ~/.bashrs/stainless_comfy so the next step (generate) can alias them and read their --help live,
+# and keeps the self-contained tools (ffmpeg, python) under ~/.bashrs/tools on their latest
+# published builds. Best-effort: a failure (offline, …) must not abort the compile.
 ./target/release/stainless_sync || echo "WARNING: stainless_sync failed; companion aliases may be stale or missing." >&2
 
 # --- 4. Generate the wrappers from the freshly installed binary -------------

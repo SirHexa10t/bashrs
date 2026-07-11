@@ -9,19 +9,21 @@ use std::process::{Command, Stdio};
 
 /// Run `program` with `args`, inheriting stdio. Returns whether it succeeded,
 /// printing a consistent diagnostic to stderr otherwise.
-pub(crate) fn run_reporting<I, S>(program: &str, args: I) -> bool
+pub(crate) fn run_reporting<P, I, S>(program: P, args: I) -> bool
 where
+    P: AsRef<OsStr>,
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    let program = program.as_ref();
     match Command::new(program).args(args).status() {
         Ok(status) if status.success() => true,
         Ok(status) => {
-            eprintln!("{program} failed with status: {status}");
+            eprintln!("{} failed with status: {status}", program.to_string_lossy());
             false
         }
         Err(err) => {
-            eprintln!("could not run {program}: {err}");
+            eprintln!("could not run {}: {err}", program.to_string_lossy());
             false
         }
     }
@@ -30,12 +32,13 @@ where
 /// Run `program` with `args`, discarding all output. Returns whether it exited
 /// successfully — for capability probes (does this subcommand work here?) that
 /// must stay silent.
-pub(crate) fn succeeds_quietly<I, S>(program: &str, args: I) -> bool
+pub(crate) fn succeeds_quietly<P, I, S>(program: P, args: I) -> bool
 where
+    P: AsRef<OsStr>,
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    Command::new(program)
+    Command::new(program.as_ref())
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -47,11 +50,13 @@ where
 /// Run `program` with `args`, capturing stdout for post-processing; the program's own
 /// stderr passes straight through to the user. Returns `Some(stdout)` on success, or
 /// `None` on a non-zero exit or a spawn failure (the latter with a diagnostic).
-pub(crate) fn capture_stdout<I, S>(program: &str, args: I) -> Option<String>
+pub(crate) fn capture_stdout<P, I, S>(program: P, args: I) -> Option<String>
 where
+    P: AsRef<OsStr>,
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    let program = program.as_ref();
     match Command::new(program).args(args).output() {
         Ok(out) => {
             if !out.stderr.is_empty() {
@@ -60,7 +65,7 @@ where
             out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
         }
         Err(err) => {
-            eprintln!("could not run {program}: {err}");
+            eprintln!("could not run {}: {err}", program.to_string_lossy());
             None
         }
     }
@@ -69,14 +74,29 @@ where
 /// Run `program` with `args`, inheriting stdio; the exit status is ignored — for commands
 /// run to show output or for a side effect, where a non-zero exit isn't a failure (e.g.
 /// `ssh -T git@github.com`, which always exits 1). A spawn error is still reported.
-pub(crate) fn run<I, S>(program: &str, args: I)
+pub(crate) fn run<P, I, S>(program: P, args: I)
 where
+    P: AsRef<OsStr>,
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    let program = program.as_ref();
     if let Err(err) = Command::new(program).args(args).status() {
-        eprintln!("could not run {program}: {err}");
+        eprintln!("could not run {}: {err}", program.to_string_lossy());
     }
+}
+
+/// Whether `program` is an executable found in any `PATH` directory — a dependency-free
+/// `command -v` (checks the executable bit, not mere presence). Backs the package-manager
+/// detection and the bundled-tools skip ([`crate::tools`]).
+pub(crate) fn on_path(program: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            std::fs::metadata(dir.join(program))
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+    })
 }
 
 #[cfg(test)]
@@ -113,5 +133,11 @@ mod tests {
         run("true", &[] as &[&str]);
         run("false", &[] as &[&str]); // non-zero exit ignored: no report, no panic
         run("bashrs_no_such_program_xyz", &[] as &[&str]); // spawn error: reported, no panic
+    }
+
+    #[test]
+    fn on_path_finds_a_ubiquitous_binary_and_rejects_a_bogus_one() {
+        assert!(on_path("sh"), "expected to find `sh` on PATH");
+        assert!(!on_path("bashrs_no_such_program_xyz"));
     }
 }

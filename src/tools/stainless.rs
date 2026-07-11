@@ -1,5 +1,5 @@
 //! Non-Rust ("stainless" — Rust-resistant) companion repos, cloned under `~/.bashrs/stainless_comfy`
-//! and exposed as plain shell aliases in `sourcefile.sh`. Data-driven, like [`super::keybinds`]: a
+//! and exposed as plain shell aliases in `sourcefile.sh`. Data-driven, like [`crate::conf::keybinds`]: a
 //! `const` table plus functions that turn it into shell lines — no macro, no clap command.
 //!
 //! Two consumers of the one table:
@@ -20,10 +20,14 @@ struct Comfy {
     repo: &'static str,
     /// Shell function name to expose.
     alias: &'static str,
-    /// Launcher, shell-quoted (e.g. the venv python); `$HOME` is expanded by the shell at use.
+    /// Launcher command — a bare name resolves like any command at use time (`python3` hits the
+    /// sourcefile's tools fallback, so it works even with no system python).
     run: &'static str,
     /// Executable, relative to the clone root.
     exe: &'static str,
+    /// PyPI packages the tool needs at runtime — installed into the bundled python environment
+    /// by [`sync`], via [`super::python`].
+    python_deps: &'static [&'static str],
 }
 
 /// The companion repos. Named `STAINLESS` (the general "non-Rust" bucket) though every entry is a
@@ -31,8 +35,10 @@ struct Comfy {
 const STAINLESS: &[Comfy] = &[Comfy {
     repo: "https://github.com/SirHexa10t/contAInerized",
     alias: "ai",
-    run: "\"$HOME/pydev/bin/python3\"",
+    run: "python3",
     exe: "dockerized_claude_code/run.py",
+    // The launcher's runtime deps, per its own install_dependencies.sh.
+    python_deps: &["prompt_toolkit", "python-dotenv", "rich"],
 }];
 
 /// Clone root, `$HOME`-relative — kept as the "comfy" area (the dir you picked) even though the
@@ -68,6 +74,11 @@ pub fn sync() {
             }
             git(Command::new("git").args(["clone", "--depth", "1", comfy.repo]).arg(&dir), comfy.repo);
         }
+        // The repo's runtime python packages, into the bundled environment (best-effort, like the
+        // clone — `install` explains itself when the environment or uv is missing).
+        if !super::python::install(comfy.python_deps) {
+            eprintln!("stainless: {}'s python packages may be missing", repo_name(comfy.repo));
+        }
     }
 }
 
@@ -78,10 +89,12 @@ fn git(cmd: &mut Command, repo: &str) {
     }
 }
 
-/// Probe `<run> <exe> --help` (through a shell, so `$HOME` in `run` expands) for a description.
-/// Best-effort: a missing tool/venv or a non-zero exit yields `None` (no comment).
+/// Probe `<run> <exe> --help` (through a shell, so `$HOME` in `exe` expands) for a description.
+/// The launcher goes through [`super::resolve`], mirroring the sourcefile's PATH shim — the probe
+/// works even when the launcher is only bundled. Best-effort: any failure yields `None` (no comment).
 fn fetch_about(comfy: &Comfy) -> Option<String> {
-    let script = format!("{} \"{}\" --help 2>&1", comfy.run, exe_shell(comfy));
+    let run = super::resolve(comfy.run);
+    let script = format!("\"{}\" \"{}\" --help 2>&1", run.to_string_lossy(), exe_shell(comfy));
     let out = Command::new("bash").arg("-c").arg(script).output().ok()?;
     if !out.status.success() {
         return None;
@@ -131,8 +144,9 @@ mod tests {
     const SAMPLE: &Comfy = &Comfy {
         repo: "https://github.com/x/contAInerized.git",
         alias: "ai",
-        run: "\"$HOME/pydev/bin/python3\"",
+        run: "python3",
         exe: "dockerized_claude_code/run.py",
+        python_deps: &[],
     };
 
     #[test]
@@ -146,7 +160,7 @@ mod tests {
     fn alias_line_wires_run_and_exe_with_an_optional_comment() {
         assert_eq!(
             alias_line(SAMPLE, None),
-            "ai() { \"$HOME/pydev/bin/python3\" \
+            "ai() { python3 \
              \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/run.py\" \"$@\"; }\n"
         );
         assert!(alias_line(SAMPLE, Some("Launch an agent")).contains("; }  # Launch an agent\n"));

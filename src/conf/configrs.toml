@@ -1,0 +1,13 @@
+# bashrs configuration — edit by hand (ALT+W), read when commands and compiles run.
+# When bashrs adds or renames settings, an outdated file is archived as configrs.toml.<time>.old
+# and a fresh one is written; merge your values back, then delete the .old file.
+
+[tools]
+# Bundle the programming languages (python, plus uv, its toolchain manager) under ~/.bashrs/tools
+# even when the system provides them. bashrs commands and companion repos run on these
+# environments, so the project controlling their versions is the reliable default.
+# false: bundle only what the system lacks.
+always_bundle_languages = true
+# Bundle the utility programs (ffmpeg) even when the system provides them.
+# false: bundle only what the system lacks.
+always_bundle_utilities = false

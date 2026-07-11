@@ -1,0 +1,167 @@
+//! Self-contained external tools, bundled under `~/.bashrs/tools/` — so commands that lean on a
+//! heavyweight program (ffmpeg, python) work without asking the user to install anything, and so
+//! the *project* controls the versions it relies on (system copies drift — apt lags — and may
+//! lack features we use). Its own pillar (not `support`) because it spans three concerns:
+//! compile-time acquisition ([`fetch`], run by the `stainless_sync` binary), runtime resolution
+//! ([`resolve`], used by the command categories), and the interactive side — a shim directory
+//! ([`bin_dir`]) whose PATH prepend is emitted into `sourcefile.sh` ([`shell_setup`], used by
+//! [`crate::cli`]). The bundled copy is the project-pinned default; the system installation is
+//! the fallback — except that an activated venv still wins for interactive `python3`.
+
+mod fetch;
+pub(crate) mod python;
+pub mod stainless;
+
+pub use fetch::sync;
+
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+/// A bundled tool: where it lives, what it provides, and how its bundle comes to exist.
+struct Tool {
+    /// Directory under `~/.bashrs/tools/` holding the bundle.
+    dir: &'static str,
+    /// The programs this tool provides: `(name on PATH, path inside `dir`)`. The first one
+    /// doubles as the probe for "already installed / already bundled".
+    bins: &'static [(&'static str, &'static str)],
+    /// How the bundle is acquired and kept current.
+    acquire: Acquire,
+    /// Which `always_bundle_*` configuration group governs it.
+    group: Group,
+}
+
+/// The configuration groups of [`Tool`]s — each with its own `[tools] always_bundle_*` flag.
+/// Languages default to bundled (bashrs commands and companion repos run on them — near
+/// non-negotiable); utilities default to bundle-only-what's-missing.
+#[derive(Clone, Copy)]
+enum Group {
+    Language,
+    Utility,
+}
+
+/// How a tool's bundle comes to exist (and updates).
+enum Acquire {
+    /// Download a static archive (URL discovered per release, root folder stripped on unpack);
+    /// re-fetched when the published URL changes, tracked by a `.source_url` marker.
+    Archive(fn() -> Option<String>),
+    /// A `uv venv` at the tool's dir — a stable `bin/python3` over an interpreter uv installs
+    /// into [`interpreters_dir`]; kept current via `uv python upgrade`.
+    UvVenv { python: &'static str },
+}
+
+/// Bundled in table order — `uv` must precede `python`, whose venv step runs it.
+const TOOLS: &[Tool] = &[
+    Tool {
+        dir: "ffmpeg",
+        bins: &[("ffmpeg", "bin/ffmpeg"), ("ffprobe", "bin/ffprobe")],
+        acquire: Acquire::Archive(fetch::ffmpeg_url),
+        group: Group::Utility,
+    },
+    // uv's archive carries the binaries at its root (no bin/); it manages the python below —
+    // which is why it belongs to the Language group despite being a utility in shape.
+    Tool {
+        dir: "uv",
+        bins: &[("uv", "uv"), ("uvx", "uvx")],
+        acquire: Acquire::Archive(fetch::uv_url),
+        group: Group::Language,
+    },
+    Tool {
+        dir: "python",
+        bins: &[("python3", "bin/python3")],
+        acquire: Acquire::UvVenv { python: "3.14" },
+        group: Group::Language,
+    },
+];
+
+/// `~/.bashrs/tools/interpreters` — where uv keeps the managed CPython builds the python venv
+/// links against (`UV_PYTHON_INSTALL_DIR`), so the whole python story stays under `~/.bashrs`.
+fn interpreters_dir() -> PathBuf {
+    root().join("interpreters")
+}
+
+/// `~/.bashrs/tools` — the bundled tools' home.
+fn root() -> PathBuf {
+    crate::conf::bashrs_home().join("tools")
+}
+
+/// The command to run for `program`: its bundled copy when present — the project-pinned version,
+/// kept current by `bashrs_compile` — else the bare name, so the system installation (or its
+/// normal "command not found" error) takes over. A program not in the table passes through.
+pub(crate) fn resolve(program: &str) -> OsString {
+    for tool in TOOLS {
+        for (name, rel) in tool.bins {
+            if *name == program {
+                let bundled = root().join(tool.dir).join(rel);
+                if bundled.exists() {
+                    return bundled.into_os_string();
+                }
+            }
+        }
+    }
+    OsString::from(program)
+}
+
+/// `~/.bashrs/tools/bin` — one symlink per bundled binary (maintained by [`fetch`]), prepended to
+/// PATH by the sourcefile. PATH is the only mechanism that also covers *argument* position —
+/// `which python3`, `env python3`, `xargs`, `#!/usr/bin/env python3` shebangs — where a shell
+/// function or alias is invisible.
+pub(crate) fn bin_dir() -> PathBuf {
+    root().join("bin")
+}
+
+/// The setup emitted into `sourcefile.sh` — the interactive side of the bundled tools, in two
+/// layers. The PATH prepend (idempotent; harmless when nothing is bundled) makes the shims win in
+/// *argument* position — `which`, `env`, shebangs. The `python3` function covers what PATH can't:
+/// sourced last in the rc chain, it replaces any same-named function the user's own rc defined
+/// earlier (the `unalias` clears an alias shadow likewise). An activated venv still wins either
+/// way, and a machine with no bundle falls through to its PATH python.
+pub(crate) fn shell_setup() -> String {
+    "case \":$PATH:\" in *\":$HOME/.bashrs/tools/bin:\"*) ;; *) export PATH=\"$HOME/.bashrs/tools/bin:$PATH\";; esac  \
+     # bundled tools (python3, ffmpeg, …) win by PATH — as arguments and in shebangs\n\
+     unalias python3 2>/dev/null || true  \
+     # own line, on purpose: an active alias would mangle the function definition at parse time\n\
+     python3() { if [ -z \"$VIRTUAL_ENV\" ] && [ -x \"$HOME/.bashrs/tools/bin/python3\" ]; \
+     then \"$HOME/.bashrs/tools/bin/python3\" \"$@\"; else command python3 \"$@\"; fi; }  \
+     # defined last so it beats older same-named rc definitions; a venv (or a missing bundle) falls through to PATH\n"
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uv_is_listed_before_the_python_venv_that_needs_it() {
+        let uv = TOOLS.iter().position(|tool| tool.dir == "uv").expect("uv row");
+        let python = TOOLS.iter().position(|tool| tool.dir == "python").expect("python row");
+        assert!(uv < python, "sync bundles in table order; the python venv step runs uv");
+    }
+
+    #[test]
+    fn resolve_prefers_the_bundle_and_falls_back_to_the_bare_name() {
+        // A tool program resolves per-environment: to its bundle when fetched, else to itself.
+        let ffmpeg = resolve("ffmpeg");
+        if root().join("ffmpeg/bin/ffmpeg").exists() {
+            assert!(ffmpeg.to_string_lossy().ends_with(".bashrs/tools/ffmpeg/bin/ffmpeg"), "{ffmpeg:?}");
+        } else {
+            assert_eq!(ffmpeg, OsString::from("ffmpeg"));
+        }
+        // Programs outside the table pass through, so the shell's own error stays meaningful.
+        assert_eq!(resolve("sh"), OsString::from("sh"));
+        assert_eq!(resolve("no_such_tool_xyz"), OsString::from("no_such_tool_xyz"));
+    }
+
+    #[test]
+    fn the_shell_setup_prepends_the_shim_dir_idempotently_and_arms_the_function() {
+        let setup = shell_setup();
+        assert!(setup.contains("PATH=\"$HOME/.bashrs/tools/bin:$PATH\""), "{setup}");
+        assert!(setup.starts_with("case \":$PATH:\" in"), "re-sourcing must not stack duplicates: {setup}");
+        // The function layer: beats older same-named rc functions/aliases, respects venvs,
+        // routes through the shim so both layers name one canonical binary.
+        assert!(setup.contains("unalias python3"), "{setup}");
+        assert!(setup.contains("python3() {"), "{setup}");
+        assert!(setup.contains("VIRTUAL_ENV"), "{setup}");
+        assert!(setup.contains("$HOME/.bashrs/tools/bin/python3"), "{setup}");
+        assert!(setup.contains("command python3"), "fall-throughs bypass the function itself: {setup}");
+    }
+}
