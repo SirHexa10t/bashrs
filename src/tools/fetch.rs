@@ -118,14 +118,31 @@ fn ensure_shims(tool: &Tool) {
             let _ = std::fs::remove_file(bin_dir().join(name));
             continue;
         }
-        let target = Path::new("..").join(tool.dir).join(rel);
         let link = bin_dir().join(name);
         let _ = std::fs::create_dir_all(bin_dir());
         let _ = std::fs::remove_file(&link);
-        if let Err(err) = std::os::unix::fs::symlink(&target, &link) {
+        // A venv's binaries must NOT be shimmed by symlink: python discovers its venv by looking
+        // for pyvenv.cfg beside the path it was *invoked as* (symlinks deliberately unresolved —
+        // that's what makes venvs work at all), so a symlink in tools/bin silently runs the bare
+        // base interpreter without the venv's site-packages. An `exec` script hands python its
+        // real in-venv path instead. Plain binaries keep the cheaper symlink.
+        let result = match tool.acquire {
+            Acquire::UvVenv { .. } => std::fs::write(&link, venv_shim(tool.dir, rel)).and_then(|()| {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&link, std::fs::Permissions::from_mode(0o755))
+            }),
+            _ => std::os::unix::fs::symlink(Path::new("..").join(tool.dir).join(rel), &link),
+        };
+        if let Err(err) = result {
             eprintln!("tools: could not shim {name}: {err}");
         }
     }
+}
+
+/// The venv-aware shim script: `exec` the binary by its real in-venv path (`$HOME`-based, so a
+/// symlinked `~/.bashrs` keeps working), preserving pyvenv.cfg discovery.
+fn venv_shim(tool_dir: &str, rel: &str) -> String {
+    format!("#!/bin/sh\nexec \"$HOME/.bashrs/tools/{tool_dir}/{rel}\" \"$@\"\n")
 }
 
 /// Download `url` and unpack the archive's contents (root folder stripped) into `dir`.
@@ -220,6 +237,19 @@ fn find_uv_asset(json: &str, arch: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn venv_shims_exec_the_real_in_venv_path() {
+        // A symlink here would break pyvenv.cfg discovery (python checks beside the path it was
+        // invoked as, symlinks unresolved) — the script must exec the true venv path, spelled
+        // via $HOME so a symlinked ~/.bashrs keeps working.
+        let shim = venv_shim("python", "bin/python3");
+        assert!(shim.starts_with("#!/bin/sh\n"), "{shim}");
+        assert!(
+            shim.contains("exec \"$HOME/.bashrs/tools/python/bin/python3\" \"$@\""),
+            "{shim}"
+        );
+    }
 
     #[test]
     fn fetch_unpacks_an_archive_with_its_root_folder_stripped_and_cleans_up() {

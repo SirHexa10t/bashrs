@@ -62,6 +62,20 @@ fn bashrs_configure_creates_the_config_from_the_template_and_opens_it() {
 }
 
 #[test]
+fn fs_usage_count_prints_a_bare_number_and_fails_on_missing_paths() {
+    let dir = std::env::temp_dir().join(format!("bashrs_usage_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("nested")).unwrap();
+    std::fs::write(dir.join("one.txt"), "x").unwrap();
+    std::fs::write(dir.join("nested/two.txt"), "y").unwrap();
+    let out = bashrs(&["fs_usage", "--count", dir.to_str().unwrap()], &[]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "2", "recursive, files only");
+    let missing = bashrs(&["fs_usage", "--count", "/no/such/dir"], &[]);
+    assert!(!missing.status.success(), "a missing path must exit non-zero");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn media_convert_refuses_to_convert_a_file_onto_itself() {
     // The guard fires on the resolved paths alone — before ffmpeg, before any filesystem access.
     let out = bashrs(&["media_convert", "clip.mp4", "mp4"], &[]);

@@ -1,17 +1,23 @@
-//! Filesystem commands (`fs_*`). Currently `lll` — a long `ls` listing aligned into a
-//! table via `table_formatter`, under a bold-blue header from the style engine. Windows
-//! `.lnk` shortcuts (which can't work under Bash) are flagged red as `name.lnk (Windows)->
-//! target`, treating them like broken links; the target is read from the shortcut when we
-//! can, and omitted (still flagged) when we can't.
+//! Filesystem commands (`fs_*`) and navigation helpers. Currently `lll` — a long `ls` listing
+//! aligned into a table via `table_formatter`, under a bold-blue header from the style engine.
+//! Windows `.lnk` shortcuts (which can't work under Bash) are flagged red as `name.lnk
+//! (Windows)-> target`, treating them like broken links; the target is read from the shortcut
+//! when we can, and omitted (still flagged) when we can't.
 
 #[bashrs_macros::category(command = FilesystemCommand, prefix = "fs_")]
 mod commands {
-    use std::collections::HashMap;
-    use std::path::Path;
+    use std::collections::{HashMap, HashSet};
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
 
     use crate::support::doc_style::{_header, _scoped, _wrap};
     use crate::support::exec;
     use clap::Args;
+
+    /// Hop one directory up
+    #[name("..")]
+    #[shell_body("cd .. \"$@\"")]
+    pub fn dir_up() {}
 
     /// Custom `ls` (like `ll`): a long, all-files listing aligned into a table. Extra
     /// arguments pass straight through to `ls` — e.g. `lll -S` sorts by size.
@@ -193,9 +199,215 @@ mod commands {
         (end > 0).then(|| String::from_utf8_lossy(&rest[..end]).into_owned())
     }
 
+    // --- fs_usage ---------------------------------------------------------------
+
+    /// Disk usage overview: each entry's allocated size, recursive file count, and inode count,
+    /// largest first with a total — like `du`, hardlinked twins counted once
+    pub fn usage(args: UsageArgs) {
+        let UsageArgs { path, count } = args;
+        if count {
+            let Some(stats) = _tree_stats(&path) else { _missing(&path) };
+            println!("{}", stats.files);
+            return;
+        }
+        let Ok(root) = std::fs::canonicalize(&path) else { _missing(&path) };
+        let mut seen = HashSet::new();
+        let mut rows: Vec<(Stats, String)> = Vec::new();
+        if root.is_dir() {
+            let mut children: Vec<PathBuf> = match std::fs::read_dir(&root) {
+                Ok(entries) => entries.flatten().map(|entry| entry.path()).collect(),
+                Err(err) => {
+                    eprintln!("fs_usage: cannot read {}: {err}", root.display());
+                    std::process::exit(1);
+                }
+            };
+            children.sort(); // deterministic hardlink attribution: first scanned owns the inode
+            for child in children {
+                let stats = _scan(&child, &mut seen);
+                rows.push((stats, _entry_name(&child)));
+            }
+        } else {
+            rows.push((_scan(&root, &mut seen), _entry_name(&root)));
+        }
+        rows.sort_by(|a, b| b.0.bytes.cmp(&a.0.bytes).then_with(|| a.1.cmp(&b.1)));
+
+        let mut lines: Vec<String> = vec!["SIZE  FILES  INODES  NAME".into()];
+        lines.extend(rows.iter().map(|(stats, name)| _usage_row(stats, name)));
+        if root.is_dir() {
+            // The rows plus the root directory's own inode — what `du -s` would report.
+            let mut total = std::fs::symlink_metadata(&root)
+                .map(|meta| Stats { bytes: meta.blocks() * 512, files: 0, inodes: 1 })
+                .unwrap_or_default();
+            for (stats, _) in &rows {
+                total.bytes += stats.bytes;
+                total.files += stats.files;
+                total.inodes += stats.inodes;
+            }
+            lines.push(_usage_row(&total, "(total)"));
+        }
+        // The fallback is unreachable: only `sort` can error, and it's off.
+        let opts = table_formatter::FormatOptions {
+            separator: 2,
+            threshold: 2,
+            trim_trailing: true,
+            ..Default::default()
+        };
+        for line in table_formatter::format_table(&lines, &opts).unwrap_or(lines) {
+            println!("{line}");
+        }
+    }
+
+    #[derive(Args)]
+    pub struct UsageArgs {
+        /// Directory (each entry becomes a row) or a single file to size up
+        #[arg(default_value = ".")]
+        pub path: PathBuf,
+        /// Print only the recursive count of regular files, as a bare number (for scripts;
+        /// directories and symlinks aren't files, a broken-symlink target counts 0)
+        #[arg(long)]
+        pub count: bool,
+    }
+
+    /// Recursive tallies for one filesystem subtree.
+    #[derive(Clone, Copy, Default)]
+    struct Stats {
+        /// Allocated bytes (`st_blocks` × 512) like `du` — not apparent length.
+        bytes: u64,
+        /// Regular files only — what "how many files" usually means.
+        files: u64,
+        /// Every entry: files, directories, symlinks; hardlinked twins once.
+        inodes: u64,
+    }
+
+    /// The whole tree's [`Stats`] at `path`. The argument itself is followed when it's a symlink
+    /// (pointing at it is asking about it — no trailing-slash tricks needed); a broken one counts
+    /// as the bare link it is; a missing path is `None`.
+    fn _tree_stats(path: &Path) -> Option<Stats> {
+        match std::fs::canonicalize(path) {
+            Ok(real) => Some(_scan(&real, &mut HashSet::new())),
+            Err(_) => std::fs::symlink_metadata(path)
+                .ok()
+                .map(|meta| Stats { bytes: meta.blocks() * 512, files: 0, inodes: 1 }),
+        }
+    }
+
+    /// Walk `path`, tallying fresh [`Stats`]: symlinks are counted, never followed (matching
+    /// `find`/`du`), and `seen` carries `(device, inode)` pairs so hardlinked twins — including
+    /// ones met by an earlier scan sharing the set — count once, as `du` does.
+    fn _scan(path: &Path, seen: &mut HashSet<(u64, u64)>) -> Stats {
+        let Ok(meta) = std::fs::symlink_metadata(path) else { return Stats::default() };
+        let mut stats = Stats::default();
+        if seen.insert((meta.dev(), meta.ino())) {
+            stats.inodes = 1;
+            stats.bytes = meta.blocks() * 512;
+            if meta.is_file() {
+                stats.files = 1;
+            }
+        }
+        if meta.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    let sub = _scan(&entry.path(), seen);
+                    stats.bytes += sub.bytes;
+                    stats.files += sub.files;
+                    stats.inodes += sub.inodes;
+                }
+            }
+        }
+        stats
+    }
+
+    /// One table row: humanized size, the counts, the name.
+    fn _usage_row(stats: &Stats, name: &str) -> String {
+        format!("{}  {}  {}  {}", _human_size(stats.bytes), stats.files, stats.inodes, name)
+    }
+
+    /// An entry's display name: its file name, `/`-marked when it's a real directory.
+    fn _entry_name(path: &Path) -> String {
+        let mut name =
+            path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned();
+        if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
+            name.push('/');
+        }
+        name
+    }
+
+    /// `du -h`-style size: 1024-based, one decimal under 10, bare integer above.
+    fn _human_size(bytes: u64) -> String {
+        const UNITS: [&str; 4] = ["K", "M", "G", "T"];
+        if bytes < 1024 {
+            return format!("{bytes}B");
+        }
+        let mut value = bytes as f64 / 1024.0;
+        let mut unit = 0;
+        while value >= 1024.0 && unit + 1 < UNITS.len() {
+            value /= 1024.0;
+            unit += 1;
+        }
+        if value < 10.0 {
+            format!("{value:.1}{}", UNITS[unit])
+        } else {
+            format!("{value:.0}{}", UNITS[unit])
+        }
+    }
+
+    /// Report a nonexistent `path` and exit — the shared failure tail of both `fs_usage` modes.
+    fn _missing(path: &Path) -> ! {
+        eprintln!("fs_usage: no such path: {}", path.display());
+        std::process::exit(1);
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn usage_scan_counts_files_and_inodes_and_dedups_hardlinks() {
+            let base = std::env::temp_dir().join(format!("bashrs_usage_scan_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(base.join("sub")).unwrap();
+            std::fs::write(base.join("a.txt"), "hello").unwrap();
+            std::fs::write(base.join("sub/b.txt"), "world!").unwrap();
+            std::os::unix::fs::symlink("a.txt", base.join("link")).unwrap();
+            std::os::unix::fs::symlink("missing", base.join("broken")).unwrap();
+            std::fs::hard_link(base.join("a.txt"), base.join("twin")).unwrap();
+
+            let stats = _tree_stats(&base).expect("the tree exists");
+            assert_eq!(stats.files, 2, "regular files only: a.txt + b.txt (twin shares a.txt's inode; symlinks aren't files)");
+            assert_eq!(stats.inodes, 6, "base, a.txt, sub, b.txt, link, broken — twin dedups away");
+            assert!(stats.bytes > 0, "allocated blocks must register");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn usage_follows_its_argument_but_never_inner_symlinks() {
+            let base = std::env::temp_dir().join(format!("bashrs_usage_arg_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(base.join("real")).unwrap();
+            std::fs::write(base.join("real/file.txt"), "data").unwrap();
+            std::os::unix::fs::symlink(base.join("real"), base.join("door")).unwrap();
+            std::os::unix::fs::symlink("nowhere", base.join("dangling")).unwrap();
+
+            // The symlink argument is followed — its target's contents are the answer …
+            assert_eq!(_tree_stats(&base.join("door")).unwrap().files, 1);
+            // … while the same link *inside* a scanned tree stays an unfollowed entry, so the
+            // target's file is not double-counted through it.
+            assert_eq!(_tree_stats(&base).unwrap().files, 1);
+            // A broken symlink argument is the bare link it is; a missing path is an error.
+            let broken = _tree_stats(&base.join("dangling")).unwrap();
+            assert_eq!((broken.files, broken.inodes), (0, 1));
+            assert!(_tree_stats(&base.join("no_such_thing")).is_none());
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn usage_sizes_read_like_du() {
+            assert_eq!(_human_size(0), "0B");
+            assert_eq!(_human_size(512), "512B");
+            assert_eq!(_human_size(2048), "2.0K");
+            assert_eq!(_human_size(10 * 1024 * 1024), "10M");
+            assert_eq!(_human_size(3 * 1024 * 1024 * 1024 / 2), "1.5G");
+        }
 
         /// A realistic `ls -tarlushFN -l` data line: 7 metadata fields, then `name`.
         fn row(name: &str) -> String {

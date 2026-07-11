@@ -125,28 +125,41 @@ pub fn parse() -> Cli {
     Cli::from_arg_matches_mut(&mut matches).unwrap_or_else(|err| err.exit())
 }
 
-/// The command categories, each paired with the label used to group them in the
-/// generated `sourcefile.sh`. One row per category — never per command.
-fn category_commands() -> [(&'static str, clap::Command); 10] {
+/// A category's pure-shell command (`#[shell_body]`): `(name, body, comment)` — emitted as a
+/// plain function, since its work (e.g. `cd`) must run in the calling shell, not the binary.
+type ShellFn = (&'static str, &'static str, &'static str);
+
+/// The command categories: the label grouping them in the generated `sourcefile.sh`, the clap
+/// graph, and the category's pure-shell commands. One row per category — never per command.
+fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 10] {
     let categories = [
-        ("bashrs", BashrsCommand::augment_subcommands(clap::Command::new("bashrs"))),
-        ("filesystem", FilesystemCommand::augment_subcommands(clap::Command::new("filesystem"))),
-        ("git", GitCommand::augment_subcommands(clap::Command::new("git"))),
-        ("media", MediaCommand::augment_subcommands(clap::Command::new("media"))),
-        ("packages", PackagesCommand::augment_subcommands(clap::Command::new("packages"))),
-        ("project", ProjectCommand::augment_subcommands(clap::Command::new("project"))),
-        ("python", PythonCommand::augment_subcommands(clap::Command::new("python"))),
+        ("bashrs", BashrsCommand::augment_subcommands(clap::Command::new("bashrs")),
+            BashrsCommand::shell_functions().to_vec()),
+        ("filesystem", FilesystemCommand::augment_subcommands(clap::Command::new("filesystem")),
+            FilesystemCommand::shell_functions().to_vec()),
+        ("git", GitCommand::augment_subcommands(clap::Command::new("git")),
+            GitCommand::shell_functions().to_vec()),
+        ("media", MediaCommand::augment_subcommands(clap::Command::new("media")),
+            MediaCommand::shell_functions().to_vec()),
+        ("packages", PackagesCommand::augment_subcommands(clap::Command::new("packages")),
+            PackagesCommand::shell_functions().to_vec()),
+        ("project", ProjectCommand::augment_subcommands(clap::Command::new("project")),
+            ProjectCommand::shell_functions().to_vec()),
+        ("python", PythonCommand::augment_subcommands(clap::Command::new("python")),
+            PythonCommand::shell_functions().to_vec()),
         // One `lookup` group: `hg` (history search) plus the generated g-family.
         ("lookup", GgCommand::augment_subcommands(GrepCommand::augment_subcommands(
             LookupCommand::augment_subcommands(clap::Command::new("lookup")),
-        ))),
+        )), [GgCommand::shell_functions(), GrepCommand::shell_functions(),
+             LookupCommand::shell_functions()].concat()),
         // One `style` group spanning both style enums: hand-written + generated.
         ("style", StylizedEchoCommand::augment_subcommands(
             StyleCommand::augment_subcommands(clap::Command::new("style")),
-        )),
-        ("comfy_repos", ComfyReposCommand::augment_subcommands(clap::Command::new("comfy_repos"))),
+        ), [StylizedEchoCommand::shell_functions(), StyleCommand::shell_functions()].concat()),
+        ("comfy_repos", ComfyReposCommand::augment_subcommands(clap::Command::new("comfy_repos")),
+            ComfyReposCommand::shell_functions().to_vec()),
     ];
-    categories.map(|(label, cmd)| (label, hide_pinned(cmd)))
+    categories.map(|(label, cmd, shell_fns)| (label, hide_pinned(cmd), shell_fns))
 }
 
 /// Space-separated `-short --long` names of `command`'s arguments (matched by clap name or visible
@@ -154,7 +167,7 @@ fn category_commands() -> [(&'static str, clap::Command); 10] {
 /// — [`HIDDEN_PINNED`]) are omitted; an unknown name yields nothing, so the completer simply offers
 /// no flags. Backs the hidden `complete-flags` command the generated completer calls at TAB-time.
 fn complete_flags(name: &str) -> String {
-    for (_, category) in category_commands() {
+    for (_, category, _) in category_commands() {
         for sub in category.get_subcommands() {
             if sub.get_name() != name && !sub.get_visible_aliases().any(|alias| alias == name) {
                 continue;
@@ -229,7 +242,7 @@ fn wrappers() -> String {
 
     let mut body = String::new();
     let mut completion_names: Vec<String> = Vec::new(); // every wrapper + alias, for `complete -F`
-    for (label, category) in category_commands() {
+    for (label, category, shell_fns) in category_commands() {
         let mut lines: Vec<String> = Vec::new();
         for sub in category.get_subcommands() {
             if sub.is_hide_set() {
@@ -258,6 +271,19 @@ fn wrappers() -> String {
                 lines.push(format!("{shell_name}() {{ {prefix}{BIN} {real} \"$@\"{suffix}; }}{about}"));
                 completion_names.push(shell_name.to_string());
             }
+        }
+        // The category's pure-shell commands (`#[shell_body]`): inline bodies, no binary call —
+        // and no completion registration, which would replace bash's default (filename)
+        // completion with a flagless void. The `unalias` must sit on its own line: a live alias
+        // with the same name (e.g. the user's own rc still carrying `alias ..='cd ..'`) would be
+        // alias-expanded INTO the definition as bash parses it — a syntax error that aborts the
+        // whole source. `|| true` pins the usual no-such-alias failure to status 0, so a caller
+        // running under `set -e` (sourced files inherit it) isn't aborted either. Same gotcha,
+        // same cure as the bundled-tools `python3` function.
+        for (name, fn_body, comment) in shell_fns {
+            let about = if comment.is_empty() { String::new() } else { format!("  # {comment}") };
+            lines.push(format!("unalias {name} 2>/dev/null || true"));
+            lines.push(format!("{name}() {{ {fn_body}; }}{about}"));
         }
         if !lines.is_empty() {
             // Align each category's inline `# …` comments into a column with `table` (the
@@ -434,6 +460,10 @@ mod tests {
                 "`{name}` not registered for completion: {registration}"
             );
         }
+        assert!(
+            registration.split_whitespace().all(|word| word != ".."),
+            "shell-body commands take no flags — registering would kill default completion: {registration}"
+        );
         assert!(script.contains("\n# completion (bash only)\n"), "should be bash-guarded");
     }
 
@@ -524,6 +554,7 @@ mod tests {
     fn wrappers_cover_every_command_and_alias() {
         let script = wrappers();
         let has = |line: &str| assert!(script.contains(line), "missing wrapper line: {line}");
+        has("fs_usage() { \"$HOME/.bashrs/bashrs\" fs_usage \"$@\"; }");
         has("media_convert() { \"$HOME/.bashrs/bashrs\" media_convert \"$@\"; }");
         has("media_convert_quality() { \"$HOME/.bashrs/bashrs\" media_convert_quality \"$@\"; }");
         has("media_convert_compact() { \"$HOME/.bashrs/bashrs\" media_convert_compact \"$@\"; }");
@@ -571,6 +602,19 @@ mod tests {
         assert!(script.contains("\n# environment\n"), "environment section missing");
         assert!(script.contains("export GREP_COLORS='mt=7;31'"), "GREP_COLORS export missing");
         assert!(script.contains("export PS1=") && script.contains("(UTC)"), "PS1 export missing");
+    }
+
+    #[test]
+    fn shell_body_commands_emit_inline_functions_in_their_category() {
+        // `..` must run in the calling shell (a child can't `cd` its parent), so its wrapper
+        // carries the body itself — no binary call — grouped under its category like any command.
+        let script = wrappers();
+        assert!(script.contains("..() { cd .. \"$@\"; }"), "`..` shell function missing:\n{script}");
+        let filesystem = script.split("\n# ").find(|s| s.starts_with("filesystem")).expect("filesystem section");
+        assert!(filesystem.contains("..() {") && filesystem.contains("# Hop one directory up"),
+            "the shell function belongs to its category, doc comment included: {filesystem}");
+        assert!(!script.contains(&format!("..() {{ \"$HOME/.bashrs/bashrs\"")),
+            "a shell-body command must not call the binary");
     }
 
     #[test]
@@ -646,7 +690,7 @@ mod tests {
             .collect();
         let grouped: BTreeSet<String> = category_commands()
             .iter()
-            .flat_map(|(_, cmd)| {
+            .flat_map(|(_, cmd, _)| {
                 cmd.get_subcommands().map(|c| c.get_name().to_string()).collect::<Vec<_>>()
             })
             .collect();
