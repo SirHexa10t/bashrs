@@ -44,6 +44,10 @@ enum Acquire {
     /// Download a static archive (URL discovered per release, root folder stripped on unpack);
     /// re-fetched when the published URL changes, tracked by a `.source_url` marker.
     Archive(fn() -> Option<String>),
+    /// A single released binary — same URL-discovery and `.source_url` freshness contract as
+    /// [`Acquire::Archive`], but the download *is* the program (written to the tool's first
+    /// `bins` path, made executable).
+    Binary(fn() -> Option<String>),
     /// A `uv venv` at the tool's dir — a stable `bin/python3` over an interpreter uv installs
     /// into [`interpreters_dir`]; kept current via `uv python upgrade`.
     UvVenv { python: &'static str },
@@ -55,6 +59,12 @@ const TOOLS: &[Tool] = &[
         dir: "ffmpeg",
         bins: &[("ffmpeg", "bin/ffmpeg"), ("ffprobe", "bin/ffprobe")],
         acquire: Acquire::Archive(fetch::ffmpeg_url),
+        group: Group::Utility,
+    },
+    Tool {
+        dir: "yt-dlp",
+        bins: &[("yt-dlp", "bin/yt-dlp")],
+        acquire: Acquire::Binary(fetch::ytdlp_url),
         group: Group::Utility,
     },
     // uv's archive carries the binaries at its root (no bin/); it manages the python below —

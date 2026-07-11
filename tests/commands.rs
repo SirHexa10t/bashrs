@@ -76,6 +76,46 @@ fn fs_usage_count_prints_a_bare_number_and_fails_on_missing_paths() {
 }
 
 #[test]
+fn dl_page_links_finds_resolves_and_downloads_from_a_local_page() {
+    // Fully offline end-to-end: curl reads file:// pages and downloads file:// links, so the
+    // whole scan → resolve → fetch pipeline runs against a local fixture site.
+    let base = std::env::temp_dir().join(format!("bashrs_dl_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("site/assets")).unwrap();
+    std::fs::create_dir_all(base.join("out")).unwrap();
+    std::fs::write(base.join("site/assets/song.mp3"), "MP3DATA").unwrap();
+    std::fs::write(base.join("site/cover.png"), "PNGDATA").unwrap();
+    std::fs::write(
+        base.join("site/page.html"),
+        r#"<html><a href="assets/song.mp3">song</a><img src="cover.png"><a href="skip.txt">no</a></html>"#,
+    )
+    .unwrap();
+    let url = format!("file://{}/site/page.html", base.display());
+    let dl = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_bashrs"))
+            .args(args)
+            .current_dir(base.join("out"))
+            .output()
+            .expect("run bashrs")
+    };
+
+    let listed = dl(&["dl_page_links", &url, "mp3", ".PNG", "--list"]);
+    let lines = String::from_utf8_lossy(&listed.stdout).into_owned();
+    assert!(lines.contains("assets/song.mp3") && lines.contains("cover.png"), "{lines}");
+    assert!(!lines.contains("skip.txt"), "unrequested types must be ignored: {lines}");
+    assert!(std::fs::read_dir(base.join("out")).unwrap().next().is_none(), "--list downloads nothing");
+
+    let run = dl(&["dl_page_links", &url, "mp3", "png"]);
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    assert_eq!(std::fs::read_to_string(base.join("out/song.mp3")).unwrap(), "MP3DATA");
+    assert_eq!(std::fs::read_to_string(base.join("out/cover.png")).unwrap(), "PNGDATA");
+
+    let none = dl(&["dl_page_links", &url, "zip"]);
+    assert!(!none.status.success(), "no matches at all must exit non-zero");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn media_convert_refuses_to_convert_a_file_onto_itself() {
     // The guard fires on the resolved paths alone — before ffmpeg, before any filesystem access.
     let out = bashrs(&["media_convert", "clip.mp4", "mp4"], &[]);

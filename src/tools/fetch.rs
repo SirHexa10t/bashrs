@@ -40,6 +40,7 @@ pub fn sync() {
         let dir = root().join(tool.dir);
         match &tool.acquire {
             Acquire::Archive(url) => sync_archive(tool, *url, &dir),
+            Acquire::Binary(url) => sync_binary(tool, *url, &dir),
             Acquire::UvVenv { python } => sync_python_venv(python, &dir),
         }
     }
@@ -50,8 +51,10 @@ pub fn sync() {
     }
 }
 
-/// The archive mode: re-fetch when the latest published URL differs from the bundled one's marker.
-fn sync_archive(tool: &Tool, url: fn() -> Option<String>, dir: &Path) {
+/// The freshness check both release modes share: `None` when the bundle at `dir` was already
+/// built from the latest published URL (per its `.source_url` marker) or no URL could be
+/// determined (diagnostics emitted here) — else the URL to (re)build from.
+fn release_url_if_stale(tool: &Tool, url: fn() -> Option<String>, dir: &Path) -> Option<String> {
     let installed = dir.join(tool.bins[0].1).exists();
     let Some(url) = url() else {
         if installed {
@@ -59,18 +62,52 @@ fn sync_archive(tool: &Tool, url: fn() -> Option<String>, dir: &Path) {
         } else {
             eprintln!("tools: could not determine a {} build for this machine (offline, or unsupported architecture)", tool.dir);
         }
-        return;
+        return None;
     };
     let recorded = std::fs::read_to_string(dir.join(SOURCE_MARKER)).unwrap_or_default();
-    if installed && recorded.trim() == url {
-        return; // already on the latest published build
-    }
+    (!installed || recorded.trim() != url).then_some(url)
+}
+
+/// The archive mode: re-fetch when the latest published URL differs from the bundled one's marker.
+fn sync_archive(tool: &Tool, url: fn() -> Option<String>, dir: &Path) {
+    let Some(url) = release_url_if_stale(tool, url, dir) else { return };
     eprintln!("tools: fetching {} into {}", tool.dir, dir.display());
     match fetch(&url, dir) {
         Ok(()) => {
             let _ = std::fs::write(dir.join(SOURCE_MARKER), &url);
         }
         Err(msg) => eprintln!("tools: could not bundle {}: {msg}", tool.dir),
+    }
+}
+
+/// The single-binary mode: same freshness contract as [`sync_archive`], but the download *is*
+/// the program — written to the tool's first `bins` path and made executable.
+fn sync_binary(tool: &Tool, url: fn() -> Option<String>, dir: &Path) {
+    let Some(url) = release_url_if_stale(tool, url, dir) else { return };
+    eprintln!("tools: fetching {} into {}", tool.dir, dir.display());
+    match download_binary(&url, &dir.join(tool.bins[0].1)) {
+        Ok(()) => {
+            let _ = std::fs::write(dir.join(SOURCE_MARKER), &url);
+        }
+        Err(msg) => eprintln!("tools: could not bundle {}: {msg}", tool.dir),
+    }
+}
+
+/// Download `url` to `dest` (parents created) and mark it executable.
+fn download_binary(url: &str, dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let downloaded =
+        Command::new("curl").args(["-fSL", "--retry", "2", "-o"]).arg(dest).arg(url).status();
+    match downloaded {
+        Ok(status) if status.success() => {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))
+                .map_err(|err| err.to_string())
+        }
+        Ok(_) => Err("curl could not download it".into()),
+        Err(err) => Err(format!("could not run curl: {err}")),
     }
 }
 
@@ -233,10 +270,46 @@ fn find_uv_asset(json: &str, arch: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// yt-dlp's standalone linux binary (a self-contained PyInstaller build, like the ffmpeg bundle
+/// is self-contained), discovered from the latest release by exact asset name.
+pub(super) fn ytdlp_url() -> Option<String> {
+    let asset = match std::env::consts::ARCH {
+        "x86_64" => "yt-dlp_linux",
+        "aarch64" => "yt-dlp_linux_aarch64",
+        _ => return None,
+    };
+    find_ytdlp_asset(&latest_release("yt-dlp/yt-dlp")?, asset)
+}
+
+/// The release asset named exactly `asset` — a `/`-anchored suffix match on the download URL,
+/// which sibling assets (`yt-dlp` / `yt-dlp_linux` / `yt-dlp_linux_aarch64`) can't satisfy for
+/// one another.
+fn find_ytdlp_asset(json: &str, asset: &str) -> Option<String> {
+    let suffix = format!("/{asset}");
+    json.split('"')
+        .find(|token| token.starts_with("https://") && token.ends_with(&suffix))
+        .map(str::to_owned)
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ytdlp_asset_matches_its_exact_name_never_a_sibling_prefix() {
+        let json = r#"{"assets":[
+            {"browser_download_url":"https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.01/yt-dlp"},
+            {"browser_download_url":"https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.01/yt-dlp_linux_aarch64"},
+            {"browser_download_url":"https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.01/yt-dlp_linux"}]}"#;
+        assert_eq!(
+            find_ytdlp_asset(json, "yt-dlp_linux").unwrap(),
+            "https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.01/yt-dlp_linux",
+            "must not stop at the bare `yt-dlp` or grab the aarch64 sibling"
+        );
+        assert!(find_ytdlp_asset(json, "yt-dlp_linux_aarch64").unwrap().ends_with("_aarch64"));
+        assert!(find_ytdlp_asset(json, "yt-dlp_windows").is_none());
+    }
 
     #[test]
     fn venv_shims_exec_the_real_in_venv_path() {

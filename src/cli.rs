@@ -8,6 +8,7 @@ use crate::categories::autogen_lookup::{GgCommand, GrepCommand};
 use crate::categories::autogen_styles::StylizedEchoCommand;
 use crate::categories::bashrs::BashrsCommand;
 use crate::categories::comfy_repos::ComfyReposCommand;
+use crate::categories::download::DownloadCommand;
 use crate::categories::filesystem::FilesystemCommand;
 use crate::categories::git::GitCommand;
 use crate::categories::lookup::LookupCommand;
@@ -38,6 +39,8 @@ pub enum Command {
     Filesystem(FilesystemCommand),
     #[command(flatten)]
     Git(GitCommand),
+    #[command(flatten)]
+    Download(DownloadCommand),
     #[command(flatten)]
     Media(MediaCommand),
     #[command(flatten)]
@@ -77,6 +80,7 @@ impl Command {
             Command::Bashrs(cmd) => cmd.run(),
             Command::Filesystem(cmd) => cmd.run(),
             Command::Git(cmd) => cmd.run(),
+            Command::Download(cmd) => cmd.run(),
             Command::Media(cmd) => cmd.run(),
             Command::ComfyRepos(cmd) => cmd.run(),
             Command::Packages(cmd) => cmd.run(),
@@ -131,7 +135,7 @@ type ShellFn = (&'static str, &'static str, &'static str);
 
 /// The command categories: the label grouping them in the generated `sourcefile.sh`, the clap
 /// graph, and the category's pure-shell commands. One row per category — never per command.
-fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 10] {
+fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 11] {
     let categories = [
         ("bashrs", BashrsCommand::augment_subcommands(clap::Command::new("bashrs")),
             BashrsCommand::shell_functions().to_vec()),
@@ -139,6 +143,8 @@ fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 10] {
             FilesystemCommand::shell_functions().to_vec()),
         ("git", GitCommand::augment_subcommands(clap::Command::new("git")),
             GitCommand::shell_functions().to_vec()),
+        ("download", DownloadCommand::augment_subcommands(clap::Command::new("download")),
+            DownloadCommand::shell_functions().to_vec()),
         ("media", MediaCommand::augment_subcommands(clap::Command::new("media")),
             MediaCommand::shell_functions().to_vec()),
         ("packages", PackagesCommand::augment_subcommands(clap::Command::new("packages")),
@@ -566,6 +572,7 @@ mod tests {
         let script = wrappers();
         let has = |line: &str| assert!(script.contains(line), "missing wrapper line: {line}");
         has("fs_usage() { \"$HOME/.bashrs/bashrs\" fs_usage \"$@\"; }");
+        has("dl_page_links() { \"$HOME/.bashrs/bashrs\" dl_page_links \"$@\"; }");
         has("media_convert() { \"$HOME/.bashrs/bashrs\" media_convert \"$@\"; }");
         has("media_convert_quality() { \"$HOME/.bashrs/bashrs\" media_convert_quality \"$@\"; }");
         has("media_convert_compact() { \"$HOME/.bashrs/bashrs\" media_convert_compact \"$@\"; }");

@@ -7,6 +7,7 @@ pub mod autogen_lookup;
 pub mod autogen_styles;
 pub mod bashrs;
 pub mod comfy_repos;
+pub mod download;
 pub mod filesystem;
 pub mod git;
 pub mod lookup;
