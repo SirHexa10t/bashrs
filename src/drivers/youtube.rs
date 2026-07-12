@@ -56,8 +56,11 @@ pub(crate) fn classify(url: &str, single: bool) -> Link {
 pub(crate) struct Env<'a> {
     /// The bundled ffmpeg's directory, when it exists — powers the subtitle embedding.
     pub(crate) ffmpeg_dir: Option<&'a Path>,
-    /// The `--cookies` file, when the user supplied one.
+    /// The `--cookies` file, when the user supplied one (explicit; wins over the import).
     pub(crate) cookies: Option<&'a Path>,
+    /// A `--cookies-from-browser` spec from a prior `--cookie-import` (`<browser>:<dir>`), used
+    /// on every run unless an explicit `--cookies` file overrides it.
+    pub(crate) cookies_from_browser: Option<&'a str>,
     /// Audio-only extraction (`-x`).
     pub(crate) audio: bool,
     /// Height cap, as a format-sort preference (`-S res:N`).
@@ -92,27 +95,50 @@ fn js_runtime_flag(deno: &Path) -> [OsString; 2] {
     ["--js-runtimes".into(), runtime]
 }
 
+/// The cookie flags for an invocation: an explicit `--cookies` file wins; otherwise a
+/// `--cookies-from-browser` spec from a prior `--cookie-import`; otherwise none. Shared by the
+/// download argv ([`common`]) and the metadata invocations ([`seeded`]) so gated content
+/// (age-restricted, members-only) is readable at *every* phase, not just the final download.
+fn cookie_args(env: Env) -> Vec<OsString> {
+    if let Some(file) = env.cookies {
+        vec!["--cookies".into(), file.as_os_str().to_owned()]
+    } else if let Some(spec) = env.cookies_from_browser {
+        vec!["--cookies-from-browser".into(), spec.into()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Starter argv for the metadata-side invocations (probes, scans): even those run the YouTube
-/// extractor, which warns — and may miss formats — without a JS runtime, and warns again when
-/// it can't find an ffmpeg. Hand it both bundles when they exist.
-fn seeded() -> Vec<OsString> {
+/// extractor, which warns — and may miss formats — without a JS runtime, warns again without an
+/// ffmpeg, and can't see gated content without cookies. Hand it the bundles and cookies.
+fn seeded(env: Env) -> Vec<OsString> {
     let mut argv =
         bundled_deno().map(|deno| js_runtime_flag(&deno).to_vec()).unwrap_or_default();
     if let Some(dir) = bundled_ffmpeg_dir() {
         argv.push("--ffmpeg-location".into());
         argv.push(dir.into_os_string());
     }
+    argv.extend(cookie_args(env));
     argv
 }
 
 /// A lone video: probe its subtitle situation, then download with the exact list.
 pub(crate) fn download_video(url: &str, into: &Path, env: Env) -> i32 {
-    let (id, picks) = video_picks(url);
+    let (id, picks) = video_picks(url, env);
     let keys: Vec<String> = picks.iter().map(|pick| pick.key.clone()).collect();
-    let code = run(video_argv(url, into, env, &keys));
+    let mut code = run(video_argv(url, into, env, &keys));
+    if code != 0 {
+        // Same diagnosis/rescue/ledger treatment the collection modes give their entries.
+        let label = id.clone().unwrap_or_else(|| url.to_string());
+        match diagnose_failure(video_argv(url, into, env, &keys), &label) {
+            None => code = 0, // the retry or a spoofed region came through
+            Some(line) => write_ledger(into, &[line]),
+        }
+    }
     if code == 0 {
         if let Some(id) = id {
-            mark_auto_titles(into, &id, &picks, env);
+            finish_media(into, &id, &picks, env);
         }
     }
     code
@@ -123,7 +149,7 @@ pub(crate) fn download_video(url: &str, into: &Path, env: Env) -> i32 {
 /// the download archive live inside the playlist's own folder, and every playable, not-yet-
 /// archived entry is downloaded individually with its own subtitle list.
 pub(crate) fn download_playlist(url: &str, id: &str, into: &Path, env: Env) -> i32 {
-    let Some(scan) = scan_playlist(url, "%(title)S[%(id)S]") else {
+    let Some(scan) = scan_playlist(url, "%(title)S[%(id)S]", env) else {
         eprintln!(
             "dl_yt: could not scan the playlist — downloading in one pass, EN-only subtitles, \
              no unplayable report"
@@ -187,15 +213,9 @@ fn download_pending(
     env: Env,
     argv: impl Fn(&str, &Path, &Path, Env, &[String], &str) -> Vec<OsString>,
 ) -> i32 {
+    println!("probing subtitles of {} entries…", pending.len());
     let indexes: Vec<String> = pending.iter().map(|entry| entry.index.clone()).collect();
-    let probed = if env.audio {
-        // Audio-only runs request no subtitles, so the subtitle probe would be pure wasted
-        // requests — every entry gets an empty plan and lands in one download group.
-        Vec::new()
-    } else {
-        println!("probing subtitles of {} entries…", pending.len());
-        batch_probe(url, &indexes)
-    };
+    let probed = batch_probe(url, &indexes, env);
     let planned: Vec<Planned> = pending
         .iter()
         .map(|entry| {
@@ -210,7 +230,7 @@ fn download_pending(
                 .unwrap_or_else(|| Planned {
                     index: entry.index.clone(),
                     id: entry.id.clone(),
-                    picks: if env.audio { Vec::new() } else { default_picks() },
+                    picks: default_picks(),
                 })
         })
         .collect();
@@ -231,9 +251,30 @@ fn download_pending(
             worst = code;
         }
         for plan in &group {
-            mark_auto_titles(home, &plan.id, &plan.picks, env);
+            finish_media(home, &plan.id, &plan.picks, env);
         }
     }
+    // Post-mortem: whatever is still unarchived failed inside a group, where `--ignore-errors`
+    // kept the rest flowing but discarded the why. Each gets a captured re-run to diagnose,
+    // geo-blocks get the region rescue, and the stubborn ones go to the ledger — unarchived on
+    // purpose, so future runs keep retrying them.
+    let survivors = archived_ids(&home.join(ARCHIVE_NAME));
+    let mut ledger = Vec::new();
+    for plan in planned.iter().filter(|plan| !survivors.contains(&plan.id)) {
+        let title = pending
+            .iter()
+            .find(|entry| entry.index == plan.index)
+            .map(|entry| entry.title.as_str())
+            .unwrap_or(&plan.id);
+        let label = format!("#{} {title}", plan.index);
+        println!("--- diagnosing {label} ---");
+        let keys: Vec<String> = plan.picks.iter().map(|pick| pick.key.clone()).collect();
+        if let Some(line) = diagnose_failure(argv(url, into, home, env, &keys, &plan.index), &label)
+        {
+            ledger.push(line);
+        }
+    }
+    write_ledger(home, &ledger);
     worst
 }
 
@@ -300,6 +341,111 @@ fn mark_auto_titles(root: &Path, id: &str, picks: &[Pick], env: Env) {
     }
 }
 
+/// Fold the kept `.vtt` sidecars into an audio file's metadata: each becomes a tag named
+/// [`subtitle_tag_name`]-style (`subtitles_en`, `subtitles_iw_autogenerated`, …) holding the
+/// full VTT text, and the sidecar is deleted. Audio containers can't carry subtitle streams,
+/// but their tags hold text fine — the words travel with the sound. Tags are written IN PLACE
+/// by mutagen on the bundled python (a remux would drag the embedded cover art through
+/// container rules — ogg refuses picture streams); missing sidecars (a 429'd track) are simply
+/// skipped: picks are must-try.
+fn embed_subtitle_tags(root: &Path, id: &str, picks: &[Pick]) {
+    if picks.is_empty() {
+        return;
+    }
+    let Some(file) = find_by_id(root, id) else { return };
+    let pairs = subtitle_sidecars(&file, picks);
+    if pairs.is_empty() {
+        return;
+    }
+    let mut argv: Vec<OsString> = vec!["-c".into(), TAGGER.into(), file.as_os_str().to_owned()];
+    for (name, sidecar) in &pairs {
+        argv.push(name.into());
+        argv.push(sidecar.as_os_str().to_owned());
+    }
+    let outcome = capture_output(crate::tools::resolve("python3"), argv);
+    let tagged = matches!(outcome, Some((true, _, _)));
+    if tagged {
+        let names: Vec<&str> = pairs.iter().map(|(name, _)| name.as_str()).collect();
+        for (_, sidecar) in &pairs {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        println!("embedded subtitle tags: {}", names.join(", "));
+    } else {
+        let why = outcome.map(|(_, _, err)| err).unwrap_or_default();
+        let why = why.lines().last().unwrap_or("unknown").trim();
+        eprintln!(
+            "dl_yt: could not embed subtitle tags into {} ({why}) — sidecar .vtt files kept",
+            file.display()
+        );
+    }
+}
+
+/// The per-file finishing pass, by mode: video files get their auto-subtitle track titles
+/// stamped; audio files get the kept `.vtt` sidecars folded into metadata tags.
+fn finish_media(root: &Path, id: &str, picks: &[Pick], env: Env) {
+    if env.audio {
+        embed_subtitle_tags(root, id, picks);
+    } else {
+        mark_auto_titles(root, id, picks, env);
+    }
+}
+
+/// The in-place tag writer, run on the bundled python (a remux would drag the embedded cover
+/// art through container rules — ogg refuses picture streams). Each tag family has its own
+/// spelling for arbitrary keys: MP4 wants freeform atoms, ID3 wants TXXX frames, and the
+/// Vorbis-comment formats (opus/ogg/flac) take plain keys.
+///
+/// Flush-left on purpose: this is embedded Python, and a raw literal preserves its indentation
+/// verbatim — a `\`-continued Rust string strips the leading whitespace and hands python an
+/// IndentationError (a regression test pins this).
+const TAGGER: &str = r#"import sys
+from mutagen import File
+from mutagen.id3 import ID3, TXXX
+from mutagen.mp4 import MP4
+audio = File(sys.argv[1])
+if audio is None:
+    sys.exit("unrecognized audio container")
+if audio.tags is None:
+    audio.add_tags()
+args = sys.argv[2:]
+for name, path in zip(args[0::2], args[1::2]):
+    text = open(path, encoding="utf-8").read()
+    if isinstance(audio, MP4):
+        audio["----:bashrs:" + name] = text.encode()
+    elif isinstance(audio.tags, ID3):
+        audio.tags.add(TXXX(encoding=3, desc=name, text=[text]))
+    else:
+        audio[name] = text
+audio.save()
+"#;
+
+/// The sidecar `.vtt` files that actually arrived for `file`'s picks, paired with their tag
+/// names — yt-dlp names each `<output-stem>.<lang-key>.vtt`. A missing sidecar (a refused
+/// track) simply isn't listed: picks are must-try.
+fn subtitle_sidecars(file: &Path, picks: &[Pick]) -> Vec<(String, PathBuf)> {
+    let stem = file.with_extension("");
+    picks
+        .iter()
+        .filter_map(|pick| {
+            let sidecar = PathBuf::from(format!("{}.{}.vtt", stem.display(), pick.key));
+            sidecar.is_file().then(|| (subtitle_tag_name(pick), sidecar))
+        })
+        .collect()
+}
+
+/// The metadata tag carrying one subtitle track: `subtitles_<key>` with the key lowercased and
+/// `_`-joined, the redundant `_orig` marker folded into the `_autogenerated` suffix that every
+/// auto track gets.
+fn subtitle_tag_name(pick: &Pick) -> String {
+    let key = pick.key.to_lowercase().replace('-', "_");
+    let key = key.strip_suffix("_orig").unwrap_or(&key);
+    if pick.auto {
+        format!("subtitles_{key}_autogenerated")
+    } else {
+        format!("subtitles_{key}")
+    }
+}
+
 /// An auto track's honest title: YouTube's name with the actively-misleading " (Original)"
 /// dropped and the machine origin stated.
 fn stamped_title(name: &str) -> String {
@@ -318,7 +464,10 @@ fn find_by_id(root: &Path, id: &str) -> Option<PathBuf> {
                 stack.push(path);
             } else if path.file_name().is_some_and(|name| {
                 let name = name.to_string_lossy();
-                name.contains(&marker) && name.ends_with(".mkv")
+                name.contains(&marker)
+                    && [".mkv", ".opus", ".m4a", ".mp3", ".ogg", ".flac", ".wav", ".webm"]
+                        .iter()
+                        .any(|ext| name.ends_with(ext))
             }) {
                 return Some(path);
             }
@@ -338,7 +487,7 @@ pub(crate) fn download_channel(root: &str, into: &Path, env: Env) -> i32 {
     for tab in CHANNEL_TABS {
         let tab_url = format!("{root}/{tab}");
         println!("=== {tab_url} ===");
-        let scan = match scan_tab(&tab_url, "%(uploader)S[%(channel_id)S]") {
+        let scan = match scan_tab(&tab_url, "%(uploader)S[%(channel_id)S]", env) {
             TabScan::Found(scan) => scan,
             TabScan::Missing => {
                 println!("the channel has no `{tab}` tab");
@@ -492,8 +641,8 @@ fn default_picks() -> Vec<Pick> {
 
 /// One video's subtitle plan plus its id (the post-pass finds the file by it). An unprobeable
 /// video falls back to the EN default — resilience over completeness.
-fn video_picks(url: &str) -> (Option<String>, Vec<Pick>) {
-    let mut argv = seeded();
+fn video_picks(url: &str, env: Env) -> (Option<String>, Vec<Pick>) {
+    let mut argv = seeded(env);
     argv.extend(
         [
             "--print", "%(id)s",
@@ -537,8 +686,8 @@ struct Planned {
 /// Probe the subtitle situation of many entries in ONE yt-dlp invocation (process startup and
 /// player work are the expensive parts — per-entry probes multiply them). Entries that fail to
 /// extract are simply absent; callers fall back to [`default_picks`] for those.
-fn batch_probe(url: &str, indexes: &[String]) -> Vec<Planned> {
-    let mut argv = seeded();
+fn batch_probe(url: &str, indexes: &[String], env: Env) -> Vec<Planned> {
+    let mut argv = seeded(env);
     argv.push("--ignore-errors".into());
     if indexes.len() > PROBE_PACING_THRESHOLD {
         // A big probe is a burst of metadata requests with no downloads between them to slow
@@ -676,19 +825,21 @@ fn common(archive_dir: &Path, env: Env, langs: &[String]) -> Vec<OsString> {
         .into_iter()
         .map(OsString::from)
         .collect();
-    if !env.audio && !langs.is_empty() {
-        // Subtitles ride video files: they can't embed into an extracted audio track, and
-        // requesting them there would only strand `.vtt` sidecars beside the audio.
+    if !langs.is_empty() {
         argv.extend(["--write-subs", "--write-auto-subs", "--sub-langs"].map(OsString::from));
         argv.push(langs.join(",").into());
-        argv.extend(["--embed-subs", "--compat-options", "no-keep-subs"].map(OsString::from));
+        if !env.audio {
+            // Audio mode skips these: subtitles can't embed into an extracted audio track, so
+            // the `.vtt` sidecars are deliberately kept for [`embed_subtitle_tags`] to fold
+            // into the file's metadata afterwards.
+            argv.extend(["--embed-subs", "--compat-options", "no-keep-subs"].map(OsString::from));
+        }
         // YouTube rate-limits its subtitle endpoint (429s, particularly on auto-translations);
         // a short pause per subtitle fetch stays under its radar and only taxes subbed videos.
         argv.extend(["--sleep-subtitles", "2"].map(OsString::from));
     }
     argv.extend(
         [
-            "--sleep-subtitles", "2",
             "--embed-metadata", "--embed-chapters",
             "--embed-thumbnail", "--convert-thumbnails", "jpg",
             "--merge-output-format", "mkv",
@@ -706,10 +857,7 @@ fn common(archive_dir: &Path, env: Env, langs: &[String]) -> Vec<OsString> {
         // Same story for the JS runtime: yt-dlp only searches PATH for deno.
         argv.extend(js_runtime_flag(deno));
     }
-    if let Some(file) = env.cookies {
-        argv.push("--cookies".into());
-        argv.push(file.as_os_str().to_owned());
-    }
+    argv.extend(cookie_args(env));
     if env.audio {
         argv.push("-x".into());
     }
@@ -839,8 +987,8 @@ enum TabScan {
 /// Scan a channel tab with stderr captured, so "this channel has no such tab" — yt-dlp's error,
 /// but an everyday reality — turns into a calm message instead of an ERROR dump; anything else
 /// on stderr is passed through as the real failure it is.
-fn scan_tab(url: &str, dir_template: &str) -> TabScan {
-    let mut args = seeded();
+fn scan_tab(url: &str, dir_template: &str, env: Env) -> TabScan {
+    let mut args = seeded(env);
     args.extend([
         OsString::from("--flat-playlist"),
         "--print".into(), SCAN_FORMAT.into(),
@@ -873,8 +1021,8 @@ fn tab_absence(stderr: &str) -> bool {
 /// One flat invocation lists the entries AND prints the collection's folder name (playlist
 /// scope, sanitized by the `S` conversion in `dir_template` — a channel tab's flat entries
 /// often lack `uploader`/`channel_id`, the `NA[NA]` trap, while the tab's own fields don't).
-fn scan_playlist(url: &str, dir_template: &str) -> Option<PlaylistScan> {
-    let mut argv = seeded();
+fn scan_playlist(url: &str, dir_template: &str, env: Env) -> Option<PlaylistScan> {
+    let mut argv = seeded(env);
     argv.extend([
         OsString::from("--flat-playlist"),
         "--print".into(), SCAN_FORMAT.into(),
@@ -931,6 +1079,114 @@ fn archived_ids(path: &Path) -> HashSet<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Regions tried in order when a download proves geo-blocked — `--xff` header spoofing
+/// defeats softly-enforced blocks.
+const XFF_REGIONS: &[&str] =
+    &["US", "GB", "DE", "FR", "NL", "SE", "CA", "AU", "JP", "KR", "BR", "IN"];
+
+/// The failure ledger, written beside the collection's archive: what stayed undownloaded and
+/// why. Entries here are also deliberately NOT archived, so every future run retries them —
+/// members-only videos get released publicly later, and blocks lift.
+const FAILED_LEDGER: &str = ".yt_failed_download.txt";
+
+// TODO: scrape historic snapshots (e.g. the WaybackMachine's copies of channel tabs) to find
+// videos that were de-listed or disappeared entirely — candidates for the unplayable report and
+// the failure ledger, which today only see what YouTube still admits exists.
+
+/// What a failed download turned out to be, judged by yt-dlp's stderr.
+#[derive(Debug, PartialEq)]
+enum Failure {
+    Geo,
+    Members,
+    AgeRestricted,
+    Other,
+}
+
+fn classify_failure(stderr: &str) -> Failure {
+    if stderr.contains("in your country") || stderr.contains("geo restriction") {
+        Failure::Geo
+    } else if stderr.contains("members-only")
+        || stderr.contains("channel's members")
+        || stderr.contains("Join this channel")
+    {
+        Failure::Members
+    } else if stderr.contains("confirm your age") || stderr.contains("age-restricted") {
+        Failure::AgeRestricted
+    } else {
+        Failure::Other
+    }
+}
+
+fn capture_ytdlp(argv: Vec<OsString>) -> Option<(bool, String, String)> {
+    let (program, args) = ytdlp_invocation(argv);
+    capture_output(program, args)
+}
+
+/// Re-run a failed download with output captured to learn WHY (group runs stream live and keep
+/// no stderr), rescue geo-blocks by walking [`XFF_REGIONS`], and return the ledger line for
+/// whatever stays dead (`None` when the plain retry or a spoofed region succeeded).
+fn diagnose_failure(base: Vec<OsString>, label: &str) -> Option<String> {
+    let Some((ok, _, stderr)) = capture_ytdlp(base.clone()) else {
+        return Some(format!("{label} — failed (could not even re-run yt-dlp)"));
+    };
+    if ok {
+        println!("{label}: succeeded on retry");
+        return None;
+    }
+    match classify_failure(&stderr) {
+        Failure::Geo => {
+            for region in XFF_REGIONS {
+                println!("{label}: geo-blocked — trying region {region}…");
+                let mut spoofed = base.clone();
+                spoofed.push("--xff".into());
+                spoofed.push((*region).into());
+                if matches!(capture_ytdlp(spoofed), Some((true, _, _))) {
+                    println!("{label}: region {region} worked");
+                    return None;
+                }
+            }
+            Some(format!("{label} — geo-blocked (tried {})", XFF_REGIONS.join(",")))
+        }
+        Failure::Members => {
+            Some(format!("{label} — members-only (channels often release these publicly later)"))
+        }
+        Failure::AgeRestricted => {
+            Some(format!("{label} — age-restricted (retry with --cookies / --cookie-chooser)"))
+        }
+        Failure::Other => {
+            let detail = stderr
+                .lines()
+                .find(|line| line.contains("ERROR"))
+                .unwrap_or("unknown error")
+                .trim();
+            Some(format!("{label} — failed: {detail}"))
+        }
+    }
+}
+
+/// Append this run's failures to the ledger and tell the user where it lives.
+fn write_ledger(dir: &Path, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let path = dir.join(FAILED_LEDGER);
+    let mut block = format!("── {} ──\n", preferences::datehour_stamp());
+    for line in lines {
+        block += line;
+        block.push('\n');
+    }
+    use std::io::Write;
+    let written = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(block.as_bytes()));
+    match written {
+        Ok(()) => println!("{} download(s) failed — details in {}", lines.len(), path.display()),
+        Err(err) => eprintln!("dl_yt: could not write {}: {err}", path.display()),
+    }
 }
 
 /// The titles YouTube substitutes once an entry can't be played by anyone anymore.
@@ -1145,11 +1401,51 @@ mod tests {
         // With no bundled ffmpeg and no cookies, neither flag appears — nor the knobs. And a
         // video with no subtitles anywhere requests none.
         let bare = common(Path::new("/dl"), Env::default(), &[]);
-        for absent in
-            ["--ffmpeg-location", "--cookies", "--js-runtimes", "-x", "-S", "--write-subs", "--sub-langs"]
-        {
+        for absent in [
+            "--ffmpeg-location", "--cookies", "--cookies-from-browser", "--js-runtimes", "-x", "-S",
+            "--write-subs", "--sub-langs", "--sleep-subtitles",
+        ] {
             assert!(!bare.iter().any(|arg| arg == absent), "{absent} leaked in");
         }
+    }
+
+    #[test]
+    fn the_metadata_seed_carries_cookies_so_gated_content_is_readable_while_probing() {
+        // Probes and scans authenticate too — an age-restricted video's subtitle probe or a
+        // members-only tab's scan would otherwise run signed-out.
+        let seed = seeded(Env { cookies_from_browser: Some("firefox:/store"), ..Default::default() });
+        let text: Vec<String> = seed.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let at = text.iter().position(|a| a == "--cookies-from-browser").expect("cookies in seed");
+        assert_eq!(text[at + 1], "firefox:/store");
+        // Nothing configured → a bare seed (bundles absent in the test env too).
+        assert!(seeded(Env::default()).iter().all(|a| a != "--cookies" && a != "--cookies-from-browser"));
+    }
+
+    #[test]
+    fn imported_browser_cookies_are_used_but_an_explicit_file_wins() {
+        let pair = |argv: &[OsString], flag: &str| {
+            argv.iter().position(|a| a == flag).map(|i| argv[i + 1].to_string_lossy().into_owned())
+        };
+        // A prior --cookie-import with no explicit file: the browser spec is passed.
+        let imported = common(
+            Path::new("/dl"),
+            Env { cookies_from_browser: Some("firefox:/store"), ..Default::default() },
+            &[],
+        );
+        assert_eq!(pair(&imported, "--cookies-from-browser").as_deref(), Some("firefox:/store"));
+        assert!(!imported.iter().any(|a| a == "--cookies"));
+        // An explicit --cookies file overrides the import — never both.
+        let explicit = common(
+            Path::new("/dl"),
+            Env {
+                cookies: Some(Path::new("/c.txt")),
+                cookies_from_browser: Some("firefox:/store"),
+                ..Default::default()
+            },
+            &[],
+        );
+        assert_eq!(pair(&explicit, "--cookies").as_deref(), Some("/c.txt"));
+        assert!(!explicit.iter().any(|a| a == "--cookies-from-browser"), "explicit file must win alone");
     }
 
     #[test]
@@ -1307,6 +1603,57 @@ mod tests {
     fn a_missing_tab_is_recognized_by_ytdlps_phrasing() {
         assert!(tab_absence("ERROR: [youtube:tab] @x: This channel does not have a streams tab"));
         assert!(!tab_absence("ERROR: [youtube:tab] @x: Unable to download webpage"));
+    }
+
+    #[test]
+    fn failures_classify_by_ytdlps_phrasing() {
+        assert_eq!(
+            classify_failure("ERROR: [youtube] x: The uploader has not made this video available in your country"),
+            Failure::Geo
+        );
+        assert_eq!(classify_failure("ERROR: Join this channel to get access to members-only content"), Failure::Members);
+        assert_eq!(classify_failure("ERROR: Sign in to confirm your age"), Failure::AgeRestricted);
+        assert_eq!(classify_failure("ERROR: HTTP Error 403: Forbidden"), Failure::Other);
+        assert_eq!(XFF_REGIONS.len(), 12, "a dozen regions, as specified");
+    }
+
+    #[test]
+    fn sidecars_pair_by_lang_key_and_skip_refused_tracks() {
+        let dir = std::env::temp_dir().join(format!("bashrs_sidecar_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("20260101__title__abcdefghijk.opus");
+        std::fs::write(&file, "").unwrap();
+        std::fs::write(dir.join("20260101__title__abcdefghijk.iw-orig.vtt"), "WEBVTT").unwrap();
+        let picks = [
+            Pick { key: "iw-orig".into(), name: String::new(), auto: true },
+            Pick { key: "en".into(), name: String::new(), auto: true }, // 429'd: never arrived
+        ];
+        let pairs = subtitle_sidecars(&file, &picks);
+        assert_eq!(pairs.len(), 1, "missing sidecars are skipped, not errors");
+        assert_eq!(pairs[0].0, "subtitles_iw_autogenerated");
+        assert!(pairs[0].1.ends_with("20260101__title__abcdefghijk.iw-orig.vtt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_embedded_tagger_stays_valid_python() {
+        // Regression: a `\`-continued Rust string once stripped the `for`-body indentation,
+        // handing python an IndentationError at runtime. The raw literal must keep it.
+        for indented in ["\n    text =", "\n    if isinstance", "\n        audio.tags.add"] {
+            assert!(TAGGER.contains(indented), "python body must stay indented: {indented:?}");
+        }
+        assert!(TAGGER.contains("audio is None"), "unrecognized containers exit cleanly");
+        assert!(TAGGER.contains("TXXX"), "ID3 (mp3) needs frame-based tags");
+    }
+
+    #[test]
+    fn subtitle_tags_name_the_language_and_the_machine_origin() {
+        let pick = |key: &str, auto: bool| Pick { key: key.into(), name: String::new(), auto };
+        assert_eq!(subtitle_tag_name(&pick("en", false)), "subtitles_en");
+        assert_eq!(subtitle_tag_name(&pick("en-US", false)), "subtitles_en_us");
+        assert_eq!(subtitle_tag_name(&pick("iw-orig", true)), "subtitles_iw_autogenerated");
+        assert_eq!(subtitle_tag_name(&pick("en-he", true)), "subtitles_en_he_autogenerated");
     }
 
     #[test]

@@ -4,19 +4,20 @@
 mod commands {
     use crate::support::args::NoArgs;
     use crate::support::exec::{capture_stdout, on_path, run_reporting, succeeds_quietly};
+    use crate::support::package_management as pm;
     use crate::support::superuser::{self, CMD};
 
     /// Update and upgrade every package manager present on the system
     #[prefixed]
     #[unprefixed]
     pub fn upup(_args: NoArgs) {
-        _upgrade(MANAGERS);
+        _upgrade(_managers_active());
         superuser::revoke(); // drop the elevation the package steps just earned
     }
 
     /// Update the development toolchains (rustup, uv, ...) that are installed
     pub fn update_toolchains(_args: NoArgs) {
-        _upgrade(TOOLCHAINS); // toolchains self-update as the user; none elevate, so nothing to revoke
+        _upgrade(_toolchains_active()); // toolchains self-update as the user; none elevate, so nothing to revoke
     }
 
     /// Update everything: package managers, then dev toolchains
@@ -28,7 +29,7 @@ mod commands {
 
     /// List installed packages, grouped under their package manager
     pub fn print(_args: NoArgs) {
-        for mgr in _active(MANAGERS) {
+        for mgr in _managers_active() {
             if let Some(list) = mgr.list {
                 println!("== {} ==", mgr.probe);
                 _print_listing(list);
@@ -94,10 +95,10 @@ mod commands {
         Manager { probe: "cpanm", steps: &[&["cpanm", "--self-upgrade"]], ..DEFAULTS },
     ];
 
-    /// Detect, then run each active tool's `steps` under a header. Shared by `upup`
-    /// (package managers) and `update_toolchains` (dev toolchains).
-    fn _upgrade(table: &'static [Manager]) {
-        for tool in _active(table) {
+    /// Run each active tool's `steps` under a header. Shared by `upup` (package managers) and
+    /// `update_toolchains` (dev toolchains).
+    fn _upgrade(active: Vec<&'static Manager>) {
+        for tool in active {
             println!("== {} ==", tool.probe);
             for &step in tool.steps {
                 _run_line(step); // report + continue, so one failure won't abort the rest
@@ -105,10 +106,27 @@ mod commands {
         }
     }
 
-    /// The tools in `table` to act on: present on `PATH`, not superseded by another
-    /// present tool, and passing their capability precheck (if any).
-    fn _active(table: &'static [Manager]) -> Vec<&'static Manager> {
-        let present: Vec<&'static Manager> = table.iter().filter(|m| on_path(m.probe)).collect();
+    /// The package managers to act on. Detection is delegated to the shared registry
+    /// ([`pm::present`]) — so Nix/Homebrew installs outside `PATH` are seen, and the manager
+    /// list has a single home — then this table's `supersedes`/`precheck` are applied.
+    fn _managers_active() -> Vec<&'static Manager> {
+        let present = pm::present(&crate::conf::home());
+        _active(MANAGERS, |probe| present.iter().any(|m| m.command == probe))
+    }
+
+    /// The dev toolchains to act on. These are self-updating installers, not system package
+    /// managers, so they're detected plainly on `PATH` (and aren't in the shared registry).
+    fn _toolchains_active() -> Vec<&'static Manager> {
+        _active(TOOLCHAINS, on_path)
+    }
+
+    /// The rows of `table` to act on: detected present by `is_present`, not superseded by
+    /// another present tool, and passing their capability precheck (if any).
+    fn _active(
+        table: &'static [Manager],
+        is_present: impl Fn(&str) -> bool,
+    ) -> Vec<&'static Manager> {
+        let present: Vec<&'static Manager> = table.iter().filter(|m| is_present(m.probe)).collect();
         present
             .iter()
             .copied()
@@ -182,5 +200,16 @@ mod commands {
             }
         }
 
+        #[test]
+        fn upgrade_recipes_and_the_shared_registry_stay_one_to_one() {
+            // The single-source-of-truth guarantee: this table's package managers and the shared
+            // registry's must be exactly the same set. A manager added to one and not the other
+            // fails here instead of silently going unhandled somewhere (the bug that once hid Nix
+            // from the cookie scan).
+            use std::collections::BTreeSet;
+            let recipes: BTreeSet<&str> = MANAGERS.iter().map(|m| m.probe).collect();
+            let registry: BTreeSet<&str> = pm::MANAGERS.iter().map(|m| m.command).collect();
+            assert_eq!(recipes, registry, "packages.rs recipes must match support::package_management");
+        }
     }
 }

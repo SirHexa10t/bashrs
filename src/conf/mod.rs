@@ -24,11 +24,24 @@ use std::path::PathBuf;
 /// signal a reload.
 pub const RELOAD_EXIT_CODE: i32 = 97;
 
+/// The user's home directory (empty path if somehow unset — callers join onto it). The one
+/// place bashrs reads `$HOME` in Rust.
+pub(crate) fn home() -> PathBuf {
+    #[allow(deprecated)] // std::env::home_dir is un-deprecated on current Rust; the project relies on it
+    std::env::home_dir().unwrap_or_default()
+}
+
 /// `~/.bashrs` — the root of everything bashrs keeps on disk (binary, sourcefile, configrs.toml,
 /// bundled tools, companion clones). The one place the directory name is spelled in Rust; the
 /// shell-side spellings (`"$HOME/.bashrs/…"`, expanded at use time) stay literal by design.
 pub(crate) fn bashrs_home() -> PathBuf {
-    std::env::home_dir().unwrap_or_default().join(".bashrs")
+    home().join(".bashrs")
+}
+
+/// `~/.bashrs/user-data` — persistent state bashrs accumulates on the user's behalf, as opposed
+/// to the binary/config/tooling it installs. Currently the imported browser cookies for `dl_yt`.
+pub(crate) fn user_data_dir() -> PathBuf {
+    bashrs_home().join("user-data")
 }
 
 #[cfg(test)]

@@ -9,6 +9,8 @@ mod commands {
 
     use crate::support::exec::{capture_stdout, run_reporting};
     use crate::drivers::youtube;
+    use crate::support::browsers;
+    use crate::support::doc_style::_header;
     use clap::Args;
 
     /// Download every link of the given file types found in a webpage, into the current dir
@@ -130,25 +132,99 @@ mod commands {
 
     // --- dl_yt ------------------------------------------------------------------
 
+    /// `~/.bashrs/user-data/browser_cookies` — where `--cookie-import` copies the chosen store
+    /// and where every `dl_yt` run looks for it.
+    fn _cookie_store_dir() -> PathBuf {
+        crate::conf::user_data_dir().join("browser_cookies")
+    }
+
+    /// The `--cookie-import` action: scan for browser cookie stores, let the user pick one, and
+    /// copy it into bashrs's own data dir (which a running browser can't lock). Later runs use
+    /// it automatically. Returns whether a store was imported.
+    fn _import_cookies() -> bool {
+        let home = crate::conf::home();
+        let stores = browsers::cookie_stores(&home);
+        if stores.is_empty() {
+            if browsers::any_browser_installed(&home) {
+                eprintln!("dl_yt: found browsers but no cookie stores yet — browse (and sign in) once, then retry");
+            } else {
+                eprintln!("dl_yt: no browser cookie stores found on this system");
+            }
+            return false;
+        }
+        let Some(store) = _pick(&stores) else { return false };
+        match browsers::import(store, &_cookie_store_dir()) {
+            Ok(()) => {
+                println!("imported cookies from {} — future dl_yt runs will use them", store.label);
+                // A copy captures cookies already flushed to the DB; a login set moments ago may
+                // still sit in the browser's write-ahead log, uncopied.
+                println!("note: if a fresh sign-in isn't recognized, fully quit the browser and re-import");
+                if store.browser != "firefox" {
+                    println!("note: Chromium-family cookies are keyring-encrypted; if reads fail, a Firefox store is the most reliable");
+                }
+                true
+            }
+            Err(err) => {
+                eprintln!("dl_yt: could not import the cookie store: {err}");
+                false
+            }
+        }
+    }
+
+    /// Prompt for one of `stores` (auto-selecting a lone candidate).
+    fn _pick(stores: &[browsers::CookieStore]) -> Option<&browsers::CookieStore> {
+        if let [only] = stores {
+            println!("one cookie store found — importing {}", only.label);
+            return Some(only);
+        }
+        println!("{}", _header("Import YouTube cookies from:"));
+        for (i, store) in stores.iter().enumerate() {
+            println!("  {}) {}", i + 1, store.label);
+        }
+        print!("choice [1-{}]: ", stores.len());
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok()?;
+        match line.trim().parse::<usize>().ok().filter(|n| (1..=stores.len()).contains(n)) {
+            Some(n) => Some(&stores[n - 1]),
+            None => {
+                eprintln!("dl_yt: not a listed number");
+                None
+            }
+        }
+    }
+
     /// Download from YouTube: a video, a playlist (plus a written report tracing its unplayable
     /// entries), or a whole channel sorted into per-tab folders — subtitles embedded (the
     /// uploader's when present, EN auto-translation otherwise). The machinery lives in
-    /// [`crate::tools::youtube`]; this stays the thin argument shell.
+    /// [`crate::drivers::youtube`]; this stays the thin argument shell.
     pub fn yt(args: YtArgs) {
-        let YtArgs { url, into, single, cookies, audio, res, taglist, extra } = args;
+        let YtArgs { url, into, single, cookies, audio, res, taglist, cookie_import, extra } = args;
         if taglist {
             std::process::exit(youtube::taglist());
         }
-        let url = url.unwrap_or_default(); // clap guarantees presence whenever -t wasn't given
+        if cookie_import {
+            let imported = _import_cookies();
+            // A bare `--cookie-import` (no URL) is a setup step: import and stop. With a URL, fall
+            // through and download, now using what was just imported.
+            if url.is_none() {
+                std::process::exit(i32::from(!imported));
+            }
+        }
+        let url = url.unwrap_or_default(); // clap guarantees presence unless an action flag was given
         if let Err(err) = std::fs::create_dir_all(&into) {
             eprintln!("dl_yt: cannot create {}: {err}", into.display());
             std::process::exit(1);
         }
         let ffmpeg = youtube::bundled_ffmpeg_dir();
         let deno = youtube::bundled_deno();
+        // Imported browser cookies are the standing default; an explicit `--cookies` file wins.
+        let imported = (cookies.is_none()).then(|| browsers::imported_spec(&_cookie_store_dir())).flatten();
         let env = youtube::Env {
             ffmpeg_dir: ffmpeg.as_deref(),
             cookies: cookies.as_deref(),
+            cookies_from_browser: imported.as_deref(),
             audio,
             res,
             extra: &extra,
@@ -167,7 +243,7 @@ mod commands {
     #[derive(Args)]
     pub struct YtArgs {
         /// A YouTube video, playlist, or channel URL
-        #[arg(required_unless_present = "taglist")]
+        #[arg(required_unless_present_any = ["taglist", "cookie_import"])]
         pub url: Option<String>,
         /// Destination root — playlists and channels build their folder trees under it
         #[arg(long, default_value = ".")]
@@ -180,12 +256,19 @@ mod commands {
         /// age-restricted content or networks YouTube bot-walls; home connections rarely do
         #[arg(long)]
         pub cookies: Option<PathBuf>,
-        /// Audio only: extract the best audio track (kept as-is, no re-encode)
+        /// Audio only: extract the best audio track (kept as-is, no re-encode); subtitles
+        /// arrive as metadata tags (`subtitles_en`, `subtitles_he_autogenerated`, …)
         #[arg(long)]
         pub audio: bool,
         /// Cap the video height (e.g. 1080) — takes the best formats at or under it
         #[arg(long, value_name = "HEIGHT")]
         pub res: Option<u32>,
+        /// Scan for browser cookie stores (native, Flatpak, Snap, Nix) and import one into
+        /// bashrs — copied, so a running browser can't lock it; later runs reuse it. For
+        /// age-restricted or walled content. Runs standalone, or before a download when a URL
+        /// is also given
+        #[arg(long, conflicts_with = "cookies")]
+        pub cookie_import: bool,
         /// Print the notable yt-dlp flags (usable after `--`), then yt-dlp's full option list
         #[arg(short = 't', long)]
         pub taglist: bool,
