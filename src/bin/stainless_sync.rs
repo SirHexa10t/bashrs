@@ -13,8 +13,8 @@ fn main() {
     // Tools before repos: the companion repos' python dependencies install into the bundled
     // environment, so python and uv must already be in place when the repos sync.
     bashrs::tools::sync();
-    // Drivers provision on top of the bundles: yt-dlp's impersonation dependency, then the
+    // Drivers provision on top of the bundles: yt-dlp's python helpers, then the
     // companion repos (whose python_deps install into the environment tools just prepared).
-    bashrs::drivers::python::ensure_impersonation();
+    bashrs::drivers::python::ensure_ytdlp_deps();
     bashrs::drivers::stainless::sync();
 }

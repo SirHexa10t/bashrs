@@ -112,16 +112,28 @@ fn missing_env() -> bool {
     false
 }
 
-/// curl_cffi in the bundled environment restores yt-dlp's impersonation support (the zipapp
-/// runs on this python) — YouTube increasingly rejects unimpersonated clients with 403s and
-/// 429s. A no-op when it's already importable, or when yt-dlp isn't even bundled.
-pub fn ensure_impersonation() {
-    let bundled_ytdlp = crate::tools::resolve("yt-dlp") != "yt-dlp";
-    if bundled_ytdlp
-        && !exec::succeeds_quietly(crate::tools::resolve("python3"), ["-c", "import curl_cffi"])
-    {
-        eprintln!("tools: installing curl_cffi (yt-dlp's impersonation support)");
-        let _ = install(&["curl_cffi"]);
+/// The optional python packages that complete the bundled yt-dlp zipapp (which runs on this
+/// python): `curl_cffi` restores the impersonation support YouTube increasingly demands
+/// (403s/429s without it), and `mutagen` powers thumbnail/tag embedding into audio formats
+/// (ffmpeg covers the video containers). A no-op for whatever is already importable, or when
+/// yt-dlp isn't even bundled.
+pub fn ensure_ytdlp_deps() {
+    if crate::tools::resolve("yt-dlp") == "yt-dlp" {
+        return;
+    }
+    let missing: Vec<&str> = [("curl_cffi", "curl_cffi"), ("mutagen", "mutagen")]
+        .iter()
+        .filter(|(module, _)| {
+            !exec::succeeds_quietly(
+                crate::tools::resolve("python3"),
+                ["-c", &format!("import {module}")],
+            )
+        })
+        .map(|(_, package)| *package)
+        .collect();
+    if !missing.is_empty() {
+        eprintln!("tools: installing yt-dlp's python helpers: {}", missing.join(", "));
+        let _ = install(&missing);
     }
 }
 

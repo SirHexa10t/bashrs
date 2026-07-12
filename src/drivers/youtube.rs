@@ -187,9 +187,15 @@ fn download_pending(
     env: Env,
     argv: impl Fn(&str, &Path, &Path, Env, &[String], &str) -> Vec<OsString>,
 ) -> i32 {
-    println!("probing subtitles of {} entries…", pending.len());
     let indexes: Vec<String> = pending.iter().map(|entry| entry.index.clone()).collect();
-    let probed = batch_probe(url, &indexes);
+    let probed = if env.audio {
+        // Audio-only runs request no subtitles, so the subtitle probe would be pure wasted
+        // requests — every entry gets an empty plan and lands in one download group.
+        Vec::new()
+    } else {
+        println!("probing subtitles of {} entries…", pending.len());
+        batch_probe(url, &indexes)
+    };
     let planned: Vec<Planned> = pending
         .iter()
         .map(|entry| {
@@ -204,7 +210,7 @@ fn download_pending(
                 .unwrap_or_else(|| Planned {
                     index: entry.index.clone(),
                     id: entry.id.clone(),
-                    picks: default_picks(),
+                    picks: if env.audio { Vec::new() } else { default_picks() },
                 })
         })
         .collect();
@@ -517,6 +523,10 @@ fn video_picks(url: &str) -> (Option<String>, Vec<Pick>) {
 const PROBE_FORMAT: &str =
     "%(playlist_index)s\t%(id)s\t%(language)s\t%(subtitles)j\t%(automatic_captions)j";
 
+/// Probes larger than this pace themselves with `--sleep-requests` (small ones finish before
+/// any rate-limiter would care).
+const PROBE_PACING_THRESHOLD: usize = 20;
+
 /// One pending entry with its computed subtitle plan.
 struct Planned {
     index: String,
@@ -529,9 +539,15 @@ struct Planned {
 /// extract are simply absent; callers fall back to [`default_picks`] for those.
 fn batch_probe(url: &str, indexes: &[String]) -> Vec<Planned> {
     let mut argv = seeded();
+    argv.push("--ignore-errors".into());
+    if indexes.len() > PROBE_PACING_THRESHOLD {
+        // A big probe is a burst of metadata requests with no downloads between them to slow
+        // the rate; pace it below YouTube's radar (~24/min measured) rather than risk the IP
+        // getting flagged before the first byte of video downloads.
+        argv.extend(["--sleep-requests", "1"].map(OsString::from));
+    }
     argv.extend([
-        OsString::from("--ignore-errors"),
-        "--playlist-items".into(), indexes.join(",").into(),
+        OsString::from("--playlist-items"), indexes.join(",").into(),
         "--print".into(), PROBE_FORMAT.into(),
         url.into(),
     ]);
