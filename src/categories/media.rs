@@ -1,5 +1,6 @@
 #[bashrs_macros::category(command = MediaCommand, prefix = "media_")]
 mod commands {
+    use crate::support::doc_style::_header;
     use crate::support::exec::{capture_stdout, run_reporting_code};
     use crate::tools;
     use clap::{Args, ValueEnum};
@@ -397,6 +398,65 @@ mod commands {
         if code != 0 {
             std::process::exit(code);
         }
+    }
+
+    /// Get metadata plus the file's embedded tags — a yt-dlp download carries title, uploader,
+    /// date, description, and source URL — rendered yaml-style
+    pub fn metadata_yt(args: MetadataArgs) {
+        let code = run_reporting_code(tools::resolve("ffprobe"), _metadata_argv(&args));
+        if code != 0 {
+            std::process::exit(code);
+        }
+        let mut argv: Vec<OsString> =
+            ["-v", "error", "-show_entries", "format_tags"].map(OsString::from).to_vec();
+        argv.push(args.file.as_os_str().to_owned());
+        let Some(raw) = capture_stdout(tools::resolve("ffprobe"), argv) else {
+            std::process::exit(1);
+        };
+        print!("{}", _tags_yamlish(&raw));
+    }
+
+    /// ffprobe's `TAG:`-prefixed block reshaped as yaml: lowercased keys (in `lll`'s header
+    /// style), multi-line values as indented block scalars — instead of continuation lines
+    /// dumped flush-left under a `TAG:KEY=first-line` opener.
+    fn _tags_yamlish(raw: &str) -> String {
+        let tags = _parse_tags(raw);
+        if tags.is_empty() {
+            return "(no embedded tags)\n".to_string();
+        }
+        let mut out = String::new();
+        for (key, value) in tags {
+            let key = _header(&key);
+            if value.contains('\n') {
+                out += &format!("{key}: |\n");
+                for line in value.lines() {
+                    out += &format!("  {line}\n");
+                }
+            } else {
+                out += &format!("{key}: {value}\n");
+            }
+        }
+        out
+    }
+
+    /// Parse ffprobe's `-show_entries format_tags` default output: a `TAG:key=value` line opens
+    /// a tag, bare lines continue the previous value (that's how multi-line descriptions
+    /// arrive), and the `[FORMAT]` wrappers are noise.
+    fn _parse_tags(raw: &str) -> Vec<(String, String)> {
+        let mut tags: Vec<(String, String)> = Vec::new();
+        for line in raw.lines() {
+            if line == "[FORMAT]" || line == "[/FORMAT]" {
+                continue;
+            }
+            if let Some(pair) = line.strip_prefix("TAG:") {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                tags.push((key.to_lowercase(), value.to_string()));
+            } else if let Some((_, value)) = tags.last_mut() {
+                value.push('\n');
+                value.push_str(line);
+            }
+        }
+        tags
     }
 
     #[derive(Args)]
@@ -874,6 +934,23 @@ mod commands {
             for field in ["codec_type", "pix_fmt", "sample_rate"] {
                 assert!(streams.contains(field), "missing {field} in {streams}");
             }
+        }
+
+        #[test]
+        fn ffprobe_tags_parse_including_multiline_values() {
+            let raw = "[FORMAT]\nTAG:title=[t] PS\nTAG:DESCRIPTION=line one\nline two\nTAG:DATE=20190620\n[/FORMAT]\n";
+            let tags = _parse_tags(raw);
+            assert_eq!(tags[0], ("title".into(), "[t] PS".into()));
+            assert_eq!(tags[1], ("description".into(), "line one\nline two".into()));
+            assert_eq!(tags[2].0, "date");
+        }
+
+        #[test]
+        fn tags_render_yaml_style_with_block_scalars() {
+            let out = _tags_yamlish("TAG:DATE=20190620\nTAG:DESCRIPTION=a\nb\n");
+            assert!(out.contains(": 20190620\n"), "{out}");
+            assert!(out.contains(": |\n  a\n  b\n"), "multi-line values become indented blocks: {out}");
+            assert_eq!(_tags_yamlish(""), "(no embedded tags)\n");
         }
 
         #[test]

@@ -97,7 +97,7 @@ pub(crate) fn always_bundle_languages() -> bool {
     read().and_then(|config| flag(&config, "tools", "always_bundle_languages")).unwrap_or(true)
 }
 
-/// Bundle the utility programs (ffmpeg) even when the system provides them
+/// Bundle the utility programs (ffmpeg, yt-dlp, deno) even when the system provides them
 /// (`[tools] always_bundle_utilities`, default `false` — bundle only what's missing).
 pub(crate) fn always_bundle_utilities() -> bool {
     read().and_then(|config| flag(&config, "tools", "always_bundle_utilities")).unwrap_or(false)

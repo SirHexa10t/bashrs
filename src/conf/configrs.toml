@@ -8,6 +8,6 @@
 # environments, so the project controlling their versions is the reliable default.
 # false: bundle only what the system lacks.
 always_bundle_languages = true
-# Bundle the utility programs (ffmpeg) even when the system provides them.
+# Bundle the utility programs (ffmpeg, yt-dlp, deno) even when the system provides them.
 # false: bundle only what the system lacks.
 always_bundle_utilities = false

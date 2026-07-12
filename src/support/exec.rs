@@ -84,6 +84,30 @@ where
     }
 }
 
+/// Run `program` with `args`, capturing BOTH streams — for callers that must inspect the
+/// failure text before deciding whether the user should see it (e.g. distinguishing "channel
+/// has no such tab" from a real network error). Returns `(succeeded, stdout, stderr)`; `None`
+/// only on a spawn failure (reported).
+pub(crate) fn capture_output<P, I, S>(program: P, args: I) -> Option<(bool, String, String)>
+where
+    P: AsRef<OsStr>,
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let program = program.as_ref();
+    match Command::new(program).args(args).output() {
+        Ok(out) => Some((
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )),
+        Err(err) => {
+            eprintln!("could not run {}: {err}", program.to_string_lossy());
+            None
+        }
+    }
+}
+
 /// Run `program` with `args`, inheriting stdio; the exit status is ignored — for commands
 /// run to show output or for a side effect, where a non-zero exit isn't a failure (e.g.
 /// `ssh -T git@github.com`, which always exits 1). A spawn error is still reported.
@@ -146,6 +170,14 @@ mod tests {
         assert_eq!(capture_stdout("echo", ["hello"]).as_deref(), Some("hello\n"));
         assert_eq!(capture_stdout("false", &[] as &[&str]), None);
         assert_eq!(capture_stdout("bashrs_no_such_program_xyz", &[] as &[&str]), None);
+    }
+
+    #[test]
+    fn capture_output_hands_back_both_streams_and_the_verdict() {
+        let (ok, out, err) = capture_output("sh", ["-c", "echo yes; echo no >&2; exit 3"]).unwrap();
+        assert!(!ok);
+        assert_eq!((out.trim(), err.trim()), ("yes", "no"));
+        assert!(capture_output("bashrs_no_such_program_xyz", &[] as &[&str]).is_none());
     }
 
     #[test]

@@ -1,12 +1,14 @@
 //! Download commands (`dl_*`) — pulling files off the web. Pages are fetched and files
-//! downloaded through `curl` (the same external the tool fetcher trusts); the bundled `yt-dlp`
-//! ([`crate::tools`]) stands ready for the media commands to come.
+//! downloaded through `curl` (the same external the tool fetcher trusts); YouTube goes through
+//! the bundled `yt-dlp` ([`crate::tools`]).
 
 #[bashrs_macros::category(command = DownloadCommand, prefix = "dl_")]
 mod commands {
     use std::collections::HashSet;
+    use std::path::PathBuf;
 
     use crate::support::exec::{capture_stdout, run_reporting};
+    use crate::tools::youtube;
     use clap::Args;
 
     /// Download every link of the given file types found in a webpage, into the current dir
@@ -126,6 +128,73 @@ mod commands {
         }
     }
 
+    // --- dl_yt ------------------------------------------------------------------
+
+    /// Download from YouTube: a video, a playlist (plus a written report tracing its unplayable
+    /// entries), or a whole channel sorted into per-tab folders — subtitles embedded (the
+    /// uploader's when present, EN auto-translation otherwise). The machinery lives in
+    /// [`crate::tools::youtube`]; this stays the thin argument shell.
+    pub fn yt(args: YtArgs) {
+        let YtArgs { url, into, single, cookies, audio, res, taglist, extra } = args;
+        if taglist {
+            std::process::exit(youtube::taglist());
+        }
+        let url = url.unwrap_or_default(); // clap guarantees presence whenever -t wasn't given
+        if let Err(err) = std::fs::create_dir_all(&into) {
+            eprintln!("dl_yt: cannot create {}: {err}", into.display());
+            std::process::exit(1);
+        }
+        let ffmpeg = youtube::bundled_ffmpeg_dir();
+        let deno = youtube::bundled_deno();
+        let env = youtube::Env {
+            ffmpeg_dir: ffmpeg.as_deref(),
+            cookies: cookies.as_deref(),
+            audio,
+            res,
+            extra: &extra,
+            js_runtime: deno.as_deref(),
+        };
+        let code = match youtube::classify(&url, single) {
+            youtube::Link::Video => youtube::download_video(&url, &into, env),
+            youtube::Link::Playlist { id } => youtube::download_playlist(&url, &id, &into, env),
+            youtube::Link::Channel { root } => youtube::download_channel(&root, &into, env),
+        };
+        if code != 0 {
+            std::process::exit(code);
+        }
+    }
+
+    #[derive(Args)]
+    pub struct YtArgs {
+        /// A YouTube video, playlist, or channel URL
+        #[arg(required_unless_present = "taglist")]
+        pub url: Option<String>,
+        /// Destination root — playlists and channels build their folder trees under it
+        #[arg(long, default_value = ".")]
+        pub into: PathBuf,
+        /// A video link that also names a playlist (`watch?v=…&list=…`) downloads the whole
+        /// playlist by default; this takes just the video
+        #[arg(long)]
+        pub single: bool,
+        /// A cookies file (Netscape format, as browser extensions export) — only needed for
+        /// age-restricted content or networks YouTube bot-walls; home connections rarely do
+        #[arg(long)]
+        pub cookies: Option<PathBuf>,
+        /// Audio only: extract the best audio track (kept as-is, no re-encode)
+        #[arg(long)]
+        pub audio: bool,
+        /// Cap the video height (e.g. 1080) — takes the best formats at or under it
+        #[arg(long, value_name = "HEIGHT")]
+        pub res: Option<u32>,
+        /// Print the notable yt-dlp flags (usable after `--`), then yt-dlp's full option list
+        #[arg(short = 't', long)]
+        pub taglist: bool,
+        /// Anything after `--` is handed to yt-dlp verbatim, after our defaults — a repeated
+        /// flag resolves in its favor; `-t` lists the ones worth knowing
+        #[arg(last = true)]
+        pub extra: Vec<String>,
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -182,5 +251,6 @@ mod commands {
                 "file:///tmp/site/sub/a.txt"
             );
         }
+
     }
 }

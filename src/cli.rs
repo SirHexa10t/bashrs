@@ -573,11 +573,13 @@ mod tests {
         let has = |line: &str| assert!(script.contains(line), "missing wrapper line: {line}");
         has("fs_usage() { \"$HOME/.bashrs/bashrs\" fs_usage \"$@\"; }");
         has("dl_page_links() { \"$HOME/.bashrs/bashrs\" dl_page_links \"$@\"; }");
+        has("dl_yt() { \"$HOME/.bashrs/bashrs\" dl_yt \"$@\"; }");
         has("media_convert() { \"$HOME/.bashrs/bashrs\" media_convert \"$@\"; }");
         has("media_convert_quality() { \"$HOME/.bashrs/bashrs\" media_convert_quality \"$@\"; }");
         has("media_convert_compact() { \"$HOME/.bashrs/bashrs\" media_convert_compact \"$@\"; }");
         has("media_trim_start() { \"$HOME/.bashrs/bashrs\" media_trim_start \"$@\"; }");
         has("media_metadata() { \"$HOME/.bashrs/bashrs\" media_metadata \"$@\"; }");
+        has("media_metadata_yt() { \"$HOME/.bashrs/bashrs\" media_metadata_yt \"$@\"; }");
         has("media_hmerge_imgs() { \"$HOME/.bashrs/bashrs\" media_hmerge_imgs \"$@\"; }");
         has("media_vmerge_imgs() { \"$HOME/.bashrs/bashrs\" media_vmerge_imgs \"$@\"; }");
         has("packages_upup() { \"$HOME/.bashrs/bashrs\" packages_upup \"$@\"; }"); // packages (both)
@@ -644,7 +646,7 @@ mod tests {
         let filesystem = script.split("\n# ").find(|s| s.starts_with("filesystem")).expect("filesystem section");
         assert!(filesystem.contains("..() {") && filesystem.contains("# Hop one directory up"),
             "the shell function belongs to its category, doc comment included: {filesystem}");
-        assert!(!script.contains(&format!("..() {{ \"$HOME/.bashrs/bashrs\"")),
+        assert!(!script.contains("..() { \"$HOME/.bashrs/bashrs\""),
             "a shell-body command must not call the binary");
     }
 

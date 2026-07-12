@@ -182,7 +182,9 @@ fn venv_shim(tool_dir: &str, rel: &str) -> String {
     format!("#!/bin/sh\nexec \"$HOME/.bashrs/tools/{tool_dir}/{rel}\" \"$@\"\n")
 }
 
-/// Download `url` and unpack the archive's contents (root folder stripped) into `dir`.
+/// Download `url` and unpack the archive's contents into `dir` — tarballs via `tar` (root
+/// folder stripped), zips via the bundled python's `zipfile` (zip is not GNU tar territory,
+/// and `unzip` isn't a given on every system; python is, by our own bundling).
 fn fetch(url: &str, dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
     let archive = dir.join("download.tmp");
@@ -194,16 +196,43 @@ fn fetch(url: &str, dir: &Path) -> Result<(), String> {
     if !matches!(downloaded, Ok(status) if status.success()) {
         return Err(format!("download failed: {url}"));
     }
+    let unpacked = if url.ends_with(".zip") { unzip(&archive, dir) } else { untar(&archive, dir) };
+    let _ = std::fs::remove_file(&archive);
+    unpacked
+}
+
+fn untar(archive: &Path, dir: &Path) -> Result<(), String> {
     let unpacked = Command::new("tar")
         .arg("-xf")
-        .arg(&archive)
+        .arg(archive)
         .arg("-C")
         .arg(dir)
         .arg("--strip-components=1")
         .status();
-    let _ = std::fs::remove_file(&archive);
     if !matches!(unpacked, Ok(status) if status.success()) {
         return Err("could not unpack the archive".into());
+    }
+    Ok(())
+}
+
+/// Unpack a zip (deno releases, notably: a bare binary at the archive root). Python's zipfile
+/// drops the executable bits, so every extracted top-level file gets them back.
+fn unzip(archive: &Path, dir: &Path) -> Result<(), String> {
+    let unpacked = Command::new(super::resolve("python3"))
+        .arg("-m")
+        .arg("zipfile")
+        .arg("-e")
+        .arg(archive)
+        .arg(dir)
+        .status();
+    if !matches!(unpacked, Ok(status) if status.success()) {
+        return Err("could not unpack the zip".into());
+    }
+    for entry in std::fs::read_dir(dir).map_err(|err| err.to_string())?.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o755));
+        }
     }
     Ok(())
 }
@@ -279,6 +308,18 @@ pub(super) fn ytdlp_url() -> Option<String> {
         _ => return None,
     };
     find_ytdlp_asset(&latest_release("yt-dlp/yt-dlp")?, asset)
+}
+
+/// deno's static binary zip for this machine, discovered from the latest release — bundled to
+/// serve yt-dlp, whose YouTube extractor needs a JS runtime (deno is the one it enables by
+/// default) or some formats go missing.
+pub(super) fn deno_url() -> Option<String> {
+    let asset = match std::env::consts::ARCH {
+        "x86_64" => "deno-x86_64-unknown-linux-gnu.zip",
+        "aarch64" => "deno-aarch64-unknown-linux-gnu.zip",
+        _ => return None,
+    };
+    find_ytdlp_asset(&latest_release("denoland/deno")?, asset)
 }
 
 /// The release asset named exactly `asset` — a `/`-anchored suffix match on the download URL,

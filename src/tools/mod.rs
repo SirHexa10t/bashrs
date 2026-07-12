@@ -9,6 +9,7 @@
 //! the fallback — except that an activated venv still wins for interactive `python3`.
 
 mod fetch;
+pub(crate) mod youtube;
 pub(crate) mod python;
 pub mod stainless;
 
@@ -80,6 +81,15 @@ const TOOLS: &[Tool] = &[
         bins: &[("python3", "bin/python3")],
         acquire: Acquire::UvVenv { python: "3.14" },
         group: Group::Language,
+    },
+    // deno exists here to serve yt-dlp: YouTube extraction needs a JS runtime (EJS) or formats
+    // go missing. Listed after python on purpose — its release is a .zip, and the fetcher
+    // unpacks those with the python bundled just above.
+    Tool {
+        dir: "deno",
+        bins: &[("deno", "deno")],
+        acquire: Acquire::Archive(fetch::deno_url),
+        group: Group::Utility,
     },
 ];
 
