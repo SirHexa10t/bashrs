@@ -3,15 +3,13 @@
 //! the *project* controls the versions it relies on (system copies drift — apt lags — and may
 //! lack features we use). Its own pillar (not `support`) because it spans three concerns:
 //! compile-time acquisition ([`fetch`], run by the `stainless_sync` binary), runtime resolution
-//! ([`resolve`], used by the command categories), and the interactive side — a shim directory
+//! ([`resolve`], used by [`crate::drivers`] and the command categories), and the interactive
+//! side — a shim directory
 //! ([`bin_dir`]) whose PATH prepend is emitted into `sourcefile.sh` ([`shell_setup`], used by
 //! [`crate::cli`]). The bundled copy is the project-pinned default; the system installation is
 //! the fallback — except that an activated venv still wins for interactive `python3`.
 
 mod fetch;
-pub(crate) mod youtube;
-pub(crate) mod python;
-pub mod stainless;
 
 pub use fetch::sync;
 
@@ -95,12 +93,12 @@ const TOOLS: &[Tool] = &[
 
 /// `~/.bashrs/tools/interpreters` — where uv keeps the managed CPython builds the python venv
 /// links against (`UV_PYTHON_INSTALL_DIR`), so the whole python story stays under `~/.bashrs`.
-fn interpreters_dir() -> PathBuf {
+pub(crate) fn interpreters_dir() -> PathBuf {
     root().join("interpreters")
 }
 
 /// `~/.bashrs/tools` — the bundled tools' home.
-fn root() -> PathBuf {
+pub(crate) fn root() -> PathBuf {
     crate::conf::bashrs_home().join("tools")
 }
 

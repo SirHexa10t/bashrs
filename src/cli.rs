@@ -20,7 +20,8 @@ use crate::categories::styles::StyleCommand;
 use crate::categories::session;
 use crate::conf::{config_file, environment, greeting, keybinds};
 use crate::conf::RELOAD_EXIT_CODE;
-use crate::tools::{self, stainless};
+use crate::drivers::stainless;
+use crate::tools;
 
 #[derive(Parser)]
 #[command(name = "bashrs", about = "Rust-based bashrc")]

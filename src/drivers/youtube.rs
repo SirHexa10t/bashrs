@@ -72,7 +72,7 @@ pub(crate) struct Env<'a> {
 /// The bundled ffmpeg's directory, when the bundle exists ([`super::resolve`] falls back to
 /// the bare name otherwise, which means "let yt-dlp find a PATH one").
 pub(crate) fn bundled_ffmpeg_dir() -> Option<PathBuf> {
-    let resolved = super::resolve("ffmpeg");
+    let resolved = crate::tools::resolve("ffmpeg");
     if resolved == "ffmpeg" {
         return None;
     }
@@ -81,7 +81,7 @@ pub(crate) fn bundled_ffmpeg_dir() -> Option<PathBuf> {
 
 /// The bundled deno binary, when the bundle exists (else yt-dlp looks for a PATH deno itself).
 pub(crate) fn bundled_deno() -> Option<PathBuf> {
-    let resolved = super::resolve("deno");
+    let resolved = crate::tools::resolve("deno");
     (resolved != "deno").then(|| PathBuf::from(resolved))
 }
 
@@ -107,8 +107,15 @@ fn seeded() -> Vec<OsString> {
 
 /// A lone video: probe its subtitle situation, then download with the exact list.
 pub(crate) fn download_video(url: &str, into: &Path, env: Env) -> i32 {
-    let langs = video_langs(url, None);
-    run(video_argv(url, into, env, &langs))
+    let (id, picks) = video_picks(url);
+    let keys: Vec<String> = picks.iter().map(|pick| pick.key.clone()).collect();
+    let code = run(video_argv(url, into, env, &keys));
+    if code == 0 {
+        if let Some(id) = id {
+            mark_auto_titles(into, &id, &picks, env);
+        }
+    }
+    code
 }
 
 /// Playlist mode. The flat scan comes first — it still *names* entries nothing can play
@@ -121,7 +128,8 @@ pub(crate) fn download_playlist(url: &str, id: &str, into: &Path, env: Env) -> i
             "dl_yt: could not scan the playlist — downloading in one pass, EN-only subtitles, \
              no unplayable report"
         );
-        return run(playlist_argv(url, into, into, env, &default_langs(), None));
+        let keys: Vec<String> = default_picks().iter().map(|pick| pick.key.clone()).collect();
+        return run(playlist_argv(url, into, into, env, &keys, None));
     };
     // The playlist's folder, spelled exactly as yt-dlp's template expansion will spell it.
     let dir = scan.dirname.clone().unwrap_or_else(|| format!("[{id}]"));
@@ -182,31 +190,135 @@ fn download_pending(
     println!("probing subtitles of {} entries…", pending.len());
     let indexes: Vec<String> = pending.iter().map(|entry| entry.index.clone()).collect();
     let probed = batch_probe(url, &indexes);
-    let planned: Vec<(String, Vec<String>)> = pending
+    let planned: Vec<Planned> = pending
         .iter()
         .map(|entry| {
-            let langs = probed
+            probed
                 .iter()
-                .find(|(index, _)| *index == entry.index)
-                .map(|(_, langs)| langs.clone())
-                .unwrap_or_else(default_langs);
-            (entry.index.clone(), langs)
+                .find(|plan| plan.index == entry.index)
+                .map(|plan| Planned {
+                    index: plan.index.clone(),
+                    id: plan.id.clone(),
+                    picks: plan.picks.clone(),
+                })
+                .unwrap_or_else(|| Planned {
+                    index: entry.index.clone(),
+                    id: entry.id.clone(),
+                    picks: default_picks(),
+                })
         })
         .collect();
     let mut worst = 0;
-    for (items, langs) in group_by_langs(&planned) {
-        let subs = if langs.is_empty() { "none".to_string() } else { langs.join(",") };
+    for group in group_by_langs(&planned) {
+        let keys: Vec<String> =
+            group[0].picks.iter().map(|pick| pick.key.clone()).collect();
+        let items =
+            group.iter().map(|plan| plan.index.as_str()).collect::<Vec<_>>().join(",");
+        let subs = if keys.is_empty() { "none".to_string() } else { keys.join(",") };
         println!(
             "=== downloading {} entr{} (subs: {subs}) ===",
-            items.split(',').count(),
-            if items.contains(',') { "ies" } else { "y" },
+            group.len(),
+            if group.len() > 1 { "ies" } else { "y" },
         );
-        let code = run(argv(url, into, home, env, &langs, &items));
+        let code = run(argv(url, into, home, env, &keys, &items));
         if code != 0 && worst == 0 {
             worst = code;
         }
+        for plan in &group {
+            mark_auto_titles(home, &plan.id, &plan.picks, env);
+        }
     }
     worst
+}
+
+/// Rename the embedded titles of auto-generated subtitle tracks. YouTube's own names read like
+/// authentic tracks — "Spanish (Original)" sounds MORE official than the uploader's, and a
+/// translated track is often titled plain "English" — so every auto pick's track becomes
+/// "<name> (auto-generated)", with the misleading " (Original)" dropped. A local stream-copy
+/// remux (no re-encode, no network); any failure leaves the downloaded file as-is.
+fn mark_auto_titles(root: &Path, id: &str, picks: &[Pick], env: Env) {
+    let autos: Vec<&Pick> = picks.iter().filter(|pick| pick.auto).collect();
+    if autos.is_empty() || env.audio {
+        return;
+    }
+    let Some(file) = find_by_id(root, id) else { return };
+    let ffprobe = env
+        .ffmpeg_dir
+        .map(|dir| dir.join("ffprobe").into_os_string())
+        .unwrap_or_else(|| "ffprobe".into());
+    let Some(listing) = capture_stdout(
+        &ffprobe,
+        [
+            OsString::from("-v"), "error".into(),
+            "-select_streams".into(), "s".into(),
+            "-show_entries".into(), "stream_tags=title".into(),
+            "-of".into(), "csv=p=0".into(),
+            file.as_os_str().to_owned(),
+        ],
+    ) else {
+        return;
+    };
+    let mut retitle: Vec<(usize, String)> = Vec::new(); // (subtitle-stream order, new title)
+    for (order, title) in listing.lines().enumerate() {
+        if let Some(pick) = autos.iter().find(|pick| pick.name == title.trim()) {
+            retitle.push((order, stamped_title(&pick.name)));
+        }
+    }
+    if retitle.is_empty() {
+        return;
+    }
+    let ffmpeg = env
+        .ffmpeg_dir
+        .map(|dir| dir.join("ffmpeg").into_os_string())
+        .unwrap_or_else(|| "ffmpeg".into());
+    let stamped = file.with_extension("stamping.mkv");
+    let mut argv: Vec<OsString> = ["-v", "error", "-y", "-i"].map(OsString::from).to_vec();
+    argv.push(file.as_os_str().to_owned());
+    argv.extend(["-map", "0", "-c", "copy"].map(OsString::from));
+    for (order, title) in &retitle {
+        argv.push(format!("-metadata:s:s:{order}").into());
+        argv.push(format!("title={title}").into());
+    }
+    argv.push(stamped.as_os_str().to_owned());
+    let renamed = matches!(
+        std::process::Command::new(&ffmpeg).args(&argv).status(),
+        Ok(status) if status.success()
+    ) && std::fs::rename(&stamped, &file).is_ok();
+    if renamed {
+        for (_, title) in &retitle {
+            println!("stamped subtitle track: {title}");
+        }
+    } else {
+        let _ = std::fs::remove_file(&stamped);
+        eprintln!("dl_yt: could not stamp auto-subtitle titles in {}", file.display());
+    }
+}
+
+/// An auto track's honest title: YouTube's name with the actively-misleading " (Original)"
+/// dropped and the machine origin stated.
+fn stamped_title(name: &str) -> String {
+    format!("{} (auto-generated)", name.replace(" (Original)", ""))
+}
+
+/// The downloaded file whose name carries `__<id>.` — the id rides in every output template
+/// precisely so files stay findable. A shallow recursive walk under `root`.
+fn find_by_id(root: &Path, id: &str) -> Option<PathBuf> {
+    let marker = format!("__{id}.");
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.contains(&marker) && name.ends_with(".mkv")
+            }) {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 /// Channel mode: every tab in turn. The archive lives inside the channel's own folder (shared
@@ -288,7 +400,8 @@ pub(crate) fn taglist() -> i32 {
         println!("  {}{pad}  {blurb}", doc_style::_scoped(&green, flag));
     }
     println!("\n{}", doc_style::_header("Everything yt-dlp accepts:"));
-    run_reporting_code(super::resolve("yt-dlp"), ["--help"])
+    let (program, args) = ytdlp_invocation(vec![OsString::from("--help")]);
+    run_reporting_code(program, args)
 }
 
 /// The flags worth knowing about, shown by [`taglist`]: `(flag as you'd type it, what it does)`.
@@ -305,62 +418,116 @@ pub(crate) const NOTABLE_FLAGS: &[(&str, &str)] = &[
 
 // --- subtitle resolution ---------------------------------------------------------
 
-/// The subtitle languages to embed for one video, given what exists. The policy: every language
+/// One subtitle track the plan requests: its yt-dlp language key, YouTube's display name for
+/// it (which becomes the embedded track title — what the post-pass matches on), and whether
+/// it's auto-generated rather than the uploader's.
+#[derive(Clone, Debug, PartialEq)]
+struct Pick {
+    key: String,
+    name: String,
+    auto: bool,
+}
+
+/// The subtitle tracks to embed for one video, given what exists. The policy: every language
 /// the uploader published; the video's native language as auto-captions when the uploader
-/// published none in it (the plain auto track, else the raw `-orig` one); and EN — real, else
-/// auto-translated — unless a real or native EN already covers it. Nothing is ever doubled.
-fn sub_langs_for(reals: &[String], autos: &[String], orig: Option<&str>) -> Vec<String> {
+/// published none in it (the raw `-orig` track, else the plain one); and EN — real, else
+/// auto-translated (the `en-<lang>` pair when published, plain `en` otherwise) — unless a real
+/// or native EN already covers it. Nothing is ever doubled, and every auto pick is flagged so
+/// [`mark_auto_titles`] can stamp its embedded title.
+///
+/// Every pick is a MUST-TRY, never a must-have — EN above all: YouTube lists auto-translations
+/// for every video but its translation endpoint is aggressively rate-limited (429s, sometimes
+/// permanently on shared/VPN IPs), so a listed track may never be served. `--ignore-errors`
+/// rides every download exactly so a refused subtitle downgrades to a warning and the video
+/// completes without it — don't "fix" a sub-only failure into a failed exit.
+fn sub_picks_for(
+    reals: &[(String, String)],
+    autos: &[(String, String)],
+    orig: Option<&str>,
+) -> Vec<Pick> {
     let base = |lang: &str| lang.split('-').next().unwrap_or(lang).to_lowercase();
-    let mut langs: Vec<String> =
-        reals.iter().filter(|lang| *lang != "live_chat").cloned().collect();
+    let auto_pick = |key: &str| {
+        autos.iter().find(|(auto_key, _)| auto_key == key).map(|(auto_key, name)| Pick {
+            key: auto_key.clone(),
+            name: if name.is_empty() { auto_key.clone() } else { name.clone() },
+            auto: true,
+        })
+    };
+    let mut picks: Vec<Pick> = reals
+        .iter()
+        .filter(|(key, _)| key != "live_chat")
+        .map(|(key, name)| Pick { key: key.clone(), name: name.clone(), auto: false })
+        .collect();
     let native = orig.filter(|orig| !orig.is_empty()).map(&base);
     if let Some(native) = &native {
-        if !langs.iter().any(|lang| base(lang) == *native) {
-            // Embedded track titles come from YouTube's own names, and only some variants
-            // announce their machine origins: `x-orig` is titled "X (Original)" where plain
-            // `x` reads like an uploader's track — prefer the honest label.
-            let labeled = format!("{native}-orig");
-            if autos.contains(&labeled) {
-                langs.push(labeled);
-            } else if autos.contains(native) {
-                langs.push(native.clone());
+        if !picks.iter().any(|pick| base(&pick.key) == *native) {
+            if let Some(pick) = auto_pick(&format!("{native}-orig")).or_else(|| auto_pick(native))
+            {
+                picks.push(pick);
             }
         }
     }
-    if !langs.iter().any(|lang| base(lang) == "en") {
-        // Same labeling preference for the translated fallback ("English from X") — though
-        // YouTube doesn't always publish the pair key, and plain `en` is the plan B.
-        let labeled = native.map(|native| format!("en-{native}"));
-        if let Some(labeled) = labeled.filter(|labeled| autos.contains(labeled)) {
-            langs.push(labeled);
-        } else if autos.iter().any(|auto| auto == "en") {
-            langs.push("en".to_string());
+    if !picks.iter().any(|pick| base(&pick.key) == "en") {
+        let translated = native.as_ref().and_then(|native| auto_pick(&format!("en-{native}")));
+        if let Some(pick) = translated.or_else(|| auto_pick("en")) {
+            picks.push(pick);
         }
     }
-    langs
+    picks
 }
 
-/// The pre-probe fallback (and the no-probe path): today's EN-family behavior.
-fn default_langs() -> Vec<String> {
-    ["en", "en-US", "en-GB"].map(str::to_string).to_vec()
+/// The pre-probe fallback (and the no-probe path): the EN-family behavior — not flagged auto,
+/// since without a probe nobody knows, and a wrong "(auto-generated)" stamp is worse than none.
+fn default_picks() -> Vec<Pick> {
+    ["en", "en-US", "en-GB"]
+        .map(|key| Pick { key: key.to_string(), name: String::new(), auto: false })
+        .to_vec()
 }
 
-/// One video's subtitle list, via a metadata probe (`item` picks an entry when `url` is a
-/// playlist or tab). An unprobeable video falls back to the EN default — resilience over
-/// completeness.
-fn video_langs(url: &str, item: Option<&str>) -> Vec<String> {
-    probe_subs(url, item)
-        .map(|(reals, autos, orig)| sub_langs_for(&reals, &autos, orig.as_deref()))
-        .unwrap_or_else(default_langs)
+/// One video's subtitle plan plus its id (the post-pass finds the file by it). An unprobeable
+/// video falls back to the EN default — resilience over completeness.
+fn video_picks(url: &str) -> (Option<String>, Vec<Pick>) {
+    let mut argv = seeded();
+    argv.extend(
+        [
+            "--print", "%(id)s",
+            "--print", "%(language)s",
+            "--print", "%(subtitles)j",
+            "--print", "%(automatic_captions)j",
+        ]
+        .map(OsString::from),
+    );
+    argv.push(url.into());
+    let (program, args) = ytdlp_invocation(argv);
+    let Some(out) = capture_stdout(program, args) else {
+        return (None, default_picks());
+    };
+    let mut lines = out.lines();
+    let id = lines.next().map(str::trim).filter(|id| !id.is_empty() && *id != "NA");
+    let (Some(language), Some(subs), Some(autos)) = (lines.next(), lines.next(), lines.next())
+    else {
+        return (id.map(str::to_string), default_picks());
+    };
+    let orig = Some(language.trim()).filter(|lang| !lang.is_empty() && *lang != "NA");
+    let picks = sub_picks_for(&json_lang_names(subs), &json_lang_names(autos), orig);
+    (id.map(str::to_string), picks)
 }
 
 /// Per-entry print format of the batch subtitle probe.
-const PROBE_FORMAT: &str = "%(playlist_index)s\t%(language)s\t%(subtitles)j\t%(automatic_captions)j";
+const PROBE_FORMAT: &str =
+    "%(playlist_index)s\t%(id)s\t%(language)s\t%(subtitles)j\t%(automatic_captions)j";
+
+/// One pending entry with its computed subtitle plan.
+struct Planned {
+    index: String,
+    id: String,
+    picks: Vec<Pick>,
+}
 
 /// Probe the subtitle situation of many entries in ONE yt-dlp invocation (process startup and
 /// player work are the expensive parts — per-entry probes multiply them). Entries that fail to
-/// extract are simply absent; callers fall back to [`default_langs`] for those.
-fn batch_probe(url: &str, indexes: &[String]) -> Vec<(String, Vec<String>)> {
+/// extract are simply absent; callers fall back to [`default_picks`] for those.
+fn batch_probe(url: &str, indexes: &[String]) -> Vec<Planned> {
     let mut argv = seeded();
     argv.extend([
         OsString::from("--ignore-errors"),
@@ -368,67 +535,55 @@ fn batch_probe(url: &str, indexes: &[String]) -> Vec<(String, Vec<String>)> {
         "--print".into(), PROBE_FORMAT.into(),
         url.into(),
     ]);
-    capture_stdout(super::resolve("yt-dlp"), argv).map(|out| parse_batch(&out)).unwrap_or_default()
+    let (program, args) = ytdlp_invocation(argv);
+    capture_stdout(program, args).map(|out| parse_batch(&out)).unwrap_or_default()
 }
 
-/// Parse [`batch_probe`]'s lines into `(entry index, its subtitle list)`.
-fn parse_batch(out: &str) -> Vec<(String, Vec<String>)> {
+/// Parse [`batch_probe`]'s lines into per-entry plans.
+fn parse_batch(out: &str) -> Vec<Planned> {
     out.lines()
         .filter_map(|line| {
-            let mut fields = line.splitn(4, '\t');
-            let (index, language, subs, autos) =
-                (fields.next()?, fields.next()?, fields.next()?, fields.next()?);
+            let mut fields = line.splitn(5, '\t');
+            let (index, id, language, subs, autos) =
+                (fields.next()?, fields.next()?, fields.next()?, fields.next()?, fields.next()?);
             let orig = (!language.is_empty() && language != "NA").then_some(language);
-            Some((
-                index.to_string(),
-                sub_langs_for(&json_top_keys(subs), &json_top_keys(autos), orig),
-            ))
+            Some(Planned {
+                index: index.to_string(),
+                id: id.to_string(),
+                picks: sub_picks_for(&json_lang_names(subs), &json_lang_names(autos), orig),
+            })
         })
         .collect()
 }
 
-/// Group entries by their computed subtitle list, so each distinct list becomes ONE download
-/// invocation (`--playlist-items` takes a comma list) instead of one per entry.
-fn group_by_langs(planned: &[(String, Vec<String>)]) -> Vec<(String, Vec<String>)> {
-    let mut groups: Vec<(Vec<String>, Vec<String>)> = Vec::new();
-    for (index, langs) in planned {
-        match groups.iter_mut().find(|(_, group_langs)| group_langs == langs) {
-            Some((indexes, _)) => indexes.push(index.clone()),
-            None => groups.push((vec![index.clone()], langs.clone())),
+/// Group planned entries by their subtitle KEY list, so each distinct list becomes ONE download
+/// invocation (`--playlist-items` takes a comma list) instead of one per entry. Auto flags may
+/// differ within a group (the same `en` can be real for one entry, translated for another) —
+/// that's per-entry data the post-pass reads from each [`Planned`].
+fn group_by_langs(planned: &[Planned]) -> Vec<Vec<&Planned>> {
+    let keys = |plan: &Planned| plan.picks.iter().map(|pick| pick.key.clone()).collect::<Vec<_>>();
+    let mut groups: Vec<(Vec<String>, Vec<&Planned>)> = Vec::new();
+    for plan in planned {
+        let plan_keys = keys(plan);
+        match groups.iter_mut().find(|(group_keys, _)| *group_keys == plan_keys) {
+            Some((_, members)) => members.push(plan),
+            None => groups.push((plan_keys, vec![plan])),
         }
     }
-    groups.into_iter().map(|(indexes, langs)| (indexes.join(","), langs)).collect()
+    groups.into_iter().map(|(_, members)| members).collect()
 }
 
-/// Ask yt-dlp what subtitles a video has: `(real languages, auto-caption keys, native language)`.
-fn probe_subs(url: &str, item: Option<&str>) -> Option<(Vec<String>, Vec<String>, Option<String>)> {
-    let mut argv: Vec<OsString> = seeded();
-    if let Some(index) = item {
-        argv.extend([OsString::from("--playlist-items"), index.into()]);
-    }
-    argv.extend(
-        ["--print", "%(language)s", "--print", "%(subtitles)j", "--print", "%(automatic_captions)j"]
-            .map(OsString::from),
-    );
-    argv.push(url.into());
-    let out = capture_stdout(super::resolve("yt-dlp"), argv)?;
-    let mut lines = out.lines();
-    let orig = lines.next()?.trim();
-    let orig = (!orig.is_empty() && orig != "NA").then(|| orig.to_string());
-    let reals = json_top_keys(lines.next()?);
-    let autos = json_top_keys(lines.next()?);
-    Some((reals, autos, orig))
-}
-
-/// The top-level keys of a JSON object, dependency-free: walk the text tracking brace/bracket
-/// depth and string state; a string that closes at depth 1 and is followed by `:` is a key.
-/// Enough for yt-dlp's `%(subtitles)j` dumps (string keys, array values).
-fn json_top_keys(json: &str) -> Vec<String> {
-    let mut keys = Vec::new();
+/// The top-level keys of a JSON object paired with the first `"name"` string inside each
+/// key's value — dependency-free, same walking technique as [`json_top_keys`]. Fits yt-dlp's
+/// `%(subtitles)j` shape: `{"en": [{"url": …, "name": "English"}, …], …}`; a key whose value
+/// carries no name gets `""`.
+fn json_lang_names(json: &str) -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> = Vec::new();
     let mut depth = 0u32;
     let mut in_string: Option<String> = None;
     let mut escaped = false;
-    let mut pending: Option<String> = None; // a string closed at depth 1, awaiting its `:`
+    let mut pending: Option<(u32, String)> = None; // a closed string, with its depth
+    let mut await_name_value = false; // the last string was a `"name"` key inside a value
     for ch in json.chars() {
         if let Some(buffer) = in_string.as_mut() {
             if escaped {
@@ -438,8 +593,15 @@ fn json_top_keys(json: &str) -> Vec<String> {
                 escaped = true;
             } else if ch == '"' {
                 let text = in_string.take().unwrap();
-                if depth == 1 {
-                    pending = Some(text);
+                if await_name_value {
+                    await_name_value = false;
+                    if let Some((_, name)) = entries.last_mut() {
+                        if name.is_empty() {
+                            *name = text;
+                        }
+                    }
+                } else {
+                    pending = Some((depth, text));
                 }
             } else {
                 buffer.push(ch);
@@ -448,11 +610,11 @@ fn json_top_keys(json: &str) -> Vec<String> {
         }
         match ch {
             '"' => in_string = Some(String::new()),
-            ':' => {
-                if let Some(key) = pending.take() {
-                    keys.push(key);
-                }
-            }
+            ':' => match pending.take() {
+                Some((1, key)) => entries.push((key, String::new())),
+                Some((_, key)) if key == "name" => await_name_value = true,
+                _ => {}
+            },
             ' ' | '\t' | '\n' | '\r' => {}
             '{' | '[' => {
                 depth += 1;
@@ -462,10 +624,13 @@ fn json_top_keys(json: &str) -> Vec<String> {
                 depth = depth.saturating_sub(1);
                 pending = None;
             }
-            _ => pending = None,
+            _ => {
+                pending = None;
+                await_name_value = false;
+            }
         }
     }
-    keys
+    entries
 }
 
 // --- argv assembly ---------------------------------------------------------------
@@ -489,6 +654,8 @@ const ARCHIVE_NAME: &str = ".yt_archive.txt";
 /// quality: mkv accepts any codec yt-dlp picks (h264 fallbacks included) and embeds the
 /// thumbnail, where webm refuses attachments and leaves the art as loose image files.
 fn common(archive_dir: &Path, env: Env, langs: &[String]) -> Vec<OsString> {
+    // `--ignore-errors` also keeps subtitle picks must-try: a 429'd track warns and is skipped
+    // without failing the video (see `sub_picks_for`).
     let mut argv: Vec<OsString> = ["--ignore-errors", "--concurrent-fragments", "4"]
         .into_iter()
         .map(OsString::from)
@@ -499,9 +666,13 @@ fn common(archive_dir: &Path, env: Env, langs: &[String]) -> Vec<OsString> {
         argv.extend(["--write-subs", "--write-auto-subs", "--sub-langs"].map(OsString::from));
         argv.push(langs.join(",").into());
         argv.extend(["--embed-subs", "--compat-options", "no-keep-subs"].map(OsString::from));
+        // YouTube rate-limits its subtitle endpoint (429s, particularly on auto-translations);
+        // a short pause per subtitle fetch stays under its radar and only taxes subbed videos.
+        argv.extend(["--sleep-subtitles", "2"].map(OsString::from));
     }
     argv.extend(
         [
+            "--sleep-subtitles", "2",
             "--embed-metadata", "--embed-chapters",
             "--embed-thumbnail", "--convert-thumbnails", "jpg",
             "--merge-output-format", "mkv",
@@ -533,8 +704,32 @@ fn common(archive_dir: &Path, env: Env, langs: &[String]) -> Vec<OsString> {
     argv
 }
 
+/// How to invoke yt-dlp: the bundled zipapp is run through the bundled python *explicitly* —
+/// its `env python3` shebang would otherwise pick whatever python the caller's PATH offers,
+/// and the curl_cffi impersonation support lives in ours. A system yt-dlp runs as itself.
+fn ytdlp_invocation(args: Vec<OsString>) -> (OsString, Vec<OsString>) {
+    let ytdlp = crate::tools::resolve("yt-dlp");
+    if ytdlp == "yt-dlp" {
+        return (ytdlp, args);
+    }
+    let mut full = vec![ytdlp];
+    full.extend(args);
+    (crate::tools::resolve("python3"), full)
+}
+
 fn run(argv: Vec<OsString>) -> i32 {
-    run_reporting_code(super::resolve("yt-dlp"), argv)
+    let (program, args) = ytdlp_invocation(argv);
+    let code = run_reporting_code(program, args);
+    if code != 0 {
+        // The interpreter's name in the line above obscures the real actor; and the most common
+        // hard failure deserves its diagnosis spelled out.
+        eprintln!(
+            "dl_yt: yt-dlp failed (exit {code}). A `403 Forbidden` on video data usually means \
+             YouTube has blocklisted this network's IP (VPN exits often are) — switching the \
+             node/network tends to fix it, and --cookies is the other lever."
+        );
+    }
+    code
 }
 
 /// A lone video, named [`YT_NAME`] directly under the destination (which also holds the
@@ -636,7 +831,8 @@ fn scan_tab(url: &str, dir_template: &str) -> TabScan {
         "--print".into(), format!("playlist:{dir_template}").into(),
         url.into(),
     ]);
-    let Some((ok, stdout, stderr)) = capture_output(super::resolve("yt-dlp"), args) else {
+    let (program, args) = ytdlp_invocation(args);
+    let Some((ok, stdout, stderr)) = capture_output(program, args) else {
         return TabScan::Failed;
     };
     if ok {
@@ -669,7 +865,8 @@ fn scan_playlist(url: &str, dir_template: &str) -> Option<PlaylistScan> {
         "--print".into(), format!("playlist:{dir_template}").into(),
         url.into(),
     ]);
-    let out = capture_stdout(super::resolve("yt-dlp"), argv)?;
+    let (program, args) = ytdlp_invocation(argv);
+    let out = capture_stdout(program, args)?;
     parse_scan(&out)
 }
 
@@ -774,11 +971,16 @@ mod tests {
         );
     }
 
+    /// The EN-family keys, as tests pass them to the argv builders.
+    fn en_keys() -> Vec<String> {
+        ["en", "en-US", "en-GB"].map(str::to_string).to_vec()
+    }
+
     #[test]
     fn the_single_flag_pins_a_video_carrying_a_playlist_to_just_the_video() {
         let url = "https://www.youtube.com/watch?v=7jrKjkrX3Gw&list=PLxyz";
         assert_eq!(classify(url, true), Link::Video);
-        let argv = video_argv(url, Path::new("."), Env::default(), &default_langs());
+        let argv = video_argv(url, Path::new("."), Env::default(), &en_keys());
         assert!(argv.contains(&OsString::from("--no-playlist")), "{argv:?}");
     }
 
@@ -805,50 +1007,95 @@ mod tests {
         );
     }
 
-    #[test]
-    fn subtitle_policy_covers_uploader_native_and_english_without_doubles() {
-        let s = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        // The PlayStation case: uploader published en+ko — both taken, no auto anything.
-        assert_eq!(
-            sub_langs_for(&s(&["en", "ko"]), &s(&["ko", "ko-orig", "en", "fr"]), Some("ko")),
-            s(&["en", "ko"])
-        );
-        // No uploader subs on a Korean video: native auto + translated EN — the variants whose
-        // YouTube names announce the machine origin win ("Korean (Original)", "English from
-        // Korean"), so nobody mistakes them for the uploader's script.
-        assert_eq!(
-            sub_langs_for(&[], &s(&["ko", "ko-orig", "en", "en-ko"]), Some("ko")),
-            s(&["ko-orig", "en-ko"])
-        );
-        assert_eq!(
-            sub_langs_for(&[], &s(&["ko", "en"]), Some("ko")),
-            s(&["ko", "en"]),
-            "the unlabeled keys are the plan B when no labeled variant is published"
-        );
-        // The Hebrew case, legacy `iw` code and all (lang=iw, keys iw/iw-orig/en).
-        assert_eq!(
-            sub_langs_for(&[], &s(&["iw", "iw-orig", "en"]), Some("iw")),
-            s(&["iw-orig", "en"])
-        );
-        // English-native video with no uploader subs: EN once, not twice — labeled.
-        assert_eq!(sub_langs_for(&[], &s(&["en", "en-orig"]), Some("en")), s(&["en-orig"]));
-        // Real Korean only: EN still arrives as the auto translation.
-        assert_eq!(sub_langs_for(&s(&["ko"]), &s(&["en", "ko-orig"]), Some("ko")), s(&["ko", "en"]));
-        // live_chat is not a subtitle; unknown native language degrades gracefully.
-        assert_eq!(sub_langs_for(&s(&["live_chat", "en"]), &[], None), s(&["en"]));
-        assert!(sub_langs_for(&[], &[], None).is_empty(), "nothing available, nothing requested");
+    /// `(key, name)` pairs the way the probe parser hands them over.
+    fn named(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items.iter().map(|(key, name)| (key.to_string(), name.to_string())).collect()
+    }
+
+    fn keys_of(picks: &[Pick]) -> Vec<&str> {
+        picks.iter().map(|pick| pick.key.as_str()).collect()
     }
 
     #[test]
-    fn json_top_keys_reads_only_the_outer_object() {
-        assert_eq!(
-            json_top_keys(r#"{"en": [{"url": "x", "name": "English"}], "ko": []}"#),
-            ["en", "ko"]
+    fn subtitle_policy_covers_uploader_native_and_english_without_doubles() {
+        // The PlayStation case: uploader published en+ko — both taken, no auto anything.
+        let real = sub_picks_for(
+            &named(&[("en", "English"), ("ko", "Korean")]),
+            &named(&[("ko", "Korean"), ("ko-orig", "Korean (Original)"), ("en", "English")]),
+            Some("ko"),
         );
-        assert_eq!(json_top_keys(r#"{"a-b": [], "c": {"nested": [1, 2]}}"#), ["a-b", "c"]);
-        assert_eq!(json_top_keys(r#"{"esc\"aped": []}"#), [r#"esc"aped"#]);
-        assert!(json_top_keys("{}").is_empty());
-        assert!(json_top_keys("null").is_empty());
+        assert_eq!(keys_of(&real), ["en", "ko"]);
+        assert!(real.iter().all(|pick| !pick.auto), "uploader subs must never be stamped");
+
+        // No uploader subs on a Korean video: native auto + translated EN, both flagged auto,
+        // preferring the pair/orig keys when published.
+        let auto = sub_picks_for(
+            &[],
+            &named(&[
+                ("ko", "Korean"),
+                ("ko-orig", "Korean (Original)"),
+                ("en", "English"),
+                ("en-ko", "English from Korean"),
+            ]),
+            Some("ko"),
+        );
+        assert_eq!(keys_of(&auto), ["ko-orig", "en-ko"]);
+        assert!(auto.iter().all(|pick| pick.auto));
+        assert_eq!(auto[0].name, "Korean (Original)", "the name is what the post-pass matches");
+
+        // The Hebrew case, legacy `iw` code and all — no pair key published, plain `en` plan B.
+        let hebrew = sub_picks_for(
+            &[],
+            &named(&[("iw", "Hebrew"), ("iw-orig", "Hebrew (Original)"), ("en", "English")]),
+            Some("iw"),
+        );
+        assert_eq!(keys_of(&hebrew), ["iw-orig", "en"]);
+        assert!(hebrew.iter().all(|pick| pick.auto), "plain `en` here is still a translation");
+
+        // English-native video with no uploader subs: EN once, not twice.
+        assert_eq!(
+            keys_of(&sub_picks_for(
+                &[],
+                &named(&[("en", "English"), ("en-orig", "English (Original)")]),
+                Some("en")
+            )),
+            ["en-orig"]
+        );
+        // Real Korean only: EN still arrives as the auto translation, flagged as such.
+        let mixed = sub_picks_for(
+            &named(&[("ko", "Korean")]),
+            &named(&[("en", "English"), ("ko-orig", "Korean (Original)")]),
+            Some("ko"),
+        );
+        assert_eq!(keys_of(&mixed), ["ko", "en"]);
+        assert_eq!(mixed.iter().map(|pick| pick.auto).collect::<Vec<_>>(), [false, true]);
+        // live_chat is not a subtitle; unknown native language degrades gracefully.
+        assert_eq!(
+            keys_of(&sub_picks_for(&named(&[("live_chat", ""), ("en", "English")]), &[], None)),
+            ["en"]
+        );
+        assert!(sub_picks_for(&[], &[], None).is_empty(), "nothing available, nothing requested");
+    }
+
+    #[test]
+    fn auto_tracks_get_stamped_titles() {
+        assert_eq!(stamped_title("Hebrew (Original)"), "Hebrew (auto-generated)");
+        assert_eq!(stamped_title("English"), "English (auto-generated)");
+        assert_eq!(stamped_title("English from Korean"), "English from Korean (auto-generated)");
+    }
+
+    #[test]
+    fn json_lang_names_pair_each_key_with_its_display_name() {
+        let json = r#"{"en": [{"url": "u", "name": "English"}], "iw-orig": [{"ext": "vtt", "name": "Hebrew (Original)"}], "bare": []}"#;
+        assert_eq!(
+            json_lang_names(json),
+            [
+                ("en".to_string(), "English".to_string()),
+                ("iw-orig".to_string(), "Hebrew (Original)".to_string()),
+                ("bare".to_string(), String::new()),
+            ]
+        );
+        assert!(json_lang_names("NA").is_empty());
     }
 
     #[test]
@@ -861,12 +1108,13 @@ mod tests {
                 js_runtime: Some(Path::new("/dn/deno")),
                 ..Default::default()
             },
-            &default_langs(),
+            &en_keys(),
         );
         let text: Vec<String> = argv.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
         for expected in [
             "--write-subs", "--write-auto-subs", "--embed-subs",
             "--sub-langs", "en,en-US,en-GB",
+            "--sleep-subtitles", "2",
             "--embed-metadata", "--embed-chapters",
             "--embed-thumbnail", "--convert-thumbnails", "jpg",
             "--merge-output-format", "mkv",
@@ -892,7 +1140,7 @@ mod tests {
     fn the_optional_knobs_shape_the_run_and_extras_land_last() {
         let extra = vec!["--merge-output-format".to_string(), "webm/mkv".to_string()];
         let env = Env { audio: true, res: Some(1080), extra: &extra, ..Default::default() };
-        let argv = video_argv("https://u", Path::new("/dl"), env, &default_langs());
+        let argv = video_argv("https://u", Path::new("/dl"), env, &en_keys());
         assert!(argv.contains(&OsString::from("-x")), "audio-only: {argv:?}");
         assert!(
             !argv.contains(&OsString::from("--embed-subs")),
@@ -920,7 +1168,7 @@ mod tests {
             let at = argv.iter().position(|a| a == "--download-archive").expect("archive flag");
             argv[at + 1].to_string_lossy().into_owned()
         };
-        let langs = default_langs();
+        let langs = en_keys();
 
         let video = video_argv("https://youtu.be/x", Path::new("/dl"), Env::default(), &langs);
         assert_eq!(template(&video), format!("/dl/{YT_NAME}"));
@@ -977,22 +1225,36 @@ mod tests {
     }
 
     #[test]
-    fn the_batch_probe_parses_per_entry_and_groups_by_subtitle_list() {
+    fn the_batch_probe_parses_per_entry_and_groups_by_subtitle_keys() {
         // Entry 1: real en+ko. Entry 2: nothing anywhere. Entry 3: auto-only Korean video.
-        let out = "1\tko\t{\"en\": [], \"ko\": []}\t{}\n\
-                   2\tNA\t{}\t{}\n\
-                   3\tko\t{}\t{\"ko\": [], \"en\": []}\n";
+        let out = "1\tidA00000001\tko\t{\"en\": [{\"name\": \"English\"}], \"ko\": [{\"name\": \"Korean\"}]}\t{}\n\
+                   2\tidB00000002\tNA\t{}\t{}\n\
+                   3\tidC00000003\tko\t{}\t{\"ko\": [{\"name\": \"Korean\"}], \"en\": [{\"name\": \"English\"}]}\n";
         let plan = parse_batch(out);
-        assert_eq!(plan[0], ("1".to_string(), vec!["en".to_string(), "ko".to_string()]));
-        assert_eq!(plan[1], ("2".to_string(), vec![]));
-        assert_eq!(plan[2], ("3".to_string(), vec!["ko".to_string(), "en".to_string()]));
+        assert_eq!(plan[0].id, "idA00000001");
+        assert_eq!(keys_of(&plan[0].picks), ["en", "ko"]);
+        assert!(plan[1].picks.is_empty());
+        assert_eq!(keys_of(&plan[2].picks), ["ko", "en"]);
+        assert!(plan[2].picks.iter().all(|pick| pick.auto));
         let groups = group_by_langs(&plan);
-        assert_eq!(groups.len(), 3, "three distinct lists here");
-        // Same list → one invocation covering both entries.
-        let twin = vec![plan[0].clone(), ("9".to_string(), plan[0].1.clone())];
+        assert_eq!(groups.len(), 3, "three distinct key lists here");
+        // Same keys → one group, even when the auto flags differ per entry (real en for one,
+        // translated en for another) — the post-pass reads each entry's own picks.
+        let twin = [
+            Planned { index: "1".into(), id: "a".into(), picks: plan[0].picks.clone() },
+            Planned {
+                index: "9".into(),
+                id: "b".into(),
+                picks: plan[0]
+                    .picks
+                    .iter()
+                    .map(|pick| Pick { auto: !pick.auto, ..pick.clone() })
+                    .collect(),
+            },
+        ];
         let merged = group_by_langs(&twin);
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].0, "1,9", "indexes join into one --playlist-items value");
+        assert_eq!(merged[0].iter().map(|plan| plan.index.as_str()).collect::<Vec<_>>(), ["1", "9"]);
     }
 
     #[test]

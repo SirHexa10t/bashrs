@@ -8,7 +8,7 @@ mod commands {
     use std::path::PathBuf;
 
     use crate::support::exec::{capture_stdout, run_reporting};
-    use crate::tools::youtube;
+    use crate::drivers::youtube;
     use clap::Args;
 
     /// Download every link of the given file types found in a webpage, into the current dir

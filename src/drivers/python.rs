@@ -11,7 +11,7 @@ use crate::support::exec;
 
 /// The bundled interpreter, when present (`None`: not bundled on this machine).
 pub(crate) fn interpreter() -> Option<PathBuf> {
-    let python = super::root().join("python").join("bin").join("python3");
+    let python = crate::tools::root().join("python").join("bin").join("python3");
     python.exists().then_some(python)
 }
 
@@ -19,7 +19,7 @@ pub(crate) fn interpreter() -> Option<PathBuf> {
 /// `py_rollback`'s restore point, rewritten by every mutating operation (and by design *not* by
 /// [`rollback`] itself, so rolling back twice is a no-op rather than a ping-pong).
 fn snapshot_file() -> PathBuf {
-    super::root().join("python").join(".packages-before-last-change")
+    crate::tools::root().join("python").join(".packages-before-last-change")
 }
 
 /// Record the environment's current package set as the rollback point.
@@ -33,7 +33,7 @@ fn snapshot(python: &Path) {
 fn freeze(python: &Path) -> Option<String> {
     let args: Vec<String> =
         vec!["pip".into(), "freeze".into(), "--python".into(), python.display().to_string()];
-    exec::capture_stdout(super::resolve("uv"), args)
+    exec::capture_stdout(crate::tools::resolve("uv"), args)
 }
 
 /// Restore the environment to exactly its pre-last-change package set (`uv pip sync`: versions
@@ -53,7 +53,7 @@ pub(crate) fn rollback() -> bool {
         python.display().to_string(),
         snapshot.display().to_string(),
     ];
-    exec::run_reporting(super::resolve("uv"), args)
+    exec::run_reporting(crate::tools::resolve("uv"), args)
 }
 
 /// Install `packages` into the bundled environment — latest versions, upgrading any already
@@ -61,7 +61,7 @@ pub(crate) fn rollback() -> bool {
 /// a spec like `pkg==1.2` — which `--upgrade` still honors). Accepts anything `uv pip install`
 /// does: bare names, `==`/`>=` specs, extras. Trivially `true` on an empty list; `false` — after
 /// reporting — when the environment is missing or `uv` fails.
-pub(crate) fn install<S: AsRef<str>>(packages: &[S]) -> bool {
+pub fn install<S: AsRef<str>>(packages: &[S]) -> bool {
     if packages.is_empty() {
         return true;
     }
@@ -92,7 +92,7 @@ fn uv_pip<S: AsRef<str>>(python: &Path, action: &[&str], packages: &[S]) -> bool
     argv.push("--python".into());
     argv.push(python.display().to_string());
     argv.extend(packages.iter().map(|package| package.as_ref().to_string()));
-    exec::run_reporting(super::resolve("uv"), argv)
+    exec::run_reporting(crate::tools::resolve("uv"), argv)
 }
 
 /// The bare package names in `uv pip freeze` output (`name==version` lines; anything else —
@@ -112,6 +112,19 @@ fn missing_env() -> bool {
     false
 }
 
+/// curl_cffi in the bundled environment restores yt-dlp's impersonation support (the zipapp
+/// runs on this python) — YouTube increasingly rejects unimpersonated clients with 403s and
+/// 429s. A no-op when it's already importable, or when yt-dlp isn't even bundled.
+pub fn ensure_impersonation() {
+    let bundled_ytdlp = crate::tools::resolve("yt-dlp") != "yt-dlp";
+    if bundled_ytdlp
+        && !exec::succeeds_quietly(crate::tools::resolve("python3"), ["-c", "import curl_cffi"])
+    {
+        eprintln!("tools: installing curl_cffi (yt-dlp's impersonation support)");
+        let _ = install(&["curl_cffi"]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,7 +141,8 @@ mod tests {
         // Environment-adaptive: Some(bundled path) where the bundle exists, None elsewhere.
         match interpreter() {
             Some(python) => assert!(python.ends_with("tools/python/bin/python3"), "{python:?}"),
-            None => assert!(!super::super::root().join("python/bin/python3").exists()),
+            None => assert!(!crate::tools::root().join("python/bin/python3").exists()),
         }
     }
 }
+

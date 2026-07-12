@@ -299,15 +299,13 @@ fn find_uv_asset(json: &str, arch: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// yt-dlp's standalone linux binary (a self-contained PyInstaller build, like the ffmpeg bundle
-/// is self-contained), discovered from the latest release by exact asset name.
+/// yt-dlp's zipapp, discovered from the latest release. Chosen over the standalone
+/// `yt-dlp_linux` deliberately: it's arch-independent, and it skips the PyInstaller
+/// self-extraction that cost 1.6s on every invocation (the zipapp starts ~4× faster on the
+/// bundled python). When the bundle is absent, [`super::resolve`] falls back to whatever
+/// `yt-dlp` the system provides.
 pub(super) fn ytdlp_url() -> Option<String> {
-    let asset = match std::env::consts::ARCH {
-        "x86_64" => "yt-dlp_linux",
-        "aarch64" => "yt-dlp_linux_aarch64",
-        _ => return None,
-    };
-    find_ytdlp_asset(&latest_release("yt-dlp/yt-dlp")?, asset)
+    find_ytdlp_asset(&latest_release("yt-dlp/yt-dlp")?, "yt-dlp")
 }
 
 /// deno's static binary zip for this machine, discovered from the latest release — bundled to
@@ -348,7 +346,11 @@ mod tests {
             "https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.01/yt-dlp_linux",
             "must not stop at the bare `yt-dlp` or grab the aarch64 sibling"
         );
-        assert!(find_ytdlp_asset(json, "yt-dlp_linux_aarch64").unwrap().ends_with("_aarch64"));
+        assert_eq!(
+            find_ytdlp_asset(json, "yt-dlp").unwrap(),
+            "https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.01/yt-dlp",
+            "the bare zipapp asset must not match its `yt-dlp_*` siblings"
+        );
         assert!(find_ytdlp_asset(json, "yt-dlp_windows").is_none());
     }
 

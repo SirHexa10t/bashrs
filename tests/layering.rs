@@ -1,7 +1,7 @@
 //! Enforces the crate's layering diagram (see `lib.rs`): imports must only point left in
 //!
 //! ```text
-//! support  <  conf  <  tools  <  categories, cli
+//! support  <  conf  <  tools  <  drivers  <  categories, cli
 //! ```
 //!
 //! A structural rule as a test, so an upward import (the kind that once threatened a
@@ -15,7 +15,8 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("support", &["support"]),
     ("conf", &["conf", "support"]),
     ("tools", &["tools", "conf", "support"]),
-    ("categories", &["categories", "conf", "support", "tools"]),
+    ("drivers", &["drivers", "tools", "conf", "support"]),
+    ("categories", &["categories", "conf", "support", "tools", "drivers"]),
 ];
 
 #[test]

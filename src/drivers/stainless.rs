@@ -90,10 +90,10 @@ fn git(cmd: &mut Command, repo: &str) {
 }
 
 /// Probe `<run> <exe> --help` (through a shell, so `$HOME` in `exe` expands) for a description.
-/// The launcher goes through [`super::resolve`], mirroring the sourcefile's PATH shim — the probe
+/// The launcher goes through [`crate::tools::resolve`], mirroring the sourcefile's PATH shim — the probe
 /// works even when the launcher is only bundled. Best-effort: any failure yields `None` (no comment).
 fn fetch_about(comfy: &Comfy) -> Option<String> {
-    let run = super::resolve(comfy.run);
+    let run = crate::tools::resolve(comfy.run);
     let script = format!("\"{}\" \"{}\" --help 2>&1", run.to_string_lossy(), exe_shell(comfy));
     let out = Command::new("bash").arg("-c").arg(script).output().ok()?;
     if !out.status.success() {

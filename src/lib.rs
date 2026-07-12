@@ -18,6 +18,7 @@
 pub mod categories;
 pub mod cli;
 pub mod conf;
+pub mod drivers;
 pub mod support;
 pub mod tools;
 
