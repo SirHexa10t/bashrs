@@ -91,12 +91,21 @@ pub fn app_home_roots(home: &Path, flatpak_id: &str, snap_name: &str) -> Vec<Pat
     roots
 }
 
-/// Every candidate *XDG-config* root — the native `~/.config`, plus each sandbox manager's
-/// config location (Flatpak's dotless `config/`, Snap's `.config` under both trees, and the
-/// sandbox home itself, since some snaps drop config there directly). Chromium-family profiles
-/// hang off these. Generous by design: non-existent candidates are filtered by the caller.
+/// Every candidate *XDG-config* root — the native config home (`$XDG_CONFIG_HOME` when set,
+/// else `~/.config`), plus each sandbox manager's config location (Flatpak's dotless `config/`,
+/// Snap's `.config` under both trees, and the sandbox home itself, since some snaps drop config
+/// there directly). Chromium-family profiles hang off these, as do modern Firefox profiles
+/// (FF147+ moved to the XDG spec). Generous by design: non-existent candidates are filtered by
+/// the caller. `~/.config` is always included even when `$XDG_CONFIG_HOME` overrides it — a
+/// browser installed before the override still has its data there.
 pub fn app_config_roots(home: &Path, flatpak_id: &str, snap_name: &str) -> Vec<PathBuf> {
     let mut roots = vec![home.join(".config")];
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        let xdg = PathBuf::from(xdg);
+        if xdg.is_absolute() && xdg != home.join(".config") {
+            roots.push(xdg);
+        }
+    }
     for manager in MANAGERS {
         for base in sandbox_roots(manager.store, home, flatpak_id, snap_name) {
             match manager.store {

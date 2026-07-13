@@ -1,8 +1,14 @@
 //! Driving the bundled `yt-dlp`: URL classification, per-video subtitle resolution, download
-//! argv assembly, the playlist unplayable-report, and the flag menu. The `dl_yt` command
+//! argv assembly, the playlist unplayable-report, and the flag menu. The `dl` command
 //! ([`crate::categories::download`]) stays a thin shell over this, the same way
 //! [`super::python`] backs the `py_*` commands. It lives in `tools` rather than `support`
 //! because it resolves and runs the bundled binaries — a layer `support` sits below.
+//!
+//! The module is YouTube-centric — the subtitle matrix, playlist reports, and channel tabs are
+//! all YouTube-shaped — but it also exposes [`download_generic`], a bare single-video download
+//! for any other site yt-dlp supports (`dl` routes there when the host isn't YouTube). The
+//! generic path reuses everything site-agnostic here: [`common`]'s argv base, the failure
+//! diagnosis + geo rescue, the ledger, and the download archive.
 //!
 //! Downloads are driven **one video at a time** (playlists and channel tabs are scanned first,
 //! then each entry gets its own yt-dlp invocation). That costs one extra metadata request per
@@ -51,7 +57,7 @@ pub(crate) fn classify(url: &str, single: bool) -> Link {
     Link::Video
 }
 
-/// What every yt-dlp invocation of one `dl_yt` run shares.
+/// What every yt-dlp invocation of one `dl` run shares.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Env<'a> {
     /// The bundled ffmpeg's directory, when it exists — powers the subtitle embedding.
@@ -109,6 +115,60 @@ fn cookie_args(env: Env) -> Vec<OsString> {
     }
 }
 
+/// What reading an imported cookie store back through yt-dlp turned up. `total` is how many
+/// cookies decrypted at all (so a non-zero value proves a Chromium store's keyring read works —
+/// not merely that a file copied); `youtube` is how many of those are for YouTube/Google, i.e.
+/// the ones that actually authenticate `dl`.
+pub(crate) struct CookieCheck {
+    pub(crate) total: usize,
+    pub(crate) youtube: usize,
+}
+
+/// Have the bundled yt-dlp read `spec` back and tally what it yields, so `--cookie-import` can
+/// tell the user whether the store is actually usable *before* every future run silently leans
+/// on it. Runs fully offline — no URL is given, so yt-dlp extracts the cookies, writes them to a
+/// throwaway Netscape file, and quits without fetching anything — yet it exercises the real
+/// decryption path, so a keyring-locked Chromium store reports `total: 0` here instead of
+/// failing quietly on the first download. The throwaway file (decrypted cookies, briefly) is
+/// removed immediately. `None` when the check couldn't run (yt-dlp not bundled, or the read
+/// crashed before writing anything) — the caller then keeps its speculative guidance rather than
+/// claiming a result. `cookies_root` is the import's own dir; the probe file lives beside the
+/// store, under the same private `~/.bashrs` tree the store already occupies.
+pub(crate) fn count_browser_cookies(spec: &str, cookies_root: &Path) -> Option<CookieCheck> {
+    let probe = cookies_root.join(".probe-cookies.txt");
+    let _ = std::fs::remove_file(&probe); // clear any stale probe an interrupted run left behind
+    let argv: Vec<OsString> = vec![
+        "--cookies-from-browser".into(),
+        spec.into(),
+        "--cookies".into(),
+        probe.clone().into_os_string(),
+    ];
+    capture_ytdlp(argv)?; // None only if yt-dlp couldn't be launched at all
+    let dump = std::fs::read_to_string(&probe).ok();
+    let _ = std::fs::remove_file(&probe); // the decrypted dump must not linger
+    Some(tally_cookie_dump(&dump?))
+}
+
+/// Count a Netscape cookie dump: total data lines, and how many are for YouTube/Google. Split
+/// out from [`count_browser_cookies`] so the parsing is testable without yt-dlp on disk.
+fn tally_cookie_dump(dump: &str) -> CookieCheck {
+    let mut check = CookieCheck { total: 0, youtube: 0 };
+    for line in dump.lines() {
+        // `#HttpOnly_` lines are cookies too (and the auth ones usually are) — keep them; only
+        // genuine comments and blanks are skipped.
+        let entry = line.strip_prefix("#HttpOnly_").unwrap_or(line);
+        if entry.starts_with('#') || entry.trim().is_empty() {
+            continue;
+        }
+        check.total += 1;
+        let domain = entry.split('\t').next().unwrap_or("").trim_start_matches('.');
+        if domain.contains("youtube") || domain.contains("google") {
+            check.youtube += 1;
+        }
+    }
+    check
+}
+
 /// Starter argv for the metadata-side invocations (probes, scans): even those run the YouTube
 /// extractor, which warns — and may miss formats — without a JS runtime, warns again without an
 /// ffmpeg, and can't see gated content without cookies. Hand it the bundles and cookies.
@@ -129,8 +189,10 @@ pub(crate) fn download_video(url: &str, into: &Path, env: Env) -> i32 {
     let keys: Vec<String> = picks.iter().map(|pick| pick.key.clone()).collect();
     let mut code = run(video_argv(url, into, env, &keys));
     if code != 0 {
-        // Same diagnosis/rescue/ledger treatment the collection modes give their entries.
-        let label = id.clone().unwrap_or_else(|| url.to_string());
+        // Same diagnosis/rescue/ledger treatment the collection modes give their entries. The
+        // bracketed id is the ledger's stable key ([`scrub_ledger`]); a URL label (id unknown)
+        // still carries the id for YouTube links via its `v=` parameter.
+        let label = id.as_ref().map(|id| format!("[{id}]")).unwrap_or_else(|| url.to_string());
         match diagnose_failure(video_argv(url, into, env, &keys), &label) {
             None => code = 0, // the retry or a spoofed region came through
             Some(line) => write_ledger(into, &[line]),
@@ -141,6 +203,26 @@ pub(crate) fn download_video(url: &str, into: &Path, env: Env) -> i32 {
             finish_media(into, &id, &picks, env);
         }
     }
+    scrub_ledger(into);
+    code
+}
+
+/// The generic single-video path for non-YouTube sites (`dl` routes here when the host isn't
+/// YouTube). One download, flat into `into` — a generic page gives no playlist/channel structure
+/// to build folders from — reusing this module's shared argv base ([`common`]), failure
+/// diagnosis + rescue, ledger, and download archive. No subtitle probing: that's a
+/// YouTube-caption-matrix affair, so a generic site just gets the media, metadata, thumbnail, and
+/// chapters. The URL is the ledger label — the only stable key without a metadata probe (and
+/// enough for [`scrub_ledger`] when it embeds the id).
+pub(crate) fn download_generic(url: &str, into: &Path, env: Env) -> i32 {
+    let mut code = run(generic_argv(url, into, env));
+    if code != 0 {
+        match diagnose_failure(generic_argv(url, into, env), url) {
+            None => code = 0, // the plain retry or a spoofed region came through
+            Some(line) => write_ledger(into, &[line]),
+        }
+    }
+    scrub_ledger(into);
     code
 }
 
@@ -151,7 +233,7 @@ pub(crate) fn download_video(url: &str, into: &Path, env: Env) -> i32 {
 pub(crate) fn download_playlist(url: &str, id: &str, into: &Path, env: Env) -> i32 {
     let Some(scan) = scan_playlist(url, "%(title)S[%(id)S]", env) else {
         eprintln!(
-            "dl_yt: could not scan the playlist — downloading in one pass, EN-only subtitles, \
+            "dl: could not scan the playlist — downloading in one pass, EN-only subtitles, \
              no unplayable report"
         );
         let keys: Vec<String> = default_picks().iter().map(|pick| pick.key.clone()).collect();
@@ -161,7 +243,7 @@ pub(crate) fn download_playlist(url: &str, id: &str, into: &Path, env: Env) -> i
     let dir = scan.dirname.clone().unwrap_or_else(|| format!("[{id}]"));
     let home = into.join(&dir);
     if let Err(err) = std::fs::create_dir_all(&home) {
-        eprintln!("dl_yt: cannot create {}: {err}", home.display());
+        eprintln!("dl: cannot create {}: {err}", home.display());
         return 1;
     }
 
@@ -178,7 +260,7 @@ pub(crate) fn download_playlist(url: &str, id: &str, into: &Path, env: Env) -> i
                 scan.entries.len(),
                 report.display()
             ),
-            Err(err) => eprintln!("dl_yt: could not write {}: {err}", report.display()),
+            Err(err) => eprintln!("dl: could not write {}: {err}", report.display()),
         }
     }
 
@@ -257,7 +339,8 @@ fn download_pending(
     // Post-mortem: whatever is still unarchived failed inside a group, where `--ignore-errors`
     // kept the rest flowing but discarded the why. Each gets a captured re-run to diagnose,
     // geo-blocks get the region rescue, and the stubborn ones go to the ledger — unarchived on
-    // purpose, so future runs keep retrying them.
+    // purpose, so future runs keep retrying them (and the scrub below clears their ledger lines
+    // the moment a retry lands).
     let survivors = archived_ids(&home.join(ARCHIVE_NAME));
     let mut ledger = Vec::new();
     for plan in planned.iter().filter(|plan| !survivors.contains(&plan.id)) {
@@ -266,14 +349,20 @@ fn download_pending(
             .find(|entry| entry.index == plan.index)
             .map(|entry| entry.title.as_str())
             .unwrap_or(&plan.id);
-        let label = format!("#{} {title}", plan.index);
+        // The bracketed id is the ledger's stable key — index and title both drift as the
+        // playlist changes, so scrub_ledger matches on the id alone.
+        let label = format!("#{} {title} [{}]", plan.index, plan.id);
         println!("--- diagnosing {label} ---");
         let keys: Vec<String> = plan.picks.iter().map(|pick| pick.key.clone()).collect();
-        if let Some(line) = diagnose_failure(argv(url, into, home, env, &keys, &plan.index), &label)
-        {
-            ledger.push(line);
+        match diagnose_failure(argv(url, into, home, env, &keys, &plan.index), &label) {
+            // A region rescue (or plain-retry success) downloaded the file just now, after the
+            // group's finish pass already ran — so post-process it here, or it would keep
+            // yt-dlp's default subtitle titles and (in audio mode) miss its metadata tags.
+            None => finish_media(home, &plan.id, &plan.picks, env),
+            Some(line) => ledger.push(line),
         }
     }
+    scrub_ledger(home);
     write_ledger(home, &ledger);
     worst
 }
@@ -337,7 +426,7 @@ fn mark_auto_titles(root: &Path, id: &str, picks: &[Pick], env: Env) {
         }
     } else {
         let _ = std::fs::remove_file(&stamped);
-        eprintln!("dl_yt: could not stamp auto-subtitle titles in {}", file.display());
+        eprintln!("dl: could not stamp auto-subtitle titles in {}", file.display());
     }
 }
 
@@ -374,7 +463,7 @@ fn embed_subtitle_tags(root: &Path, id: &str, picks: &[Pick]) {
         let why = outcome.map(|(_, _, err)| err).unwrap_or_default();
         let why = why.lines().last().unwrap_or("unknown").trim();
         eprintln!(
-            "dl_yt: could not embed subtitle tags into {} ({why}) — sidecar .vtt files kept",
+            "dl: could not embed subtitle tags into {} ({why}) — sidecar .vtt files kept",
             file.display()
         );
     }
@@ -494,7 +583,7 @@ pub(crate) fn download_channel(root: &str, into: &Path, env: Env) -> i32 {
                 continue;
             }
             TabScan::Failed => {
-                eprintln!("dl_yt: could not read the `{tab}` tab — moving on");
+                eprintln!("dl: could not read the `{tab}` tab — moving on");
                 continue;
             }
         };
@@ -800,12 +889,18 @@ fn json_lang_names(json: &str) -> Vec<(String, String)> {
 
 // --- argv assembly ---------------------------------------------------------------
 
-/// The file name every mode shares: sortable upload date, title, and the video id that keeps
-/// any file traceable back to its source (ideas kept from the old dl_youtube.py).
+/// The file name every YouTube mode shares: sortable upload date, title, and the video id that
+/// keeps any file traceable back to its source (ideas kept from the old dl_youtube.py).
 const YT_NAME: &str = "%(upload_date)s__%(title)s__%(id)s.%(ext)s";
 
-/// The download-archive's file name, dropped inside whatever folder owns the collection.
-const ARCHIVE_NAME: &str = ".yt_archive.txt";
+/// Output template for a generic (non-YouTube) single download: title + id, flat under the
+/// destination. Simpler than [`YT_NAME`] — a random site rarely carries a reliable upload date,
+/// and there's no collection to sort into. The `[id]` also gives [`scrub_ledger`] a key to match.
+const GENERIC_NAME: &str = "%(title)s [%(id)s].%(ext)s";
+
+/// The download-archive's file name, dropped inside whatever folder owns the collection. Named
+/// for the `dl` command, not YouTube — every platform's downloads log here now.
+const ARCHIVE_NAME: &str = ".dl_video_archive.txt";
 
 /// The flags every yt-dlp run shares: keep going past broken entries, parallel fragments, the
 /// video's requested subtitles fetched-and-embedded (sidecars cleaned up), its title/uploader/
@@ -888,9 +983,9 @@ fn run(argv: Vec<OsString>) -> i32 {
         // The interpreter's name in the line above obscures the real actor; and the most common
         // hard failure deserves its diagnosis spelled out.
         eprintln!(
-            "dl_yt: yt-dlp failed (exit {code}). A `403 Forbidden` on video data usually means \
-             YouTube has blocklisted this network's IP (VPN exits often are) — switching the \
-             node/network tends to fix it, and --cookies is the other lever."
+            "dl: yt-dlp failed (exit {code}). A `403 Forbidden` on media usually means the site \
+             has blocklisted this network's IP (VPN / datacenter exits often are) — switching \
+             the node/network tends to fix it, and --cookies is the other lever."
         );
     }
     code
@@ -903,6 +998,19 @@ fn video_argv(url: &str, into: &Path, env: Env, langs: &[String]) -> Vec<OsStrin
     let mut argv = common(into, env, langs);
     argv.extend(["--no-playlist", "--output"].map(OsString::from));
     argv.push(into.join(YT_NAME).into_os_string());
+    argv.extend(env.extra.iter().map(OsString::from));
+    argv.push(url.into());
+    argv
+}
+
+/// A generic single download: [`common`] with no subtitle list (off YouTube there's no caption
+/// matrix to resolve), flat under `into` via [`GENERIC_NAME`]. `--no-playlist` keeps a page that
+/// happens to expose a playlist to the one video asked for — override with `-- --yes-playlist`,
+/// since `extra` is appended last and wins.
+fn generic_argv(url: &str, into: &Path, env: Env) -> Vec<OsString> {
+    let mut argv = common(into, env, &[]);
+    argv.extend(["--no-playlist", "--output"].map(OsString::from));
+    argv.push(into.join(GENERIC_NAME).into_os_string());
     argv.extend(env.extra.iter().map(OsString::from));
     argv.push(url.into());
     argv
@@ -1088,8 +1196,9 @@ const XFF_REGIONS: &[&str] =
 
 /// The failure ledger, written beside the collection's archive: what stayed undownloaded and
 /// why. Entries here are also deliberately NOT archived, so every future run retries them —
-/// members-only videos get released publicly later, and blocks lift.
-const FAILED_LEDGER: &str = ".yt_failed_download.txt";
+/// members-only videos get released publicly later, and blocks lift. Named for `dl`, not
+/// YouTube — the generic path writes here too.
+const FAILED_LEDGER: &str = ".dl_video_failed_download.txt";
 
 // TODO: scrape historic snapshots (e.g. the WaybackMachine's copies of channel tabs) to find
 // videos that were de-listed or disappeared entirely — candidates for the unplayable report and
@@ -1105,14 +1214,18 @@ enum Failure {
 }
 
 fn classify_failure(stderr: &str) -> Failure {
-    if stderr.contains("in your country") || stderr.contains("geo restriction") {
+    // Match case-insensitively against the phrasings yt-dlp's YouTube extractor actually emits
+    // (verified against its source): the per-video geo notice ("…available in your country"),
+    // the generic `raise_geo_restricted` default ("…from your location due to geo restriction"),
+    // and the region/restricted variants; the members badge reasons; the age gate. A missed
+    // phrasing costs the geo rescue, so the geo set errs wide.
+    let s = stderr.to_lowercase();
+    let has = |needle: &str| s.contains(needle);
+    if has("in your country") || has("from your location") || has("in your region") || has("geo restrict") || has("geo_restrict") {
         Failure::Geo
-    } else if stderr.contains("members-only")
-        || stderr.contains("channel's members")
-        || stderr.contains("Join this channel")
-    {
+    } else if has("members-only") || has("members only") || has("channel's members") || has("join this channel") {
         Failure::Members
-    } else if stderr.contains("confirm your age") || stderr.contains("age-restricted") {
+    } else if has("confirm your age") || has("age-restricted") || has("age-verification") || has("age_check_required") {
         Failure::AgeRestricted
     } else {
         Failure::Other
@@ -1126,10 +1239,12 @@ fn capture_ytdlp(argv: Vec<OsString>) -> Option<(bool, String, String)> {
 
 /// Re-run a failed download with output captured to learn WHY (group runs stream live and keep
 /// no stderr), rescue geo-blocks by walking [`XFF_REGIONS`], and return the ledger line for
-/// whatever stays dead (`None` when the plain retry or a spoofed region succeeded).
+/// whatever stays dead (`None` when the plain retry or a spoofed region succeeded). A terminal
+/// failure is also announced on stderr as it's decided, so the reason is visible in the run's
+/// output — not only later in the ledger.
 fn diagnose_failure(base: Vec<OsString>, label: &str) -> Option<String> {
     let Some((ok, _, stderr)) = capture_ytdlp(base.clone()) else {
-        return Some(format!("{label} — failed (could not even re-run yt-dlp)"));
+        return Some(dead(format!("{label} — failed (could not even re-run yt-dlp)")));
     };
     if ok {
         println!("{label}: succeeded on retry");
@@ -1147,13 +1262,13 @@ fn diagnose_failure(base: Vec<OsString>, label: &str) -> Option<String> {
                     return None;
                 }
             }
-            Some(format!("{label} — geo-blocked (tried {})", XFF_REGIONS.join(",")))
+            Some(dead(format!("{label} — geo-blocked (tried {})", XFF_REGIONS.join(","))))
         }
         Failure::Members => {
-            Some(format!("{label} — members-only (channels often release these publicly later)"))
+            Some(dead(format!("{label} — members-only (channels often release these publicly later)")))
         }
         Failure::AgeRestricted => {
-            Some(format!("{label} — age-restricted (retry with --cookies / --cookie-chooser)"))
+            Some(dead(format!("{label} — age-restricted (retry with --cookies / --cookie-import)")))
         }
         Failure::Other => {
             let detail = stderr
@@ -1161,8 +1276,75 @@ fn diagnose_failure(base: Vec<OsString>, label: &str) -> Option<String> {
                 .find(|line| line.contains("ERROR"))
                 .unwrap_or("unknown error")
                 .trim();
-            Some(format!("{label} — failed: {detail}"))
+            Some(dead(format!("{label} — failed: {detail}")))
         }
+    }
+}
+
+/// Announce a terminal download failure on stderr and hand the same text back for the ledger,
+/// so the reason shows in the live run and is recorded in one move.
+fn dead(line: String) -> String {
+    eprintln!("dl: {line}");
+    line
+}
+
+/// Whether a ledger line refers to video `id` — via the bracketed `[id]` every writer now
+/// emits, the `=id` shape of a URL label (`watch?v=id`), or a legacy bare-id label opening the
+/// line. Deliberately delimited forms rather than raw substring: a short id from a non-YouTube
+/// extractor must not match mid-word inside some other entry's title.
+fn ledger_line_refers(line: &str, id: &str) -> bool {
+    line.contains(&format!("[{id}]"))
+        || line.contains(&format!("={id}"))
+        || line.starts_with(&format!("{id} "))
+}
+
+/// Clear ledger entries whose videos have since downloaded — the archive is the proof of
+/// success. Runs after every download pass, so a lifted geo-block or a members-only video the
+/// channel later released drops off the list the moment its retry lands (entries are left
+/// unarchived precisely so reruns keep retrying them). Timestamp headers left with no entries
+/// go too, and a fully-cleared ledger file is removed. One line per entry keeps this a
+/// line-filter; entries whose label carries no id (non-YouTube URL labels) stay until pruned
+/// by hand.
+fn scrub_ledger(dir: &Path) {
+    let path = dir.join(FAILED_LEDGER);
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    let archived = archived_ids(&dir.join(ARCHIVE_NAME));
+    if archived.is_empty() {
+        return;
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut cleared = 0usize;
+    for line in text.lines() {
+        if line.starts_with("── ") {
+            // A header whose whole block was cleared is still on top of the stack — replace it.
+            if kept.last().is_some_and(|last| last.starts_with("── ")) {
+                kept.pop();
+            }
+            kept.push(line);
+        } else if archived.iter().any(|id| ledger_line_refers(line, id)) {
+            cleared += 1;
+        } else if !line.trim().is_empty() {
+            kept.push(line);
+        }
+    }
+    if kept.last().is_some_and(|last| last.starts_with("── ")) {
+        kept.pop();
+    }
+    if cleared == 0 {
+        return;
+    }
+    let outcome = if kept.is_empty() {
+        std::fs::remove_file(&path)
+    } else {
+        std::fs::write(&path, kept.join("\n") + "\n")
+    };
+    match outcome {
+        Ok(()) => println!(
+            "{cleared} previously-failed download(s) have since succeeded — cleared from {}{}",
+            path.display(),
+            if kept.is_empty() { " (nothing left; file removed)" } else { "" },
+        ),
+        Err(err) => eprintln!("dl: could not rewrite {}: {err}", path.display()),
     }
 }
 
@@ -1185,7 +1367,7 @@ fn write_ledger(dir: &Path, lines: &[String]) {
         .and_then(|mut file| file.write_all(block.as_bytes()));
     match written {
         Ok(()) => println!("{} download(s) failed — details in {}", lines.len(), path.display()),
-        Err(err) => eprintln!("dl_yt: could not write {}: {err}", path.display()),
+        Err(err) => eprintln!("dl: could not write {}: {err}", path.display()),
     }
 }
 
@@ -1391,7 +1573,7 @@ mod tests {
             "--embed-thumbnail", "--convert-thumbnails", "jpg",
             "--merge-output-format", "mkv",
             "--ignore-errors",
-            "--download-archive", "/dl/.yt_archive.txt",
+            "--download-archive", "/dl/.dl_video_archive.txt",
             "--ffmpeg-location", "/ff/bin",
             "--cookies", "/c.txt",
             "--js-runtimes", "deno:/dn/deno",
@@ -1407,6 +1589,34 @@ mod tests {
         ] {
             assert!(!bare.iter().any(|arg| arg == absent), "{absent} leaked in");
         }
+    }
+
+    #[test]
+    fn the_generic_argv_reuses_the_shared_base_flat_no_subs_no_playlist() {
+        let extra = vec!["--yes-playlist".to_string()];
+        let argv = generic_argv(
+            "https://vimeo.com/12345",
+            Path::new("/dl"),
+            Env { res: Some(720), extra: &extra, ..Default::default() },
+        );
+        let text: Vec<String> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        // Same shared knobs + log files as the YouTube path (metadata, thumbnail, mkv, archive).
+        for expected in ["--embed-metadata", "--merge-output-format", "mkv", "--download-archive", "/dl/.dl_video_archive.txt"] {
+            assert!(text.contains(&expected.to_string()), "missing {expected}: {text:?}");
+        }
+        // But no subtitle probing off YouTube, and a flat output template (no folder tree).
+        for absent in ["--write-subs", "--write-auto-subs", "--sub-langs", "--embed-subs"] {
+            assert!(!text.contains(&absent.to_string()), "{absent} leaked into the generic path");
+        }
+        let out = text.iter().position(|a| a == "--output").expect("has --output");
+        assert_eq!(text[out + 1], "/dl/%(title)s [%(id)s].%(ext)s", "flat generic name under `into`");
+        // Quality knob still applies; the URL lands last; `-- --yes-playlist` follows our
+        // --no-playlist so a user can override the single-video default.
+        assert!(text.contains(&"res:720".to_string()));
+        assert_eq!(text.last().unwrap(), "https://vimeo.com/12345");
+        let no = text.iter().position(|a| a == "--no-playlist").expect("defaults to single");
+        let yes = text.iter().rposition(|a| a == "--yes-playlist").expect("extra passed through");
+        assert!(yes > no, "user's --yes-playlist must come after our --no-playlist to win");
     }
 
     #[test]
@@ -1446,6 +1656,28 @@ mod tests {
         );
         assert_eq!(pair(&explicit, "--cookies").as_deref(), Some("/c.txt"));
         assert!(!explicit.iter().any(|a| a == "--cookies-from-browser"), "explicit file must win alone");
+    }
+
+    #[test]
+    fn cookie_dump_tally_counts_entries_and_flags_youtube_relevance() {
+        // A Netscape dump as yt-dlp writes it: header + comment skipped, `#HttpOnly_` kept (the
+        // auth cookies are usually HttpOnly), YouTube/Google domains tallied apart from the rest.
+        let dump = "# Netscape HTTP Cookie File\n\
+                    # a comment\n\
+                    \n\
+                    #HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t2000000000\tLOGIN_INFO\ttok\n\
+                    .google.com\tTRUE\t/\tTRUE\t2000000000\tSID\tsid\n\
+                    .example.com\tTRUE\t/\tFALSE\t2000000000\tprefs\tx\n";
+        let check = tally_cookie_dump(dump);
+        assert_eq!(check.total, 3, "three cookie rows, comments/blank excluded");
+        assert_eq!(check.youtube, 2, "the youtube + google rows, not example.com");
+    }
+
+    #[test]
+    fn cookie_dump_tally_of_an_empty_or_header_only_dump_is_zero() {
+        assert_eq!(tally_cookie_dump("").total, 0);
+        let header_only = tally_cookie_dump("# Netscape HTTP Cookie File\n\n");
+        assert_eq!((header_only.total, header_only.youtube), (0, 0));
     }
 
     #[test]
@@ -1498,7 +1730,7 @@ mod tests {
         );
         assert!(template(&entry).starts_with("/dl/%(playlist_title)s[%(playlist_id)s]/"));
         assert!(template(&entry).contains("%(playlist_index)03d__"));
-        assert_eq!(archive(&entry), "/dl/My List[PL1]/.yt_archive.txt");
+        assert_eq!(archive(&entry), "/dl/My List[PL1]/.dl_video_archive.txt");
         let items = entry.iter().position(|a| a == "--playlist-items").expect("item selection");
         assert_eq!(entry[items + 1], OsString::from("4"));
 
@@ -1512,7 +1744,7 @@ mod tests {
             "7",
         );
         assert!(template(&tab).starts_with("/dl/%(uploader)s[%(channel_id)s]/videos/"));
-        assert_eq!(archive(&tab), "/dl/Chan[UC1]/.yt_archive.txt");
+        assert_eq!(archive(&tab), "/dl/Chan[UC1]/.dl_video_archive.txt");
         assert_eq!(last(&tab), "https://c/videos", "the tab url comes last");
     }
 
@@ -1607,14 +1839,95 @@ mod tests {
 
     #[test]
     fn failures_classify_by_ytdlps_phrasing() {
-        assert_eq!(
-            classify_failure("ERROR: [youtube] x: The uploader has not made this video available in your country"),
-            Failure::Geo
-        );
-        assert_eq!(classify_failure("ERROR: Join this channel to get access to members-only content"), Failure::Members);
+        // Geo — both real YouTube-extractor phrasings, plus the generic raise_geo_restricted
+        // default and the region/case variants the widened matcher must still catch.
+        for msg in [
+            "ERROR: [youtube] x: The uploader has not made this video available in your country",
+            "ERROR: [youtube] x: This video is not available from your location due to geo restriction",
+            "ERROR: This playlist is likely not available in your region",
+            "ERROR: Video is GEO restricted",
+        ] {
+            assert_eq!(classify_failure(msg), Failure::Geo, "{msg}");
+        }
+        // Members — the badge reasons YouTube returns, hyphen and space spellings.
+        for msg in [
+            "ERROR: Join this channel to get access to members-only content like this video",
+            "ERROR: This video is available to this channel's members on level: Tier 1",
+        ] {
+            assert_eq!(classify_failure(msg), Failure::Members, "{msg}");
+        }
+        // Age — the sign-in gate and the account age-verification wording.
         assert_eq!(classify_failure("ERROR: Sign in to confirm your age"), Failure::AgeRestricted);
+        assert_eq!(
+            classify_failure("ERROR: This video is age-restricted and YouTube is requiring account age-verification"),
+            Failure::AgeRestricted
+        );
+        // Everything else stays Other (the IP-block 403 among them).
         assert_eq!(classify_failure("ERROR: HTTP Error 403: Forbidden"), Failure::Other);
         assert_eq!(XFF_REGIONS.len(), 12, "a dozen regions, as specified");
+    }
+
+    #[test]
+    fn the_geo_ledger_line_names_the_video_the_failure_and_the_regions_tried() {
+        // The things the ledger must record for a stubborn geo-block: which video (title for
+        // the human, bracketed id as the stable machine key), that it was geo-blocked, and
+        // every spoofed region attempted — one entry per line, so the scrub can line-filter.
+        let line =
+            format!("#7 Some Title [dQw4w9WgXcQ] — geo-blocked (tried {})", XFF_REGIONS.join(","));
+        assert!(line.contains("#7 Some Title"), "names the video");
+        assert!(ledger_line_refers(&line, "dQw4w9WgXcQ"), "carries the scrub key");
+        assert!(line.contains("geo-blocked"), "names the failure");
+        assert!(!line.contains('\n'), "one line per entry");
+        for region in XFF_REGIONS {
+            assert!(line.contains(region), "records region {region}");
+        }
+    }
+
+    #[test]
+    fn ledger_lines_match_ids_only_in_delimited_forms() {
+        assert!(ledger_line_refers("#3 Title [abc123XYZ_-] — members-only", "abc123XYZ_-"));
+        assert!(ledger_line_refers("https://www.youtube.com/watch?v=abc123XYZ_- — failed: gone", "abc123XYZ_-"));
+        assert!(ledger_line_refers("abc123XYZ_- — geo-blocked (tried US)", "abc123XYZ_-"), "legacy bare-id label");
+        // A short id must not clear someone else's entry by matching inside its title.
+        assert!(!ledger_line_refers("#4 my abc mixtape [zzzzzzzzzzz] — members-only", "abc"));
+    }
+
+    #[test]
+    fn the_scrub_clears_now_downloaded_entries_prunes_empty_blocks_and_removes_an_emptied_ledger() {
+        let dir = std::env::temp_dir().join(format!("bashrs_scrub_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger = dir.join(FAILED_LEDGER);
+        std::fs::write(
+            &ledger,
+            "── 2026-01-01_1200 ──\n\
+             #7 Released Later [vidAAAAAAAA] — members-only (channels often release these publicly later)\n\
+             ── 2026-01-02_1200 ──\n\
+             #2 Still Blocked [vidBBBBBBBB] — geo-blocked (tried US,GB)\n\
+             #9 Also Freed [vidCCCCCCCC] — members-only (channels often release these publicly later)\n",
+        )
+        .unwrap();
+
+        // Run 1: A and C have since downloaded (they're in the archive); B still hasn't.
+        std::fs::write(dir.join(ARCHIVE_NAME), "youtube vidAAAAAAAA\nyoutube vidCCCCCCCC\n").unwrap();
+        scrub_ledger(&dir);
+        let text = std::fs::read_to_string(&ledger).unwrap();
+        assert!(!text.contains("vidAAAAAAAA") && !text.contains("vidCCCCCCCC"), "cleared: {text}");
+        assert!(text.contains("vidBBBBBBBB"), "unresolved entry stays: {text}");
+        assert_eq!(
+            text.matches("── ").count(),
+            1,
+            "the block whose only entry cleared lost its header too: {text}"
+        );
+
+        // Run 2: B downloads as well — nothing left, so the ledger file itself goes.
+        std::fs::write(dir.join(ARCHIVE_NAME), "youtube vidAAAAAAAA\nyoutube vidBBBBBBBB\nyoutube vidCCCCCCCC\n").unwrap();
+        scrub_ledger(&dir);
+        assert!(!ledger.exists(), "an emptied ledger is removed");
+
+        // And scrubbing with no ledger (or no archive) is a quiet no-op.
+        scrub_ledger(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

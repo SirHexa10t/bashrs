@@ -39,7 +39,7 @@ pub(crate) fn bashrs_home() -> PathBuf {
 }
 
 /// `~/.bashrs/user-data` — persistent state bashrs accumulates on the user's behalf, as opposed
-/// to the binary/config/tooling it installs. Currently the imported browser cookies for `dl_yt`.
+/// to the binary/config/tooling it installs. Currently the imported browser cookies for `dl`.
 pub(crate) fn user_data_dir() -> PathBuf {
     bashrs_home().join("user-data")
 }

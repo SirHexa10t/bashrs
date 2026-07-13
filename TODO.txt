@@ -2,4 +2,18 @@ Reimplement the bashrc commands in my other repo
 
 Copy over the TODOs
 
+Add a print at the end of sourcefile, notifying the user if his personal-data (inserted by user manually) indicates that something's coming up:
+    subscription renewal (service, credit-card benefits, infrastructure provider's discount...)
+    birthdays
+    deadlines
+    appointments
+    
 
+youtube/ffmpeg:
+    Download from X, Twitter, tiktok, other sites
+    
+    rewrite media_metadata to display info differently
+    
+    ffprobe import as library?
+
+    scraping historic snapshots of channels to find if any of their videos have been de-listed/disappeared

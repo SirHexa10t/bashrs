@@ -574,7 +574,7 @@ mod tests {
         let has = |line: &str| assert!(script.contains(line), "missing wrapper line: {line}");
         has("fs_usage() { \"$HOME/.bashrs/bashrs\" fs_usage \"$@\"; }");
         has("dl_page_links() { \"$HOME/.bashrs/bashrs\" dl_page_links \"$@\"; }");
-        has("dl_yt() { \"$HOME/.bashrs/bashrs\" dl_yt \"$@\"; }");
+        has("dl() { \"$HOME/.bashrs/bashrs\" dl \"$@\"; }");
         has("media_convert() { \"$HOME/.bashrs/bashrs\" media_convert \"$@\"; }");
         has("media_convert_quality() { \"$HOME/.bashrs/bashrs\" media_convert_quality \"$@\"; }");
         has("media_convert_compact() { \"$HOME/.bashrs/bashrs\" media_convert_compact \"$@\"; }");
