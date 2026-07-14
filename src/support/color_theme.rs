@@ -1,10 +1,11 @@
 //! Syntax-highlighting a block of code with ANSI colour, via `synoptic`. Shared by the
 //! `code_highlight` style command and by `bashrs_sourcefile` (which colours the shell it
-//! prints), so both go through one palette. (Rendering an embedded Markdown *doc* for `dl -c` is a
-//! separate concern — marker-stripping rather than highlighting — and lives in
-//! [`crate::support::doc_render`], the hand-built sibling of this synoptic-backed module.)
+//! prints); the colours come from the shared [`crate::support::theme`], so this stays the
+//! synoptic *mechanism*. (Rendering an embedded Markdown *doc* for `dl -c` is a separate concern —
+//! marker-stripping rather than highlighting — and lives in [`crate::support::doc_render`], the
+//! hand-built sibling of this synoptic-backed module.)
 
-use crate::support::doc_style::{escape, RESET};
+use crate::support::{doc_style::RESET, theme};
 
 /// Colour `code` as language `ext` (a file extension synoptic knows — `rs`, `sh`, `py`, …),
 /// returning the ANSI-coloured text with each line newline-terminated. An extension synoptic
@@ -30,34 +31,14 @@ pub(crate) fn highlight(code: &str, ext: &str) -> String {
     out
 }
 
-/// Wrap `text` in the ANSI colour for a synoptic token `kind`; unknown kinds stay plain.
+/// Wrap `text` in the ANSI colour the shared [`theme`] assigns to a synoptic token `kind`; unknown
+/// kinds stay plain.
 fn paint(kind: &str, text: &str) -> String {
-    match PALETTE.iter().find(|(k, _)| *k == kind) {
-        Some(entry) => format!("{}{text}{RESET}", escape(entry.1)),
+    match theme::code_style(kind) {
+        Some(style) => format!("{style}{text}{RESET}"),
         None => text.to_owned(),
     }
 }
-
-/// synoptic token kind → SGR colour code, for the code languages synoptic highlights.
-const PALETTE: &[(&str, &str)] = &[
-    ("keyword", "35"),   // magenta
-    ("macro", "35"),
-    ("string", "32"),    // green
-    ("character", "32"),
-    ("comment", "90"),   // grey
-    ("digit", "36"),     // cyan
-    ("number", "36"),
-    ("boolean", "33"),   // yellow
-    ("function", "34"),  // blue
-    ("struct", "33"),
-    ("type", "33"),
-    ("namespace", "34"),
-    ("reference", "36"),
-    ("attribute", "33"),
-    ("tag", "34"),
-    ("header", "35"),
-    ("operator", "37"),  // white
-];
 
 #[cfg(test)]
 mod tests {

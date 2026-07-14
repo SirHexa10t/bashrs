@@ -10,6 +10,7 @@ mod commands {
     use crate::support::exec::{capture_stdout, run_reporting};
     use crate::drivers::youtube;
     use crate::support::browsers;
+    use crate::support::doc_render;
     use crate::support::doc_style::_header;
     use clap::Args;
 
@@ -378,26 +379,16 @@ mod commands {
         pub extra: Vec<String>,
     }
 
-    /// The `dl -c` site-coverage listing, embedded at compile time from a template beside this
-    /// module (long enough to earn its own file, and easier to edit as prose). A line beginning
-    /// with `# ` is a section heading; every other line is body. The starter content ships here;
-    /// edit the `.txt` to revise it.
-    const COMPATIBILITY: &str = include_str!("templates/yt-dlp_compatibility.txt");
+    /// The `dl -c` site-coverage listing — a Markdown doc embedded at compile time (long enough
+    /// to earn its own file, and natural to author/read as Markdown). Rendered for the terminal
+    /// by [`doc_render::render_doc`]; edit the `.md` to revise it.
+    const COMPATIBILITY: &str = include_str!("templates/yt-dlp_compatibility.md");
 
-    /// Render [`COMPATIBILITY`] for `dl -c`: each `# `-prefixed line becomes a section heading in
-    /// the shared bold-blue header style (the one behind `becho` and `lll`'s column row, via
-    /// [`_header`]); every other line prints verbatim. Assembled into one buffer and returned, so
-    /// the caller emits it in a single write rather than line by line.
+    /// What `dl -c` prints: [`COMPATIBILITY`] rendered to ANSI-coloured text by
+    /// [`doc_render::render_doc`] — markers stripped, headings/emphasis/code/lists/quotes coloured
+    /// via the shared theme, pre-drawn tables and body passed through untouched.
     fn _compatibility_help() -> String {
-        let mut out = String::with_capacity(COMPATIBILITY.len() + 256);
-        for line in COMPATIBILITY.lines() {
-            match line.strip_prefix("# ") {
-                Some(heading) => out.push_str(&_header(heading)),
-                None => out.push_str(line),
-            }
-            out.push('\n');
-        }
-        out
+        doc_render::render_doc(COMPATIBILITY)
     }
 
     #[cfg(test)]
@@ -405,24 +396,18 @@ mod commands {
         use super::*;
 
         #[test]
-        fn compatibility_help_blues_hash_headings_and_prints_the_rest_verbatim() {
+        fn compatibility_help_renders_the_markdown_doc_with_colour_and_intact_lines() {
             let out = _compatibility_help();
-            let mut headings = 0;
-            for line in COMPATIBILITY.lines() {
-                if let Some(heading) = line.strip_prefix("# ") {
-                    // Every `# ` line is rendered through the shared bold-blue `_header` (the style
-                    // behind `becho` / `lll`'s header) with the marker stripped — tie the check to
-                    // that function so a style change can't silently un-blue these.
-                    assert!(out.contains(&_header(heading)), "heading not header-styled: {heading}");
-                    assert!(!out.contains(&format!("# {heading}")), "raw `# ` marker leaked: {heading}");
-                    headings += 1;
-                } else {
-                    // Non-heading lines (intro, bodies, outro) print verbatim, indent and all.
-                    assert!(out.contains(line), "line mangled: {line:?}");
-                }
+            // The doc is rendered markdown → coloured (ANSI escapes present).
+            assert!(out.contains('\x1b'), "expected colour from the markdown render");
+            // Line-based render: never reflows, so it has exactly one output line per source
+            // line — pre-drawn tables and indented blocks survive intact.
+            assert_eq!(out.lines().count(), COMPATIBILITY.lines().count(), "line count must be preserved");
+            // A representative box-drawing table row (if the doc has one) passes through verbatim,
+            // borders and spacing untouched.
+            if let Some(row) = COMPATIBILITY.lines().find(|l| l.contains('│')) {
+                assert!(out.contains(row), "table row reflowed/mangled: {row:?}");
             }
-            assert!(headings > 0, "the template should define at least one `# ` heading");
-            assert!(out.contains("\n  • YouTube "), "a body line's indent must survive");
         }
 
         #[test]

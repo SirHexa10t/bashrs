@@ -19,3 +19,4 @@ grep = "0.4"          # ripgrep's search engine, run in-process by the lookup/st
 ignore = "0.4"        # ripgrep's parallel .gitignore-aware directory walker — the `gg` tree search
 termcolor = "1"       # colour selection (ColorChoice) for grep's Standard printer
 console = "0.16"      # ANSI-escape stripping (strip_ansi_codes) for `lll`'s .lnk detection
+minimad = "0.16"      # line-based Markdown parser — `doc_render` emits its own ANSI from this
