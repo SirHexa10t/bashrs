@@ -115,26 +115,75 @@ fn cookie_args(env: Env) -> Vec<OsString> {
     }
 }
 
-/// What reading an imported cookie store back through yt-dlp turned up. `total` is how many
-/// cookies decrypted at all (so a non-zero value proves a Chromium store's keyring read works —
-/// not merely that a file copied); `youtube` is how many of those are for YouTube/Google, i.e.
-/// the ones that actually authenticate `dl`.
-pub(crate) struct CookieCheck {
-    pub(crate) total: usize,
-    pub(crate) youtube: usize,
+/// Pare a browser's cookie DB down to only `domains`' cookies, writing the filtered copy into
+/// `store_dir` for `--cookie-import`. The privacy crux: an import keeps *just* the target site's
+/// cookies, never the whole DB (your banking/email cookies never touch bashrs's disk). Done
+/// without decrypting anything — the domain column (`host` / `host_key`) is plaintext in both
+/// families, so we filter rows on it and copy the (still-encrypted, for Chromium) values through
+/// verbatim, leaving yt-dlp to decrypt via the keyring exactly as before. Runs on the bundled
+/// python's sqlite3 (like [`TAGGER`]); returns the number of cookies kept, or `None` if the
+/// filter couldn't run. Reads the source read-only + lock-ignoring, so a running browser is fine
+/// (it sees the checkpointed DB — the same WAL caveat the import message spells out).
+pub(crate) fn filter_cookie_db(
+    store: &crate::support::browsers::CookieStore,
+    store_dir: &Path,
+    domains: &[String],
+) -> Option<usize> {
+    let (src, dest_name) = &store.files[0];
+    let dest = store_dir.join(dest_name);
+    let kind = if store.browser == "firefox" { "firefox" } else { "chromium" };
+    let mut argv: Vec<OsString> = vec![
+        "-c".into(), COOKIE_FILTER.into(),
+        src.as_os_str().to_owned(), dest.into_os_string(), kind.into(),
+    ];
+    argv.extend(domains.iter().map(OsString::from));
+    let (ok, out, _err) = capture_output(crate::tools::resolve("python3"), argv)?;
+    ok.then(|| out.trim().parse().ok()).flatten()
 }
 
-/// Have the bundled yt-dlp read `spec` back and tally what it yields, so `--cookie-import` can
-/// tell the user whether the store is actually usable *before* every future run silently leans
-/// on it. Runs fully offline — no URL is given, so yt-dlp extracts the cookies, writes them to a
-/// throwaway Netscape file, and quits without fetching anything — yet it exercises the real
-/// decryption path, so a keyring-locked Chromium store reports `total: 0` here instead of
-/// failing quietly on the first download. The throwaway file (decrypted cookies, briefly) is
-/// removed immediately. `None` when the check couldn't run (yt-dlp not bundled, or the read
-/// crashed before writing anything) — the caller then keeps its speculative guidance rather than
-/// claiming a result. `cookies_root` is the import's own dir; the probe file lives beside the
-/// store, under the same private `~/.bashrs` tree the store already occupies.
-pub(crate) fn count_browser_cookies(spec: &str, cookies_root: &Path) -> Option<CookieCheck> {
+/// The cookie-DB filter, embedded python (bundled python has sqlite3). Recreates the source
+/// table's exact schema in the destination, copies only the rows whose host matches a target
+/// domain (equal or a dot-boundary subdomain), and carries the version metadata yt-dlp needs to
+/// read the result — Firefox's `PRAGMA user_version` (cookie-expiry units) and Chromium's `meta`
+/// table (encryption version). Prints the kept-row count. Flush-left: a raw literal keeps python's
+/// indentation (a `\`-continued Rust string would strip it — see [`TAGGER`]).
+const COOKIE_FILTER: &str = r#"import sqlite3, sys
+src, dst, kind = sys.argv[1], sys.argv[2], sys.argv[3]
+domains = [d.lower() for d in sys.argv[4:]]
+def keep(host):
+    h = (host or "").lstrip(".").lower()
+    return any(h == d or h.endswith("." + d) for d in domains)
+table, hostcol = ("moz_cookies", "host") if kind == "firefox" else ("cookies", "host_key")
+s = sqlite3.connect("file:%s?immutable=1" % src, uri=True)
+d = sqlite3.connect(dst)
+schema = s.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+if not schema:
+    print(0); sys.exit(0)
+d.execute(schema[0])
+cols = [r[1] for r in s.execute("PRAGMA table_info(%s)" % table)]
+hi = cols.index(hostcol)
+kept = [r for r in s.execute("SELECT * FROM %s" % table) if keep(r[hi])]
+d.executemany("INSERT INTO %s VALUES (%s)" % (table, ",".join("?" * len(cols))), kept)
+if kind == "firefox":
+    d.execute("PRAGMA user_version=%d" % s.execute("PRAGMA user_version").fetchone()[0])
+else:
+    meta = s.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
+    if meta:
+        d.execute(meta[0])
+        d.executemany("INSERT INTO meta VALUES (?,?)", list(s.execute("SELECT key, value FROM meta")))
+d.commit()
+print(len(kept))
+"#;
+
+/// Have the bundled yt-dlp read the imported (already domain-filtered) store back and count what
+/// decrypts, so `--cookie-import` can confirm the store is actually usable *before* every future
+/// run leans on it. Runs fully offline — no URL, so yt-dlp extracts the cookies to a throwaway
+/// Netscape file and quits without fetching — yet it drives the real decryption path, so a
+/// keyring-locked Chromium store reports `0` here instead of failing quietly on the first
+/// download. The throwaway file (decrypted cookies, briefly) is removed immediately. `None` when
+/// the check couldn't run (yt-dlp not bundled, or the read crashed before writing) — the caller
+/// then keeps its provisional count rather than claiming a verified one.
+pub(crate) fn readable_cookie_count(spec: &str, cookies_root: &Path) -> Option<usize> {
     let probe = cookies_root.join(".probe-cookies.txt");
     let _ = std::fs::remove_file(&probe); // clear any stale probe an interrupted run left behind
     let argv: Vec<OsString> = vec![
@@ -146,27 +195,16 @@ pub(crate) fn count_browser_cookies(spec: &str, cookies_root: &Path) -> Option<C
     capture_ytdlp(argv)?; // None only if yt-dlp couldn't be launched at all
     let dump = std::fs::read_to_string(&probe).ok();
     let _ = std::fs::remove_file(&probe); // the decrypted dump must not linger
-    Some(tally_cookie_dump(&dump?))
+    Some(count_cookie_dump(&dump?))
 }
 
-/// Count a Netscape cookie dump: total data lines, and how many are for YouTube/Google. Split
-/// out from [`count_browser_cookies`] so the parsing is testable without yt-dlp on disk.
-fn tally_cookie_dump(dump: &str) -> CookieCheck {
-    let mut check = CookieCheck { total: 0, youtube: 0 };
-    for line in dump.lines() {
-        // `#HttpOnly_` lines are cookies too (and the auth ones usually are) — keep them; only
-        // genuine comments and blanks are skipped.
-        let entry = line.strip_prefix("#HttpOnly_").unwrap_or(line);
-        if entry.starts_with('#') || entry.trim().is_empty() {
-            continue;
-        }
-        check.total += 1;
-        let domain = entry.split('\t').next().unwrap_or("").trim_start_matches('.');
-        if domain.contains("youtube") || domain.contains("google") {
-            check.youtube += 1;
-        }
-    }
-    check
+/// Count the cookie rows in a Netscape dump (`#HttpOnly_` lines are cookies too; only genuine
+/// comments and blanks are skipped). Split out so it's testable without yt-dlp on disk.
+fn count_cookie_dump(dump: &str) -> usize {
+    dump.lines()
+        .map(|line| line.strip_prefix("#HttpOnly_").unwrap_or(line))
+        .filter(|entry| !entry.starts_with('#') && !entry.trim().is_empty())
+        .count()
 }
 
 /// Starter argv for the metadata-side invocations (probes, scans): even those run the YouTube
@@ -1659,25 +1697,22 @@ mod tests {
     }
 
     #[test]
-    fn cookie_dump_tally_counts_entries_and_flags_youtube_relevance() {
-        // A Netscape dump as yt-dlp writes it: header + comment skipped, `#HttpOnly_` kept (the
-        // auth cookies are usually HttpOnly), YouTube/Google domains tallied apart from the rest.
+    fn cookie_dump_count_skips_comments_and_blanks_but_keeps_httponly() {
+        // A Netscape dump as yt-dlp writes it: header + comment + blank skipped, `#HttpOnly_`
+        // kept (the auth cookies are usually HttpOnly). The store is pre-filtered per site, so
+        // the read-back only needs the decryptable total — not a per-domain tally.
         let dump = "# Netscape HTTP Cookie File\n\
                     # a comment\n\
                     \n\
                     #HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t2000000000\tLOGIN_INFO\ttok\n\
-                    .google.com\tTRUE\t/\tTRUE\t2000000000\tSID\tsid\n\
-                    .example.com\tTRUE\t/\tFALSE\t2000000000\tprefs\tx\n";
-        let check = tally_cookie_dump(dump);
-        assert_eq!(check.total, 3, "three cookie rows, comments/blank excluded");
-        assert_eq!(check.youtube, 2, "the youtube + google rows, not example.com");
+                    .google.com\tTRUE\t/\tTRUE\t2000000000\tSID\tsid\n";
+        assert_eq!(count_cookie_dump(dump), 2, "two cookie rows, comments/blank excluded");
     }
 
     #[test]
-    fn cookie_dump_tally_of_an_empty_or_header_only_dump_is_zero() {
-        assert_eq!(tally_cookie_dump("").total, 0);
-        let header_only = tally_cookie_dump("# Netscape HTTP Cookie File\n\n");
-        assert_eq!((header_only.total, header_only.youtube), (0, 0));
+    fn cookie_dump_count_of_an_empty_or_header_only_dump_is_zero() {
+        assert_eq!(count_cookie_dump(""), 0);
+        assert_eq!(count_cookie_dump("# Netscape HTTP Cookie File\n\n"), 0);
     }
 
     #[test]

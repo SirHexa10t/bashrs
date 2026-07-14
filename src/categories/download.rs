@@ -132,16 +132,20 @@ mod commands {
 
     // --- dl ------------------------------------------------------------------
 
-    /// `~/.bashrs/user-data/browser_cookies` — where `--cookie-import` copies the chosen store
-    /// and where every `dl` run looks for it.
+    /// `~/.bashrs/user-data/browser_cookies` — the base holding one subdir per imported site
+    /// (`<key>/store/` + `<key>/browser.spec`). `--cookie-import` writes a site's subdir; each
+    /// `dl <url>` run reads the subdir matching the URL's site.
     fn _cookie_store_dir() -> PathBuf {
         crate::conf::user_data_dir().join("browser_cookies")
     }
 
-    /// The `--cookie-import` action: scan for browser cookie stores, let the user pick one, and
-    /// copy it into bashrs's own data dir (which a running browser can't lock). Later runs use
-    /// it automatically. Returns whether a store was imported.
-    fn _import_cookies() -> bool {
+    /// The `--cookie-import <target>` action: resolve the target site, scan for browser cookie
+    /// stores, let the user pick one, and copy *only that site's* cookies into a per-site dir
+    /// under bashrs's data (which a running browser can't lock). Later `dl` runs on that site
+    /// use it automatically. `target` is a site keyword, a domain, or a URL. Returns whether a
+    /// usable store was imported.
+    fn _import_cookies(target: &str) -> bool {
+        let site = browsers::resolve_target(target);
         let home = crate::conf::home();
         let stores = browsers::cookie_stores(&home);
         if stores.is_empty() {
@@ -152,76 +156,81 @@ mod commands {
             }
             return false;
         }
-        let Some(store) = _pick(&stores) else { return false };
-        let dir = _cookie_store_dir();
-        if let Err(err) = browsers::import(store, &dir) {
-            eprintln!("dl: could not import the cookie store: {err}");
+        let Some(store) = _pick(&stores, &site.label) else { return false };
+        let site_dir = _cookie_store_dir().join(&site.key);
+        let store_dir = match browsers::reset_site(&site_dir) {
+            Ok(dir) => dir,
+            Err(err) => {
+                eprintln!("dl: could not prepare the {} cookie store: {err}", site.label);
+                return false;
+            }
+        };
+        // Cherry-pick: only the target site's cookies are copied — never the whole DB.
+        let Some(matched) = youtube::filter_cookie_db(store, &store_dir, &site.domains) else {
+            let _ = browsers::forget(&site_dir);
+            eprintln!("dl: could not filter the cookie store (is the bundled python available?)");
+            return false;
+        };
+        if matched == 0 {
+            let _ = browsers::forget(&site_dir);
+            eprintln!(
+                "dl: no {} cookies in {} — sign in to {} in that browser/profile, then re-import",
+                site.label, store.label, site.label
+            );
             return false;
         }
-        println!("imported cookies from {}", store.label);
-        _report_cookie_check(store, &dir)
+        if let Err(err) = browsers::write_spec(&site_dir, store.browser) {
+            let _ = browsers::forget(&site_dir);
+            eprintln!("dl: could not record the {} cookie store: {err}", site.label);
+            return false;
+        }
+        println!("imported {matched} {} cookie(s) from {}", site.label, store.label);
+        _report_cookie_check(&site, store.browser, matched, &site_dir)
     }
 
-    /// Read the freshly imported store back through yt-dlp and tell the user what it actually
-    /// yielded — turning "imported (hopefully)" into a concrete result, and catching a
-    /// keyring-locked Chromium store or a not-signed-in profile *now* instead of silently on
-    /// every later run. Returns whether a usable store remains imported. When the check can't run
-    /// (yt-dlp not bundled yet), falls back to the speculative guidance rather than overclaiming.
-    fn _report_cookie_check(store: &browsers::CookieStore, dir: &std::path::Path) -> bool {
-        let Some(spec) = browsers::imported_spec(dir) else { return true };
-        // The WAL caveat holds whenever cookies did come through: a copy captures only what the
+    /// Read the freshly imported (already domain-filtered) store back through yt-dlp to confirm
+    /// the cookies actually *decrypt* — a keyring-locked Chromium store filters fine but reads
+    /// back empty — and report the concrete result, catching that failure now instead of on
+    /// every later run. Returns whether a usable store remains. When the read-back can't run
+    /// (yt-dlp not bundled yet), keeps the store on the provisional count rather than overclaiming.
+    fn _report_cookie_check(site: &browsers::SiteTarget, browser: &str, matched: usize, site_dir: &Path) -> bool {
+        // The WAL caveat holds whenever cookies came through: a copy captures only what the
         // browser already flushed to the DB, so a sign-in from moments ago may not be in it yet.
         let wal_note = || println!("note: if a fresh sign-in isn't recognized, fully quit the browser and re-import");
-        match youtube::count_browser_cookies(&spec, dir) {
-            Some(check) if check.youtube > 0 => {
-                println!(
-                    "validated — {} YouTube/Google cookies readable ({} total); future dl runs will use them",
-                    check.youtube, check.total
-                );
-                wal_note();
-                true
-            }
-            Some(check) if check.total > 0 => {
-                // The store decrypts fine, it just has nothing for YouTube — a profile that was
-                // never signed in. Keep it (it's valid), but say why it won't help yet.
-                eprintln!(
-                    "dl: read {} cookies from {}, but none for YouTube/Google — sign in to YouTube in that browser/profile, then re-import",
-                    check.total, store.label
-                );
+        let Some(spec) = browsers::imported_spec(site_dir) else { return true };
+        match youtube::readable_cookie_count(&spec, site_dir) {
+            Some(n) if n > 0 => {
+                println!("validated — {n} {} cookie(s) readable; dl runs on {} will use them", site.label, site.label);
                 wal_note();
                 true
             }
             Some(_) => {
-                // Nothing decrypted at all. Rolling the import back keeps every future run from
-                // re-attempting the same doomed read (a locked Chromium keyring can even prompt).
-                let _ = browsers::forget(dir);
-                if store.browser == "firefox" {
-                    eprintln!("dl: no cookies could be read from {} — sign in to YouTube there first, then re-import", store.label);
+                // Filtered rows but none decrypt → useless; drop it so future runs don't keep
+                // re-attempting a doomed read (a locked Chromium keyring can even prompt).
+                let _ = browsers::forget(site_dir);
+                if browser == "firefox" {
+                    eprintln!("dl: {matched} {} cookie(s) imported but none could be read — the profile DB may be unreadable; re-import", site.label);
                 } else {
-                    eprintln!("dl: no cookies could be decrypted from {} — Chromium cookies need the desktop keyring unlocked; a Firefox store is the most reliable. Import discarded.", store.label);
+                    eprintln!("dl: {matched} {} cookie(s) imported but none decrypted — Chromium needs the desktop keyring unlocked; a Firefox store is more reliable. Import discarded.", site.label);
                 }
                 false
             }
             None => {
-                // Couldn't run the read-back (yt-dlp not installed yet). The copy is in place;
-                // fall back to the pre-validation guidance instead of claiming a count.
-                println!("future dl runs will use them");
+                println!("(couldn't verify readability — is yt-dlp installed? the {matched} imported cookie(s) will be tried on dl runs)");
                 wal_note();
-                if store.browser != "firefox" {
-                    println!("note: Chromium-family cookies are keyring-encrypted; if reads fail, a Firefox store is the most reliable");
-                }
                 true
             }
         }
     }
 
-    /// Prompt for one of `stores` (auto-selecting a lone candidate).
-    fn _pick(stores: &[browsers::CookieStore]) -> Option<&browsers::CookieStore> {
+    /// Prompt for one of `stores` to import `site_label`'s cookies from (auto-selecting a lone
+    /// candidate).
+    fn _pick<'a>(stores: &'a [browsers::CookieStore], site_label: &str) -> Option<&'a browsers::CookieStore> {
         if let [only] = stores {
-            println!("one cookie store found — importing {}", only.label);
+            println!("one cookie store found — importing {site_label} cookies from {}", only.label);
             return Some(only);
         }
-        println!("{}", _header("Import YouTube cookies from:"));
+        println!("{}", _header(&format!("Import {site_label} cookies from:")));
         for (i, store) in stores.iter().enumerate() {
             println!("  {}) {}", i + 1, store.label);
         }
@@ -256,10 +265,10 @@ mod commands {
         if taglist {
             std::process::exit(youtube::taglist());
         }
-        if cookie_import {
-            let imported = _import_cookies();
-            // A bare `--cookie-import` (no URL) is a setup step: import and stop. With a URL, fall
-            // through and download, now using what was just imported.
+        if let Some(target) = &cookie_import {
+            let imported = _import_cookies(target);
+            // `--cookie-import <target>` (no URL) is a setup step: import and stop. With a URL,
+            // fall through and download, now able to use what was just imported.
             if url.is_none() {
                 std::process::exit(i32::from(!imported));
             }
@@ -271,8 +280,12 @@ mod commands {
         }
         let ffmpeg = youtube::bundled_ffmpeg_dir();
         let deno = youtube::bundled_deno();
-        // Imported browser cookies are the standing default; an explicit `--cookies` file wins.
-        let imported = (cookies.is_none()).then(|| browsers::imported_spec(&_cookie_store_dir())).flatten();
+        // Auto-select the per-site store matching this URL's host — a prior `--cookie-import` for
+        // this site is the standing default; an explicit `--cookies` file wins.
+        let site = browsers::resolve_target(&url);
+        let imported = (cookies.is_none())
+            .then(|| browsers::imported_spec(&_cookie_store_dir().join(&site.key)))
+            .flatten();
         let env = youtube::Env {
             ffmpeg_dir: ffmpeg.as_deref(),
             cookies: cookies.as_deref(),
@@ -310,24 +323,16 @@ mod commands {
     }
 
     /// Whether `url`'s host is YouTube — any subdomain of `youtube.com` / `youtube-nocookie.com`,
-    /// or `youtu.be`. The gate that routes [`dl`] to the YouTube path rather than the generic one.
+    /// or `youtu.be`. The gate that routes [`dl`] to the YouTube path rather than the generic one
+    /// (a separate concern from cookie targeting, though both key off the host). Host extraction
+    /// is [`browsers::host_of`], which already strips a leading `www.`.
     fn _is_youtube(url: &str) -> bool {
-        let host = _url_host(url);
-        let host = host.strip_prefix("www.").unwrap_or(&host);
+        let host = browsers::host_of(url);
         host == "youtu.be"
             || host == "youtube.com"
             || host.ends_with(".youtube.com")
             || host == "youtube-nocookie.com"
             || host.ends_with(".youtube-nocookie.com")
-    }
-
-    /// The lowercased host of a URL — scheme, userinfo, and port stripped. `""` for input with no
-    /// host (a bare path), which never matches [`_is_youtube`] and so takes the generic path.
-    fn _url_host(url: &str) -> String {
-        let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-        let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
-        let host = authority.rsplit('@').next().unwrap_or(authority); // drop any user:pass@
-        host.split(':').next().unwrap_or(host).to_lowercase() // drop any :port
     }
 
     #[derive(Args)]
@@ -353,12 +358,14 @@ mod commands {
         /// Cap the video height (e.g. 1080) — takes the best formats at or under it
         #[arg(long, value_name = "HEIGHT")]
         pub res: Option<u32>,
-        /// Scan for browser cookie stores (native, Flatpak, Snap, Nix) and import one into
-        /// bashrs — copied, so a running browser can't lock it; later runs reuse it. For
-        /// age-restricted or walled content. Runs standalone, or before a download when a URL
-        /// is also given
-        #[arg(long, conflicts_with = "cookies")]
-        pub cookie_import: bool,
+        /// Import a browser's cookies for one site, so later dl runs on it authenticate. TARGET
+        /// is a site keyword (youtube, tiktok, facebook, instagram, twitter, reddit, vimeo,
+        /// twitch), a domain (example.com), or a URL. Only that site's cookies are copied —
+        /// never your whole cookie DB. Scans installed browsers (native/Flatpak/Snap/Nix) and
+        /// copies from your pick, so a running browser can't lock it. Runs standalone, or before
+        /// a download when a URL is also given
+        #[arg(long, value_name = "TARGET", conflicts_with = "cookies")]
+        pub cookie_import: Option<String>,
         /// Print the notable yt-dlp flags (usable after `--`), then yt-dlp's full option list
         #[arg(short = 't', long)]
         pub taglist: bool,
@@ -371,52 +378,25 @@ mod commands {
         pub extra: Vec<String>,
     }
 
-    /// The lead-in and closing lines of `dl -c` (plain text, framing the sections).
-    const COMPATIBILITY_INTRO: &str =
-        "yt-dlp backs `dl` and supports well over a thousand sites. What to expect:";
-    const COMPATIBILITY_OUTRO: &str = "For anything gated (logins, paid, region- or age-locked), \
-        --cookie-import or\n--cookies is usually what unlocks it.";
+    /// The `dl -c` site-coverage listing, embedded at compile time from a template beside this
+    /// module (long enough to earn its own file, and easier to edit as prose). A line beginning
+    /// with `# ` is a section heading; every other line is body. The starter content ships here;
+    /// edit the `.txt` to revise it.
+    const COMPATIBILITY: &str = include_str!("templates/yt-dlp_compatibility.txt");
 
-    /// The body of `dl -c`, as `(heading, detail)` sections. Kept as data so [`_compatibility_help`]
-    /// can render each heading in the shared bold-blue header style (the one behind `becho` and
-    /// `lll`'s column row) without ANSI escapes cluttering the copy. Details are flush-left in the
-    /// source (no `\`-continuation, which would strip the first line's indent) so their leading
-    /// spaces are exactly what prints.
-    const COMPATIBILITY_SECTIONS: &[(&str, &str)] = &[
-        ("Best-maintained / flagship",
-"  • YouTube — the primary target, most robust (videos, playlists, channels,
-    live, chapters, subtitles, SponsorBlock integration).
-  • Vimeo, Dailymotion, SoundCloud, Bandcamp, Twitch — long-standing, reliable."),
-        ("Social media",
-"  Twitter/X, Instagram, TikTok, Facebook, Reddit, Tumblr, Bluesky, Snapchat,
-  Pinterest. These break more often (frequent site changes) and increasingly
-  need cookies for anything gated."),
-        ("Broadcasters / catch-up TV (a large share of the extractor count)",
-"  BBC iPlayer, ITV, Channel 4; ARD/ZDF and other German public broadcasters;
-  France.tv/Arte; RAI; NHK; PBS; CBC; ABC (AU); Al Jazeera, etc."),
-        ("Audio / music / podcasts",
-"  SoundCloud, Bandcamp, Mixcloud, generic podcast RSS, many radio catch-up
-  sites. (Note: not Spotify / Apple Music — DRM.)"),
-        ("Learning platforms",
-"  Coursera, Udemy, Khan Academy, LinkedIn Learning — the paid ones require
-  --username/--password or --cookies."),
-        ("Adult sites",
-"  Many are supported (Pornhub, xHamster, etc.)."),
-        ("Generic extractor",
-"  For sites without a dedicated module, yt-dlp scrapes the page for <video>
-  tags and HLS (.m3u8) / DASH (.mpd) manifests and reconstructs the stream —
-  which is why it \"just works\" on lots of random embed pages."),
-    ];
-
-    /// What `dl -c` prints: a plain-language tour of yt-dlp's site coverage, headings styled
-    /// bold-blue via [`_header`] (the same style `becho` and `lll`'s header use). Assembled into
-    /// one buffer and returned, so the caller emits it in a single write rather than line by line.
+    /// Render [`COMPATIBILITY`] for `dl -c`: each `# `-prefixed line becomes a section heading in
+    /// the shared bold-blue header style (the one behind `becho` and `lll`'s column row, via
+    /// [`_header`]); every other line prints verbatim. Assembled into one buffer and returned, so
+    /// the caller emits it in a single write rather than line by line.
     fn _compatibility_help() -> String {
-        let mut out = format!("{COMPATIBILITY_INTRO}\n");
-        for (heading, detail) in COMPATIBILITY_SECTIONS {
-            out.push_str(&format!("\n{}\n{detail}\n", _header(heading)));
+        let mut out = String::with_capacity(COMPATIBILITY.len() + 256);
+        for line in COMPATIBILITY.lines() {
+            match line.strip_prefix("# ") {
+                Some(heading) => out.push_str(&_header(heading)),
+                None => out.push_str(line),
+            }
+            out.push('\n');
         }
-        out.push_str(&format!("\n{COMPATIBILITY_OUTRO}\n"));
         out
     }
 
@@ -425,30 +405,24 @@ mod commands {
         use super::*;
 
         #[test]
-        fn compatibility_help_styles_headings_via_the_shared_header_and_buffers_it_all() {
+        fn compatibility_help_blues_hash_headings_and_prints_the_rest_verbatim() {
             let out = _compatibility_help();
-            // Every section heading is rendered through the shared bold-blue `_header` (the style
-            // behind `becho` / `lll`'s header) — tie the assertion to that function so a style
-            // change can't silently un-blue these.
-            for (heading, detail) in COMPATIBILITY_SECTIONS {
-                assert!(out.contains(&_header(heading)), "heading not header-styled: {heading}");
-                assert!(out.contains(detail), "detail missing/mangled under: {heading}");
+            let mut headings = 0;
+            for line in COMPATIBILITY.lines() {
+                if let Some(heading) = line.strip_prefix("# ") {
+                    // Every `# ` line is rendered through the shared bold-blue `_header` (the style
+                    // behind `becho` / `lll`'s header) with the marker stripped — tie the check to
+                    // that function so a style change can't silently un-blue these.
+                    assert!(out.contains(&_header(heading)), "heading not header-styled: {heading}");
+                    assert!(!out.contains(&format!("# {heading}")), "raw `# ` marker leaked: {heading}");
+                    headings += 1;
+                } else {
+                    // Non-heading lines (intro, bodies, outro) print verbatim, indent and all.
+                    assert!(out.contains(line), "line mangled: {line:?}");
+                }
             }
-            // Intro and outro frame it as plain text (not styled).
-            assert!(out.starts_with(COMPATIBILITY_INTRO));
-            assert!(out.contains(COMPATIBILITY_OUTRO));
-            // A detail's leading indent survives (the `\`-continuation bug would eat it).
-            assert!(out.contains("\n  • YouTube "), "first bullet lost its indent");
-            // One buffer, assembled once — the whole thing is a single owned String.
-            assert!(out.lines().count() > COMPATIBILITY_SECTIONS.len());
-        }
-
-        #[test]
-        fn url_host_strips_scheme_userinfo_port_and_path() {
-            assert_eq!(_url_host("https://www.youtube.com/watch?v=x"), "www.youtube.com");
-            assert_eq!(_url_host("http://user:pass@Host.EXAMPLE.com:8080/a/b"), "host.example.com");
-            assert_eq!(_url_host("youtu.be/abc"), "youtu.be"); // scheme-less
-            assert_eq!(_url_host("/local/path.mp4"), ""); // no host → generic path
+            assert!(headings > 0, "the template should define at least one `# ` heading");
+            assert!(out.contains("\n  • YouTube "), "a body line's indent must survive");
         }
 
         #[test]

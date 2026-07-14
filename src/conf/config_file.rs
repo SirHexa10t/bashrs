@@ -20,9 +20,10 @@ pub(crate) fn path() -> PathBuf {
 }
 
 /// The starter file written on first use: every tunable at its default, explanation beside it.
-/// A real TOML file beside this module (editable as TOML, testable as TOML), embedded at compile
-/// time — the installed binary travels alone, so the template can't live on disk at runtime.
-pub(crate) const TEMPLATE: &str = include_str!("configrs.toml");
+/// A real TOML file under `templates/` beside this module (editable as TOML, testable as TOML),
+/// embedded at compile time — the installed binary travels alone, so the template can't live on
+/// disk at runtime.
+pub(crate) const TEMPLATE: &str = include_str!("templates/configrs.toml");
 
 /// Make the config file exist *and match the current settings shape*; returns its path.
 /// Missing → written from [`TEMPLATE`]. Present but lacking keys the template has (bashrs added

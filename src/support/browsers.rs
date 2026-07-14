@@ -1,6 +1,12 @@
-//! Browser cookie-store discovery and import, backing `dl --cookie-import`. Rather than hand
-//! yt-dlp a live browser profile (whose cookie DB a running browser keeps locked), the import
-//! *copies* the store into bashrs's own data dir and points yt-dlp there — a copy has no lock.
+//! Browser cookie-store discovery and per-site import layout, backing `dl --cookie-import`.
+//! Rather than hand yt-dlp a live browser profile (whose cookie DB a running browser keeps
+//! locked), the import writes a pared-down copy into bashrs's own data dir and points yt-dlp
+//! there — a copy has no lock, and paring it to just the target site's cookies keeps every
+//! other site's (banking, email, …) off bashrs's disk. This module owns the pure parts: finding
+//! browser stores, the target-site registry + host resolution ([`resolve_target`]), and the
+//! per-site store layout ([`reset_site`] / [`write_spec`] / [`imported_spec`] / [`forget`]). The
+//! actual domain-filtered copy runs the bundled python and so lives a layer up, in the driver
+//! ([`crate::drivers::youtube::filter_cookie_db`]) — `support` sits below `tools`.
 //!
 //! Where a browser keeps its cookies is a product of three things: the browser family (Firefox
 //! stores a plaintext `cookies.sqlite`; Chromium keeps an encrypted `Cookies` DB — under
@@ -263,17 +269,126 @@ pub fn any_browser_installed(home: &Path) -> bool {
     })
 }
 
-/// Copy `store` into `cookies_root/store/` (replacing any previous import) and record its
-/// browser in `cookies_root/browser.spec`. The copy is what frees the cookies from the running
-/// browser's file lock.
-pub fn import(store: &CookieStore, cookies_root: &Path) -> std::io::Result<()> {
-    let store_dir = cookies_root.join(STORE_SUBDIR);
-    let _ = std::fs::remove_dir_all(&store_dir); // a stale prior import must not linger
-    std::fs::create_dir_all(&store_dir)?;
-    for (src, dest_name) in &store.files {
-        std::fs::copy(src, store_dir.join(dest_name))?;
+// ============================================================
+// Target sites — which cookie domains a download needs
+// ============================================================
+// `--cookie-import <target>` and every `dl <url>` run resolve their argument to a target site:
+// the set of cookie domains worth extracting, and a stable key naming the per-site store dir.
+// A copied store holds ONLY these domains' cookies — never the whole browser DB — so an import
+// for one site can't leak your banking/email cookies to disk. Sites where auth lives on a
+// second domain (YouTube's session is on google.com) list both.
+
+/// A known site: its `--cookie-import` keyword and `dl` routing, plus the cookie domains to keep.
+struct Site {
+    /// The keyword (`--cookie-import youtube`) and the per-site store dir name.
+    name: &'static str,
+    /// Host suffixes that route to this site — a URL or domain whose host equals one of these
+    /// (or is a subdomain of it) selects this entry. `youtu.be` routes to `youtube`.
+    aliases: &'static [&'static str],
+    /// The cookie domains to extract — a superset of `aliases` when auth lives elsewhere
+    /// (YouTube pulls `google.com` too, where the Google session cookies actually live).
+    cookie_domains: &'static [&'static str],
+}
+
+/// The curated known sites. `--cookie-import`'s help lists these names (a test keeps the two in
+/// sync); anything not here is handled as a bare domain. Order is the help/listing order.
+const SITES: &[Site] = &[
+    Site { name: "youtube", aliases: &["youtube.com", "youtu.be", "youtube-nocookie.com"], cookie_domains: &["youtube.com", "google.com"] },
+    Site { name: "tiktok", aliases: &["tiktok.com"], cookie_domains: &["tiktok.com"] },
+    Site { name: "facebook", aliases: &["facebook.com", "fb.watch"], cookie_domains: &["facebook.com"] },
+    Site { name: "instagram", aliases: &["instagram.com"], cookie_domains: &["instagram.com"] },
+    Site { name: "twitter", aliases: &["twitter.com", "x.com"], cookie_domains: &["twitter.com", "x.com"] },
+    Site { name: "reddit", aliases: &["reddit.com"], cookie_domains: &["reddit.com"] },
+    Site { name: "vimeo", aliases: &["vimeo.com"], cookie_domains: &["vimeo.com"] },
+    Site { name: "twitch", aliases: &["twitch.tv"], cookie_domains: &["twitch.tv"] },
+];
+
+/// A resolved cookie target: the per-site store dir name (`key`), the cookie domains to keep, and
+/// a human `label` for messages. For a known site the key is its curated name; for anything else
+/// it's the bare registrable domain, so an unknown site still gets its own isolated store.
+#[derive(Debug, PartialEq)]
+pub struct SiteTarget {
+    pub key: String,
+    pub domains: Vec<String>,
+    pub label: String,
+}
+
+/// The comma-joined known-site names, for `--cookie-import`'s help text and the sync test.
+pub fn known_site_names() -> String {
+    SITES.iter().map(|s| s.name).collect::<Vec<_>>().join(", ")
+}
+
+/// Resolve a `--cookie-import` argument — a site keyword (`youtube`), a domain (`tiktok.com`),
+/// or a full URL (`https://www.tiktok.com/@u/video/1`) — to its [`SiteTarget`]. Also used per
+/// `dl <url>` run to find which imported store (if any) serves the download's host.
+pub fn resolve_target(input: &str) -> SiteTarget {
+    let input = input.trim();
+    // A bare keyword ("youtube") matches a curated site by name.
+    if let Some(site) = SITES.iter().find(|s| s.name.eq_ignore_ascii_case(input)) {
+        return site.target();
     }
-    std::fs::write(cookies_root.join(SPEC_FILE), store.browser)
+    // Otherwise treat it as a URL/domain and match its host against the sites' aliases.
+    let host = host_of(input);
+    if let Some(site) = SITES.iter().find(|s| host_matches_any(&host, s.aliases)) {
+        return site.target();
+    }
+    // Unknown → its own registrable domain, isolated store, only that domain's cookies.
+    let domain = registrable_domain(&host);
+    SiteTarget { key: domain.clone(), domains: vec![domain.clone()], label: domain }
+}
+
+impl Site {
+    fn target(&self) -> SiteTarget {
+        SiteTarget {
+            key: self.name.to_string(),
+            domains: self.cookie_domains.iter().map(|d| d.to_string()).collect(),
+            label: self.name.to_string(),
+        }
+    }
+}
+
+/// True when `host` equals one of `domains` or is a subdomain of it (dot-boundary match, so
+/// `evil-youtube.com` and `youtube.com.evil.test` don't match `youtube.com`).
+fn host_matches_any(host: &str, domains: &[&str]) -> bool {
+    domains.iter().any(|d| host == *d || host.ends_with(&format!(".{d}")))
+}
+
+/// The lowercased host of a URL or bare domain — scheme, userinfo, port, path, and a leading
+/// `www.` stripped. A value with no host (a bare path) yields `""`.
+pub fn host_of(input: &str) -> String {
+    let after_scheme = input.split_once("://").map_or(input, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority); // drop any user:pass@
+    let host = host.split(':').next().unwrap_or(host).to_lowercase(); // drop any :port
+    host.strip_prefix("www.").unwrap_or(&host).to_string()
+}
+
+/// The registrable domain of a host by the simple last-two-labels rule (`m.example.com` →
+/// `example.com`). Good for the common single-part TLDs; a multi-part TLD (`bbc.co.uk`) resolves
+/// one label short (`co.uk`) — acceptable, since known sites match by alias before reaching here
+/// and the fallback only scopes an unknown site's own store.
+fn registrable_domain(host: &str) -> String {
+    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
+    match labels.len() {
+        0 => String::new(),
+        n => labels[n.saturating_sub(2)..].join("."),
+    }
+}
+
+/// Clear `site_dir` and create its empty `store/`, returned ready for a filtered import to write
+/// the pared-down cookie DB into. Wiping first means a re-import of a site never mingles with the
+/// previous one (and switching browsers for a site replaces cleanly).
+pub fn reset_site(site_dir: &Path) -> std::io::Result<PathBuf> {
+    let _ = std::fs::remove_dir_all(site_dir); // a stale prior import must not linger
+    let store_dir = site_dir.join(STORE_SUBDIR);
+    std::fs::create_dir_all(&store_dir)?;
+    Ok(store_dir)
+}
+
+/// Record which yt-dlp browser a site's imported store came from, in `site_dir/browser.spec` —
+/// the marker [`imported_spec`] reads to build the `--cookies-from-browser` spec.
+pub fn write_spec(site_dir: &Path, browser: &str) -> std::io::Result<()> {
+    std::fs::write(site_dir.join(SPEC_FILE), browser)
 }
 
 /// Drop a previously imported store — the copied DB and the spec marker both. Used to roll back
@@ -469,24 +584,6 @@ mod tests {
     }
 
     #[test]
-    fn import_flattens_the_store_and_round_trips_a_uniform_spec() {
-        let h = FakeHome::new("import");
-        h.touch(".config/chromium/Default/Network/Cookies");
-        let store = cookie_stores(&h.0).into_iter().find(|s| s.browser == "chromium").unwrap();
-        let cookies_root = h.0.join(".bashrs/user-data/browser_cookies");
-
-        assert!(imported_spec(&cookies_root).is_none(), "nothing imported yet");
-        import(&store, &cookies_root).unwrap();
-        assert!(cookies_root.join("store/Cookies").is_file(), "DB flattened to store/Cookies");
-        let spec = imported_spec(&cookies_root).expect("a spec after import");
-        assert!(spec.starts_with("chromium:") && spec.ends_with("browser_cookies/store"), "{spec}");
-
-        // Re-importing replaces cleanly — no leftover files from a prior store.
-        import(&store, &cookies_root).unwrap();
-        assert_eq!(std::fs::read_dir(cookies_root.join("store")).unwrap().count(), 1);
-    }
-
-    #[test]
     fn any_browser_installed_notices_a_sandbox_profile_without_cookies() {
         let h = FakeHome::new("installed");
         h.touch(".var/app/org.chromium.Chromium/config/chromium/Default/Preferences");
@@ -494,43 +591,87 @@ mod tests {
         assert!(cookie_stores(&h.0).is_empty(), "but with no cookie DB there is nothing to import");
     }
 
+    // The DB filtering itself is python-backed (verified live); these cover the pure-fs store
+    // layout the driver writes into and the caller reads back.
+
     #[test]
-    fn re_importing_a_different_family_fully_replaces_the_prior_store() {
-        // The exact sequence a user runs when switching browsers: import Chromium, then Firefox.
-        // The Chromium `Cookies` must NOT linger beside the fresh `cookies.sqlite` — `import`
-        // wipes `store/` first, so the dir reflects only the newest import. (Tested at `import`
-        // level so the guarantee holds independent of the caller's post-import validation.)
-        let h = FakeHome::new("swap");
-        h.touch(".config/google-chrome/Default/Network/Cookies");
-        h.touch(".mozilla/firefox/ab.default-release/cookies.sqlite");
-        let cookies_root = h.0.join(".bashrs/user-data/browser_cookies");
+    fn store_layout_round_trips_a_uniform_spec_and_reset_wipes_it() {
+        let h = FakeHome::new("layout");
+        let site_dir = h.0.join(".bashrs/user-data/browser_cookies/youtube");
+        assert!(imported_spec(&site_dir).is_none(), "nothing imported yet");
 
-        let chromium = cookie_stores(&h.0).into_iter().find(|s| s.browser == "chrome").unwrap();
-        import(&chromium, &cookies_root).unwrap();
-        assert!(cookies_root.join("store/Cookies").is_file(), "chromium DB in place");
+        let store_dir = reset_site(&site_dir).unwrap();
+        std::fs::write(store_dir.join("cookies.sqlite"), "db").unwrap(); // stand-in for a filtered DB
+        write_spec(&site_dir, "firefox").unwrap();
+        let spec = imported_spec(&site_dir).expect("a spec once a store exists");
+        assert!(spec.starts_with("firefox:") && spec.ends_with("youtube/store"), "{spec}");
 
-        let firefox = cookie_stores(&h.0).into_iter().find(|s| s.browser == "firefox").unwrap();
-        import(&firefox, &cookies_root).unwrap();
-        let names: Vec<String> = std::fs::read_dir(cookies_root.join("store"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, ["cookies.sqlite"], "only the new Firefox DB remains — no stale Cookies");
-        assert_eq!(imported_spec(&cookies_root).unwrap().split(':').next(), Some("firefox"));
+        // A re-import wipes the whole site dir first — a stale DB from a prior browser can't linger.
+        let store_dir2 = reset_site(&site_dir).unwrap();
+        assert_eq!(std::fs::read_dir(&store_dir2).unwrap().count(), 0, "store emptied on reset");
+        assert!(imported_spec(&site_dir).is_none(), "spec gone until re-written");
+    }
+
+    #[test]
+    fn per_site_dirs_keep_different_sites_and_browsers_apart() {
+        // A user can import youtube from Firefox and tiktok from Chrome — the two stores coexist
+        // in their own subdirs and each resolves independently.
+        let base = FakeHome::new("persite").0.join("browser_cookies");
+        let yt = base.join("youtube");
+        let tk = base.join("tiktok");
+        std::fs::write(reset_site(&yt).unwrap().join("cookies.sqlite"), "ff").unwrap();
+        write_spec(&yt, "firefox").unwrap();
+        std::fs::write(reset_site(&tk).unwrap().join("Cookies"), "cr").unwrap();
+        write_spec(&tk, "chrome").unwrap();
+        assert!(imported_spec(&yt).unwrap().starts_with("firefox:"));
+        assert!(imported_spec(&tk).unwrap().starts_with("chrome:"));
+        forget(&yt).unwrap();
+        assert!(imported_spec(&yt).is_none(), "forgetting youtube leaves tiktok alone");
+        assert!(imported_spec(&tk).is_some());
     }
 
     #[test]
     fn forget_removes_the_store_and_spec_and_is_idempotent() {
-        let h = FakeHome::new("forget");
-        h.touch(".config/chromium/Default/Network/Cookies");
-        let store = cookie_stores(&h.0).into_iter().find(|s| s.browser == "chromium").unwrap();
-        let cookies_root = h.0.join(".bashrs/user-data/browser_cookies");
-        import(&store, &cookies_root).unwrap();
-        assert!(imported_spec(&cookies_root).is_some());
+        let site_dir = FakeHome::new("forget").0.join("browser_cookies/vimeo");
+        std::fs::write(reset_site(&site_dir).unwrap().join("cookies.sqlite"), "db").unwrap();
+        write_spec(&site_dir, "firefox").unwrap();
+        assert!(imported_spec(&site_dir).is_some());
 
-        forget(&cookies_root).unwrap();
-        assert!(imported_spec(&cookies_root).is_none(), "spec + store gone after forget");
-        assert!(!cookies_root.join(STORE_SUBDIR).exists());
-        forget(&cookies_root).unwrap(); // idempotent: a second forget is a clean no-op
+        forget(&site_dir).unwrap();
+        assert!(imported_spec(&site_dir).is_none(), "spec + store gone after forget");
+        assert!(!site_dir.join(STORE_SUBDIR).exists());
+        forget(&site_dir).unwrap(); // idempotent: a second forget is a clean no-op
+    }
+
+    #[test]
+    fn resolve_target_maps_keywords_domains_and_urls_to_sites() {
+        // A keyword, a domain, and a URL all resolve to the youtube site — and pull google.com.
+        for input in ["youtube", "youtube.com", "https://www.youtube.com/watch?v=x", "https://youtu.be/x"] {
+            let t = resolve_target(input);
+            assert_eq!(t.key, "youtube", "{input}");
+            assert!(t.domains.contains(&"google.com".to_string()), "youtube pulls google.com: {input}");
+        }
+        // A URL to a known site isolates by keyword; twitter aliases x.com.
+        assert_eq!(resolve_target("https://x.com/i/status/1").key, "twitter");
+        // An unknown site → its own registrable domain, only that domain.
+        let unknown = resolve_target("https://videos.example.co/watch/9");
+        assert_eq!(unknown.key, "example.co");
+        assert_eq!(unknown.domains, ["example.co"]);
+    }
+
+    #[test]
+    fn host_of_strips_scheme_userinfo_port_path_and_www() {
+        assert_eq!(host_of("https://www.youtube.com/watch?v=x"), "youtube.com");
+        assert_eq!(host_of("http://user:pass@Host.EXAMPLE.com:8080/a/b"), "host.example.com");
+        assert_eq!(host_of("youtu.be/abc"), "youtu.be"); // scheme-less
+        assert_eq!(host_of("tiktok.com"), "tiktok.com"); // bare domain
+        assert_eq!(host_of("/local/path.mp4"), ""); // no host
+    }
+
+    #[test]
+    fn known_site_names_stay_in_sync_with_the_help_text() {
+        // `--cookie-import`'s help hardcodes this list; if a site is added/removed here, update
+        // the DlArgs help too (this guard makes the drift a test failure, not a silent mismatch).
+        assert_eq!(known_site_names(), "youtube, tiktok, facebook, instagram, twitter, reddit, vimeo, twitch");
     }
 }
