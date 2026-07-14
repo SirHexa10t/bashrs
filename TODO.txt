@@ -17,3 +17,20 @@ youtube/ffmpeg:
     ffprobe import as library?
 
     scraping historic snapshots of channels to find if any of their videos have been de-listed/disappeared
+
+
+markdown-renderer survey (dl -c) — conclusions (2026-07-14):
+    Candidates surveyed: minimad, pulldown-cmark, termimad (Rust crates, in-process);
+    glow (external Go binary); rich (bundled python).
+
+    dl -c:
+        minimad was the best of the new in-process options (2 crates, our own emitter).
+        termimad looked BEST overall (in-process, now colored) but is heavy.
+        FUTURE: port termimad's coloring into the minimad emitter — termimad's look at
+        minimad's weight. (Per-crate binary-size cost recorded below to inform this.)
+
+    bashrs_sourcefile (shell-code highlighting):
+        rich had the nicest colors, but truncated the displayed window too early (hid
+        text) and used a different background color. Both probably workaroundable, but we
+        prefer to avoid Python in a Rust project when avoidable. Decision: keep synoptic
+        for now; revisit recoloring sourcefile output later (LOW priority).

@@ -1,6 +1,8 @@
 //! Syntax-highlighting a block of code with ANSI colour, via `synoptic`. Shared by the
 //! `code_highlight` style command and by `bashrs_sourcefile` (which colours the shell it
-//! prints), so both go through one palette.
+//! prints), so both go through one palette. (Rendering an embedded Markdown *doc* for `dl -c` is a
+//! separate concern — marker-stripping rather than highlighting — and lives in
+//! [`crate::support::doc_render`], the hand-built sibling of this synoptic-backed module.)
 
 use crate::support::doc_style::{escape, RESET};
 
@@ -36,7 +38,7 @@ fn paint(kind: &str, text: &str) -> String {
     }
 }
 
-/// synoptic token kind → SGR colour code.
+/// synoptic token kind → SGR colour code, for the code languages synoptic highlights.
 const PALETTE: &[(&str, &str)] = &[
     ("keyword", "35"),   // magenta
     ("macro", "35"),

@@ -1,5 +1,5 @@
 //! Rust support shared across the command categories — clap argument structs ([`args`]), a syntax
-//! colour theme ([`color_theme`]), the styling engine
+//! colour theme ([`color_theme`]), a Markdown-doc renderer ([`doc_render`]), the styling engine
 //! ([`doc_style`]), an external-process runner
 //! ([`exec`]), text-input resolution ([`input`]), an in-process stream grep ([`streamgrep`]), a
 //! recursive tree grep ([`treegrep`]), binary-format decoders for `gg --delve` ([`delve`]), output
@@ -11,6 +11,7 @@ pub mod args;
 pub mod browsers;
 pub mod color_theme;
 pub mod delve;
+pub mod doc_render;
 pub mod doc_style;
 pub mod exec;
 pub mod input;

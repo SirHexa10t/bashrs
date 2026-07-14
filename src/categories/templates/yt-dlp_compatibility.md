@@ -1,0 +1,155 @@
+Verified against the official `supportedsites.md` on yt-dlp `master`, snapshot 2026-07-14.
+Headline numbers: **1,731 extractor entries** · **137 flagged "(Currently broken)"** (~8%) · **228 advertise account login** (`--username` / `.netrc`) and effectively require `--cookies` / `--cookies-from-browser`.
+
+# **Legend**
+    🔑 account login supported
+    ⚠️  some sub-extractors currently broken
+    ✗  not supported.
+
+An "extractor" is not a "site": the single `pbs` entry covers 100+ US member stations, while YouTube alone has 15 dedicated extractors. And per the list's own header: *"If a site is not listed here, it might still be supported by yt-dlp's embed extraction or generic extractor. … The only reliable way to check if a site is supported is to try it."* This manifest is a map, not a guarantee.
+
+
+# 1. Flagship: YouTube 🔑
+
+15 dedicated extractors: single videos, playlists, channels/tabs, live streams, clips, Shorts audio-pivot, YouTube Music search, `ytsearch:` prefixes and search URLs — plus cookie-gated personal feeds (watch history, subscriptions, liked videos, Watch Later, notifications). SponsorBlock chapter marking/removal is a yt-dlp *feature* layered on top, not an extractor.
+
+
+# 2. Major video platforms, worldwide
+
+┌──────────────────────────────────┬───────────────┬───────────────────────────────────────────────────────────────────────────────────┐
+│             Platform             │  Extractors   │                                       Notes                                       │
+├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ Vimeo 🔑                         │ 11            │ incl. On Demand, review pages, user likes                                         │
+├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ Dailymotion 🔑                   │ 4             │ video / playlist / search / user                                                  │
+├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ Niconico 🔑                      │ 6             │ video, live (ニコニコ生放送), playlists, series, tags; history needs cookies      │
+├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ Bilibili                         │ 19            │ video, bangumi (anime), audio, courses ("cheese"), search, favorites, user spaces │
+├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ iQIYI / iq.com                   │ 2             │ Chinese + international sites                                                     │
+├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ Youku                            │ 2             │ 优酷 videos + shows                                                               │
+├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ Douyin / Weibo / XiaoHongShu     │ 1 / 3 / 1     │ Chinese TikTok, microblog video, RED                                              │
+├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ VK 🔑 / Rutube / OK.ru / Smotrim │ 3 / 7 / 1 / 4 │ the main Russian platforms                                                        │
+├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ Globo 🔑                         │ 1             │ Brazil's largest broadcaster                                                      │
+└──────────────────────────────────┴───────────────┴───────────────────────────────────────────────────────────────────────────────────┘
+
+
+# 3. Live streaming
+
+Twitch 🔑 (7: VODs, clips, streams, collections) · Kick (live / VOD / clips) · Chzzk (Naver's Twitch, live + VOD) · SOOP 🔑 (4 — formerly AfreecaTV, sooplive.com) · TwitCasting (3) · DLive (2) · Niconico Live · YouTube live.
+
+
+# 4. Social media
+
+- **Twitter/X** — 6 extractors incl. Spaces and live broadcasts
+- **Instagram** — 5; ⚠️ `instagram:user` (profile pages) currently broken; cookies increasingly required
+- **TikTok** — 8 incl. `vm.tiktok` short links and live; ⚠️ `tiktok:tag`, `tiktok:sound`, `tiktok:effect` currently broken
+- **Facebook** — 4 incl. Reels and the Ads library
+- Reddit · Tumblr 🔑 · Bluesky · Pinterest (+collections) · LinkedIn (posts + events)
+- **Snapchat — Spotlight only** (`SnapchatSpotlight`); no stories or general content
+- Telegram — public embed pages only (`telegram:embed`)
+
+
+# 5. Creator, membership & alt-tech platforms
+
+Rumble (3: videos, channels, embeds) · **Odysee — via the `lbry` extractors** (videos, channels, playlists) · PeerTube (federated instances, 2) · Patreon (single posts + whole campaigns) · Boosty · Floatplane (2) · Nebula 🔑 (5) · Dropout 🔑 · Substack · Weverse 🔑 (6 — HYBE's fan platform) · Loom (⚠️ folder listing broken).
+
+
+# 6. Public broadcasters & catch-up TV (the largest share of the list)
+
+- **UK:** BBC iPlayer 🔑 (6), ITV — but ✗ **Channel 4** (no All4/Channel4 extractor exists).
+- **Europe:** ARD Mediathek + Audiothek (5), ZDF (2), Arte (5, multi-language), France.tv, RAI/RaiPlay, NPO (npo.nl, ntr.nl, zapp.nl…), SVT Play, RTVE (5), and dozens more.
+- **Asia-Pacific:** NHK (8 — VOD, Radiru radio, For-School), TVer, AbemaTV 🔑, Radiko (JP radio), SBS Australia *and* SBS Korea, ABC Australia iview.
+- **Americas / Middle East:** PBS (one extractor covering 100+ member stations), CBC (4), even ISIS-propaganda channels like Al Jazeera.
+
+Geo-blocking is the norm here; expect to need a local IP.
+
+
+# 7. Audio, music & podcasts
+
+SoundCloud 🔑 (7, `scsearch:`) · Bandcamp (4, incl. Bandcamp Weekly) · Mixcloud (3) · archive.org audio/video · iHeartRadio (+podcasts) · TuneIn (4) · **ApplePodcasts** (podcasts, unlike Apple Music, are supported) · Acast · Spreaker · Libsyn · plain RSS feeds via the generic extractor.
+
+✗ **Spotify — nothing at all** (even the old podcast extractors are gone) · ✗ Apple Music (DRM).
+
+
+# 8. Learning
+
+Udemy 🔑 (+courses) · LinkedIn Learning (+courses) · Khan Academy (2) · Laracasts (2) · GameDev.tv 🔑.
+
+✗ **Coursera** (not in the current list, despite what many blog posts claim) · ✗ MasterClass · ✗ Skillshare.
+
+
+# 9. News & sports
+
+CNN · NYTimes (4, incl. Cooking) · Washington Post · CBS News (4, incl. livestreams) · Fox News (3) · Bloomberg · ABC News · BFMTV · scores more.
+
+ESPN (+CricInfo) · MLB + MLB.TV 🔑 · NFL (nfl.com + NFL Plus episodes/replays) · ⚠️ **NBA — all six extractors currently broken**.
+
+
+# 10. Adult
+
+PornHub 🔑 (+Thumbzilla) · xHamster · XVideos (2) · YouPorn (6) · RedGifs (3) · many more.
+
+✗ OnlyFans · ✗ Fansly.
+
+
+# 11. The long tail: embedded players & the generic extractor
+
+Dedicated extractors exist for the hosting platforms behind countless corporate and news sites: **Brightcove** (legacy + new), **Kaltura**, **JW Platform**, **Wistia** (3), **Dacast** (2), **Zoom** (recordings + clips), **Loom**. For everything else, the `generic` extractor scrapes the page for `<video>` tags, HLS (`.m3u8`) and DASH (`.mpd`) manifests, and RSS feeds — which is why yt-dlp often "just works" on sites nobody wrote an extractor for.
+
+# 12. What is NOT here
+
+- **DRM walled gardens (yt-dlp does not circumvent DRM):** Netflix · Disney+ (the listed `Disney` extractor is legacy disney.com clips only) · Amazon Prime Video (the Amazon entries are MiniTV, Store pages and Reviews only) · Hulu · Max (the listed `hbo` extractor is legacy hbo.com) · Peacock · Paramount+ (`ParamountPressExpress` is a press site) · Apple TV+ · Spotify · Apple Music.
+- **Removed or dead:** Crunchyroll (formerly supported; absent since the service went fully DRM) · Funimation (the service itself shut down in 2024) · Zee5 and JioCinema (absent — JioCinema merged into Hotstar, and the `hotstar` entry is now literally labeled "JioHotstar").
+- **Never supported:** Coursera · MasterClass · Skillshare · OnlyFans · Fansly · Channel 4 (UK) · Snapchat stories.
+- **Listed but currently broken (137 entries, ~8%):** most notably `instagram:user`, three TikTok discovery extractors, all six NBA extractors, `loom:folder`.
+- **Vestigial — listed but pointing at dead services:** `apple:music:connect` (Apple discontinued Connect in 2018) · `Vevo`/`VevoPlaylist` (Vevo's standalone site closed in 2018; its catalog lives on YouTube).
+
+
+# Sources
+
+1. yt-dlp supportedsites.md (master) (https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md) — sole source for the entire manifest: every presence/absence claim, all counts (1,731 entries, 137 broken, 228 netrc-capable), sub-extractor breakdowns, broken flags, and the header disclaimer. Fetched raw and grepped exhaustively, including a re-check pass after two head-truncated greps nearly caused false "not supported" claims.
+
+
+
+
+# How restrictions change the cookie need
+
+- **Age (18+):** cookies from an 18+ account are *necessary* but currently **not always sufficient** on YouTube — it also depends on which Innertube client yt-dlp picks and the PO token (maintainers closed a "cookies don't work for age-gated" report as incomplete). Keep yt-dlp current + a PO provider.
+- **Geo-restriction:** cookies do **nothing**. It's purely IP-based — you need a real IP in the allowed region (see below).
+-- YouTube resolves per-video geo-availability **server-side from the request's real IP** (your VPN/proxy exit). Cookies carry session/identity tokens — there is no location field in them YouTube uses to override the IP.
+-- yt-dlp **cannot even send a conflicting country**: its Innertube context sets only `hl` (interface language), and grepping the extractor source (`youtube/_base.py`, `_video.py`) confirms it **never sets `gl`** (country). When a video is blocked, yt-dlp only *reads* the allowed-country list to report it.
+-- The `PREF` cookie / account region only shifts *defaults* (language, recommendations, trending), not the hard per-video block. *(This discovery-vs-enforcement split is community-documented — no official Google statement — so it's well-supported rather than primary.)*
+- **Private / unlisted / members-only / channel memberships / rentals:** login cookies from an account with access.
+- **DRM:** yt-dlp doesn't circumvent it. YouTube quirk worth knowing: the `tv` client returns DRM'd formats with *no* cookies, but passing cookies (even a guest session) yields non-DRM formats — so cookies affect *format availability*, not just gated content.
+- **Premium formats** (1080p Premium bitrate): need Premium-account cookies.
+- **Bot / rate-limit ("Sign in to confirm you're not a bot"):** triggered by flagged IPs and heavy use; mitigated by cookies + PO token + a residential IP + a modest request rate.
+
+
+# The real risks run the **other** direction:
+
+1. **Account-security friction.** Logging in (via cookies) from a VPN IP in a country unlike your account's usual location can trip "confirm you're not a bot"/CAPTCHA/verification, and can get cookies rotated or the account temporarily limited. **Datacenter** VPN IPs trip this far more than **residential** ones *(the datacenter-vs-residential detail is community-level, not from yt-dlp docs)*.
+2. **XFF spoofing doesn't work on YouTube** — and yt-dlp knows it: `_GEO_BYPASS = False` is hardcoded in the YouTube extractor, so `--xff`/`--geo-bypass-country` isn't even attempted. Maintainer (seproDev) on issue #9883: *"XFF only works for very few sites. Youtube is not one of them. You either need to use a system wide VPN or specify a proxy server."* Use a real IP via OS-level VPN or `--proxy`.
+3. **Keep the connection consistent.** Route *all* yt-dlp traffic — auth and media — through the same regional IP; a split (auth from home, media via proxy) invites failures and extra scrutiny.
+4. **Entitlement edge cases.** A few things are region-locked to the *account* regardless of IP (YouTube TV, some live sports, purchases tied to billing country) and can stay unavailable even on a matching VPN IP — but that's the account's entitlement, not cookies overriding the IP.
+
+**Net recommendation:** residential IP in the target region (VPN/`--proxy`) + fresh `youtube.com` cookies from an entitled account + a PO-token provider, all over the one connection.
+
+
+ Sources
+
+1. [yt-dlp Extractors wiki — Exporting YouTube Cookies](https://github.com/yt-dlp/yt-dlp/wiki/Extractors) — confirms export from `youtube.com` only (not google.com), the incognito/`robots.txt`/close-window method, and tab-based cookie rotation.
+2. yt-dlp extractor source `youtube/_base.py` & `_video.py` (raw.githubusercontent.com, master) — primary evidence that `_GEO_BYPASS = False` for YouTube and the Innertube context sets `hl` but never `gl`; `raise_geo_restricted` only reads the allowed-country list. Surfaced by the verification agent.
+3. [yt-dlp PO Token Guide wiki](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide) — what PO tokens are, when required (GVS/player/subs) regardless of auth, the guest-vs-DRM format behavior, and the `VISITOR_INFO1_LIVE` binding.
+4. [yt-dlp issue #9883 — geo-restricted YouTube downloads](https://github.com/yt-dlp/yt-dlp/issues/9883) — maintainer statements (seproDev, bashonly) that `--xff`/`--geo-bypass` never worked on YouTube and only a system-wide VPN or `--proxy` (an IP change) does.
+5. [yt-dlp FAQ wiki](https://github.com/yt-dlp/yt-dlp/wiki/FAQ) — `--cookies-from-browser` exports *all* sites' cookies (the privacy warning motivating your feature); `--cookies` vs `--cookies-from-browser`; Netscape-format/domain-matching requirements.
+6. Twitter/X: [issue #10010 (twitter.com→x.com migration)](https://github.com/yt-dlp/yt-dlp/issues/10010), [commit a6ba714 (login support removed)](https://github.com/yt-dlp/yt-dlp/commit/a6ba7140051dbe1d63a1da4de263bb9c886c0a32), [issue #11770 (NSFW requires auth)](https://github.com/yt-dlp/yt-dlp/issues/11770) — the multi-domain wrinkle and cookie-only auth.
+7. [yt-dlp issue #13445 — age-restricted cookies insufficient](https://github.com/yt-dlp/yt-dlp/issues/13445) and [issue #12045 — cookies still trigger bot challenge](https://github.com/yt-dlp/yt-dlp/issues/12045) — why cookies alone aren't always enough for age/bot gates.
+8. [How yt-dlp Handles Geo-Restrictions (instagit writeup)](https://instagit.com/yt-dlp/yt-dlp/how-yt-dlp-handles-geo-restrictions-and-ip-filtering/) — the `--geo-bypass`/`--xff` XFF-spoofing mechanism and its limits.
+9. [YouTube Help — block videos in specific territories](https://support.google.com/youtube/answer/6303378) — official confirmation that geo-fencing is enforced by viewer location.
+10. Community, flagged as non-primary: [ImprovedTube #623](https://github.com/code-charity/youtube/issues/623) and [cookiedatabase.org — PREF](https://cookiedatabase.org/cookie/youtube/pref/) — that `gl`/`PREF` affects discovery, not restricted-playback enforcement.
