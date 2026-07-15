@@ -12,7 +12,8 @@
 mod commands {
     use crate::categories::styles::_styled_echo;
     use crate::support::args::EchoArgs;
-    use crate::support::theme::{Basic, BasicLook, Underline, Weight};
+    use crate::support::generator_basis::BasicLook;
+    use crate::support::theme::{Basic, Underline, Weight};
 
     // GENERATED-STYLE-MATRIX-START
 

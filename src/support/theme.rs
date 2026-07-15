@@ -3,12 +3,13 @@
 // `include!`s this file textually (it can't link the crate) to regenerate the `recho` command
 // matrix, so it must stay dependency-free and safe to paste mid-file.
 //
-// Every atom is a variant of a category enum (Weight, Underline, Basic, Md) and carries its
-// (name, particle, sgr) through the shared `Style` trait. The three recho dimensions bundle into a
-// `BasicLook`; the doc-only shades in `Md` never enter the matrix. Colour *policy* (which role gets
-// which atom) lives with the consumers — `doc_style` for docs, `theme_code` for code highlighting.
+// Every variant of a category enum (Weight, Underline, Basic, Md) is a `Style`, carrying its
+// (name, particle, sgr) through that trait. The doc-only shades in `Md` never enter the recho
+// matrix; the three recho dimensions bundle into a `BasicLook`, which — being specific to the
+// autogenerator — lives in `generator_basis`, not here. Colour *policy* (which role gets which
+// `Style`) lives with the consumers — `doc_style` for docs, `theme_code` for code highlighting.
 
-/// The shared shape of every style atom: its human `name`, its `recho` command `particle`, and its
+/// The shared shape of every `Style`: its human `name`, its `recho` command `particle`, and its
 /// SGR sub-code. One `parts()` per category; the accessors are derived from it. Object-safe (`&self`,
 /// no `Copy` bound) so a heterogeneous `&[&dyn Style]` can be composed by `doc_style::_wrap`.
 /// (`allow(dead_code)`: `name`/`particle` are used only by `build.rs`'s codegen and `sgr` only at
@@ -36,7 +37,7 @@ pub(crate) enum Weight {
     Dark,
 }
 
-/// Underline, on or off. `None` is the "off" member so [`BasicLook`] needs no `Option`.
+/// Underline, on or off. `None` is the "off" member so the `BasicLook` composite needs no `Option`.
 #[derive(Clone, Copy)]
 pub(crate) enum Underline {
     None,
@@ -137,22 +138,12 @@ impl Style for Md {
     }
 }
 
-/// The recho autogenerator's composite — the three matrix dimensions, each typed to its category.
-/// `None` variants stand in for "absent", so no `Option` is needed. (`allow(dead_code)`: `build.rs`
-/// emits `BasicLook { … }` as generated *text* rather than constructing one, so it's unused there.)
-#[allow(dead_code)]
-pub(crate) struct BasicLook {
-    pub(crate) weight: Weight,
-    pub(crate) underline: Underline,
-    pub(crate) colour: Basic,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn atoms_report_name_particle_and_sgr() {
+    fn styles_report_name_particle_and_sgr() {
         assert_eq!(Basic::Cyan.name(), "cyan");
         assert_eq!(Basic::Cyan.particle(), "c");
         assert_eq!(Basic::Cyan.sgr(), "36");

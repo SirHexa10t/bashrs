@@ -1,7 +1,7 @@
 //! Syntax-highlighting a block of code with ANSI colour, via `synoptic`. Shared by the
 //! `code_highlight` style command and by `bashrs_sourcefile` (which colours the shell it
 //! prints). The kind→colour map ([`_code_colour`]) is the code-highlighting theme; its colours are
-//! [`crate::support::theme`] atoms, and [`argname`] reuses it to style a lone flag name as code.
+//! [`crate::support::theme`] `Style`s, and [`argname`] reuses it to style a lone flag name as code.
 //! (Rendering an embedded Markdown *doc* for `dl -c` is a separate
 //! concern — marker-stripping rather than highlighting — and lives in
 //! [`crate::support::doc_render`], the hand-built sibling of this synoptic-backed module.)

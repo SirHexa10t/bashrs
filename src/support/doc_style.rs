@@ -6,7 +6,7 @@
 //!
 //! A nested colour/style restores the enclosing one when it ends (rather than clearing to the
 //! terminal default), and every span starts from a clean slate so styles don't compound — see
-//! [`_scoped`]. Styles are assembled from [`crate::support::theme`]'s atoms: [`_wrap`] joins their
+//! [`_scoped`]. Styles are assembled from [`crate::support::theme`]'s `Style`s: [`_wrap`] joins their
 //! SGR sub-codes, and the element helpers (`heading`, `bold`, `code`, …) name the roles `dl -c`'s
 //! renderer paints.
 
@@ -21,16 +21,16 @@ pub(crate) fn escape(sgr: &str) -> String {
     format!("\x1b[{sgr}m")
 }
 
-/// Assemble an ANSI escape from a set of style atoms — read each one's [`Style::sgr`], skip the
+/// Assemble an ANSI escape from a set of `Style`s — read each one's [`Style::sgr`], skip the
 /// empties (a `None`-style member), and join with `;`. e.g. `_wrap(&[&Weight::Bold, &Basic::Red])`
 /// → `"\x1b[1;31m"`; `_wrap(&[&Weight::Bold])` → `"\x1b[1m"`.
-pub(crate) fn _wrap(atoms: &[&dyn Style]) -> String {
-    let sgr = atoms.iter().map(|a| a.sgr()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(";");
+pub(crate) fn _wrap(styles: &[&dyn Style]) -> String {
+    let sgr = styles.iter().map(|s| s.sgr()).filter(|c| !c.is_empty()).collect::<Vec<_>>().join(";");
     escape(&sgr)
 }
 
 /// Style `text` in the shared bold-blue "header" style — `lll`'s column row and `gg`'s section
-/// titles both use it, so the style is defined once and composed from theme atoms like the rest.
+/// titles both use it, so the style is defined once and composed from theme styles like the rest.
 pub(crate) fn _header(text: &str) -> String {
     _scoped(&_wrap(&[&Weight::Bold, &Basic::Blue]), text)
 }
@@ -121,7 +121,7 @@ mod tests {
     }
 
     #[test]
-    fn wrap_joins_atom_sgrs_and_skips_empties() {
+    fn wrap_joins_style_sgrs_and_skips_empties() {
         assert_eq!(_wrap(&[&Weight::Bold, &Basic::Red]), "\x1b[1;31m"); // bold red
         assert_eq!(_wrap(&[&Weight::Bold]), "\x1b[1m"); // bold only (boecho)
         assert_eq!(
@@ -138,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn element_styles_paint_the_expected_atoms() {
+    fn element_styles_paint_the_expected_colours() {
         assert_eq!(bold(), _wrap(&[&Weight::Bold, &Basic::Yellow]));
         assert_eq!(italic(), "\x1b[3;95m"); // italic + bright magenta
         assert_eq!(code(), "\x1b[38;5;208m"); // orange

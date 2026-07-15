@@ -11,7 +11,8 @@
 mod commands {
     use crate::support::args::EchoArgs;
     use crate::support::doc_style::{_scoped, _wrap};
-    use crate::support::theme::{Basic, BasicLook, Weight};
+    use crate::support::generator_basis::BasicLook;
+    use crate::support::theme::{Basic, Weight};
     use crate::support::{input, streamgrep, theme_code};
     use clap::Args;
     use std::path::Path;
