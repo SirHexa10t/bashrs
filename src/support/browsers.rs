@@ -275,8 +275,8 @@ pub fn any_browser_installed(home: &Path) -> bool {
 // `--cookie-import <target>` and every `dl <url>` run resolve their argument to a target site:
 // the set of cookie domains worth extracting, and a stable key naming the per-site store dir.
 // A copied store holds ONLY these domains' cookies — never the whole browser DB — so an import
-// for one site can't leak your banking/email cookies to disk. Sites where auth lives on a
-// second domain (YouTube's session is on google.com) list both.
+// for one site can't leak your banking/email cookies to disk. A site whose auth genuinely spans a
+// second registrable domain (Twitter/X: x.com + legacy twitter.com) lists both.
 
 /// A known site: its `--cookie-import` keyword and `dl` routing, plus the cookie domains to keep.
 struct Site {
@@ -285,15 +285,18 @@ struct Site {
     /// Host suffixes that route to this site — a URL or domain whose host equals one of these
     /// (or is a subdomain of it) selects this entry. `youtu.be` routes to `youtube`.
     aliases: &'static [&'static str],
-    /// The cookie domains to extract — a superset of `aliases` when auth lives elsewhere
-    /// (YouTube pulls `google.com` too, where the Google session cookies actually live).
+    /// The cookie domains to extract. Usually just the site's own domain; list a second only when
+    /// auth genuinely lives there (Twitter/X: `x.com` + legacy `twitter.com`). Deliberately NOT
+    /// `google.com` for YouTube — yt-dlp reads YouTube auth from the `youtube.com` jar alone (the
+    /// Google-SSO cookies are mirrored there), so adding it would copy the whole Google session to
+    /// disk for nothing.
     cookie_domains: &'static [&'static str],
 }
 
 /// The curated known sites. `--cookie-import`'s help lists these names (a test keeps the two in
 /// sync); anything not here is handled as a bare domain. Order is the help/listing order.
 const SITES: &[Site] = &[
-    Site { name: "youtube", aliases: &["youtube.com", "youtu.be", "youtube-nocookie.com"], cookie_domains: &["youtube.com", "google.com"] },
+    Site { name: "youtube", aliases: &["youtube.com", "youtu.be", "youtube-nocookie.com"], cookie_domains: &["youtube.com"] },
     Site { name: "tiktok", aliases: &["tiktok.com"], cookie_domains: &["tiktok.com"] },
     Site { name: "facebook", aliases: &["facebook.com", "fb.watch"], cookie_domains: &["facebook.com"] },
     Site { name: "instagram", aliases: &["instagram.com"], cookie_domains: &["instagram.com"] },
@@ -301,7 +304,17 @@ const SITES: &[Site] = &[
     Site { name: "reddit", aliases: &["reddit.com"], cookie_domains: &["reddit.com"] },
     Site { name: "vimeo", aliases: &["vimeo.com"], cookie_domains: &["vimeo.com"] },
     Site { name: "twitch", aliases: &["twitch.tv"], cookie_domains: &["twitch.tv"] },
+    Site { name: "niconico", aliases: &["nicovideo.jp", "nico.ms"], cookie_domains: &["nicovideo.jp"] },
+    Site { name: "bilibili", aliases: &["bilibili.com", "b23.tv"], cookie_domains: &["bilibili.com"] },
+    Site { name: "patreon", aliases: &["patreon.com"], cookie_domains: &["patreon.com"] },
+    Site { name: "nebula", aliases: &["nebula.tv", "watchnebula.com"], cookie_domains: &["nebula.tv", "watchnebula.com"] },
+    Site { name: "bbc", aliases: &["bbc.co.uk", "bbc.com"], cookie_domains: &["bbc.co.uk", "bbc.com"] },
 ];
+
+/// Informal keywords that resolve to a curated site whose store key differs from the word people
+/// type — the Twitter→X rebrand is the one that matters (`x` → the `twitter` store). Each value is
+/// a site `name` in [`SITES`]; a test keeps every one pointing at a real site.
+const KEYWORD_ALIASES: &[(&str, &str)] = &[("x", "twitter")];
 
 /// A resolved cookie target: the per-site store dir name (`key`), the cookie domains to keep, and
 /// a human `label` for messages. For a known site the key is its curated name; for anything else
@@ -318,22 +331,42 @@ pub fn known_site_names() -> String {
     SITES.iter().map(|s| s.name).collect::<Vec<_>>().join(", ")
 }
 
+/// Whether `input` is a cookie target we can actually resolve — a known site (keyword, informal
+/// alias like `x`, or a URL/domain matching one), or a proper domain/URL whose host carries a dot.
+/// A bare word that's neither (e.g. `tiktok2`) maps to no cookie domain, so `--cookie-import`
+/// rejects it up front instead of building an empty store.
+pub fn is_importable_target(input: &str) -> bool {
+    site_for(input).is_some() || host_of(input.trim()).contains('.')
+}
+
+/// The curated [`Site`] an input names — a keyword by `name` (or an informal alias like `x` →
+/// twitter), or a URL/domain by its host matching an alias. `None` for anything not curated. This
+/// is the shared "which known site is this?" recognition: [`resolve_target`] and
+/// [`is_importable_target`] use it today, and it's the seam a future caller can reuse to fold a
+/// site's many addresses back to the one it owns.
+fn site_for(input: &str) -> Option<&'static Site> {
+    let input = input.trim();
+    // A keyword matches by `name`, after mapping any informal alias (x → twitter) onto it.
+    let canonical = KEYWORD_ALIASES
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(input))
+        .map_or(input, |(_, name)| name);
+    if let Some(site) = SITES.iter().find(|s| s.name.eq_ignore_ascii_case(canonical)) {
+        return Some(site);
+    }
+    // Otherwise treat it as a URL/domain and match its host against the sites' aliases.
+    SITES.iter().find(|s| host_matches_any(&host_of(input), s.aliases))
+}
+
 /// Resolve a `--cookie-import` argument — a site keyword (`youtube`), a domain (`tiktok.com`),
 /// or a full URL (`https://www.tiktok.com/@u/video/1`) — to its [`SiteTarget`]. Also used per
 /// `dl <url>` run to find which imported store (if any) serves the download's host.
 pub fn resolve_target(input: &str) -> SiteTarget {
-    let input = input.trim();
-    // A bare keyword ("youtube") matches a curated site by name.
-    if let Some(site) = SITES.iter().find(|s| s.name.eq_ignore_ascii_case(input)) {
-        return site.target();
-    }
-    // Otherwise treat it as a URL/domain and match its host against the sites' aliases.
-    let host = host_of(input);
-    if let Some(site) = SITES.iter().find(|s| host_matches_any(&host, s.aliases)) {
+    if let Some(site) = site_for(input) {
         return site.target();
     }
     // Unknown → its own registrable domain, isolated store, only that domain's cookies.
-    let domain = registrable_domain(&host);
+    let domain = registrable_domain(&host_of(input.trim()));
     SiteTarget { key: domain.clone(), domains: vec![domain.clone()], label: domain }
 }
 
@@ -412,6 +445,31 @@ pub fn imported_spec(cookies_root: &Path) -> Option<String> {
     let store_dir = cookies_root.join(STORE_SUBDIR);
     let has_files = std::fs::read_dir(&store_dir).ok()?.flatten().next().is_some();
     (!browser.is_empty() && has_files).then(|| format!("{browser}:{}", store_dir.display()))
+}
+
+/// The cookie-DB family for a yt-dlp browser name: Firefox keeps its cookies in `moz_cookies`,
+/// every Chromium variant in `cookies`. The import filter and the expiry check both key off this.
+pub(crate) fn store_kind(browser: &str) -> &'static str {
+    if browser == "firefox" {
+        "firefox"
+    } else {
+        "chromium"
+    }
+}
+
+/// The imported store's cookie DB file and its [`store_kind`] family, or `None` when nothing's
+/// imported. The store dir holds exactly one file (the filtered DB), so we take it; the family
+/// comes from the recorded spec. Lets a caller read the DB's plaintext columns (cookie expiry)
+/// without yt-dlp or decryption. Sibling of [`imported_spec`].
+pub fn imported_db(cookies_root: &Path) -> Option<(PathBuf, &'static str)> {
+    let browser = std::fs::read_to_string(cookies_root.join(SPEC_FILE)).ok()?;
+    let kind = store_kind(browser.trim());
+    let db = std::fs::read_dir(cookies_root.join(STORE_SUBDIR))
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.is_file())?;
+    Some((db, kind))
 }
 
 #[cfg(test)]
@@ -645,11 +703,13 @@ mod tests {
 
     #[test]
     fn resolve_target_maps_keywords_domains_and_urls_to_sites() {
-        // A keyword, a domain, and a URL all resolve to the youtube site — and pull google.com.
+        // A keyword, a domain, and a URL all resolve to the youtube site — keeping only youtube.com
+        // cookies (never google.com: yt-dlp reads YouTube auth from the youtube.com jar alone, so
+        // pulling google.com would copy the user's whole Google session to disk for nothing).
         for input in ["youtube", "youtube.com", "https://www.youtube.com/watch?v=x", "https://youtu.be/x"] {
             let t = resolve_target(input);
             assert_eq!(t.key, "youtube", "{input}");
-            assert!(t.domains.contains(&"google.com".to_string()), "youtube pulls google.com: {input}");
+            assert_eq!(t.domains, ["youtube.com"], "youtube keeps only its own domain: {input}");
         }
         // A URL to a known site isolates by keyword; twitter aliases x.com.
         assert_eq!(resolve_target("https://x.com/i/status/1").key, "twitter");
@@ -657,6 +717,35 @@ mod tests {
         let unknown = resolve_target("https://videos.example.co/watch/9");
         assert_eq!(unknown.key, "example.co");
         assert_eq!(unknown.domains, ["example.co"]);
+    }
+
+    #[test]
+    fn added_sites_resolve_by_keyword_and_url_including_dual_domain_ones() {
+        // Single-domain additions: the keyword lands on the site's own domain, a URL routes by alias.
+        assert_eq!(resolve_target("bilibili").domains, ["bilibili.com"]);
+        assert_eq!(resolve_target("https://www.bilibili.com/video/BV1").key, "bilibili");
+        assert_eq!(resolve_target("niconico").domains, ["nicovideo.jp"]);
+        assert_eq!(resolve_target("patreon").domains, ["patreon.com"]);
+        // Nebula keeps its current and legacy domains.
+        assert_eq!(resolve_target("nebula").domains, ["nebula.tv", "watchnebula.com"]);
+        // BBC spans two registrable domains; a bbc.co.uk URL matches by alias, so it keeps BOTH —
+        // and never falls back to the last-two-labels rule, which would wrongly yield just `co.uk`.
+        let bbc = resolve_target("https://www.bbc.co.uk/iplayer/episode/x");
+        assert_eq!(bbc.key, "bbc");
+        assert_eq!(bbc.domains, ["bbc.co.uk", "bbc.com"]);
+        // Every added keyword is importable.
+        for kw in ["niconico", "bilibili", "patreon", "nebula", "bbc"] {
+            assert!(is_importable_target(kw), "{kw}");
+        }
+    }
+
+    #[test]
+    fn importable_targets_are_keywords_or_dotted_hosts_not_bare_words() {
+        assert!(is_importable_target("tiktok")); // known keyword
+        assert!(is_importable_target("example.com")); // bare domain
+        assert!(is_importable_target("https://www.tiktok.com/@u/video/1")); // URL
+        assert!(!is_importable_target("tiktok2")); // a bare word, not a keyword, no dot
+        assert!(!is_importable_target("com")); // not a domain on its own
     }
 
     #[test]
@@ -672,6 +761,33 @@ mod tests {
     fn known_site_names_stay_in_sync_with_the_help_text() {
         // `--cookie-import`'s help hardcodes this list; if a site is added/removed here, update
         // the DlArgs help too (this guard makes the drift a test failure, not a silent mismatch).
-        assert_eq!(known_site_names(), "youtube, tiktok, facebook, instagram, twitter, reddit, vimeo, twitch");
+        assert_eq!(
+            known_site_names(),
+            "youtube, tiktok, facebook, instagram, twitter, reddit, vimeo, twitch, niconico, bilibili, patreon, nebula, bbc"
+        );
+    }
+
+    #[test]
+    fn keyword_aliases_resolve_to_real_sites_and_x_means_twitter() {
+        for (alias, name) in KEYWORD_ALIASES {
+            assert!(SITES.iter().any(|s| s.name == *name), "alias {alias} points at unknown site {name}");
+        }
+        assert_eq!(resolve_target("x").key, "twitter"); // the Twitter→X rebrand keyword
+        assert!(is_importable_target("x"), "x resolves via the twitter alias, so it's importable");
+    }
+
+    #[test]
+    fn imported_db_finds_the_store_file_and_its_family() {
+        assert_eq!(store_kind("firefox"), "firefox");
+        assert_eq!(store_kind("chrome"), "chromium");
+
+        let site_dir = FakeHome::new("impdb").0.join("browser_cookies/tiktok");
+        assert!(imported_db(&site_dir).is_none(), "nothing imported yet");
+        let store_dir = reset_site(&site_dir).unwrap();
+        std::fs::write(store_dir.join("cookies.sqlite"), "db").unwrap();
+        write_spec(&site_dir, "firefox").unwrap();
+        let (db, kind) = imported_db(&site_dir).expect("a db once imported");
+        assert!(db.ends_with("cookies.sqlite"), "{db:?}");
+        assert_eq!(kind, "firefox");
     }
 }

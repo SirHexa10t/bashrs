@@ -132,7 +132,7 @@ pub(crate) fn filter_cookie_db(
 ) -> Option<usize> {
     let (src, dest_name) = &store.files[0];
     let dest = store_dir.join(dest_name);
-    let kind = if store.browser == "firefox" { "firefox" } else { "chromium" };
+    let kind = crate::support::browsers::store_kind(store.browser);
     let mut argv: Vec<OsString> = vec![
         "-c".into(), COOKIE_FILTER.into(),
         src.as_os_str().to_owned(), dest.into_os_string(), kind.into(),
@@ -174,6 +174,40 @@ else:
         d.executemany("INSERT INTO meta VALUES (?,?)", list(s.execute("SELECT key, value FROM meta")))
 d.commit()
 print(len(kept))
+"#;
+
+/// Whether the imported store's cookies have all expired — `Some(true)` if every persistent cookie's
+/// expiry is in the past, `Some(false)` if any is still live (or there are only session cookies,
+/// whose death isn't a timestamp), `None` if the check couldn't run. Reads the expiry column
+/// straight from the store DB via the bundled python's sqlite3 (like [`filter_cookie_db`]) — expiry
+/// is plaintext in both families, so no decryption and no yt-dlp.
+pub(crate) fn cookies_expired(db: &Path, kind: &str) -> Option<bool> {
+    let argv: Vec<OsString> =
+        vec!["-c".into(), COOKIE_EXPIRY.into(), db.as_os_str().to_owned(), kind.into()];
+    let (ok, out, _err) = capture_output(crate::tools::resolve("python3"), argv)?;
+    if !ok {
+        return None;
+    }
+    match out.trim() {
+        "expired" => Some(true),
+        "live" => Some(false),
+        _ => None,
+    }
+}
+
+/// Prints `expired` (every persistent cookie is in the past) or `live`. Firefox `moz_cookies.expiry`
+/// is unix seconds; Chromium `cookies.expires_utc` is microseconds since 1601-01-01, converted to
+/// unix. Session cookies (0/null expiry) are skipped — their death isn't a timestamp — so a store of
+/// only session cookies reads `live`, never a false `expired`. Flush-left raw literal to keep
+/// python's indentation (see [`COOKIE_FILTER`]).
+const COOKIE_EXPIRY: &str = r#"import sqlite3, sys, time
+db, kind = sys.argv[1], sys.argv[2]
+table, col = ("moz_cookies", "expiry") if kind == "firefox" else ("cookies", "expires_utc")
+con = sqlite3.connect("file:%s?immutable=1" % db, uri=True)
+exps = [r[0] for r in con.execute("SELECT %s FROM %s" % (col, table)) if r[0]]
+if kind != "firefox":
+    exps = [e / 1000000.0 - 11644473600 for e in exps]
+print("expired" if exps and max(exps) < time.time() else "live")
 "#;
 
 /// Have the bundled yt-dlp read the imported (already domain-filtered) store back and count what
@@ -232,8 +266,8 @@ pub(crate) fn download_video(url: &str, into: &Path, env: Env) -> i32 {
         // bracketed id is the ledger's stable key ([`scrub_ledger`]); a URL label (id unknown)
         // still carries the id for YouTube links via its `v=` parameter.
         let label = id.as_ref().map(|id| format!("[{id}]")).unwrap_or_else(|| url.to_string());
-        match diagnose_failure(video_argv(url, into, env, &keys), &label) {
-            None => code = 0, // the retry or a spoofed region came through
+        match diagnose_failure(video_argv(url, into, env, &keys), &label, GeoRescue::IpEnforced) {
+            None => code = 0, // the plain retry came through
             Some(line) => write_ledger(into, &[line]),
         }
     }
@@ -256,7 +290,7 @@ pub(crate) fn download_video(url: &str, into: &Path, env: Env) -> i32 {
 pub(crate) fn download_generic(url: &str, into: &Path, env: Env) -> i32 {
     let mut code = run(generic_argv(url, into, env));
     if code != 0 {
-        match diagnose_failure(generic_argv(url, into, env), url) {
+        match diagnose_failure(generic_argv(url, into, env), url, GeoRescue::XffSweep) {
             None => code = 0, // the plain retry or a spoofed region came through
             Some(line) => write_ledger(into, &[line]),
         }
@@ -393,10 +427,10 @@ fn download_pending(
         let label = format!("#{} {title} [{}]", plan.index, plan.id);
         println!("--- diagnosing {label} ---");
         let keys: Vec<String> = plan.picks.iter().map(|pick| pick.key.clone()).collect();
-        match diagnose_failure(argv(url, into, home, env, &keys, &plan.index), &label) {
-            // A region rescue (or plain-retry success) downloaded the file just now, after the
-            // group's finish pass already ran — so post-process it here, or it would keep
-            // yt-dlp's default subtitle titles and (in audio mode) miss its metadata tags.
+        match diagnose_failure(argv(url, into, home, env, &keys, &plan.index), &label, GeoRescue::IpEnforced) {
+            // A plain-retry success downloaded the file just now, after the group's finish pass
+            // already ran — so post-process it here, or it would keep yt-dlp's default subtitle
+            // titles and (in audio mode) miss its metadata tags.
             None => finish_media(home, &plan.id, &plan.picks, env),
             Some(line) => ledger.push(line),
         }
@@ -1232,6 +1266,17 @@ fn archived_ids(path: &Path) -> HashSet<String> {
 const XFF_REGIONS: &[&str] =
     &["US", "GB", "DE", "FR", "NL", "SE", "CA", "AU", "JP", "KR", "BR", "IN"];
 
+/// How [`diagnose_failure`] treats a geo-block, chosen by the caller per site. Header spoofing
+/// only shifts a *softly*-enforced block (a `--xff` region the site trusts); YouTube enforces geo
+/// by the real connection IP and ignores the header (verified against yt-dlp's source), so a dozen
+/// spoofed retries would only waste time — it reports the block instead.
+enum GeoRescue {
+    /// Walk [`XFF_REGIONS`], retrying each — for sites that may honor `X-Forwarded-For`.
+    XffSweep,
+    /// Report the block without retrying — for sites that enforce geo by IP (YouTube).
+    IpEnforced,
+}
+
 /// The failure ledger, written beside the collection's archive: what stayed undownloaded and
 /// why. Entries here are also deliberately NOT archived, so every future run retries them —
 /// members-only videos get released publicly later, and blocks lift. Named for `dl`, not
@@ -1246,25 +1291,36 @@ const FAILED_LEDGER: &str = ".dl_video_failed_download.txt";
 #[derive(Debug, PartialEq)]
 enum Failure {
     Geo,
+    BotWall,
     Members,
     AgeRestricted,
+    Sensitive,
+    LoginRequired,
     Other,
 }
 
 fn classify_failure(stderr: &str) -> Failure {
-    // Match case-insensitively against the phrasings yt-dlp's YouTube extractor actually emits
-    // (verified against its source): the per-video geo notice ("…available in your country"),
-    // the generic `raise_geo_restricted` default ("…from your location due to geo restriction"),
-    // and the region/restricted variants; the members badge reasons; the age gate. A missed
-    // phrasing costs the geo rescue, so the geo set errs wide.
+    // Match case-insensitively against the phrasings yt-dlp's extractors actually emit (verified
+    // against their source): the geo notices; the anti-bot/CAPTCHA and JS-challenge walls; the
+    // members badge reasons; the YouTube age gate; and the login/private/sensitive gates. Order
+    // matters where phrasings could overlap — the bot-wall is checked before the login/age gates
+    // (YouTube's "…confirm you're not a bot" is a bot-wall, not a login). A missed geo phrasing
+    // costs the geo rescue, so that set errs wide; a bare 403 is left as `Other` on purpose (it's
+    // ambiguous — rate-limit vs. bot vs. transient — and we won't mislabel it).
     let s = stderr.to_lowercase();
     let has = |needle: &str| s.contains(needle);
     if has("in your country") || has("from your location") || has("in your region") || has("geo restrict") || has("geo_restrict") {
         Failure::Geo
+    } else if has("not a bot") || has("captcha") || has("unusual traffic") || has("solve js challenge") || has("challenge data") || has("verify you are human") || has("verify you're human") {
+        Failure::BotWall
     } else if has("members-only") || has("members only") || has("channel's members") || has("join this channel") {
         Failure::Members
     } else if has("confirm your age") || has("age-restricted") || has("age-verification") || has("age_check_required") {
         Failure::AgeRestricted
+    } else if has("for some audiences") || has("not be comfortable") {
+        Failure::Sensitive
+    } else if has("requiring login") || has("log in for access") || has("log into an account") || has("permission to view") || has("account is private") || has("private video") {
+        Failure::LoginRequired
     } else {
         Failure::Other
     }
@@ -1275,12 +1331,14 @@ fn capture_ytdlp(argv: Vec<OsString>) -> Option<(bool, String, String)> {
     capture_output(program, args)
 }
 
-/// Re-run a failed download with output captured to learn WHY (group runs stream live and keep
-/// no stderr), rescue geo-blocks by walking [`XFF_REGIONS`], and return the ledger line for
-/// whatever stays dead (`None` when the plain retry or a spoofed region succeeded). A terminal
-/// failure is also announced on stderr as it's decided, so the reason is visible in the run's
-/// output — not only later in the ledger.
-fn diagnose_failure(base: Vec<OsString>, label: &str) -> Option<String> {
+/// Re-run a failed download with output captured to learn WHY (group runs stream live and keep no
+/// stderr) and return the ledger line for whatever stays dead (`None` when a retry succeeded).
+/// A geo-block is handled per `rescue`: [`GeoRescue::XffSweep`] walks [`XFF_REGIONS`] for sites
+/// that may honor a spoofed `X-Forwarded-For`; [`GeoRescue::IpEnforced`] (YouTube) reports it
+/// without retrying, since YouTube reads the real connection IP and ignores the header. A terminal
+/// failure is also announced on stderr as it's decided, so the reason shows in the run's output —
+/// not only later in the ledger.
+fn diagnose_failure(base: Vec<OsString>, label: &str, rescue: GeoRescue) -> Option<String> {
     let Some((ok, _, stderr)) = capture_ytdlp(base.clone()) else {
         return Some(dead(format!("{label} — failed (could not even re-run yt-dlp)")));
     };
@@ -1288,26 +1346,38 @@ fn diagnose_failure(base: Vec<OsString>, label: &str) -> Option<String> {
         println!("{label}: succeeded on retry");
         return None;
     }
+    // Whether the failed attempt already carried cookies — the login/age gates give honest advice
+    // from this (don't say "add cookies" when they were already there).
+    let had_cookies = base.iter().any(|a| a == "--cookies" || a == "--cookies-from-browser");
     match classify_failure(&stderr) {
-        Failure::Geo => {
-            for region in XFF_REGIONS {
-                println!("{label}: geo-blocked — trying region {region}…");
-                let mut spoofed = base.clone();
-                spoofed.push("--xff".into());
-                spoofed.push((*region).into());
-                if matches!(capture_ytdlp(spoofed), Some((true, _, _))) {
-                    println!("{label}: region {region} worked");
-                    return None;
+        Failure::Geo => match rescue {
+            // Sites that may honor a spoofed X-Forwarded-For: try each region, take the first win.
+            GeoRescue::XffSweep => {
+                for region in XFF_REGIONS {
+                    println!("{label}: geo-blocked — trying region {region}…");
+                    let mut spoofed = base.clone();
+                    spoofed.push("--xff".into());
+                    spoofed.push((*region).into());
+                    if matches!(capture_ytdlp(spoofed), Some((true, _, _))) {
+                        println!("{label}: region {region} worked");
+                        return None;
+                    }
                 }
+                Some(dead(format!("{label} — geo-blocked (tried {})", XFF_REGIONS.join(","))))
             }
-            Some(dead(format!("{label} — geo-blocked (tried {})", XFF_REGIONS.join(","))))
-        }
+            // YouTube reads the real connection IP and ignores X-Forwarded-For, so spoofing can't
+            // move the block — don't burn a dozen retries; report it and the only real fix.
+            GeoRescue::IpEnforced => Some(dead(format!(
+                "{label} — geo-blocked (enforced by IP; retry from a VPN or --proxy with an IP in an allowed region)"
+            ))),
+        },
+        Failure::BotWall => Some(dead(bot_wall_line(label))),
         Failure::Members => {
             Some(dead(format!("{label} — members-only (channels often release these publicly later)")))
         }
-        Failure::AgeRestricted => {
-            Some(dead(format!("{label} — age-restricted (retry with --cookies / --cookie-import)")))
-        }
+        Failure::AgeRestricted => Some(dead(age_restricted_line(label, had_cookies))),
+        Failure::Sensitive => Some(dead(sensitive_content_line(label, had_cookies))),
+        Failure::LoginRequired => Some(dead(login_required_line(label, had_cookies))),
         Failure::Other => {
             let detail = stderr
                 .lines()
@@ -1324,6 +1394,49 @@ fn diagnose_failure(base: Vec<OsString>, label: &str) -> Option<String> {
 fn dead(line: String) -> String {
     eprintln!("dl: {line}");
     line
+}
+
+/// The ledger line for an age-restricted block, tailored to whether cookies were already tried.
+/// Without cookies it's a plain nudge to add them; with cookies the gate is the harder kind — it
+/// needs a signed-in *18+* account, and YouTube age-verifies the browser *session*, so the fix is
+/// to verify in that browser and re-import, not to repeat "add cookies" when the user already did.
+fn age_restricted_line(label: &str, had_cookies: bool) -> String {
+    if had_cookies {
+        format!("{label} — age-restricted despite cookies (use a signed-in 18+ account; play it in that browser once to verify age, then re-import)")
+    } else {
+        format!("{label} — age-restricted (needs cookies from a signed-in 18+ account: dl --cookie-import youtube, then retry)")
+    }
+}
+
+/// The ledger line for content behind a login / private / sensitive gate, tailored to whether
+/// cookies were already tried. Unlike a bot-wall this IS solvable — cookies from an account with
+/// access are the fix — so without them it points at the import; with them it means the account
+/// lacks access or the cookies went stale, not that a plain retry would help.
+fn login_required_line(label: &str, had_cookies: bool) -> String {
+    if had_cookies {
+        format!("{label} — still blocked with cookies (the account may lack access, or the cookies went stale — re-import from a browser where it plays)")
+    } else {
+        format!("{label} — needs an account with access: import cookies (dl --cookie-import <site>), then retry")
+    }
+}
+
+/// The ledger line for a post flagged "sensitive" / not-for-all-audiences (TikTok's "may not be
+/// comfortable for some audiences"). Solvable like a login gate — an account allowed to view it —
+/// but the account itself must be permitted (18+ / mature content enabled), so with cookies already
+/// present the fix is that account condition, not another plain retry.
+fn sensitive_content_line(label: &str, had_cookies: bool) -> String {
+    if had_cookies {
+        format!("{label} — flagged sensitive and still blocked with cookies (the account must be allowed to view sensitive/mature content — re-import from a browser where it plays)")
+    } else {
+        format!("{label} — flagged sensitive (not for all audiences): needs a signed-in account allowed to view it (dl --cookie-import <site>), then retry")
+    }
+}
+
+/// The ledger line for an anti-bot / CAPTCHA / JS-challenge wall. Unlike the login/age gates this
+/// has no reliable fix — yt-dlp can't solve a human-verification challenge — so the line is honest
+/// that the post may be undownloadable and never tells the user to just try again.
+fn bot_wall_line(label: &str) -> String {
+    format!("{label} — blocked by an anti-bot/CAPTCHA challenge yt-dlp can't solve; may be undownloadable (only fresh cookies from a browser where it plays, a matching IP, and current yt-dlp sometimes help)")
 }
 
 /// Whether a ledger line refers to video `id` — via the bracketed `[id]` every writer now
@@ -1897,25 +2010,102 @@ mod tests {
             classify_failure("ERROR: This video is age-restricted and YouTube is requiring account age-verification"),
             Failure::AgeRestricted
         );
-        // Everything else stays Other (the IP-block 403 among them).
+        // Bot-wall — the anti-automation walls yt-dlp can't solve: YouTube's bot check, TikTok's
+        // JS challenge, Google's unusual-traffic notice.
+        for msg in [
+            "ERROR: [youtube] x: Sign in to confirm you're not a bot. Use --cookies-from-browser",
+            "ERROR: [TikTok] x: Unable to solve JS challenge",
+            "ERROR: Our systems have detected unusual traffic from your computer network",
+        ] {
+            assert_eq!(classify_failure(msg), Failure::BotWall, "{msg}");
+        }
+        // Sensitive / not-for-all-audiences — flagged group-offensive; "for some audiences" is the
+        // tell, and it's checked before the login gate even though it also says "Log in for access"
+        // (distinct from YouTube's age gate, which says "for some users").
+        assert_eq!(
+            classify_failure("ERROR: [TikTok] x: This post may not be comfortable for some audiences. Log in for access"),
+            Failure::Sensitive
+        );
+        // Login / private gates — solvable with cookies from an account with access.
+        for msg in [
+            "ERROR: [TikTok] x: TikTok is requiring login for access to this content",
+            "ERROR: [youtube] x: Private video. Sign in if you've been granted access to this video",
+        ] {
+            assert_eq!(classify_failure(msg), Failure::LoginRequired, "{msg}");
+        }
+        // A bare 403 stays Other on purpose — ambiguous (rate-limit vs. bot vs. transient), so we
+        // don't mislabel it as a bot-wall.
         assert_eq!(classify_failure("ERROR: HTTP Error 403: Forbidden"), Failure::Other);
         assert_eq!(XFF_REGIONS.len(), 12, "a dozen regions, as specified");
     }
 
     #[test]
-    fn the_geo_ledger_line_names_the_video_the_failure_and_the_regions_tried() {
-        // The things the ledger must record for a stubborn geo-block: which video (title for
-        // the human, bracketed id as the stable machine key), that it was geo-blocked, and
-        // every spoofed region attempted — one entry per line, so the scrub can line-filter.
-        let line =
-            format!("#7 Some Title [dQw4w9WgXcQ] — geo-blocked (tried {})", XFF_REGIONS.join(","));
-        assert!(line.contains("#7 Some Title"), "names the video");
-        assert!(ledger_line_refers(&line, "dQw4w9WgXcQ"), "carries the scrub key");
-        assert!(line.contains("geo-blocked"), "names the failure");
-        assert!(!line.contains('\n'), "one line per entry");
+    fn geo_ledger_lines_name_the_video_and_carry_the_scrub_key() {
+        // Two geo outcomes reach the ledger. The generic path may sweep XFF regions, so its line
+        // records every region tried; the YouTube path is IP-enforced (spoofing can't help), so
+        // its line names the block and the real fix, no regions. Both must name the video, carry
+        // the scrub key in a delimited form, and stay on one line (so scrub_ledger can line-filter).
+        let swept = format!(
+            "https://vid.example/watch?v=dQw4w9WgXcQ — geo-blocked (tried {})",
+            XFF_REGIONS.join(",")
+        );
+        assert!(ledger_line_refers(&swept, "dQw4w9WgXcQ"), "sweep line carries the scrub key");
+        assert!(swept.contains("geo-blocked") && !swept.contains('\n'), "one geo-blocked line");
         for region in XFF_REGIONS {
-            assert!(line.contains(region), "records region {region}");
+            assert!(swept.contains(region), "sweep line records region {region}");
         }
+
+        let ip_enforced = "#7 Some Title [dQw4w9WgXcQ] — geo-blocked (enforced by IP; retry from a VPN or --proxy with an IP in an allowed region)".to_string();
+        assert!(ip_enforced.contains("#7 Some Title"), "names the video");
+        assert!(ledger_line_refers(&ip_enforced, "dQw4w9WgXcQ"), "carries the scrub key");
+        assert!(ip_enforced.contains("geo-blocked") && !ip_enforced.contains('\n'), "one geo-blocked line");
+        assert!(!ip_enforced.contains("tried"), "no region sweep on the IP-enforced path");
+    }
+
+    #[test]
+    fn the_age_restricted_line_adapts_to_whether_cookies_were_tried() {
+        let without = age_restricted_line("[dQw4w9WgXcQ]", false);
+        assert!(without.contains("age-restricted"), "names the gate");
+        assert!(without.contains("--cookie-import"), "nudges toward importing cookies");
+        assert!(!without.contains("despite"), "the no-cookies case just asks for cookies");
+
+        let with = age_restricted_line("[dQw4w9WgXcQ]", true);
+        assert!(with.contains("despite cookies"), "the cookies-present case names the harder gate");
+        assert!(with.contains("18+") && with.contains("verify age"), "points at the real fix");
+        assert!(ledger_line_refers(&with, "dQw4w9WgXcQ"), "still carries the scrub key");
+    }
+
+    #[test]
+    fn the_login_required_line_points_at_cookies_and_adapts_to_whether_they_were_tried() {
+        let without = login_required_line("[dQw4w9WgXcQ]", false);
+        assert!(without.contains("--cookie-import"), "nudges toward importing cookies");
+        assert!(without.contains("retry"), "with cookies as the real fix, retrying is right advice");
+
+        let with = login_required_line("[dQw4w9WgXcQ]", true);
+        assert!(with.contains("lack access") || with.contains("stale"), "names why the cookies didn't help");
+        assert!(!with.contains("retry"), "no plain-retry advice once cookies already failed");
+        assert!(ledger_line_refers(&with, "dQw4w9WgXcQ"), "carries the scrub key");
+    }
+
+    #[test]
+    fn the_sensitive_content_line_points_at_an_allowed_account_and_adapts_to_cookies() {
+        let without = sensitive_content_line("[dQw4w9WgXcQ]", false);
+        assert!(without.contains("sensitive"), "names why it's gated");
+        assert!(without.contains("--cookie-import") && without.contains("retry"), "cookies are the fix");
+
+        let with = sensitive_content_line("[dQw4w9WgXcQ]", true);
+        assert!(with.contains("sensitive/mature") || with.contains("allowed to view"), "names the account condition");
+        assert!(!with.contains("retry"), "no plain-retry once cookies already failed");
+        assert!(ledger_line_refers(&with, "dQw4w9WgXcQ"), "carries the scrub key");
+    }
+
+    #[test]
+    fn the_bot_wall_line_is_honest_that_it_may_be_unsolvable_and_never_says_retry() {
+        let line = bot_wall_line("[dQw4w9WgXcQ]");
+        assert!(line.contains("anti-bot") || line.contains("CAPTCHA"), "names the difficulty");
+        assert!(line.contains("undownloadable"), "is honest it may not be possible");
+        assert!(!line.to_lowercase().contains("retry"), "must not tell the user to just download again");
+        assert!(ledger_line_refers(&line, "dQw4w9WgXcQ"), "carries the scrub key");
     }
 
     #[test]

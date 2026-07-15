@@ -11,7 +11,7 @@ mod commands {
     use crate::drivers::youtube;
     use crate::support::browsers;
     use crate::support::doc_render;
-    use crate::support::doc_style::_header;
+    use crate::support::doc_style::{self, _header};
     use clap::Args;
 
     /// Download every link of the given file types found in a webpage, into the current dir
@@ -146,6 +146,15 @@ mod commands {
     /// use it automatically. `target` is a site keyword, a domain, or a URL. Returns whether a
     /// usable store was imported.
     fn _import_cookies(target: &str) -> bool {
+        // Reject a target we can't map to cookie domains (a bare word like `tiktok2`) up front —
+        // otherwise we'd build an empty store and report a misleading "no cookies found".
+        if !browsers::is_importable_target(target) {
+            eprintln!(
+                "dl: '{target}' isn't a site I can target — pass a keyword ({}), a domain (example.com), or a video URL",
+                browsers::known_site_names()
+            );
+            return false;
+        }
         let site = browsers::resolve_target(target);
         let home = crate::conf::home();
         let stores = browsers::cookie_stores(&home);
@@ -186,7 +195,27 @@ mod commands {
             return false;
         }
         println!("imported {matched} {} cookie(s) from {}", site.label, store.label);
+        if site.key == "youtube" {
+            println!("note: YouTube rotates cookies on open tabs — if auth later fails, re-export via a private window (sign in, open only youtube.com/robots.txt, then close it) and re-import");
+        }
         _report_cookie_check(&site, store.browser, matched, &site_dir)
+    }
+
+    /// Warn (in red) when the imported store a download is about to use holds only expired cookies,
+    /// so a gated fetch that's about to fail for a stale session says so up front — with the
+    /// re-import fix — rather than surfacing as a bare auth error. Silent when the store is fresh or
+    /// the check can't run.
+    fn _warn_if_cookies_expired(site_dir: &Path, site: &browsers::SiteTarget) {
+        let Some((db, kind)) = browsers::imported_db(site_dir) else { return };
+        if youtube::cookies_expired(&db, kind) == Some(true) {
+            eprintln!(
+                "{}",
+                doc_style::warning(&format!(
+                    "dl: the imported {} cookies have expired — re-import with `dl --cookie-import {}`",
+                    site.label, site.key
+                ))
+            );
+        }
     }
 
     /// Read the freshly imported (already domain-filtered) store back through yt-dlp to confirm
@@ -258,7 +287,7 @@ mod commands {
     /// [`crate::drivers::youtube`]; this stays the thin argument shell.
     #[name("dl")]
     pub fn dl(args: DlArgs) {
-        let DlArgs { url, into, single, cookies, audio, res, taglist, cookie_import, compatibility_help, extra } = args;
+        let DlArgs { url, into, single, cookies, no_cookies, audio, res, taglist, cookie_import, compatibility_help, extra } = args;
         if compatibility_help {
             print!("{}", _compatibility_help());
             return;
@@ -282,11 +311,16 @@ mod commands {
         let ffmpeg = youtube::bundled_ffmpeg_dir();
         let deno = youtube::bundled_deno();
         // Auto-select the per-site store matching this URL's host — a prior `--cookie-import` for
-        // this site is the standing default; an explicit `--cookies` file wins.
+        // this site is the standing default; an explicit `--cookies` file wins, and `--no-cookies`
+        // opts out of stored cookies entirely (download anonymously).
         let site = browsers::resolve_target(&url);
-        let imported = (cookies.is_none())
-            .then(|| browsers::imported_spec(&_cookie_store_dir().join(&site.key)))
+        let site_dir = _cookie_store_dir().join(&site.key);
+        let imported = (!no_cookies && cookies.is_none())
+            .then(|| browsers::imported_spec(&site_dir))
             .flatten();
+        if imported.is_some() {
+            _warn_if_cookies_expired(&site_dir, &site);
+        }
         let env = youtube::Env {
             ffmpeg_dir: ffmpeg.as_deref(),
             cookies: cookies.as_deref(),
@@ -352,6 +386,11 @@ mod commands {
         /// age-restricted content or networks that bot-wall; home connections rarely do
         #[arg(long)]
         pub cookies: Option<PathBuf>,
+        /// Ignore cookies stored by a prior `--cookie-import` for this site and download
+        /// anonymously — useful when a site bot-walls a signed-in session (e.g. TikTok) and
+        /// sending your real cookies risks getting that session flagged
+        #[arg(long, conflicts_with_all = ["cookies", "cookie_import"])]
+        pub no_cookies: bool,
         /// Audio only: extract the best audio track (kept as-is, no re-encode); on the YouTube
         /// path subtitles arrive as metadata tags (`subtitles_en`, `subtitles_he_autogenerated`, …)
         #[arg(long)]
@@ -361,7 +400,8 @@ mod commands {
         pub res: Option<u32>,
         /// Import a browser's cookies for one site, so later dl runs on it authenticate. TARGET
         /// is a site keyword (youtube, tiktok, facebook, instagram, twitter, reddit, vimeo,
-        /// twitch), a domain (example.com), or a URL. Only that site's cookies are copied —
+        /// twitch, niconico, bilibili, patreon, nebula, bbc), a domain (example.com), or a URL.
+        /// Only that site's cookies are copied —
         /// never your whole cookie DB. Scans installed browsers (native/Flatpak/Snap/Nix) and
         /// copies from your pick, so a running browser can't lock it. Runs standalone, or before
         /// a download when a URL is also given

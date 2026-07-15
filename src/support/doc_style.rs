@@ -80,6 +80,13 @@ pub(crate) fn broken_link_text(text: &str) -> String {
     _scoped(&_wrap(&[&Weight::Bold, &Basic::Red]), text)
 }
 
+/// Style `text` as a warning — bold red — for a stderr heads-up like `dl` noting that an imported
+/// cookie store has expired. A distinct role from [`broken_link_text`], though it shares the colour
+/// today. Scoped, so it nests safely.
+pub(crate) fn warning(text: &str) -> String {
+    _scoped(&_wrap(&[&Weight::Bold, &Basic::Red]), text)
+}
+
 /// Style `text` with `codes`, keeping nested styles scoped instead of compounded.
 ///
 /// Scopes are encoded in the stream itself, so nesting survives across the separate processes of
@@ -147,6 +154,7 @@ mod tests {
         assert_eq!(link_url(), "\x1b[4;96m"); // underline + bright cyan
         assert!(heading("Hi").contains("Hi") && heading("Hi").ends_with(RESET));
         assert!(broken_link_text("x").contains(&_wrap(&[&Weight::Bold, &Basic::Red]))); // bold red
+        assert_eq!(warning("x"), format!("{RESET}{RED}x{RESET}")); // bold red, scoped
     }
 
     #[test]
