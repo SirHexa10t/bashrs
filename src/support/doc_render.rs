@@ -1,9 +1,9 @@
 //! Rendering an embedded Markdown doc to ANSI-coloured terminal text via `minimad`'s line-based
 //! parser and our own emit through [`crate::support::doc_style`]'s named style vocabulary. The
-//! hand-built, *marker-stripping* counterpart to [`crate::support::color_theme`]'s synoptic
+//! hand-built, *marker-stripping* counterpart to [`crate::support::theme_code`]'s synoptic
 //! highlighting: `#`, `**`, `` ` `` and friends are consumed, not shown, and every element is
-//! coloured through the shared [`crate::support::theme`] — this module owns the *structure* (what
-//! a heading, bullet, quote or code line becomes), the theme owns the colours. Inline
+//! coloured via [`crate::support::doc_style`]'s element helpers — this module owns the *structure*
+//! (what a heading, bullet, quote or code line becomes), `doc_style` owns the colours. Inline
 //! marks are honoured even inside a heading — a `**word**` in a title restyles in place, then the
 //! title colour resumes.
 //!
@@ -18,7 +18,7 @@
 //! `[text](url)` (text blue, URL bright-cyan underlined, markers dropped) and bare
 //! `http(s)://`/`www.` URLs, in place.
 
-use crate::support::{doc_style::RESET, theme};
+use crate::support::doc_style::{self, RESET};
 
 /// Nested-list glyphs by depth; index saturates at the deepest we style (minimad only reaches the
 /// first two anyway — see the module note on the four-space rule).
@@ -26,7 +26,7 @@ const BULLETS: [&str; 3] = ["• ", "◦ ", "▪ "];
 
 /// Render a Markdown `doc` to ANSI-coloured text for terminal display (`dl -c`'s site listing).
 /// Markers are stripped; headings, emphasis, inline code, list items and blockquotes are coloured
-/// via the shared theme; every other line (paragraphs, pre-drawn tables) passes
+/// via `doc_style`'s element helpers; every other line (paragraphs, pre-drawn tables) passes
 /// through with only its inline spans styled. One output line per source line.
 pub(crate) fn render_doc(doc: &str) -> String {
     use minimad::{CompositeStyle, Line};
@@ -40,7 +40,7 @@ pub(crate) fn render_doc(doc: &str) -> String {
                 // closes — so `**word**` in a heading shows bold-yellow, then the blue resumes.
                 CompositeStyle::Header(_) => {
                     let inner: String = composite.compounds.iter().map(_inline).collect();
-                    out.push_str(&theme::doc_heading(&inner));
+                    out.push_str(&doc_style::heading(&inner));
                 }
                 // Bullet: `depth` is the leading-space count, two per level.
                 CompositeStyle::ListItem(depth) => {
@@ -57,12 +57,12 @@ pub(crate) fn render_doc(doc: &str) -> String {
                 }
                 // Blockquote → dim (the vocabulary has no grey).
                 CompositeStyle::Quote => {
-                    out.push_str(&format!("{}{}{RESET}", theme::doc_quote(), _plain(composite)));
+                    out.push_str(&format!("{}{}{RESET}", doc_style::quote(), _plain(composite)));
                 }
                 // Indented (four-space) code block → cyan, indent restored (minimad strips it).
                 // Our docs use this only for the legend block; a line here is literal by intent.
                 CompositeStyle::Code => {
-                    out.push_str(&format!("    {}{}{RESET}", theme::doc_code(), _plain(composite)));
+                    out.push_str(&format!("    {}{}{RESET}", doc_style::code(), _plain(composite)));
                 }
                 // Paragraphs and anything else (incl. pre-drawn box-table rows): only inline spans
                 // are styled, so fixed-layout text survives verbatim.
@@ -86,17 +86,17 @@ fn _emit_spans(out: &mut String, composite: &minimad::Composite) {
     }
 }
 
-/// One inline span → ANSI, taking its colour from the shared [`theme`]: code, then bold, then
-/// italic (mutually exclusive here). Unmarked text goes through [`_linkify`], which is where
+/// One inline span → ANSI, taking its colour from [`doc_style`]'s element helpers: code, then bold,
+/// then italic (mutually exclusive here). Unmarked text goes through [`_linkify`], which is where
 /// Markdown links get their colour (minimad doesn't parse them).
 fn _inline(compound: &minimad::Compound) -> String {
     let s = compound.as_str();
     let style = if compound.code {
-        theme::doc_code()
+        doc_style::code()
     } else if compound.bold {
-        theme::doc_bold()
+        doc_style::bold()
     } else if compound.italic {
-        theme::doc_italic()
+        doc_style::italic()
     } else {
         return _linkify(s);
     };
@@ -126,7 +126,7 @@ fn _linkify(s: &str) -> String {
             if let Some(close) = after.find(']') {
                 if let Some(url_on) = after[close + 1..].strip_prefix('(') {
                     if let Some(end) = url_on.find(')') {
-                        out.push_str(&theme::doc_link_text());
+                        out.push_str(&doc_style::link_text());
                         out.push_str(&after[..close]); // link text
                         out.push_str(RESET);
                         out.push(' ');
@@ -165,7 +165,7 @@ fn _url_len(s: &str) -> usize {
 
 /// Append `url` in the theme's link-URL style (bright cyan, underlined), then a reset.
 fn _push_url(out: &mut String, url: &str) {
-    out.push_str(&theme::doc_link_url());
+    out.push_str(&doc_style::link_url());
     out.push_str(url);
     out.push_str(RESET);
 }
@@ -174,17 +174,15 @@ fn _push_url(out: &mut String, url: &str) {
 mod tests {
     use super::*;
 
-    /// The SGR a `_wrap` criterion resolves to, for asserting a span carries a given colour.
-    fn sgr(criteria: [&str; 3]) -> String {
-        crate::support::doc_style::_wrap(criteria)
-    }
+    /// The heading style (bold blue) as a raw escape, for asserting headings carry it.
+    const HEADING: &str = "\x1b[1;34m";
 
     #[test]
     fn headings_lose_their_markers_and_are_coloured() {
         let out = render_doc("# Legend");
         assert!(!out.contains('#'), "the `#` marker must be stripped: {out:?}");
         assert!(out.contains("Legend"), "heading text kept: {out:?}");
-        assert!(out.contains(&sgr(["bo", "", "b"])), "heading is bold blue: {out:?}");
+        assert!(out.contains(HEADING), "heading is bold blue: {out:?}");
     }
 
     #[test]
@@ -192,8 +190,8 @@ mod tests {
         // The heading is bold-blue, but a `**word**` within it shows bold-yellow, and the heading
         // colour must resume afterward (the mid-style restyle via `_scoped`).
         let out = render_doc("# risks run the **other** direction");
-        let head = sgr(["bo", "", "b"]); // the heading's bold blue (shared _header style)
-        let bold = theme::doc_bold(); // the theme's bold
+        let head = HEADING; // the heading's bold blue (shared _header style)
+        let bold = doc_style::bold(); // the doc bold style
         assert!(out.contains(&format!("{bold}other{RESET}")), "the bold word is re-marked: {out:?}");
         assert!(out.contains(&format!("{RESET}{head} direction")), "heading colour resumes after: {out:?}");
     }
@@ -202,9 +200,9 @@ mod tests {
     fn inline_emphasis_markers_are_stripped_and_coloured() {
         let out = render_doc("plain **bold** and `code` and *italic* here");
         assert!(!out.contains('*') && !out.contains('`'), "markers stripped: {out:?}");
-        assert!(out.contains(&format!("{}bold{RESET}", theme::doc_bold())), "bold uses the theme: {out:?}");
-        assert!(out.contains(&format!("{}code{RESET}", theme::doc_code())), "code uses the theme: {out:?}");
-        assert!(out.contains(&format!("{}italic{RESET}", theme::doc_italic())), "italic uses the theme: {out:?}");
+        assert!(out.contains(&format!("{}bold{RESET}", doc_style::bold())), "bold uses the theme: {out:?}");
+        assert!(out.contains(&format!("{}code{RESET}", doc_style::code())), "code uses the theme: {out:?}");
+        assert!(out.contains(&format!("{}italic{RESET}", doc_style::italic())), "italic uses the theme: {out:?}");
     }
 
     #[test]
@@ -227,15 +225,15 @@ mod tests {
     fn blockquotes_are_dimmed_without_the_marker() {
         let out = render_doc("> quoted");
         assert!(!out.contains('>'), "quote marker stripped: {out:?}");
-        assert!(out.contains(&format!("{}quoted{RESET}", theme::doc_quote())), "dim quote: {out:?}");
+        assert!(out.contains(&format!("{}quoted{RESET}", doc_style::quote())), "dim quote: {out:?}");
     }
 
     #[test]
     fn links_are_recoloured_and_lose_their_markers() {
         let out = render_doc("see [ImprovedTube #623](https://example.com/x) here");
         assert!(!out.contains("]("), "the `](` link joiner is gone: {out:?}");
-        assert!(out.contains(&format!("{}ImprovedTube #623{RESET}", theme::doc_link_text())), "text blue: {out:?}");
-        assert!(out.contains(&format!("{}https://example.com/x{RESET}", theme::doc_link_url())), "url cyan: {out:?}");
+        assert!(out.contains(&format!("{}ImprovedTube #623{RESET}", doc_style::link_text())), "text blue: {out:?}");
+        assert!(out.contains(&format!("{}https://example.com/x{RESET}", doc_style::link_url())), "url cyan: {out:?}");
         // a bracket that isn't a real link is left alone
         assert!(render_doc("array[0] = 1").contains("array[0] = 1"), "non-link bracket preserved");
     }
@@ -243,11 +241,11 @@ mod tests {
     #[test]
     fn bare_urls_are_styled_in_place() {
         let out = render_doc("see https://example.com/x and www.foo.org, ok");
-        assert!(out.contains(&format!("{}https://example.com/x{RESET}", theme::doc_link_url())), "http url: {out:?}");
+        assert!(out.contains(&format!("{}https://example.com/x{RESET}", doc_style::link_url())), "http url: {out:?}");
         // trailing comma is prose, trimmed off the styled URL
-        assert!(out.contains(&format!("{}www.foo.org{RESET}", theme::doc_link_url())), "www url: {out:?}");
+        assert!(out.contains(&format!("{}www.foo.org{RESET}", doc_style::link_url())), "www url: {out:?}");
         // a bare domain with no scheme/www is left plain
-        assert!(!render_doc("visit example.com now").contains(&theme::doc_link_url()), "bare domain untouched");
+        assert!(!render_doc("visit example.com now").contains(&doc_style::link_url()), "bare domain untouched");
     }
 
     #[test]

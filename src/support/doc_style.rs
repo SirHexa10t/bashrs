@@ -1,14 +1,16 @@
-//! The styling engine — SGR-escape assembly and scope-aware wrapping. The one place raw ANSI
-//! escapes are built, shared by the `recho` command matrix ([`crate::categories::autogen_styles`]),
-//! the hand-written style commands ([`crate::categories::styles`], e.g. `errcho`), and anything
-//! needing a styled string: `lll`'s header, `gg`'s section titles, `code_highlight`.
+//! The styling engine — SGR-escape assembly, scope-aware wrapping, and the markdown element styles.
+//! The one place raw ANSI escapes are built, shared by the `recho` command matrix
+//! ([`crate::categories::autogen_styles`]), the hand-written style commands
+//! ([`crate::categories::styles`], e.g. `errcho`), and anything needing a styled string: `lll`'s
+//! header, `gg`'s section titles, `code_highlight`.
 //!
 //! A nested colour/style restores the enclosing one when it ends (rather than clearing to the
 //! terminal default), and every span starts from a clean slate so styles don't compound — see
-//! [`_scoped`]. A style is named by a `[weight, underline, color]` triple, resolved against the
-//! vocabulary in [`crate::support::generative_constants`] by [`_wrap`].
+//! [`_scoped`]. Styles are assembled from [`crate::support::theme`]'s atoms: [`_wrap`] joins their
+//! SGR sub-codes, and the element helpers (`heading`, `bold`, `code`, …) name the roles `dl -c`'s
+//! renderer paints.
 
-use crate::support::generative_constants::{COLORS, UNDERLINES, WEIGHTS};
+use crate::support::theme::{Basic, Md, Style, Underline, Weight};
 
 /// Ends a styled span, restoring the terminal to its default.
 pub(crate) const RESET: &str = "\x1b[0m";
@@ -19,28 +21,63 @@ pub(crate) fn escape(sgr: &str) -> String {
     format!("\x1b[{sgr}m")
 }
 
-/// The SGR sub-code mapped to `key` in `map` (a `&[(criterion, code, word)]`), or `""`.
-fn lookup(map: &[(&'static str, &'static str, &'static str)], key: &str) -> &'static str {
-    map.iter().find(|(k, _, _)| *k == key).map_or("", |(_, v, _)| *v)
-}
-
-/// Resolve a `[weight, underline, color]` triple to its full SGR escape by looking each criterion
-/// up in its map and joining the non-empty codes with `;`. e.g. `["bo", "u", "r"]` →
-/// `"\x1b[1;4;31m"`, `["bo", "", ""]` → `"\x1b[1m"`.
-pub(crate) fn _wrap(criteria: [&str; 3]) -> String {
-    let [w, u, c] = criteria;
-    let sgr = [lookup(WEIGHTS, w), lookup(UNDERLINES, u), lookup(COLORS, c)]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(";");
+/// Assemble an ANSI escape from a set of style atoms — read each one's [`Style::sgr`], skip the
+/// empties (a `None`-style member), and join with `;`. e.g. `_wrap(&[&Weight::Bold, &Basic::Red])`
+/// → `"\x1b[1;31m"`; `_wrap(&[&Weight::Bold])` → `"\x1b[1m"`.
+pub(crate) fn _wrap(atoms: &[&dyn Style]) -> String {
+    let sgr = atoms.iter().map(|a| a.sgr()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(";");
     escape(&sgr)
 }
 
 /// Style `text` in the shared bold-blue "header" style — `lll`'s column row and `gg`'s section
-/// titles both use it, so the style is defined once and resolved through `_wrap` like the rest.
+/// titles both use it, so the style is defined once and composed from theme atoms like the rest.
 pub(crate) fn _header(text: &str) -> String {
-    _scoped(&_wrap(["bo", "", "b"]), text)
+    _scoped(&_wrap(&[&Weight::Bold, &Basic::Blue]), text)
+}
+
+// --- markdown element styles (the palette `dl -c`'s renderer paints) ----------------------------
+
+/// Heading — bold blue, via the shared [`_header`] look. Takes the already-inline-styled `inner`
+/// so a `**word**` within a title restyles in place ([`_scoped`] re-asserts the heading colour
+/// after each nested span).
+pub(crate) fn heading(inner: &str) -> String {
+    _header(inner)
+}
+
+/// **Bold** → bold yellow.
+pub(crate) fn bold() -> String {
+    _wrap(&[&Weight::Bold, &Basic::Yellow])
+}
+
+/// *Italic* → italic + bright magenta.
+pub(crate) fn italic() -> String {
+    _wrap(&[&Md::Italic, &Md::BrightMagenta])
+}
+
+/// Inline code and indented code blocks → orange (a red-ish tone the palette otherwise underuses).
+pub(crate) fn code() -> String {
+    _wrap(&[&Basic::Orange])
+}
+
+/// Blockquote → dim (dim reads as an aside; the palette has no grey colour).
+pub(crate) fn quote() -> String {
+    _wrap(&[&Weight::Dark])
+}
+
+/// A Markdown link's visible text → blue (plain, so it reads distinctly from a bold-blue heading).
+pub(crate) fn link_text() -> String {
+    _wrap(&[&Basic::Blue])
+}
+
+/// A link's URL (Markdown or bare) → bright cyan, underlined — the "this is a link" look.
+pub(crate) fn link_url() -> String {
+    _wrap(&[&Underline::Underlined, &Md::BrightCyan])
+}
+
+/// Style `text` as a broken/dangling link — bold red — so `lll` flags a Windows `.lnk` shortcut
+/// (its name and target) against `ls`'s own colouring. Scoped, so it nests safely.
+pub(crate) fn broken_link_text(text: &str) -> String {
+    _scoped(&_wrap(&[&Weight::Bold, &Basic::Red]), text)
 }
 
 /// Style `text` with `codes`, keeping nested styles scoped instead of compounded.
@@ -84,15 +121,32 @@ mod tests {
     }
 
     #[test]
-    fn wrap_assembles_the_escape_from_the_criteria_maps() {
-        assert_eq!(_wrap(["bo", "", "r"]), "\x1b[1;31m"); // bold red
-        assert_eq!(_wrap(["bo", "", ""]), "\x1b[1m"); // bold only (boecho)
-        assert_eq!(_wrap(["da", "u", "r"]), "\x1b[2;4;31m"); // dark underlined red
+    fn wrap_joins_atom_sgrs_and_skips_empties() {
+        assert_eq!(_wrap(&[&Weight::Bold, &Basic::Red]), "\x1b[1;31m"); // bold red
+        assert_eq!(_wrap(&[&Weight::Bold]), "\x1b[1m"); // bold only (boecho)
+        assert_eq!(
+            _wrap(&[&Weight::Dark, &Underline::Underlined, &Basic::Red]),
+            "\x1b[2;4;31m" // dark underlined red
+        );
+        // `None`-style empties drop out rather than leaving a stray `;`.
+        assert_eq!(_wrap(&[&Basic::None, &Basic::Red]), "\x1b[31m");
     }
 
     #[test]
     fn header_is_bold_blue() {
         assert_eq!(_header("hi"), format!("{RESET}{BLUE}hi{RESET}"));
+    }
+
+    #[test]
+    fn element_styles_paint_the_expected_atoms() {
+        assert_eq!(bold(), _wrap(&[&Weight::Bold, &Basic::Yellow]));
+        assert_eq!(italic(), "\x1b[3;95m"); // italic + bright magenta
+        assert_eq!(code(), "\x1b[38;5;208m"); // orange
+        assert_eq!(quote(), "\x1b[2m"); // dim
+        assert_eq!(link_text(), "\x1b[34m"); // blue
+        assert_eq!(link_url(), "\x1b[4;96m"); // underline + bright cyan
+        assert!(heading("Hi").contains("Hi") && heading("Hi").ends_with(RESET));
+        assert!(broken_link_text("x").contains(&_wrap(&[&Weight::Bold, &Basic::Red]))); // bold red
     }
 
     #[test]

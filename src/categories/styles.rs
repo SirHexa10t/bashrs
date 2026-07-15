@@ -2,7 +2,7 @@
 //! (`errcho`), a `synoptic`-backed `code_highlight`, and a `grep`-crate-backed `keyword_highlight`,
 //! none part of the generated `recho` matrix. Echo verbs build on the stylized-echo engine
 //! (`_wrap`/`_scoped` in [`crate::support::doc_style`], `EchoArgs` from [`crate::support::args`]);
-//! `code_highlight` colours via [`crate::support::color_theme`]. This module also owns `_styled_echo`,
+//! `code_highlight` colours via [`crate::support::theme_code`]. This module also owns `_styled_echo`,
 //! the print-in-a-style helper the generated `recho` matrix ([`crate::categories::autogen_styles`])
 //! forwards to. Add manual style commands here — `build.rs` regenerates the matrix separately and
 //! never touches this file.
@@ -11,14 +11,15 @@
 mod commands {
     use crate::support::args::EchoArgs;
     use crate::support::doc_style::{_scoped, _wrap};
-    use crate::support::{color_theme, input, streamgrep};
+    use crate::support::theme::{Basic, BasicLook, Weight};
+    use crate::support::{input, streamgrep, theme_code};
     use clap::Args;
     use std::path::Path;
 
     /// echo in bold red, to stderr
     #[unprefixed]
     pub fn errcho(args: EchoArgs) {
-        eprintln!("{}", _scoped(&_wrap(["bo", "", "r"]), &args.words.join(" ")));
+        eprintln!("{}", _scoped(&_wrap(&[&Weight::Bold, &Basic::Red]), &args.words.join(" ")));
     }
 
     /// Syntax-highlight code — from an argument, a file, or stdin
@@ -31,7 +32,7 @@ mod commands {
         let Some(ext) = _language(&args) else {
             return eprintln!("code_highlight: pass a language with --lang (e.g. --lang rs) unless the input is a file");
         };
-        print!("{}", color_theme::highlight(&code, &ext));
+        print!("{}", theme_code::highlight(&code, &ext));
     }
 
     /// Code to highlight (inline text, a file path, or omitted to read stdin), plus the
@@ -77,9 +78,9 @@ mod commands {
         }
     }
 
-    /// Print the words scoped in the style named by `criteria` (see [`crate::support::doc_style`]).
-    pub(crate) fn _styled_echo(criteria: [&str; 3], args: &EchoArgs) {
-        println!("{}", _scoped(&_wrap(criteria), &args.words.join(" ")));
+    /// Print the words scoped in the style described by `look` (weight / underline / colour).
+    pub(crate) fn _styled_echo(look: BasicLook, args: &EchoArgs) {
+        println!("{}", _scoped(&_wrap(&[&look.weight, &look.underline, &look.colour]), &args.words.join(" ")));
     }
 
     #[cfg(test)]

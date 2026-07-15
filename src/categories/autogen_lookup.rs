@@ -5,7 +5,7 @@
 //! - the `gg`-family (`GgCommand`): `gg`, `gg2`, … — the recursive parallel tree search.
 //!
 //! Each block is nothing but its generated shim region (between the `GENERATED-*` markers, rewritten
-//! by `build.rs` from `generative_constants.rs`) plus the imports those shims need — so this file is
+//! by `build.rs` from `generator_basis.rs`) plus the imports those shims need — so this file is
 //! never edited by hand. Every shim just forwards its parsed args to a runner in
 //! [`crate::categories::lookup`] (`_grep` / `_gg`); the argument structs live in
 //! [`crate::support::args`], and the hand-written `GG`/`GGG` commands sit beside the runners in

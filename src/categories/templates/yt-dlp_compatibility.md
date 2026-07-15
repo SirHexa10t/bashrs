@@ -141,7 +141,7 @@ Dedicated extractors exist for the hosting platforms behind countless corporate 
 **Net recommendation:** residential IP in the target region (VPN/`--proxy`) + fresh `youtube.com` cookies from an entitled account + a PO-token provider, all over the one connection.
 
 
- Sources
+# Sources
 
 1. [yt-dlp Extractors wiki — Exporting YouTube Cookies](https://github.com/yt-dlp/yt-dlp/wiki/Extractors) — confirms export from `youtube.com` only (not google.com), the incognito/`robots.txt`/close-window method, and tab-based cookie rotation.
 2. yt-dlp extractor source `youtube/_base.py` & `_video.py` (raw.githubusercontent.com, master) — primary evidence that `_GEO_BYPASS = False` for YouTube and the Innertube context sets `hl` but never `gl`; `raise_geo_restricted` only reads the allowed-country list. Surfaced by the verification agent.

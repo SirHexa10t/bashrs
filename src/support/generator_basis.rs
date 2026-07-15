@@ -1,28 +1,8 @@
-// All the data that drives build-time code generation, in one place (merged from the former
-// style/lookup/treegrep "vocab" files). Two consumers: the crate reads the style vocabulary at
-// runtime (`doc_style::_wrap`), and `build.rs` `include!`s this whole file (it can't link the
-// crate) to regenerate the `recho` matrix and the `g`/`gg` search families. Keep it plain data —
-// `const`s plus the one struct they need, no `//!` docs — so it stays safe to `include!` anywhere.
-
-// Style vocabulary for the `recho` matrix: `(key, SGR sub-code, human word)`. Read at runtime by
-// `doc_style::_wrap` and baked into `autogen_styles` by `build.rs`.
-pub(crate) const WEIGHTS: &[(&str, &str, &str)] = &[("bo", "1", "bold"), ("da", "2", "dark")];
-pub(crate) const UNDERLINES: &[(&str, &str, &str)] = &[("", "", "unchanged"), ("u", "4", "underlined")];
-pub(crate) const COLORS: &[(&str, &str, &str)] = &[
-    ("", "", ""),
-    ("r", "31", "red"),
-    ("g", "32", "green"),
-    ("b", "34", "blue"),
-    ("c", "36", "cyan"),
-    ("y", "33", "yellow"),
-    ("or", "38;5;208", "orange"),
-    ("w", "37", "white"),
-    ("m", "35", "magenta"),
-];
-
-// The `g`/`gg` search-family vocabulary, expanded into `autogen_lookup.rs`. Build-time-only — the
-// generated shims bake their tuning in, so nothing reads any of this at runtime
-// (`allow(dead_code)`); `build.rs` consumes it via `include!`.
+// The `g`/`gg` search-family generation data, expanded into `autogen_lookup.rs`. Build-time-only —
+// the generated shims bake their tuning in, so nothing reads this at runtime (`allow(dead_code)`);
+// `build.rs` can't link the crate, so it pulls this file in textually via `include!`. Keep it plain
+// data — the one struct plus its two consts, no `//!` docs — so it stays safe to `include!`
+// anywhere. (The style vocabulary now lives in `theme.rs`, likewise `include!`d by `build.rs`.)
 
 /// A generated search-shortcut family (`g`/`g<N>`, `gg`/`gg<N>`): the two differ only in this data,
 /// so one `build.rs` template renders both. The bare (0-context) shim reads `-C` from the args; a

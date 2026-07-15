@@ -1,11 +1,13 @@
 //! Syntax-highlighting a block of code with ANSI colour, via `synoptic`. Shared by the
 //! `code_highlight` style command and by `bashrs_sourcefile` (which colours the shell it
-//! prints); the colours come from the shared [`crate::support::theme`], so this stays the
-//! synoptic *mechanism*. (Rendering an embedded Markdown *doc* for `dl -c` is a separate concern —
-//! marker-stripping rather than highlighting — and lives in [`crate::support::doc_render`], the
-//! hand-built sibling of this synoptic-backed module.)
+//! prints). The kind→colour map ([`_code_colour`]) is the code-highlighting theme; its colours are
+//! [`crate::support::theme`] atoms, and [`argname`] reuses it to style a lone flag name as code.
+//! (Rendering an embedded Markdown *doc* for `dl -c` is a separate
+//! concern — marker-stripping rather than highlighting — and lives in
+//! [`crate::support::doc_render`], the hand-built sibling of this synoptic-backed module.)
 
-use crate::support::{doc_style::RESET, theme};
+use crate::support::doc_style::{escape, RESET};
+use crate::support::theme::{Basic, Md, Style};
 
 /// Colour `code` as language `ext` (a file extension synoptic knows — `rs`, `sh`, `py`, …),
 /// returning the ANSI-coloured text with each line newline-terminated. An extension synoptic
@@ -31,13 +33,37 @@ pub(crate) fn highlight(code: &str, ext: &str) -> String {
     out
 }
 
-/// Wrap `text` in the ANSI colour the shared [`theme`] assigns to a synoptic token `kind`; unknown
-/// kinds stay plain.
+/// Wrap `text` in the colour this module assigns to a synoptic token `kind`; unknown kinds stay plain.
 fn paint(kind: &str, text: &str) -> String {
-    match theme::code_style(kind) {
-        Some(style) => format!("{style}{text}{RESET}"),
+    match _code_colour(kind) {
+        Some(sgr) => format!("{}{text}{RESET}", escape(sgr)),
         None => text.to_owned(),
     }
+}
+
+/// The code-highlighting theme: a synoptic token `kind` → the SGR of its `theme` colour, or `None`
+/// for kinds left uncoloured. Base colours come from the vocabulary; `comment` reaches for the
+/// doc-only grey.
+fn _code_colour(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "keyword" | "macro" | "header" => Basic::Magenta.sgr(),
+        "string" | "character" => Basic::Green.sgr(),
+        "comment" => Md::Grey.sgr(),
+        "digit" | "number" | "reference" => Basic::Cyan.sgr(),
+        "boolean" | "struct" | "type" | "attribute" => Basic::Yellow.sgr(),
+        "function" | "namespace" | "tag" => Basic::Blue.sgr(),
+        "operator" => Basic::White.sgr(),
+        // Not a synoptic token — a standalone code term (a command-line flag name), styled green
+        // by [`argname`] for non-highlighted contexts like the yt-dlp taglist.
+        "argname" => Basic::Green.sgr(),
+        _ => return None,
+    })
+}
+
+/// Style `text` as an argument/flag name (a code term) → green. For contexts that aren't full
+/// syntax highlighting but still want a flag to read as code, e.g. the yt-dlp `taglist`.
+pub(crate) fn argname(text: &str) -> String {
+    paint("argname", text)
 }
 
 #[cfg(test)]
@@ -49,6 +75,11 @@ mod tests {
         assert_eq!(paint("string", "hi"), "\x1b[32mhi\x1b[0m");
         assert_eq!(paint("comment", "// x"), "\x1b[90m// x\x1b[0m");
         assert_eq!(paint("no_such_kind", "raw"), "raw"); // graceful: printed uncoloured
+    }
+
+    #[test]
+    fn argname_styles_a_flag_as_green_code() {
+        assert_eq!(argname("--audio-format"), "\x1b[32m--audio-format\x1b[0m");
     }
 
     #[test]

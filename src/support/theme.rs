@@ -1,119 +1,175 @@
-//! The program's one colour theme — every semantic colour decision in a single place, so code
-//! highlighting ([`crate::support::color_theme`]) and Markdown docs ([`crate::support::doc_render`])
-//! share one palette.
-//!
-//! Base colours are the named vocabulary in [`crate::support::generative_constants`] (the same
-//! colours the `recho` command matrix exposes), resolved through [`crate::support::doc_style`];
-//! this module assigns those to roles and adds the few shades the vocabulary doesn't carry —
-//! grey, the high-intensity cyan/magenta, and the italic attribute. Those extras live here (not in
-//! the vocabulary) precisely so they never spawn `<name>echo` commands.
+// The program's one colour theme — the whole style vocabulary as pure data, and the single basis
+// every other styling module builds on. No imports and plain `//` comments (not `//!`): `build.rs`
+// `include!`s this file textually (it can't link the crate) to regenerate the `recho` command
+// matrix, so it must stay dependency-free and safe to paste mid-file.
+//
+// Every atom is a variant of a category enum (Weight, Underline, Basic, Md) and carries its
+// (name, particle, sgr) through the shared `Style` trait. The three recho dimensions bundle into a
+// `BasicLook`; the doc-only shades in `Md` never enter the matrix. Colour *policy* (which role gets
+// which atom) lives with the consumers — `doc_style` for docs, `theme_code` for code highlighting.
 
-use crate::support::doc_style::{escape, _header, _wrap};
-use crate::support::generative_constants::COLORS;
-
-// --- theme-only shades: deliberately NOT in the recho vocabulary ---
-/// Muted grey for code comments (SGR bright-black).
-const GREY: &str = "90";
-/// High-intensity cyan/magenta (the bright SGR variants) — the doc render's inline code and italic.
-const BRIGHT_CYAN: &str = "96";
-const BRIGHT_MAGENTA: &str = "95";
-/// The italic attribute — the vocabulary's weights are only bold/dark.
-const ITALIC: &str = "3";
-
-/// The SGR sub-code of a base vocabulary colour name (`"m"` → `"35"`); `""` for an unknown key,
-/// which only a typo in this file could produce.
-fn base(name: &str) -> &'static str {
-    COLORS.iter().find(|(key, _, _)| *key == name).map_or("", |(_, sgr, _)| *sgr)
+/// The shared shape of every style atom: its human `name`, its `recho` command `particle`, and its
+/// SGR sub-code. One `parts()` per category; the accessors are derived from it. Object-safe (`&self`,
+/// no `Copy` bound) so a heterogeneous `&[&dyn Style]` can be composed by `doc_style::_wrap`.
+/// (`allow(dead_code)`: `name`/`particle` are used only by `build.rs`'s codegen and `sgr` only at
+/// runtime, so each looks dead in the other compilation context.)
+#[allow(dead_code)]
+pub(crate) trait Style {
+    /// `(name, particle, sgr)` — name first for readability.
+    fn parts(&self) -> (&'static str, &'static str, &'static str);
+    fn name(&self) -> &'static str {
+        self.parts().0
+    }
+    fn particle(&self) -> &'static str {
+        self.parts().1
+    }
+    fn sgr(&self) -> &'static str {
+        self.parts().2
+    }
 }
 
-// --- code highlighting: synoptic token kind → colour ---
-
-/// The ANSI style opening for a synoptic token `kind`, or `None` for kinds left uncoloured. The
-/// colours are the shared vocabulary (magenta/green/cyan/…); only `comment` reaches for the
-/// theme-only grey.
-pub(crate) fn code_style(kind: &str) -> Option<String> {
-    let colour = match kind {
-        "keyword" | "macro" | "header" => base("m"), // magenta
-        "string" | "character" => base("g"),         // green
-        "comment" => GREY,
-        "digit" | "number" | "reference" => base("c"), // cyan
-        "boolean" | "struct" | "type" | "attribute" => base("y"), // yellow
-        "function" | "namespace" | "tag" => base("b"), // blue
-        "operator" => base("w"),                       // white
-        _ => return None,
-    };
-    Some(escape(colour))
+/// Font weight. No `None` variant — every generated `recho` command carries a weight (bold is the
+/// silent default). Room to grow (e.g. a combined variant later).
+#[derive(Clone, Copy)]
+pub(crate) enum Weight {
+    Bold,
+    Dark,
 }
 
-// --- Markdown docs: element → style opening (item text follows, then a RESET) ---
-
-/// Heading — bold blue, via the shared [`_header`] look (also `gg`/`lll` titles). Takes the
-/// already-inline-styled `inner` so a `**word**` within a title restyles in place (that's
-/// `_header`'s `_scoped` mechanism re-asserting the heading colour after the nested span).
-pub(crate) fn doc_heading(inner: &str) -> String {
-    _header(inner)
+/// Underline, on or off. `None` is the "off" member so [`BasicLook`] needs no `Option`.
+#[derive(Clone, Copy)]
+pub(crate) enum Underline {
+    None,
+    Underlined,
 }
 
-/// **Bold** → bold yellow.
-pub(crate) fn doc_bold() -> String {
-    _wrap(["bo", "", "y"])
+/// The base palette — the `recho` command colours. `None` is the "no colour" member.
+#[derive(Clone, Copy)]
+pub(crate) enum Basic {
+    None,
+    Red,
+    Green,
+    Blue,
+    Cyan,
+    Yellow,
+    Orange,
+    White,
+    Magenta,
 }
 
-/// *Italic* → italic + bright magenta (no italic weight in the vocabulary, so the attribute is raw).
-pub(crate) fn doc_italic() -> String {
-    escape(&format!("{ITALIC};{BRIGHT_MAGENTA}"))
+/// Doc-only shades the recho vocabulary deliberately doesn't carry (so they never spawn
+/// `<name>echo` commands): the muted grey, the high-intensity cyan/magenta, and the italic attribute.
+/// (`allow(dead_code)`: unused when `build.rs` `include!`s this file, which only touches the recho
+/// dimensions.)
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) enum Md {
+    Grey,
+    BrightCyan,
+    BrightMagenta,
+    Italic,
 }
 
-/// Inline code and indented code blocks → bright cyan.
-pub(crate) fn doc_code() -> String {
-    escape(BRIGHT_CYAN)
+impl Style for Weight {
+    fn parts(&self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Weight::Bold => ("bold", "bo", "1"),
+            Weight::Dark => ("dark", "da", "2"),
+        }
+    }
+}
+impl Weight {
+    #[allow(dead_code)] // build.rs-only: the recho matrix iterates it
+    pub(crate) const ALL: &'static [Weight] = &[Weight::Bold, Weight::Dark];
 }
 
-/// Blockquote → dim (the vocabulary has no grey colour, and dim reads as an aside).
-pub(crate) fn doc_quote() -> String {
-    _wrap(["da", "", ""])
+impl Style for Underline {
+    fn parts(&self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Underline::None => ("none", "", ""),
+            Underline::Underlined => ("underlined", "u", "4"),
+        }
+    }
+}
+impl Underline {
+    #[allow(dead_code)] // build.rs-only: the recho matrix iterates it
+    pub(crate) const ALL: &'static [Underline] = &[Underline::None, Underline::Underlined];
 }
 
-/// A Markdown link's visible text → blue (plain, so it reads distinctly from a bold-blue heading).
-pub(crate) fn doc_link_text() -> String {
-    _wrap(["", "", "b"])
+impl Style for Basic {
+    fn parts(&self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Basic::None => ("none", "", ""),
+            Basic::Red => ("red", "r", "31"),
+            Basic::Green => ("green", "g", "32"),
+            Basic::Blue => ("blue", "b", "34"),
+            Basic::Cyan => ("cyan", "c", "36"),
+            Basic::Yellow => ("yellow", "y", "33"),
+            Basic::Orange => ("orange", "or", "38;5;208"),
+            Basic::White => ("white", "w", "37"),
+            Basic::Magenta => ("magenta", "m", "35"),
+        }
+    }
+}
+impl Basic {
+    #[allow(dead_code)] // build.rs-only: the recho matrix iterates it
+    pub(crate) const ALL: &'static [Basic] = &[
+        Basic::None,
+        Basic::Red,
+        Basic::Green,
+        Basic::Blue,
+        Basic::Cyan,
+        Basic::Yellow,
+        Basic::Orange,
+        Basic::White,
+        Basic::Magenta,
+    ];
 }
 
-/// A link's URL (Markdown or bare) → bright cyan, underlined — the "this is a link" look.
-pub(crate) fn doc_link_url() -> String {
-    escape(&format!("4;{BRIGHT_CYAN}")) // 4 = underline
+impl Style for Md {
+    fn parts(&self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Md::Grey => ("grey", "gr", "90"),
+            Md::BrightCyan => ("bright cyan", "bc", "96"),
+            Md::BrightMagenta => ("bright magenta", "bm", "95"),
+            Md::Italic => ("italic", "it", "3"),
+        }
+    }
+}
+
+/// The recho autogenerator's composite — the three matrix dimensions, each typed to its category.
+/// `None` variants stand in for "absent", so no `Option` is needed. (`allow(dead_code)`: `build.rs`
+/// emits `BasicLook { … }` as generated *text* rather than constructing one, so it's unused there.)
+#[allow(dead_code)]
+pub(crate) struct BasicLook {
+    pub(crate) weight: Weight,
+    pub(crate) underline: Underline,
+    pub(crate) colour: Basic,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::support::doc_style::RESET;
 
     #[test]
-    fn base_resolves_vocabulary_colours_and_is_safe_on_typos() {
-        assert_eq!(base("c"), "36"); // cyan is in the vocabulary
-        assert_eq!(base("b"), "34"); // blue
-        assert_eq!(base("zz"), ""); // unknown key → empty, never a panic
+    fn atoms_report_name_particle_and_sgr() {
+        assert_eq!(Basic::Cyan.name(), "cyan");
+        assert_eq!(Basic::Cyan.particle(), "c");
+        assert_eq!(Basic::Cyan.sgr(), "36");
+        assert_eq!(Weight::Bold.sgr(), "1");
+        assert_eq!(Md::Italic.sgr(), "3");
     }
 
     #[test]
-    fn code_style_maps_known_kinds_and_skips_unknowns() {
-        assert_eq!(code_style("string").unwrap(), escape("32")); // green, from the vocabulary
-        assert_eq!(code_style("comment").unwrap(), escape("90")); // theme-only grey
-        // kinds sharing a colour resolve identically (one source, not copy-pasted codes)
-        assert_eq!(code_style("keyword").unwrap(), code_style("header").unwrap());
-        assert!(code_style("no_such_kind").is_none());
+    fn none_members_are_empty_so_they_contribute_nothing() {
+        assert_eq!(Basic::None.sgr(), "");
+        assert_eq!(Underline::None.sgr(), "");
     }
 
     #[test]
-    fn doc_styles_are_the_bright_palette() {
-        assert_eq!(doc_code(), escape("96")); // bright cyan
-        assert_eq!(doc_italic(), escape("3;95")); // italic + bright magenta
-        assert_eq!(doc_bold(), _wrap(["bo", "", "y"])); // bold yellow
-        assert_eq!(doc_quote(), _wrap(["da", "", ""])); // dim
-        assert_eq!(doc_link_text(), _wrap(["", "", "b"])); // blue
-        assert_eq!(doc_link_url(), escape("4;96")); // underline + bright cyan
-        let heading = doc_heading("Title");
-        assert!(heading.contains("Title") && heading.ends_with(RESET), "{heading:?}");
+    fn all_covers_every_variant_for_the_generator_to_iterate() {
+        assert_eq!(Basic::ALL.len(), 9); // None + 8 colours
+        assert_eq!(Weight::ALL.len(), 2);
+        assert_eq!(Underline::ALL.len(), 2);
     }
 }

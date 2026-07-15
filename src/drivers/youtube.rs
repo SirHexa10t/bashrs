@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use crate::support::doc_style;
 use crate::support::exec::{capture_output, capture_stdout, run_reporting_code};
 use crate::support::preferences;
+use crate::support::theme_code;
 
 /// What a YouTube URL points at — each kind downloads differently.
 #[derive(Debug, PartialEq)]
@@ -676,10 +677,9 @@ pub(crate) fn download_channel(root: &str, into: &Path, env: Env) -> i32 {
 pub(crate) fn taglist() -> i32 {
     println!("{}", doc_style::_header("Notable yt-dlp flags — pass them after `--`:"));
     let width = NOTABLE_FLAGS.iter().map(|(flag, _)| flag.len()).max().unwrap_or(0);
-    let green = doc_style::_wrap(["", "", "g"]);
     for (flag, blurb) in NOTABLE_FLAGS {
         let pad = " ".repeat(width - flag.len());
-        println!("  {}{pad}  {blurb}", doc_style::_scoped(&green, flag));
+        println!("  {}{pad}  {blurb}", theme_code::argname(flag));
     }
     println!("\n{}", doc_style::_header("Everything yt-dlp accepts:"));
     let (program, args) = ytdlp_invocation(vec![OsString::from("--help")]);

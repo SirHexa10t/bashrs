@@ -1,5 +1,5 @@
 //! Rust support shared across the command categories — clap argument structs ([`args`]), a syntax
-//! syntax highlighter ([`color_theme`]), the one shared colour theme ([`theme`]), a Markdown-doc
+//! highlighter ([`theme_code`]), the one shared colour theme ([`theme`]), a Markdown-doc
 //! renderer ([`doc_render`]), the styling engine ([`doc_style`]), an external-process runner
 //! ([`exec`]), text-input resolution ([`input`]), an in-process stream grep ([`streamgrep`]), a
 //! recursive tree grep ([`treegrep`]), binary-format decoders for `gg --delve` ([`delve`]), output
@@ -9,7 +9,6 @@
 
 pub mod args;
 pub mod browsers;
-pub mod color_theme;
 pub mod delve;
 pub mod doc_render;
 pub mod doc_style;
@@ -20,9 +19,10 @@ pub mod preferences;
 pub mod shell;
 pub mod streamgrep;
 pub mod superuser;
-// Data, not a helper module: every build-time-generation constant (style vocab + search families),
-// merged into one file and shared with `build.rs` via `include!`. Only the style vocab is also read
-// at runtime (by `doc_style`); the search families are build-time-only.
-pub(crate) mod generative_constants;
+// Data, not a helper module: the `g`/`gg` search-family generation data, shared with `build.rs`
+// via `include!` (build-time-only — nothing reads it at runtime). The style vocabulary now lives in
+// `theme`, which `build.rs` also `include!`s.
+pub(crate) mod generator_basis;
 pub mod theme;
+pub mod theme_code;
 pub mod treegrep;

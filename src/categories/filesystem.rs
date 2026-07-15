@@ -10,7 +10,7 @@ mod commands {
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
 
-    use crate::support::doc_style::{_header, _scoped, _wrap};
+    use crate::support::doc_style::{self, _header};
     use crate::support::exec;
     use clap::Args;
 
@@ -109,7 +109,7 @@ mod commands {
         if !plain.ends_with(".lnk") {
             return name.to_string(); // `.lnk` appeared mid-name, not as the extension
         }
-        let red = |s: &str| _scoped(&_wrap(["bo", "", "r"]), s);
+        let red = doc_style::broken_link_text;
         // `?` stands in when the shortcut's target can't be read (unparseable / uncorrelated).
         let target = match targets.get(plain) {
             Some(t) => t.split_whitespace().collect::<Vec<_>>().join(" "),

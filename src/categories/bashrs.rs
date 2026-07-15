@@ -4,7 +4,7 @@
 mod commands {
     use crate::conf::config_file;
     use crate::support::args::NoArgs;
-    use crate::support::{color_theme, exec};
+    use crate::support::{exec, theme_code};
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -63,7 +63,7 @@ mod commands {
         match std::fs::read_to_string(&path) {
             Ok(contents) => {
                 // Syntax-highlight the shell as we print it.
-                let shown = color_theme::highlight(&contents, "sh");
+                let shown = theme_code::highlight(&contents, "sh");
                 print!("{shown}");
                 if !shown.ends_with('\n') {
                     println!();
