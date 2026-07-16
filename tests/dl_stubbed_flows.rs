@@ -18,6 +18,9 @@ struct Rig {
     home: PathBuf,
     into: PathBuf,
     stub: PathBuf,
+    /// An extra dir for the child's PATH — the bundled tools' bin dir, for tests whose flow
+    /// probes real media with ffprobe (the scratch HOME hides the bundle, so PATH must carry it).
+    extra_path: Option<PathBuf>,
 }
 
 impl Rig {
@@ -33,13 +36,18 @@ impl Rig {
         let ytdlp = bin.join("yt-dlp");
         fs::copy(&script, &ytdlp).unwrap();
         fs::set_permissions(&ytdlp, fs::Permissions::from_mode(0o755)).unwrap();
-        Rig { root, home, into, stub }
+        Rig { root, home, into, stub, extra_path: None }
     }
 
     /// Run `dl <url> --into <rig into> <flags…>` with the rig's HOME/PATH/stub environment.
     fn dl(&self, mode: &str, url: &str, flags: &[&str]) -> Output {
+        let extra = self
+            .extra_path
+            .as_ref()
+            .map(|dir| format!("{}:", dir.display()))
+            .unwrap_or_default();
         let path = format!(
-            "{}:{}",
+            "{}:{extra}{}",
             self.root.join("bin").display(),
             std::env::var("PATH").unwrap_or_default()
         );
@@ -73,6 +81,39 @@ impl Drop for Rig {
 
 fn text(out: &Output) -> String {
     format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+}
+
+/// Skip-with-notice: the directory to put on the child's PATH so ffmpeg+ffprobe resolve (the
+/// bundled tools' bin dir), `Some(None)` when the inherited PATH already carries them, or `None`
+/// (after a visible SKIP line) when no ffmpeg exists at all.
+fn ffmpeg_or_skip(test: &str) -> Option<Option<PathBuf>> {
+    let works = |dir: Option<&Path>| {
+        ["ffmpeg", "ffprobe"].iter().all(|name| {
+            let bin = dir.map(|dir| dir.join(name)).unwrap_or_else(|| PathBuf::from(name));
+            Command::new(bin).arg("-version").output().is_ok_and(|out| out.status.success())
+        })
+    };
+    let bundled = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".bashrs/tools/bin"));
+    if let Some(dir) = bundled.filter(|dir| works(Some(dir))) {
+        return Some(Some(dir));
+    }
+    if works(None) {
+        return Some(None);
+    }
+    eprintln!("SKIPPED {test}: no usable ffmpeg/ffprobe available");
+    None
+}
+
+/// A tiny real mkv at `path` (needs [`ffmpeg_or_skip`] to have passed).
+fn build_mkv(dir: Option<&Path>, path: &Path) {
+    let ffmpeg = dir.map(|dir| dir.join("ffmpeg")).unwrap_or_else(|| PathBuf::from("ffmpeg"));
+    let ok = Command::new(ffmpeg)
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=blue:s=64x64:d=1"])
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .arg(path)
+        .status()
+        .is_ok_and(|status| status.success());
+    assert!(ok, "could not build a test mkv");
 }
 
 #[test]
@@ -202,4 +243,163 @@ fn a_playlist_scan_reports_tombstones_skips_archived_and_downloads_pending_in_on
     let downloads: Vec<&str> = calls.lines().filter(|line| !line.contains("--print")).collect();
     assert_eq!(downloads.len(), 1, "the shared subtitle plan downloads as one group:\n{calls}");
     assert!(downloads[0].contains("--playlist-items 1,4"), "both pending entries: {}", downloads[0]);
+    // Two entries sit far under the pacing threshold — the probe must not sleep between requests.
+    let probe = calls.lines().find(|l| l.contains("--print") && l.contains("--playlist-items"));
+    assert!(!probe.unwrap().contains("--sleep-requests"), "small probes must not pace:\n{calls}");
+}
+
+#[test]
+fn a_channel_walks_every_tab_downloading_reporting_missing_and_failed_ones() {
+    let rig = Rig::new("channel");
+    // The stub keys tab behaviour off the URL: videos → this scan; shorts → yt-dlp's "no such
+    // tab" error; streams → a hard failure; playlists → reachable but empty (no
+    // scan_playlists.txt). One run exercises every TabScan outcome.
+    fs::write(
+        rig.stub.join("scan.txt"),
+        "1\tvidchan0001\tClip One\tStub Channel\n\
+         2\tvidchan0002\tClip Two\tStub Channel\n\
+         Stub Channel [UCstub]\n",
+    )
+    .unwrap();
+    fs::write(
+        rig.stub.join("probe.txt"),
+        "1\tvidchan0001\ten\t{\"en\": [{\"name\": \"English\"}]}\t{}\n\
+         2\tvidchan0002\ten\t{\"en\": [{\"name\": \"English\"}]}\t{}\n",
+    )
+    .unwrap();
+    fs::write(rig.stub.join("archive_adds.txt"), "youtube vidchan0001\nyoutube vidchan0002\n")
+        .unwrap();
+
+    let out = rig.dl("ok", "https://www.youtube.com/@stubchannel", &[]);
+    assert!(out.status.success(), "one good tab means a good run: {}", text(&out));
+    let all = text(&out);
+    for tab in ["videos", "shorts", "streams", "playlists"] {
+        assert!(
+            all.contains(&format!("=== https://www.youtube.com/@stubchannel/{tab} ===")),
+            "every tab is announced: {all}"
+        );
+    }
+    assert!(all.contains("the channel has no `shorts` tab"), "{all}");
+    assert!(all.contains("Unable to download webpage"), "a failed tab's real error passes through: {all}");
+    assert!(all.contains("could not read the `streams` tab — moving on"), "{all}");
+    assert!(all.contains("the channel has no `playlists` tab"), "reachable-but-empty reads as absent: {all}");
+    assert!(all.contains("downloading 2 entries (subs: en)"), "{all}");
+    // The channel's own folder (named by the first readable tab's scan) holds the shared archive.
+    let archive = fs::read_to_string(rig.into.join("Stub Channel [UCstub]/.dl_video_archive.txt"))
+        .expect("archive under the channel home");
+    assert!(archive.contains("vidchan0001") && archive.contains("vidchan0002"), "{archive}");
+    let calls = rig.calls();
+    assert_eq!(calls.lines().filter(|line| line.contains("--flat-playlist")).count(), 4, "one scan per tab:\n{calls}");
+    let downloads: Vec<&str> = calls.lines().filter(|line| !line.contains("--print")).collect();
+    assert_eq!(downloads.len(), 1, "the videos tab downloads as one group:\n{calls}");
+}
+
+#[test]
+fn a_probe_over_the_pacing_threshold_sleeps_between_requests() {
+    let rig = Rig::new("pacing");
+    // 21 pending entries (threshold is 20): a metadata burst that big paces itself.
+    let mut scan = String::new();
+    let mut archive_adds = String::new();
+    for i in 1..=21 {
+        scan.push_str(&format!("{i}\tvidpend{i:04}\tEntry {i}\tBig List\n"));
+        archive_adds.push_str(&format!("youtube vidpend{i:04}\n"));
+    }
+    scan.push_str("Big List [PLbig]\n");
+    fs::write(rig.stub.join("scan.txt"), scan).unwrap();
+    fs::write(rig.stub.join("probe.txt"), "").unwrap(); // probe answers nothing → EN fallback
+    fs::write(rig.stub.join("archive_adds.txt"), archive_adds).unwrap();
+
+    let out = rig.dl("ok", "https://www.youtube.com/playlist?list=PLbig", &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    let calls = rig.calls();
+    let probe = calls
+        .lines()
+        .find(|line| line.contains("--print") && line.contains("--playlist-items"))
+        .expect("a batch probe ran");
+    assert!(probe.contains("--sleep-requests 1"), "big probes must pace themselves:\n{probe}");
+}
+
+#[test]
+fn no_cookies_keeps_an_imported_store_out_of_every_invocation() {
+    // The same seeded store, with and without --no-cookies: the flag must keep it off the argv.
+    let with_store = |tag: &str, flags: &[&str]| {
+        let rig = Rig::new(tag);
+        let site = rig.home.join(".bashrs/user-data/browser_cookies/youtube");
+        fs::create_dir_all(site.join("store")).unwrap();
+        fs::write(site.join("browser.spec"), "firefox").unwrap();
+        fs::write(site.join("store/cookies.sqlite"), "junk").unwrap();
+        let out = rig.dl("ok", YT_VIDEO, flags);
+        assert!(out.status.success(), "{}", text(&out));
+        rig.calls()
+    };
+    let used = with_store("cookies_on", &[]);
+    assert!(used.contains("--cookies-from-browser"), "the store is the standing default:\n{used}");
+    let suppressed = with_store("cookies_off", &["--no-cookies"]);
+    assert!(
+        !suppressed.contains("--cookies-from-browser"),
+        "--no-cookies must keep the store out of every yt-dlp call:\n{suppressed}"
+    );
+}
+
+#[test]
+fn the_subtitle_pass_reports_audio_files_as_tag_carriers_and_skips_them() {
+    let rig = Rig::new("subs_audio");
+    fs::write(rig.into.join("song__stubvid0000.opus"), b"OPUSDATA").unwrap();
+    let out = rig.dl("ok", YT_VIDEO, &["--subtitles"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let all = text(&out);
+    assert!(all.contains("already downloaded — scanning subtitles"), "{all}");
+    assert!(all.contains("audio — subtitles kept as tags; nothing to patch"), "{all}");
+    assert_eq!(
+        fs::read(rig.into.join("song__stubvid0000.opus")).unwrap(),
+        b"OPUSDATA",
+        "the audio file stays untouched"
+    );
+}
+
+#[test]
+fn an_unreadable_video_file_is_reported_and_left_alone() {
+    let rig = Rig::new("subs_junk");
+    fs::write(rig.into.join("v__stubvid0000.mkv"), b"not really an mkv").unwrap();
+    let out = rig.dl("ok", YT_VIDEO, &["--subtitles"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("could not read (ffprobe) — skipping"), "{}", text(&out));
+    assert_eq!(
+        fs::read(rig.into.join("v__stubvid0000.mkv")).unwrap(),
+        b"not really an mkv",
+        "an unreadable file must not be modified"
+    );
+}
+
+#[test]
+fn a_subtitle_fetch_that_yields_no_sidecars_is_reported_as_rate_limited() {
+    let Some(ffmpeg_dir) = ffmpeg_or_skip("no-sidecars branch") else { return };
+    let mut rig = Rig::new("subs_dry");
+    rig.extra_path = ffmpeg_dir.clone();
+    build_mkv(ffmpeg_dir.as_deref(), &rig.into.join("v__stubvid0000.mkv"));
+    // The probe advertises an `en` track, but the stub's "download" writes no sidecar files.
+    fs::write(
+        rig.stub.join("video_probe.txt"),
+        "stubvid0000\nen\n{\"en\": [{\"name\": \"English\"}]}\n{}\n",
+    )
+    .unwrap();
+    let out = rig.dl("ok", YT_VIDEO, &["--subtitles"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let all = text(&out);
+    assert!(all.contains("missing subtitle(s): en"), "{all}");
+    assert!(all.contains("no subtitles arrived (rate-limited?)"), "{all}");
+}
+
+#[test]
+fn a_video_with_no_subtitles_anywhere_reads_as_nothing_to_embed_not_all_zero() {
+    let Some(ffmpeg_dir) = ffmpeg_or_skip("no-subtitles wording") else { return };
+    let mut rig = Rig::new("subs_none");
+    rig.extra_path = ffmpeg_dir.clone();
+    build_mkv(ffmpeg_dir.as_deref(), &rig.into.join("v__stubvid0000.mkv"));
+    // Default probe: NA everywhere → the expected set is empty.
+    let out = rig.dl("ok", YT_VIDEO, &["--subtitles"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let all = text(&out);
+    assert!(all.contains("no subtitles exist for this video — nothing to embed"), "{all}");
+    assert!(!all.contains("all 0 expected"), "the absurd wording must be gone: {all}");
 }
