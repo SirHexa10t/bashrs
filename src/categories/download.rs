@@ -210,7 +210,7 @@ mod commands {
         if youtube::cookies_expired(&db, kind) == Some(true) {
             eprintln!(
                 "{}",
-                doc_style::warning(&format!(
+                doc_style::problematic(&format!(
                     "dl: the imported {} cookies have expired — re-import with `dl --cookie-import {}`",
                     site.label, site.key
                 ))
@@ -287,7 +287,7 @@ mod commands {
     /// [`crate::drivers::youtube`]; this stays the thin argument shell.
     #[name("dl")]
     pub fn dl(args: DlArgs) {
-        let DlArgs { url, into, single, cookies, no_cookies, audio, res, taglist, cookie_import, compatibility_help, extra } = args;
+        let DlArgs { url, into, single, cookies, no_cookies, audio, res, allow_ipv6, thumbnail, subtitles, taglist, cookie_import, compatibility_help, extra } = args;
         if compatibility_help {
             print!("{}", _compatibility_help());
             return;
@@ -327,6 +327,9 @@ mod commands {
             cookies_from_browser: imported.as_deref(),
             audio,
             res,
+            allow_ipv6,
+            thumbnail,
+            subtitles,
             extra: &extra,
             js_runtime: deno.as_deref(),
         };
@@ -398,6 +401,20 @@ mod commands {
         /// Cap the video height (e.g. 1080) — takes the best formats at or under it
         #[arg(long, value_name = "HEIGHT")]
         pub res: Option<u32>,
+        /// Let yt-dlp use IPv6. By default `dl` forces IPv4 — on a broken or slow IPv6 route,
+        /// every request otherwise stalls ~5s on the fallback. Pass this on an IPv6-only network
+        #[arg(long)]
+        pub allow_ipv6: bool,
+        /// Embed a cover-art thumbnail into each video (off by default — it costs extra requests).
+        /// Handled as a late, idempotent pass: it skips videos that already have one and, ignoring
+        /// the download archive, will patch previously-downloaded videos on a re-run
+        #[arg(long)]
+        pub thumbnail: bool,
+        /// Force a subtitle scan of the target video(s) and embed any expected tracks that are
+        /// missing. Subtitles already ride a normal download; this late, idempotent pass (ignoring
+        /// the download archive) is for patching previously-downloaded videos on a re-run
+        #[arg(long)]
+        pub subtitles: bool,
         /// Import a browser's cookies for one site, so later dl runs on it authenticate. TARGET
         /// is a site keyword (youtube, tiktok, facebook, instagram, twitter, reddit, vimeo,
         /// twitch, niconico, bilibili, patreon, nebula, bbc), a domain (example.com), or a URL.

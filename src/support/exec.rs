@@ -108,6 +108,59 @@ where
     }
 }
 
+// Elapsed-time profiling helpers — no callers in normal builds (hence the `allow(dead_code)`s);
+// kept for the next latency hunt: `_stamp` marks a phase, `run_timed` swaps in for a
+// `run_reporting_code`/`capture_stdout` call to timestamp a child's every output line.
+#[allow(dead_code)]
+fn _elapsed_s() -> f64 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+}
+#[allow(dead_code)]
+pub(crate) fn _stamp(label: &str) {
+    eprintln!("[t+{:>7.3}s] {label}", _elapsed_s());
+}
+/// Stamp one line of a child's output (`|` marks it child output, vs a phase stamp).
+#[allow(dead_code)]
+fn _stamp_line(line: &str) {
+    eprintln!("[t+{:>7.3}s] |   {line}", _elapsed_s());
+}
+/// Run `program`+`args` with both streams piped, stamping EVERY child output line with elapsed
+/// time — so a subprocess's own phase lines reveal where the wall-time actually goes. Captures
+/// stdout for the caller; returns `(exit_code, stdout)`.
+#[allow(dead_code)]
+pub(crate) fn run_timed(program: &OsStr, args: &[std::ffi::OsString]) -> Option<(i32, String)> {
+    use std::io::{BufRead, BufReader};
+    let mut child = match Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            eprintln!("could not run {}: {err}", program.to_string_lossy());
+            return None;
+        }
+    };
+    let stderr = child.stderr.take().expect("stderr piped");
+    let err_thread = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            _stamp_line(&line);
+        }
+    });
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut captured = String::new();
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        _stamp_line(&line);
+        captured.push_str(&line);
+        captured.push('\n');
+    }
+    let _ = err_thread.join();
+    let code = child.wait().ok().and_then(|status| status.code()).unwrap_or(-1);
+    Some((code, captured))
+}
+
 /// Run `program` with `args`, inheriting stdio; the exit status is ignored — for commands
 /// run to show output or for a side effect, where a non-zero exit isn't a failure (e.g.
 /// `ssh -T git@github.com`, which always exits 1). A spawn error is still reported.

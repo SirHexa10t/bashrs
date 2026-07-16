@@ -80,11 +80,17 @@ pub(crate) fn broken_link_text(text: &str) -> String {
     _scoped(&_wrap(&[&Weight::Bold, &Basic::Red]), text)
 }
 
-/// Style `text` as a warning — bold red — for a stderr heads-up like `dl` noting that an imported
-/// cookie store has expired. A distinct role from [`broken_link_text`], though it shares the colour
-/// today. Scoped, so it nests safely.
-pub(crate) fn warning(text: &str) -> String {
+/// Style `text` as a "problematic" / bad-status marker — bold red — e.g. a `dl` heads-up that an
+/// imported cookie store expired, or a video missing its thumbnail. Pairs with [`approved`]. A
+/// distinct role from [`broken_link_text`], though it shares the colour. Scoped, so it nests safely.
+pub(crate) fn problematic(text: &str) -> String {
     _scoped(&_wrap(&[&Weight::Bold, &Basic::Red]), text)
+}
+
+/// Style `text` as an "approved" / good-status marker — bold green — e.g. a video that already
+/// carries its thumbnail. Pairs with [`problematic`]. Scoped, so it nests safely.
+pub(crate) fn approved(text: &str) -> String {
+    _scoped(&_wrap(&[&Weight::Bold, &Basic::Green]), text)
 }
 
 /// Style `text` with `codes`, keeping nested styles scoped instead of compounded.
@@ -154,7 +160,8 @@ mod tests {
         assert_eq!(link_url(), "\x1b[4;96m"); // underline + bright cyan
         assert!(heading("Hi").contains("Hi") && heading("Hi").ends_with(RESET));
         assert!(broken_link_text("x").contains(&_wrap(&[&Weight::Bold, &Basic::Red]))); // bold red
-        assert_eq!(warning("x"), format!("{RESET}{RED}x{RESET}")); // bold red, scoped
+        assert_eq!(problematic("x"), format!("{RESET}{RED}x{RESET}")); // bold red, scoped
+        assert_eq!(approved("x"), format!("{RESET}{GREEN}x{RESET}")); // bold green, scoped
     }
 
     #[test]

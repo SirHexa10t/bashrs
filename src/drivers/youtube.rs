@@ -58,6 +58,21 @@ pub(crate) fn classify(url: &str, single: bool) -> Link {
     Link::Video
 }
 
+/// The 11-char video id in a lone YouTube URL — `watch?v=ID`, `youtu.be/ID`, `/shorts/ID`,
+/// `/embed/ID`. `None` for a shape we don't recognize (the caller falls back to a probe). Lets
+/// [`download_video`] tell "already on disk" without a yt-dlp call, so it can skip the subtitle
+/// probe + download for a video it already has.
+fn id_from_url(url: &str) -> Option<String> {
+    let rest = ["v=", "youtu.be/", "/shorts/", "/embed/"]
+        .iter()
+        .find_map(|marker| url.split_once(marker).map(|(_, rest)| rest))?;
+    let id: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    (id.len() == 11).then_some(id)
+}
+
 /// What every yt-dlp invocation of one `dl` run shares.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Env<'a> {
@@ -72,6 +87,18 @@ pub(crate) struct Env<'a> {
     pub(crate) audio: bool,
     /// Height cap, as a format-sort preference (`-S res:N`).
     pub(crate) res: Option<u32>,
+    /// Let yt-dlp use IPv6. Off by default — every invocation adds `--force-ipv4`, because a
+    /// broken or slow IPv6 route stalls each request ~5s on the happy-eyeballs fallback (measured);
+    /// `--allow-ipv6` opts back in for an IPv6-only network.
+    pub(crate) allow_ipv6: bool,
+    /// Embed a cover-art thumbnail (`--thumbnail`). Off by default — a late, idempotent pass
+    /// ([`embed_thumbnails`]) handles it, so the main download stays fast and a re-run can patch
+    /// previously-downloaded videos.
+    pub(crate) thumbnail: bool,
+    /// Force the subtitle patch pass (`--subtitles`): scan a video (fresh or already on disk) for
+    /// its expected subtitles and embed any that are missing ([`embed_subtitles`]). A fresh
+    /// download already embeds subtitles inline, so this is a no-op there and a patch on re-runs.
+    pub(crate) subtitles: bool,
     /// Raw passthrough args, appended after every default so they win any flag repeated.
     pub(crate) extra: &'a [String],
     /// The bundled deno, when it exists — yt-dlp's YouTube extractor wants a JS runtime (EJS)
@@ -242,12 +269,24 @@ fn count_cookie_dump(dump: &str) -> usize {
         .count()
 }
 
+/// `--force-ipv4` unless the user opted into IPv6. Added to *every* network invocation (via
+/// [`seeded`] and [`common`]): a broken or slow IPv6 route otherwise stalls each yt-dlp request
+/// ~5s on the happy-eyeballs fallback (measured — the difference between a ~13s and a ~87s
+/// download of one small video).
+fn ipv4_flag(env: Env) -> Vec<OsString> {
+    if env.allow_ipv6 {
+        Vec::new()
+    } else {
+        vec!["--force-ipv4".into()]
+    }
+}
+
 /// Starter argv for the metadata-side invocations (probes, scans): even those run the YouTube
 /// extractor, which warns — and may miss formats — without a JS runtime, warns again without an
 /// ffmpeg, and can't see gated content without cookies. Hand it the bundles and cookies.
 fn seeded(env: Env) -> Vec<OsString> {
-    let mut argv =
-        bundled_deno().map(|deno| js_runtime_flag(&deno).to_vec()).unwrap_or_default();
+    let mut argv = ipv4_flag(env);
+    argv.extend(bundled_deno().map(|deno| js_runtime_flag(&deno).to_vec()).unwrap_or_default());
     if let Some(dir) = bundled_ffmpeg_dir() {
         argv.push("--ffmpeg-location".into());
         argv.push(dir.into_os_string());
@@ -258,27 +297,68 @@ fn seeded(env: Env) -> Vec<OsString> {
 
 /// A lone video: probe its subtitle situation, then download with the exact list.
 pub(crate) fn download_video(url: &str, into: &Path, env: Env) -> i32 {
-    let (id, picks) = video_picks(url, env);
-    let keys: Vec<String> = picks.iter().map(|pick| pick.key.clone()).collect();
-    let mut code = run(video_argv(url, into, env, &keys));
-    if code != 0 {
-        // Same diagnosis/rescue/ledger treatment the collection modes give their entries. The
-        // bracketed id is the ledger's stable key ([`scrub_ledger`]); a URL label (id unknown)
-        // still carries the id for YouTube links via its `v=` parameter.
-        let label = id.as_ref().map(|id| format!("[{id}]")).unwrap_or_else(|| url.to_string());
-        match diagnose_failure(video_argv(url, into, env, &keys), &label, GeoRescue::IpEnforced) {
-            None => code = 0, // the plain retry came through
-            Some(line) => write_ledger(into, &[line]),
+    // The subtitle probe and the download are both for a video we don't have yet. If its file is
+    // already on disk (id parsed straight from the URL — no yt-dlp call), skip both: subtitle
+    // handling rides the download, so there's nothing to probe for. A URL we can't pull an id from
+    // falls back to the probe. The opt-in `--thumbnail` pass below still runs, patching a re-run.
+    let url_id = id_from_url(url);
+    let on_disk = url_id.as_deref().is_some_and(|id| find_by_id(into, id).is_some());
+    let mut code = 0;
+    // `picks` feed the opt-in `--subtitles` pass. A fresh download always probes (it needs the
+    // list to embed inline); an already-downloaded video probes only when `--subtitles` forces a
+    // scan; a plain re-run on an existing video probes nothing.
+    let mut picks: Vec<Pick> = Vec::new();
+    let id = if !on_disk {
+        // Announced because the probe runs silently for a few seconds (its output is captured).
+        println!("probing subtitles…");
+        let (probe_id, probed) = video_picks(url, env);
+        picks = probed;
+        let keys: Vec<String> = picks.iter().map(|pick| pick.key.clone()).collect();
+        code = run(video_argv(url, into, env, &keys));
+        if code != 0 {
+            // The bracketed id is the ledger's stable key ([`scrub_ledger`]); a URL label still
+            // carries the id for YouTube links via its `v=` parameter.
+            let label =
+                probe_id.as_ref().map(|id| format!("[{id}]")).unwrap_or_else(|| url.to_string());
+            match diagnose_failure(video_argv(url, into, env, &keys), &label, GeoRescue::IpEnforced)
+            {
+                None => code = 0, // the plain retry came through
+                Some(line) => write_ledger(into, &[line]),
+            }
         }
-    }
+        if code == 0 {
+            if let Some(id) = &probe_id {
+                finish_media(into, id, &picks, env);
+            }
+        }
+        probe_id.or(url_id)
+    } else if env.subtitles {
+        println!("{}: already downloaded — scanning subtitles", url_id.as_deref().unwrap_or(url));
+        let (probe_id, probed) = video_picks(url, env);
+        picks = probed;
+        probe_id.or(url_id)
+    } else {
+        println!("{}: already downloaded — skipping", url_id.as_deref().unwrap_or(url));
+        url_id
+    };
     if code == 0 {
-        if let Some(id) = id {
-            finish_media(into, &id, &picks, env);
+        if let Some(id) = &id {
+            if env.thumbnail {
+                embed_thumbnails(into, std::slice::from_ref(id), env);
+            }
+            if env.subtitles {
+                println!("subtitles: scanning 1 video…");
+                embed_subtitles(into, id, url, &picks, env);
+            }
         }
     }
     scrub_ledger(into);
     code
 }
+
+/// The sites the late `--thumbnail`/`--subtitles` patch passes support — YouTube only, today.
+/// Kept as a list so the generic path's notice names exactly what IS covered as it grows.
+const PATCHABLE_PLATFORMS: &[&str] = &["youtube"];
 
 /// The generic single-video path for non-YouTube sites (`dl` routes here when the host isn't
 /// YouTube). One download, flat into `into` — a generic page gives no playlist/channel structure
@@ -288,6 +368,20 @@ pub(crate) fn download_video(url: &str, into: &Path, env: Env) -> i32 {
 /// chapters. The URL is the ledger label — the only stable key without a metadata probe (and
 /// enough for [`scrub_ledger`] when it embeds the id).
 pub(crate) fn download_generic(url: &str, into: &Path, env: Env) -> i32 {
+    // The patch passes need a per-video id in the filename and a known thumbnail/caption source —
+    // YouTube-machinery, today. Name what IS supported (the list will grow) instead of silently
+    // ignoring the flag.
+    if env.thumbnail || env.subtitles {
+        let flags = match (env.thumbnail, env.subtitles) {
+            (true, true) => "--thumbnail/--subtitles",
+            (true, false) => "--thumbnail",
+            _ => "--subtitles",
+        };
+        eprintln!(
+            "dl: {flags} supported platforms: {} — skipped for this site",
+            PATCHABLE_PLATFORMS.join(", ")
+        );
+    }
     let mut code = run(generic_argv(url, into, env));
     if code != 0 {
         match diagnose_failure(generic_argv(url, into, env), url, GeoRescue::XffSweep) {
@@ -347,12 +441,30 @@ pub(crate) fn download_playlist(url: &str, id: &str, into: &Path, env: Env) -> i
     if skipped > 0 {
         println!("{skipped} entries already archived (or unplayable) — skipped");
     }
-    if pending.is_empty() {
-        return 0;
+    let code = if pending.is_empty() {
+        0
+    } else {
+        download_pending(url, &pending, into, &home, env, |url, into, home, env, langs, items| {
+            playlist_argv(url, into, home, env, langs, Some(items))
+        })
+    };
+    // Late thumbnail pass (opt-in) over every playable entry — including archived ones, so a
+    // re-run with `--thumbnail` patches previously-downloaded videos.
+    if env.thumbnail {
+        let ids: Vec<String> = scan
+            .entries
+            .iter()
+            .filter(|entry| !is_tombstone(&entry.title))
+            .map(|entry| entry.id.clone())
+            .collect();
+        embed_thumbnails(&home, &ids, env);
     }
-    download_pending(url, &pending, into, &home, env, |url, into, home, env, langs, items| {
-        playlist_argv(url, into, home, env, langs, Some(items))
-    })
+    if env.subtitles {
+        let entries: Vec<&ScanEntry> =
+            scan.entries.iter().filter(|entry| !is_tombstone(&entry.title)).collect();
+        patch_collection_subtitles(url, &entries, &home, env);
+    }
+    code
 }
 
 /// The shared batched tail of playlist and channel-tab downloads: ONE probe invocation covers
@@ -614,6 +726,380 @@ fn stamped_title(name: &str) -> String {
     format!("{} (auto-generated)", name.replace(" (Original)", ""))
 }
 
+/// The absolute stream index of the embedded cover in an ffprobe
+/// `stream=index:stream_disposition=attached_pic -of default=nw=1` listing (`index=N` lines, each
+/// followed by its dispositions), or `None` when no stream carries `attached_pic=1`. Pure, so the
+/// idempotency gate and the remux cover-carry are unit-tested without ffprobe.
+fn attached_pic_stream_index(listing: &str) -> Option<u32> {
+    let mut current = None;
+    for line in listing.lines() {
+        if let Some(index) = line.strip_prefix("index=") {
+            current = index.trim().parse().ok();
+        } else if line.trim() == "DISPOSITION:attached_pic=1" {
+            return current;
+        }
+    }
+    None
+}
+
+/// The absolute stream index of `file`'s embedded thumbnail: `Some(Some(idx))` when one exists,
+/// `Some(None)` when none does, `None` when ffprobe couldn't run — the caller then leaves the
+/// file untouched rather than guess.
+fn embedded_thumbnail_index(file: &Path, env: Env) -> Option<Option<u32>> {
+    let ffprobe = env
+        .ffmpeg_dir
+        .map(|dir| dir.join("ffprobe").into_os_string())
+        .unwrap_or_else(|| "ffprobe".into());
+    let listing = capture_stdout(
+        &ffprobe,
+        [
+            OsString::from("-v"), "error".into(),
+            "-show_entries".into(), "stream=index:stream_disposition=attached_pic".into(),
+            "-of".into(), "default=nw=1".into(),
+            file.as_os_str().to_owned(),
+        ],
+    )?;
+    Some(attached_pic_stream_index(&listing))
+}
+
+/// Whether `file` already carries an embedded thumbnail. `None` when ffprobe couldn't run.
+fn has_embedded_thumbnail(file: &Path, env: Env) -> Option<bool> {
+    Some(embedded_thumbnail_index(file, env)?.is_some())
+}
+
+/// Pull the attached cover (stream `index`) out of `file` — a one-packet stream copy into a temp
+/// `.jpg` beside it — so a remux can re-`-attach` it. Covers here are always JPEG: both `dl`'s
+/// own pass and yt-dlp's legacy inline embeds convert to jpg. `None` (temp cleaned) on failure.
+fn extract_thumbnail(file: &Path, index: u32, env: Env) -> Option<PathBuf> {
+    let ffmpeg = env
+        .ffmpeg_dir
+        .map(|dir| dir.join("ffmpeg").into_os_string())
+        .unwrap_or_else(|| "ffmpeg".into());
+    let tmp = file.with_extension("cover-keep.jpg");
+    let mut argv: Vec<OsString> = ["-v", "error", "-y", "-i"].map(OsString::from).to_vec();
+    argv.push(file.as_os_str().to_owned());
+    argv.push("-map".into());
+    argv.push(format!("0:{index}").into());
+    argv.extend(["-frames:v", "1", "-c", "copy"].map(OsString::from));
+    argv.push(tmp.as_os_str().to_owned());
+    let ok = matches!(
+        std::process::Command::new(&ffmpeg).args(&argv).status(),
+        Ok(status) if status.success()
+    ) && tmp.is_file();
+    if ok {
+        Some(tmp)
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+        None
+    }
+}
+
+/// Fetch YouTube video `id`'s thumbnail to `dest` (a `.jpg`), best quality first: `maxresdefault`
+/// (HD, often absent for low-effort uploads), then `hqdefault` (always present). Uses `curl` — the
+/// same fetcher `dl` uses for pages — hitting the two known URLs directly, so no yt-dlp launch and
+/// no format-probe cascade. Returns whether a file landed.
+fn fetch_youtube_thumbnail(id: &str, dest: &Path) -> bool {
+    for quality in ["maxresdefault", "hqdefault"] {
+        let url = format!("https://i.ytimg.com/vi/{id}/{quality}.jpg");
+        let landed = capture_output(
+            "curl",
+            [OsString::from("-fsSL"), "-o".into(), dest.as_os_str().to_owned(), url.into()],
+        )
+        .is_some_and(|(ok, _, _)| ok);
+        if landed {
+            return true;
+        }
+    }
+    false
+}
+
+/// Attach `thumb` into the mkv `file` as cover art (an mkv attachment, exactly as yt-dlp embeds
+/// it), keeping every existing stream (`-map 0 -c copy`). Writes a sibling temp file and renames
+/// over the original. Returns whether it succeeded.
+fn attach_thumbnail(file: &Path, thumb: &Path, env: Env) -> bool {
+    let ffmpeg = env
+        .ffmpeg_dir
+        .map(|dir| dir.join("ffmpeg").into_os_string())
+        .unwrap_or_else(|| "ffmpeg".into());
+    let out = file.with_extension("thumbing.mkv");
+    let mut argv: Vec<OsString> = ["-v", "error", "-y", "-i"].map(OsString::from).to_vec();
+    argv.push(file.as_os_str().to_owned());
+    argv.extend(["-map", "0", "-c", "copy", "-attach"].map(OsString::from));
+    argv.push(thumb.as_os_str().to_owned());
+    argv.extend(
+        ["-metadata:s:t:0", "mimetype=image/jpeg", "-metadata:s:t:0", "filename=cover.jpg"]
+            .map(OsString::from),
+    );
+    argv.push(out.as_os_str().to_owned());
+    let ok = matches!(
+        std::process::Command::new(&ffmpeg).args(&argv).status(),
+        Ok(status) if status.success()
+    ) && std::fs::rename(&out, file).is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(&out);
+    }
+    ok
+}
+
+/// Fetch and embed `id`'s thumbnail into `file`, cleaning up the temp image. Returns success.
+fn embed_one_thumbnail(file: &Path, id: &str, env: Env) -> bool {
+    let thumb = file.with_extension("cover.jpg");
+    let ok = fetch_youtube_thumbnail(id, &thumb) && attach_thumbnail(file, &thumb, env);
+    let _ = std::fs::remove_file(&thumb);
+    ok
+}
+
+/// The late, opt-in (`--thumbnail`) cover-art pass: for each video `id` under `dir`, scan and
+/// report whether it already has an embedded thumbnail — so the user sees up front what's missing
+/// rather than waiting on unbounded work — then fetch + embed only the ones lacking one.
+/// Deliberately independent of the download archive, so a re-run *patches* previously-downloaded
+/// videos; the embedded-thumbnail check keeps it idempotent (a video that already has one is never
+/// re-fetched or re-embedded).
+fn embed_thumbnails(dir: &Path, ids: &[String], env: Env) {
+    if ids.is_empty() {
+        return;
+    }
+    println!("thumbnails: scanning {} video(s)…", ids.len());
+    let mut missing: Vec<(String, PathBuf)> = Vec::new();
+    for id in ids {
+        match find_by_id(dir, id) {
+            None => println!("  [{id}]: {}", doc_style::problematic("no file found — skipping")),
+            // A cover embeds as an mkv attachment ([`attach_thumbnail`] muxes into the mkv
+            // container) — renaming that over an audio/webm file would swap its container out
+            // from under it, corrupting it. Skip anything that isn't an mkv, and say so.
+            Some(file) if file.extension().and_then(|ext| ext.to_str()) != Some("mkv") => {
+                println!("  [{id}]: {}", doc_style::problematic("not an mkv — cover art embeds into video (mkv) only; skipping"));
+            }
+            Some(file) => match has_embedded_thumbnail(&file, env) {
+                Some(true) => println!("  [{id}]: {}", doc_style::approved("already has a thumbnail")),
+                Some(false) => {
+                    println!("  [{id}]: {}", doc_style::problematic("missing a thumbnail"));
+                    missing.push((id.clone(), file));
+                }
+                None => println!("  [{id}]: {}", doc_style::problematic("could not read (ffprobe) — skipping")),
+            },
+        }
+    }
+    if missing.is_empty() {
+        println!("thumbnails: all present — nothing to embed");
+        return;
+    }
+    println!("thumbnails: fetching + embedding {} …", missing.len());
+    for (id, file) in &missing {
+        if embed_one_thumbnail(file, id, env) {
+            println!("  [{id}]: {}", doc_style::approved("embedded"));
+        } else {
+            eprintln!("  [{id}]: {}", doc_style::problematic("could not embed a thumbnail"));
+        }
+    }
+}
+
+/// The titles of the subtitle streams in an ffprobe `-select_streams s -show_entries
+/// stream=index:stream_tags=title -of default=nw=1` listing — one `TAG:title=…` line per titled
+/// stream. Split out pure so the idempotency match is unit-tested without ffprobe.
+fn subtitle_titles(listing: &str) -> Vec<String> {
+    listing.lines().filter_map(|line| line.strip_prefix("TAG:title=").map(str::to_string)).collect()
+}
+
+/// `(subtitle-stream count, their titles)` for `file`, in one ffprobe pass. `None` if ffprobe
+/// couldn't run — the caller then leaves the file untouched rather than guess. The count places
+/// new tracks at the right output index when muxing; the titles are the idempotency check.
+fn subtitle_streams(file: &Path, env: Env) -> Option<(usize, Vec<String>)> {
+    let ffprobe = env
+        .ffmpeg_dir
+        .map(|dir| dir.join("ffprobe").into_os_string())
+        .unwrap_or_else(|| "ffprobe".into());
+    let listing = capture_stdout(
+        &ffprobe,
+        [
+            OsString::from("-v"), "error".into(),
+            "-select_streams".into(), "s".into(),
+            "-show_entries".into(), "stream=index:stream_tags=title".into(),
+            "-of".into(), "default=nw=1".into(),
+            file.as_os_str().to_owned(),
+        ],
+    )?;
+    let count = listing.lines().filter(|line| line.starts_with("index=")).count();
+    Some((count, subtitle_titles(&listing)))
+}
+
+/// The title an embedded track carries for `pick` — the auto-generated stamp for an auto track,
+/// the plain name otherwise. This is what [`embed_subtitles`] matches on and writes.
+fn subtitle_title(pick: &Pick) -> String {
+    if pick.auto {
+        stamped_title(&pick.name)
+    } else {
+        pick.name.clone()
+    }
+}
+
+/// The fixed, id-based stem the subtitle patch fetches its sidecars to (`.dlsub-<id>.<key>.vtt`) —
+/// deliberately NOT the video's own filename, so a title/date drift between the on-disk file and
+/// yt-dlp's current template can't hide the freshly-fetched tracks.
+fn subtitle_sidecar(into: &Path, id: &str, key: &str) -> PathBuf {
+    into.join(format!(".dlsub-{id}.{key}.vtt"))
+}
+
+/// Fetch `keys`' subtitle sidecars for `url` (bundled yt-dlp, no media), written to the fixed
+/// [`subtitle_sidecar`] paths. Returns whether yt-dlp ran.
+fn fetch_subtitles(url: &str, id: &str, keys: &[String], into: &Path, env: Env) -> bool {
+    let mut argv = seeded(env);
+    argv.extend([
+        OsString::from("--skip-download"),
+        "--write-subs".into(),
+        "--write-auto-subs".into(),
+        "--sub-langs".into(),
+        keys.join(",").into(),
+        "--no-playlist".into(),
+        "--output".into(),
+        into.join(format!(".dlsub-{id}.%(ext)s")).into_os_string(),
+        url.into(),
+    ]);
+    let (program, args) = ytdlp_invocation(argv);
+    capture_stdout(program, args).is_some()
+}
+
+/// Mux the arrived subtitle sidecars into the mkv `file` in one ffmpeg pass, keeping every existing
+/// stream and tagging each new track's language + title. `existing` is the file's current subtitle
+/// count, so the new tracks land at the right output indices. An attached cover can't just ride
+/// `-map 0` — a remux demotes it to a plain video track (the `attached_pic` disposition doesn't
+/// survive an mkv round-trip) — so it's extracted first, excluded from the map, and re-`-attach`ed
+/// in the same pass. Renames over the original. Returns success.
+fn mux_subtitles(file: &Path, arrived: &[(&Pick, PathBuf)], existing: usize, env: Env) -> bool {
+    let ffmpeg = env
+        .ffmpeg_dir
+        .map(|dir| dir.join("ffmpeg").into_os_string())
+        .unwrap_or_else(|| "ffmpeg".into());
+    let cover_index = embedded_thumbnail_index(file, env).flatten();
+    // Extraction failing (odd, but possible) degrades to the old demote-the-cover behaviour —
+    // the exclusion below is applied only when the re-attach is actually in hand.
+    let cover = cover_index.and_then(|index| extract_thumbnail(file, index, env));
+    let out = file.with_extension("subbing.mkv");
+    let mut argv: Vec<OsString> = ["-v", "error", "-y", "-i"].map(OsString::from).to_vec();
+    argv.push(file.as_os_str().to_owned());
+    for (_, sidecar) in arrived {
+        argv.push("-i".into());
+        argv.push(sidecar.as_os_str().to_owned());
+    }
+    if let Some(tmp) = &cover {
+        argv.push("-attach".into());
+        argv.push(tmp.as_os_str().to_owned());
+    }
+    argv.extend(["-map", "0"].map(OsString::from));
+    if let (Some(index), Some(_)) = (cover_index, &cover) {
+        argv.push("-map".into());
+        argv.push(format!("-0:{index}").into());
+    }
+    for input in 1..=arrived.len() {
+        argv.push("-map".into());
+        argv.push(input.to_string().into());
+    }
+    argv.extend(["-c", "copy", "-c:s", "srt"].map(OsString::from));
+    if cover.is_some() {
+        argv.extend(
+            ["-metadata:s:t:0", "mimetype=image/jpeg", "-metadata:s:t:0", "filename=cover.jpg"]
+                .map(OsString::from),
+        );
+    }
+    for (offset, (pick, _)) in arrived.iter().enumerate() {
+        let idx = existing + offset;
+        let lang = pick.key.split('-').next().unwrap_or(&pick.key);
+        argv.push(format!("-metadata:s:s:{idx}").into());
+        argv.push(format!("language={lang}").into());
+        argv.push(format!("-metadata:s:s:{idx}").into());
+        argv.push(format!("title={}", subtitle_title(pick)).into());
+    }
+    argv.push(out.as_os_str().to_owned());
+    let ok = matches!(
+        std::process::Command::new(&ffmpeg).args(&argv).status(),
+        Ok(status) if status.success()
+    ) && std::fs::rename(&out, file).is_ok();
+    if let Some(tmp) = &cover {
+        let _ = std::fs::remove_file(tmp); // the extracted cover was only for the re-attach
+    }
+    if !ok {
+        let _ = std::fs::remove_file(&out);
+    }
+    ok
+}
+
+/// The late, opt-in (`--subtitles`) subtitle patch pass for one video: report which of its
+/// `expected` tracks are already embedded, then fetch + mux only the missing ones. Idempotent (a
+/// track whose title is already present is never re-fetched) and archive-independent (so a re-run
+/// patches an already-downloaded video). Video-only: an mkv holds subtitle streams; audio files
+/// carry their subtitles as metadata tags from the original download, so they're skipped here.
+fn embed_subtitles(into: &Path, id: &str, url: &str, expected: &[Pick], env: Env) {
+    let Some(file) = find_by_id(into, id) else {
+        println!("  [{id}]: {}", doc_style::problematic("no file found — skipping"));
+        return;
+    };
+    if file.extension().and_then(|ext| ext.to_str()) != Some("mkv") {
+        println!("  [{id}]: {}", doc_style::approved("audio — subtitles kept as tags; nothing to patch"));
+        return;
+    }
+    let Some((count, embedded)) = subtitle_streams(&file, env) else {
+        println!("  [{id}]: {}", doc_style::problematic("could not read (ffprobe) — skipping"));
+        return;
+    };
+    let missing: Vec<&Pick> = expected
+        .iter()
+        .filter(|pick| {
+            let title = subtitle_title(pick);
+            !title.is_empty() && !embedded.contains(&title)
+        })
+        .collect();
+    if missing.is_empty() {
+        println!(
+            "  [{id}]: {}",
+            doc_style::approved(&format!("all {} expected subtitle(s) already embedded", expected.len()))
+        );
+        return;
+    }
+    let want: Vec<&str> = missing.iter().map(|pick| pick.key.as_str()).collect();
+    println!("  [{id}]: {}", doc_style::problematic(&format!("missing subtitle(s): {}", want.join(", "))));
+    let keys: Vec<String> = missing.iter().map(|pick| pick.key.clone()).collect();
+    if !fetch_subtitles(url, id, &keys, into, env) {
+        eprintln!("  [{id}]: {}", doc_style::problematic("could not fetch subtitles"));
+        return;
+    }
+    let arrived: Vec<(&Pick, PathBuf)> = missing
+        .iter()
+        .filter_map(|pick| {
+            let sidecar = subtitle_sidecar(into, id, &pick.key);
+            sidecar.is_file().then_some((*pick, sidecar))
+        })
+        .collect();
+    if arrived.is_empty() {
+        eprintln!("  [{id}]: {}", doc_style::problematic("no subtitles arrived (rate-limited?)"));
+        return;
+    }
+    let ok = mux_subtitles(&file, &arrived, count, env);
+    for (_, sidecar) in &arrived {
+        let _ = std::fs::remove_file(sidecar);
+    }
+    if ok {
+        let done: Vec<&str> = arrived.iter().map(|(pick, _)| pick.key.as_str()).collect();
+        println!("  [{id}]: {}", doc_style::approved(&format!("embedded {}", done.join(", "))));
+    } else {
+        eprintln!("  [{id}]: {}", doc_style::problematic("could not embed subtitles"));
+    }
+}
+
+/// The collection `--subtitles` pass: one batch probe for every entry's expected tracks, then
+/// [`embed_subtitles`] per entry — ignoring the archive, so already-downloaded entries get patched
+/// too. `url` is the playlist/tab the entries belong to; `home` holds their files.
+fn patch_collection_subtitles(url: &str, entries: &[&ScanEntry], home: &Path, env: Env) {
+    if entries.is_empty() {
+        return;
+    }
+    println!("subtitles: scanning {} video(s)…", entries.len());
+    let indexes: Vec<String> = entries.iter().map(|entry| entry.index.clone()).collect();
+    for plan in batch_probe(url, &indexes, env) {
+        let watch = format!("https://www.youtube.com/watch?v={}", plan.id);
+        embed_subtitles(home, &plan.id, &watch, &plan.picks, env);
+    }
+}
+
 /// The downloaded file whose name carries `__<id>.` — the id rides in every output template
 /// precisely so files stay findable. A shallow recursive walk under `root`.
 fn find_by_id(root: &Path, id: &str) -> Option<PathBuf> {
@@ -691,14 +1177,23 @@ pub(crate) fn download_channel(root: &str, into: &Path, env: Env) -> i32 {
         if skipped > 0 {
             println!("{skipped} entries already archived — skipped");
         }
-        if pending.is_empty() {
-            succeeded += 1;
-            continue;
-        }
-        let tab_code =
+        let tab_code = if pending.is_empty() {
+            0
+        } else {
             download_pending(&tab_url, &pending, into, &home, env, |url, into, home, env, langs, items| {
                 channel_tab_argv(url, tab, into, home, env, langs, items)
-            });
+            })
+        };
+        // Late thumbnail pass (opt-in) over the whole tab — archived entries included, so a re-run
+        // with `--thumbnail` patches previously-downloaded videos.
+        if env.thumbnail {
+            let ids: Vec<String> = scan.entries.iter().map(|entry| entry.id.clone()).collect();
+            embed_thumbnails(&home, &ids, env);
+        }
+        if env.subtitles {
+            let entries: Vec<&ScanEntry> = scan.entries.iter().collect();
+            patch_collection_subtitles(&tab_url, &entries, &home, env);
+        }
         if tab_code == 0 {
             succeeded += 1;
         }
@@ -992,6 +1487,7 @@ fn common(archive_dir: &Path, env: Env, langs: &[String]) -> Vec<OsString> {
         .into_iter()
         .map(OsString::from)
         .collect();
+    argv.extend(ipv4_flag(env));
     if !langs.is_empty() {
         argv.extend(["--write-subs", "--write-auto-subs", "--sub-langs"].map(OsString::from));
         argv.push(langs.join(",").into());
@@ -1008,7 +1504,6 @@ fn common(archive_dir: &Path, env: Env, langs: &[String]) -> Vec<OsString> {
     argv.extend(
         [
             "--embed-metadata", "--embed-chapters",
-            "--embed-thumbnail", "--convert-thumbnails", "jpg",
             "--merge-output-format", "mkv",
             "--download-archive",
         ]
@@ -1721,7 +2216,6 @@ mod tests {
             "--sub-langs", "en,en-US,en-GB",
             "--sleep-subtitles", "2",
             "--embed-metadata", "--embed-chapters",
-            "--embed-thumbnail", "--convert-thumbnails", "jpg",
             "--merge-output-format", "mkv",
             "--ignore-errors",
             "--download-archive", "/dl/.dl_video_archive.txt",
@@ -1740,6 +2234,223 @@ mod tests {
         ] {
             assert!(!bare.iter().any(|arg| arg == absent), "{absent} leaked in");
         }
+        // Thumbnails are a late opt-in pass now, never inline in the download argv.
+        assert!(!text.iter().any(|a| a == "--embed-thumbnail"), "thumbnail must not be inline");
+    }
+
+    #[test]
+    fn the_attached_pic_index_is_read_from_ffprobes_stream_listing() {
+        // `index=N` lines each followed by that stream's dispositions (default=nw=1 layout).
+        let with_cover = "index=0\nDISPOSITION:attached_pic=0\nindex=1\nDISPOSITION:attached_pic=0\nindex=2\nDISPOSITION:attached_pic=1";
+        assert_eq!(attached_pic_stream_index(with_cover), Some(2), "the cover's absolute index");
+        let without = "index=0\nDISPOSITION:attached_pic=0\nindex=1\nDISPOSITION:attached_pic=0";
+        assert_eq!(attached_pic_stream_index(without), None, "video+audio, no cover");
+        assert_eq!(attached_pic_stream_index(""), None, "no streams");
+    }
+
+    #[test]
+    fn id_from_url_pulls_the_11_char_video_id_or_gives_up() {
+        assert_eq!(id_from_url("https://www.youtube.com/watch?v=MFT4OgFxfes").as_deref(), Some("MFT4OgFxfes"));
+        assert_eq!(id_from_url("https://youtu.be/pv21e6iEZUw?si=x").as_deref(), Some("pv21e6iEZUw"));
+        assert_eq!(
+            id_from_url("https://www.youtube.com/watch?v=7jrKjkrX3Gw&list=PLxyz").as_deref(),
+            Some("7jrKjkrX3Gw")
+        );
+        assert_eq!(id_from_url("https://www.youtube.com/shorts/abcDEF12345").as_deref(), Some("abcDEF12345"));
+        assert_eq!(id_from_url("https://example.com/video/123"), None); // no recognizable id
+    }
+
+    #[test]
+    fn subtitle_titles_reads_ffprobes_titled_streams_for_the_idempotency_match() {
+        let listing = "index=2\nTAG:title=English\nindex=3\nTAG:title=Hebrew (auto-generated)\nindex=4";
+        assert_eq!(subtitle_titles(listing), ["English", "Hebrew (auto-generated)"]);
+        assert!(subtitle_titles("index=2\nindex=3").is_empty(), "streams with no title tag → none");
+        // The title a pick is matched/written by: plain name for a real track, stamped for auto.
+        let real = Pick { key: "en".into(), name: "English".into(), auto: false };
+        let auto = Pick { key: "iw-orig".into(), name: "Hebrew (Original)".into(), auto: true };
+        assert_eq!(subtitle_title(&real), "English");
+        assert_eq!(subtitle_title(&auto), "Hebrew (auto-generated)");
+    }
+
+    // --- python-backed checks (fixture sqlite DBs; skip-with-notice when python3 is absent) ----
+
+    /// Skip-with-notice: the resolved python3 when it can do sqlite work, else `None` after
+    /// printing a visible SKIP line — the test then passes vacuously instead of failing on a
+    /// machine with no bundled or system python.
+    fn python3_or_skip(test: &str) -> Option<std::ffi::OsString> {
+        let python = crate::tools::resolve("python3");
+        let works = std::process::Command::new(&python)
+            .args(["-c", "import sqlite3"])
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !works {
+            eprintln!("SKIPPED {test}: no usable python3 (with sqlite3) available");
+        }
+        works.then_some(python)
+    }
+
+    /// Run a python snippet with `args`, returning its stdout (asserting it succeeded).
+    fn py(python: &std::ffi::OsStr, code: &str, args: &[&std::ffi::OsStr]) -> String {
+        let out = std::process::Command::new(python)
+            .arg("-c")
+            .arg(code)
+            .args(args)
+            .output()
+            .expect("run python3");
+        assert!(out.status.success(), "python failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// A fresh scratch directory under the system temp dir.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bashrs_yt_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_cookie_filter_keeps_only_target_domain_rows_and_carries_read_metadata() {
+        // The feature's privacy contract: an import copies the target site's rows — dot-hosts,
+        // the bare domain, true subdomains — and NOTHING else; lookalike hosts stay behind. The
+        // version metadata each family needs to read the copy travels with it.
+        let Some(python) = python3_or_skip("cookie filter") else { return };
+        let dir = scratch_dir("cookiefilter");
+        let domains = vec!["tiktok.com".to_string()];
+
+        // Firefox family: `moz_cookies.host`, expiry units recorded in `PRAGMA user_version`.
+        let src = dir.join("cookies.sqlite");
+        py(
+            &python,
+            r#"import sqlite3, sys, time
+con = sqlite3.connect(sys.argv[1])
+con.execute("CREATE TABLE moz_cookies (id INTEGER PRIMARY KEY, host TEXT, name TEXT, value TEXT, expiry INTEGER)")
+exp = int(time.time()) + 86400
+rows = [(".tiktok.com", "keep_dot"), ("tiktok.com", "keep_bare"), ("sub.tiktok.com", "keep_sub"),
+        ("evil.com", "other_site"), ("xtiktok.com", "suffix_lookalike"), ("tiktok.com.evil.net", "prefix_lookalike")]
+con.executemany("INSERT INTO moz_cookies (host, name, value, expiry) VALUES (?, ?, 'v', %d)" % exp, rows)
+con.execute("PRAGMA user_version = 10")
+con.commit()"#,
+            &[src.as_os_str()],
+        );
+        let store_dir = dir.join("ff_store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let store = crate::support::browsers::CookieStore {
+            label: "test firefox".into(),
+            browser: "firefox",
+            files: vec![(src, "cookies.sqlite")],
+        };
+        assert_eq!(filter_cookie_db(&store, &store_dir, &domains), Some(3), "dot + bare + subdomain, nothing else");
+        let read = py(
+            &python,
+            r#"import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+print(con.execute("PRAGMA user_version").fetchone()[0])
+for (n,) in con.execute("SELECT name FROM moz_cookies ORDER BY name"):
+    print(n)"#,
+            &[store_dir.join("cookies.sqlite").as_os_str()],
+        );
+        assert_eq!(read, "10\nkeep_bare\nkeep_dot\nkeep_sub\n", "rows filtered, user_version carried");
+
+        // Chromium family: `cookies.host_key`, encryption version in the `meta` table.
+        let src = dir.join("Cookies");
+        py(
+            &python,
+            r#"import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("CREATE TABLE cookies (creation_utc INTEGER, host_key TEXT, name TEXT, encrypted_value BLOB)")
+con.execute("CREATE TABLE meta (key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR)")
+con.execute("INSERT INTO meta VALUES ('version', '24')")
+rows = [(".tiktok.com", "keep_dot"), ("www.tiktok.com", "keep_www"), ("accounts.evil.com", "other_site")]
+con.executemany("INSERT INTO cookies (creation_utc, host_key, name, encrypted_value) VALUES (0, ?, ?, x'76')", rows)
+con.commit()"#,
+            &[src.as_os_str()],
+        );
+        let store_dir = dir.join("cr_store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let store = crate::support::browsers::CookieStore {
+            label: "test chrome".into(),
+            browser: "chrome",
+            files: vec![(src, "Cookies")],
+        };
+        assert_eq!(filter_cookie_db(&store, &store_dir, &domains), Some(2));
+        let read = py(
+            &python,
+            r#"import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+print(con.execute("SELECT value FROM meta WHERE key='version'").fetchone()[0])
+for (n,) in con.execute("SELECT name FROM cookies ORDER BY name"):
+    print(n)"#,
+            &[store_dir.join("Cookies").as_os_str()],
+        );
+        assert_eq!(read, "24\nkeep_dot\nkeep_www\n", "rows filtered, meta carried");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_expiry_probe_reads_both_epochs_and_never_cries_wolf_on_session_cookies() {
+        let Some(python) = python3_or_skip("cookie expiry") else { return };
+        let dir = scratch_dir("cookieexpiry");
+        // One builder for both families: rows are `past`/`future`/`session`, converted to the
+        // family's epoch (firefox: unix seconds; chromium: microseconds since 1601).
+        let builder = r#"import sqlite3, sys, time
+db, kind, rows = sys.argv[1], sys.argv[2], sys.argv[3].split(",")
+now = int(time.time())
+val = {"past": now - 86400, "future": now + 86400, "session": 0}
+table, col = ("moz_cookies", "expiry") if kind == "firefox" else ("cookies", "expires_utc")
+con = sqlite3.connect(db)
+con.execute("CREATE TABLE %s (%s INTEGER)" % (table, col))
+for r in rows:
+    e = val[r]
+    if kind != "firefox" and e:
+        e = int((e + 11644473600) * 1000000)
+    con.execute("INSERT INTO %s VALUES (?)" % table, (e,))
+con.commit()"#;
+        let case = |name: &str, kind: &str, rows: &str| {
+            let db = dir.join(name);
+            py(&python, builder, &[db.as_os_str(), kind.as_ref(), rows.as_ref()]);
+            cookies_expired(&db, kind)
+        };
+        assert_eq!(case("ff_dead", "firefox", "past,past"), Some(true), "all past → expired");
+        assert_eq!(case("ff_live", "firefox", "past,future"), Some(false), "one live → live");
+        assert_eq!(case("ff_sess", "firefox", "session,session"), Some(false), "session-only → never a false alarm");
+        assert_eq!(case("cr_dead", "chromium", "past"), Some(true), "webkit epoch converts");
+        assert_eq!(case("cr_live", "chromium", "past,future"), Some(false));
+        assert_eq!(case("cr_sess", "chromium", "session"), Some(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_thumbnail_pass_leaves_non_mkv_files_untouched() {
+        // Regression: the cover attaches via an mkv remux — renaming that over an audio file
+        // would swap its container. The pass must skip non-mkv files without touching them
+        // (guard fires before any ffprobe/fetch, so this runs fully offline).
+        let dir = scratch_dir("thumbguard");
+        let file = dir.join("song__abcdefghijk.opus");
+        std::fs::write(&file, b"OPUSDATA").unwrap();
+        embed_thumbnails(&dir, &["abcdefghijk".to_string()], Env::default());
+        assert_eq!(std::fs::read(&file).unwrap(), b"OPUSDATA", "audio bytes must be untouched");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name() != "song__abcdefghijk.opus")
+            .collect();
+        assert!(leftovers.is_empty(), "no temp or mkv artifacts may appear: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ipv4_is_forced_by_default_on_probe_and_download_unless_allow_ipv6() {
+        // Default: every network invocation forces IPv4 — a broken IPv6 route otherwise stalls
+        // each request ~5s on the happy-eyeballs fallback.
+        assert!(seeded(Env::default()).iter().any(|a| a == "--force-ipv4"), "probe forces v4");
+        let dl = common(Path::new("/dl"), Env::default(), &[]);
+        assert!(dl.iter().any(|a| a == "--force-ipv4"), "download forces v4");
+        // `--allow-ipv6` opts back out, on both paths.
+        let v6 = Env { allow_ipv6: true, ..Default::default() };
+        assert!(!seeded(v6).iter().any(|a| a == "--force-ipv4"), "probe honors --allow-ipv6");
+        let dl6 = common(Path::new("/dl"), v6, &[]);
+        assert!(!dl6.iter().any(|a| a == "--force-ipv4"), "download honors --allow-ipv6");
     }
 
     #[test]
