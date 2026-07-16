@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# A yt-dlp stand-in for the offline tests (tests/dl_stubbed_flows.rs): deterministic and
-# network-free. The tests put this first on PATH (as `yt-dlp`) under a scratch HOME with no
-# bundled tools, so the binary's own resolution lands here.
+# A yt-dlp stand-in for the offline tests (tests/dl_stubbed_flows.rs, tests/dl_cookie_import.rs):
+# deterministic and network-free. The tests put this first on PATH (as `yt-dlp`) under a scratch
+# HOME with no bundled tools, so the binary's own resolution lands here.
+#
+# Bash builtins only — no cat/cp/touch — so it also runs on the cookie-import rig's HERMETIC
+# PATH, which holds nothing but {yt-dlp, python3, bash}.
 #
 # Contract:
 #   BASHRS_STUB_DIR   scratch dir — every invocation's argv is appended to calls.log; scan.txt
@@ -25,6 +28,13 @@ args=" $* "
 dir="${BASHRS_STUB_DIR:?BASHRS_STUB_DIR must point at the test scratch dir}"
 printf '%s\n' "$*" >> "$dir/calls.log"
 
+# Print a replay file's contents — the builtin stand-in for `cat`. (`$(<f)` strips trailing
+# newlines and printf restores one; line-oriented consumers see identical text. An absent or
+# empty file prints nothing, like `cat` on an empty file.)
+emit() {
+    if [[ -s "$1" ]]; then printf '%s\n' "$(<"$1")"; fi
+}
+
 # A flat scan. Channel-tab URLs get per-tab behaviour so one channel run exercises every
 # TabScan outcome: videos → the scan, shorts → yt-dlp's "no such tab" error, streams → a hard
 # failure, playlists → scan_playlists.txt (empty ⇒ a reachable-but-empty tab).
@@ -37,18 +47,18 @@ if [[ "$args" == *" --flat-playlist "* ]]; then
             echo "ERROR: Unable to download webpage" >&2
             exit 1 ;;
         *"/playlists "*)
-            if [[ -f "$dir/scan_playlists.txt" ]]; then cat "$dir/scan_playlists.txt"; fi
+            emit "$dir/scan_playlists.txt"
             exit 0 ;;
         *)
-            cat "$dir/scan.txt"
+            emit "$dir/scan.txt"
             exit 0 ;;
     esac
 fi
 if [[ "$args" == *" --print "* ]]; then
     if [[ "$args" == *" --playlist-items "* ]]; then
-        cat "$dir/probe.txt"
+        emit "$dir/probe.txt"
     elif [[ -f "$dir/video_probe.txt" ]]; then
-        cat "$dir/video_probe.txt"
+        emit "$dir/video_probe.txt"
     else
         printf 'stubvid0000\nNA\nNA\nNA\n'
     fi
@@ -67,10 +77,10 @@ for arg in "$@"; do
 done
 succeed() {
     if [[ -n "$archive" && -f "$dir/archive_adds.txt" ]]; then
-        cat "$dir/archive_adds.txt" >> "$archive"
+        printf '%s\n' "$(<"$dir/archive_adds.txt")" >> "$archive"
     fi
     if [[ -n "$cookies_out" && -f "$dir/cookie_dump.txt" ]]; then
-        cp "$dir/cookie_dump.txt" "$cookies_out"
+        printf '%s\n' "$(<"$dir/cookie_dump.txt")" > "$cookies_out"
     fi
     exit 0
 }
@@ -90,7 +100,7 @@ case "${BASHRS_STUB_MODE:-ok}" in
         exit 1 ;;
     fail_once_then_ok)
         if [[ -e "$dir/failed_once" ]]; then succeed; fi
-        touch "$dir/failed_once"
+        : > "$dir/failed_once"
         echo "ERROR: transient stub failure" >&2
         exit 1 ;;
     members)

@@ -32,6 +32,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crate::support::exec;
 use crate::support::package_management as pm;
 
 /// A copyable cookie store found on disk, ready for the `--cookie-import` menu.
@@ -256,15 +257,25 @@ fn flavor(root: &Path) -> &'static str {
     }
 }
 
-/// Whether any known browser looks installed (native binary, or a sandbox profile dir present),
-/// even without a cookie store yet — lets the caller tell "no browsers" from "browsers, but you
-/// haven't signed in anywhere yet".
+/// Whether any known browser looks installed (a binary on PATH or under a package manager's
+/// root, or a sandbox profile dir present), even without a cookie store yet — lets the caller
+/// tell "no browsers" from "browsers, but you haven't signed in anywhere yet". Deliberately
+/// machine-wide; the PATH half makes it untestable from a fake HOME, so the home-derived
+/// evidence is split into [`browser_under_home`], which the tests pin.
 pub fn any_browser_installed(home: &Path) -> bool {
+    FAMILIES.iter().any(|family| family.binaries.iter().any(|bin| exec::on_path(bin)))
+        || browser_under_home(home)
+}
+
+/// The home-derived installation evidence: a browser binary under a package manager's bin root,
+/// or a sandbox (flatpak/snap) per-app home dir — everything [`any_browser_installed`] can see
+/// without consulting PATH.
+fn browser_under_home(home: &Path) -> bool {
     FAMILIES.iter().any(|family| {
-        family.binaries.iter().any(|bin| pm::native_binary_present(home, bin))
+        family.binaries.iter().any(|bin| pm::manager_binary_present(home, bin))
             || pm::app_home_roots(home, family.flatpak_id, family.snap_name)
                 .iter()
-                .skip(1) // skip the native home (covered by the binary check)
+                .skip(1) // skip the native home (no binary lives in $HOME itself)
                 .any(|root| root.is_dir())
     })
 }
@@ -636,16 +647,18 @@ mod tests {
 
     #[test]
     fn nothing_is_found_on_a_bare_home() {
+        // `browser_under_home`, not `any_browser_installed`: the latter also consults PATH, so
+        // asserting it here would fail on any machine that has a real browser installed.
         let h = FakeHome::new("bare");
         assert!(cookie_stores(&h.0).is_empty());
-        assert!(!any_browser_installed(&h.0));
+        assert!(!browser_under_home(&h.0));
     }
 
     #[test]
-    fn any_browser_installed_notices_a_sandbox_profile_without_cookies() {
+    fn a_sandbox_profile_under_home_counts_as_installed_even_without_cookies() {
         let h = FakeHome::new("installed");
         h.touch(".var/app/org.chromium.Chromium/config/chromium/Default/Preferences");
-        assert!(any_browser_installed(&h.0), "a flatpak profile dir counts as installed");
+        assert!(browser_under_home(&h.0), "a flatpak profile dir counts as installed");
         assert!(cookie_stores(&h.0).is_empty(), "but with no cookie DB there is nothing to import");
     }
 

@@ -2,8 +2,13 @@
 //! cookie DBs inside fake browser profiles under a scratch HOME, the real binary, python3 doing
 //! the actual row filtering, and the scripted yt-dlp stand-in (tests/fixtures/yt_dlp_stub.sh)
 //! making the readability verdicts deterministic. The heart of it is the feature's privacy
-//! contract: ONLY the target site's rows ever reach bashrs's disk. Network-free; the sqlite-backed
-//! tests need a python3 (skip-with-notice otherwise).
+//! contract: ONLY the target site's rows ever reach bashrs's disk.
+//!
+//! The child's world is HERMETIC: its PATH holds only the rig's bin dir — the stub as `yt-dlp`,
+//! a HOME-independent `python3`, and `bash` for the stub's shebang. Anything less deterministic
+//! leaks the running machine in: real browsers on PATH flip `any_browser_installed`'s message,
+//! and the bashrs venv shim (`exec "$HOME/…"`, expanded at runtime) resolves to nothing under
+//! the scratch HOME. Network-free; the sqlite-backed tests skip-with-notice without a python3.
 
 use std::fs;
 use std::io::Write;
@@ -13,18 +18,47 @@ use std::process::{Command, Output, Stdio};
 
 const YT_VIDEO: &str = "https://www.youtube.com/watch?v=stubvid0000";
 
-/// Skip-with-notice: PATH python3 when it can do sqlite work (the same fallback the binary
-/// itself lands on under a scratch HOME with no bundled tools), else `None` after a visible
-/// SKIP line — the test then passes vacuously instead of failing on a bare machine.
-fn python3_or_skip(test: &str) -> Option<PathBuf> {
-    let works = Command::new("python3")
-        .args(["-c", "import sqlite3"])
-        .output()
-        .is_ok_and(|out| out.status.success());
-    if !works {
-        eprintln!("SKIPPED {test}: no python3 (with sqlite3) on PATH");
+/// The first existing file among fixed guesses for `name`, then every PATH dir — for wiring
+/// real binaries (bash, python) into the rig's hermetic bin dir by absolute path.
+fn locate(name: &str, fixed: &[&str]) -> Option<PathBuf> {
+    let from_path = std::env::var_os("PATH").map(|paths| {
+        std::env::split_paths(&paths).map(|dir| dir.join(name)).collect::<Vec<_>>()
+    });
+    fixed
+        .iter()
+        .map(PathBuf::from)
+        .chain(from_path.unwrap_or_default())
+        .find(|candidate| candidate.is_file())
+}
+
+/// Skip-with-notice: an absolute python3 that works independently of `$HOME`. The bashrs venv
+/// shim that machines with the sourcefile loaded have first on PATH `exec`s a `$HOME`-relative
+/// path (expanded at runtime), so under the rig's scratch HOME it points at nothing — every
+/// candidate is therefore probed with a bogus HOME and the first real interpreter wins. `None`
+/// (after a visible SKIP line) when no candidate works; the test then passes vacuously.
+fn hermetic_python3(test: &str) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> =
+        ["/usr/bin/python3", "/usr/local/bin/python3", "/bin/python3"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            candidates.push(dir.join("python3"));
+            candidates.push(dir.join("python"));
+        }
     }
-    works.then(|| PathBuf::from("python3"))
+    let found = candidates.into_iter().filter(|path| path.is_file()).find(|path| {
+        Command::new(path)
+            .env("HOME", "/nonexistent")
+            .args(["-c", "import sqlite3"])
+            .output()
+            .is_ok_and(|out| out.status.success())
+    });
+    if found.is_none() {
+        eprintln!("SKIPPED {test}: no HOME-independent python3 (with sqlite3) found");
+    }
+    found
 }
 
 /// Run a python snippet with `args`, asserting success.
@@ -40,8 +74,8 @@ fn py_read(python: &Path, code: &str, args: &[&std::ffi::OsStr]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// One test's world: a scratch HOME (profiles + bashrs state), a download dir, and the yt-dlp
-/// stand-in on PATH with its state dir. Removed on drop.
+/// One test's world: a scratch HOME (profiles + bashrs state), a download dir, the stub's state
+/// dir, and the hermetic bin dir that becomes the child's ENTIRE PATH. Removed on drop.
 struct Rig {
     root: PathBuf,
     home: PathBuf,
@@ -50,7 +84,9 @@ struct Rig {
 }
 
 impl Rig {
-    fn new(tag: &str) -> Rig {
+    /// `python`: the HOME-independent interpreter to expose as the child's `python3` (tests
+    /// whose flow never reaches python pass `None`).
+    fn new(tag: &str, python: Option<&Path>) -> Rig {
         let root =
             std::env::temp_dir().join(format!("bashrs_dl_import_{tag}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -63,20 +99,29 @@ impl Rig {
         let ytdlp = bin.join("yt-dlp");
         fs::copy(&script, &ytdlp).unwrap();
         fs::set_permissions(&ytdlp, fs::Permissions::from_mode(0o755)).unwrap();
+        // The stub's `#!/usr/bin/env bash` resolves bash via the child's (hermetic) PATH.
+        if let Some(bash) = locate("bash", &["/bin/bash", "/usr/bin/bash"]) {
+            let _ = std::os::unix::fs::symlink(bash, bin.join("bash"));
+        }
+        if let Some(python) = python {
+            let _ = std::os::unix::fs::symlink(python, bin.join("python3"));
+        }
         Rig { root, home, into, stub }
     }
 
+    fn bin(&self) -> PathBuf {
+        self.root.join("bin")
+    }
+
     /// Run `bashrs <args…>` in the rig's world, optionally feeding stdin (the `_pick` menu).
+    /// PATH is the rig's bin dir ALONE — hermetic on purpose: the machine's own PATH would leak
+    /// real browsers (flipping the installed-browser message) and `$HOME`-relative python shims
+    /// (broken under the scratch HOME) into the child.
     fn run(&self, mode: &str, args: &[&str], stdin: Option<&str>) -> Output {
-        let path = format!(
-            "{}:{}",
-            self.root.join("bin").display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_bashrs"));
         cmd.args(args)
             .env("HOME", &self.home)
-            .env("PATH", path)
+            .env("PATH", self.bin())
             .env("BASHRS_STUB_DIR", &self.stub)
             .env("BASHRS_STUB_MODE", mode);
         match stdin {
@@ -169,8 +214,8 @@ for (n,) in con.execute("SELECT name FROM %s ORDER BY name" % table):
 
 #[test]
 fn cookie_import_copies_only_the_target_sites_rows_and_records_the_store() {
-    let Some(python) = python3_or_skip("cookie import e2e") else { return };
-    let rig = Rig::new("happy");
+    let Some(python) = hermetic_python3("cookie import e2e") else { return };
+    let rig = Rig::new("happy", Some(&python));
     build_firefox_profile(&python, &rig, "tiktok.com");
     readable_dump(&rig, "tiktok.com");
 
@@ -198,8 +243,8 @@ fn cookie_import_copies_only_the_target_sites_rows_and_records_the_store() {
 
 #[test]
 fn a_store_whose_cookies_cannot_be_read_back_is_discarded_not_kept_broken() {
-    let Some(python) = python3_or_skip("zero-decrypt verdict") else { return };
-    let rig = Rig::new("zerodecrypt");
+    let Some(python) = hermetic_python3("zero-decrypt verdict") else { return };
+    let rig = Rig::new("zerodecrypt", Some(&python));
     build_firefox_profile(&python, &rig, "tiktok.com");
     // The stub's "extraction" yields a dump with no cookie rows — the filtered store is useless.
     fs::write(rig.stub.join("cookie_dump.txt"), "# Netscape HTTP Cookie File\n# empty\n").unwrap();
@@ -214,8 +259,8 @@ fn a_store_whose_cookies_cannot_be_read_back_is_discarded_not_kept_broken() {
 
 #[test]
 fn an_unverifiable_import_keeps_the_store_provisionally() {
-    let Some(python) = python3_or_skip("unverifiable verdict") else { return };
-    let rig = Rig::new("unverifiable");
+    let Some(python) = hermetic_python3("unverifiable verdict") else { return };
+    let rig = Rig::new("unverifiable", Some(&python));
     build_firefox_profile(&python, &rig, "tiktok.com");
     // The readability probe itself dies (mode `fail`) — the count is unknowable, so the store
     // stays on its provisional count rather than being overclaimed or thrown away.
@@ -228,8 +273,8 @@ fn an_unverifiable_import_keeps_the_store_provisionally() {
 
 #[test]
 fn cookie_import_with_a_url_falls_through_to_a_download_using_the_fresh_store() {
-    let Some(python) = python3_or_skip("import fall-through") else { return };
-    let rig = Rig::new("fallthrough");
+    let Some(python) = hermetic_python3("import fall-through") else { return };
+    let rig = Rig::new("fallthrough", Some(&python));
     build_firefox_profile(&python, &rig, "youtube.com");
     readable_dump(&rig, "youtube.com");
 
@@ -254,8 +299,8 @@ fn cookie_import_with_a_url_falls_through_to_a_download_using_the_fresh_store() 
 
 #[test]
 fn multiple_stores_prompt_a_menu_and_honor_or_reject_the_choice() {
-    let Some(python) = python3_or_skip("store menu") else { return };
-    let rig = Rig::new("menu");
+    let Some(python) = hermetic_python3("store menu") else { return };
+    let rig = Rig::new("menu", Some(&python));
     build_firefox_profile(&python, &rig, "tiktok.com");
     // A second store: a legacy flat Chromium profile (values encrypted; irrelevant to the menu).
     let chrome = rig.home.join(".config/google-chrome/Default");
@@ -292,7 +337,7 @@ con.commit()"#,
 
 #[test]
 fn an_expired_store_warns_in_red_before_the_download_and_a_live_one_stays_silent() {
-    let Some(python) = python3_or_skip("expiry warning") else { return };
+    let Some(python) = hermetic_python3("expiry warning") else { return };
     // Seed an already-imported store directly (spec + a real cookie DB), with the given expiry.
     let seed = |rig: &Rig, expiry: &str| {
         let site = rig.site_dir("youtube");
@@ -310,7 +355,7 @@ con.commit()"#,
         );
     };
 
-    let rig = Rig::new("expired");
+    let rig = Rig::new("expired", Some(&python));
     seed(&rig, "past");
     let into = rig.into.to_string_lossy().into_owned();
     let out = rig.run("ok", &["dl", YT_VIDEO, "--into", &into], None);
@@ -321,7 +366,7 @@ con.commit()"#,
         "the red heads-up names the fix: {all}"
     );
 
-    let rig = Rig::new("live");
+    let rig = Rig::new("live", Some(&python));
     seed(&rig, "future");
     let into = rig.into.to_string_lossy().into_owned();
     let out = rig.run("ok", &["dl", YT_VIDEO, "--into", &into], None);
@@ -331,7 +376,7 @@ con.commit()"#,
 
 #[test]
 fn an_unresolvable_import_target_is_rejected_before_touching_anything() {
-    let rig = Rig::new("reject");
+    let rig = Rig::new("reject", None);
     let out = rig.import("ok", "tiktok2");
     assert!(!out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("isn't a site I can target"), "{}", text(&out));
@@ -343,8 +388,27 @@ fn an_unresolvable_import_target_is_rejected_before_touching_anything() {
 
 #[test]
 fn import_on_a_machine_with_no_browser_stores_reports_and_fails() {
-    let rig = Rig::new("bare");
+    // The hermetic PATH holds no browser binaries, so the "no browsers at all" branch is
+    // deterministic here — regardless of what the running machine has installed.
+    let rig = Rig::new("bare", None);
     let out = rig.import("ok", "tiktok");
     assert!(!out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("no browser cookie stores found"), "{}", text(&out));
+}
+
+#[test]
+fn a_browser_on_path_without_stores_prompts_a_sign_in_instead() {
+    // The sibling branch: a browser binary IS reachable (planted on the hermetic PATH) but no
+    // profile holds cookies yet — the message should invite a sign-in, not claim no browsers.
+    let rig = Rig::new("nostores", None);
+    let firefox = rig.bin().join("firefox");
+    fs::write(&firefox, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+    fs::set_permissions(&firefox, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = rig.import("ok", "tiktok");
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("found browsers but no cookie stores yet"),
+        "{}",
+        text(&out)
+    );
 }

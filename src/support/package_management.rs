@@ -77,8 +77,14 @@ pub fn present(home: &Path) -> Vec<&'static Manager> {
 /// extra roots (so a Nix- or Homebrew-installed program is found even when its environment
 /// isn't sourced). Backs [`crate::support::browsers`]'s native-install detection.
 pub fn native_binary_present(home: &Path, bin: &str) -> bool {
-    exec::on_path(bin)
-        || MANAGERS.iter().any(|m| m.bin_roots.iter().any(|r| expand(home, r).join(bin).exists()))
+    exec::on_path(bin) || manager_binary_present(home, bin)
+}
+
+/// The home-derived half of [`native_binary_present`]: `bin` under a package manager's bin root
+/// (Nix profile, Homebrew, …). No PATH consultation, so a fake-HOME test stays deterministic on
+/// machines that have the real program installed.
+pub fn manager_binary_present(home: &Path, bin: &str) -> bool {
+    MANAGERS.iter().any(|m| m.bin_roots.iter().any(|r| expand(home, r).join(bin).exists()))
 }
 
 /// Every candidate *home* root an app's data might sit under — the native `$HOME`, plus each

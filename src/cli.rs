@@ -376,8 +376,10 @@ fn wrappers() -> String {
         // that don't maintain PS1's invariant (non-interactive zsh keeps a default PS1).
         // `return 0` explicitly, so the early-out doesn't parrot the caller's stale status.
         out += "\ncase $- in *i*) ;; *) return 0 ;; esac  # interactive shells only — non-interactive contexts must inherit nothing\n";
-        // Bail early (before defining anything) if the binary isn't present.
-        out += &format!("[ -f {BIN} ] || return\n");
+        // Bail early (before defining anything) if the binary isn't present. `return 0`, not a
+        // bare `return`: bare would silently forward the failed test's status 1 to whatever
+        // sourced this file, and a not-yet-installed bashrs is a quiet no-op, not an error.
+        out += &format!("[ -f {BIN} ] || return 0\n");
         out += &body;
     }
     out
@@ -633,7 +635,7 @@ mod tests {
         let guard =
             script.find("case $- in *i*) ;; *) return 0 ;; esac").expect("interactivity guard missing");
         assert_eq!(script.matches("case $- in").count(), 1, "exactly one guard");
-        let binary = script.find("[ -f \"$HOME/.bashrs/bashrs\" ] || return").expect("binary guard");
+        let binary = script.find("[ -f \"$HOME/.bashrs/bashrs\" ] || return 0").expect("binary guard");
         let first_definition = script.find("() {").expect("some wrapper");
         assert!(guard < binary && binary < first_definition, "guards first, cheapest first");
     }
@@ -693,7 +695,9 @@ mod tests {
 
     #[test]
     fn wrappers_bail_early_when_the_binary_is_missing() {
-        assert!(wrappers().contains("[ -f \"$HOME/.bashrs/bashrs\" ] || return"));
+        // `return 0` explicitly: a bare `return` would forward the failed test's status 1 to
+        // whatever sourced the file, and "bashrs isn't installed" is a no-op, not an error.
+        assert!(wrappers().contains("[ -f \"$HOME/.bashrs/bashrs\" ] || return 0"));
     }
 
     #[test]

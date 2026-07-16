@@ -120,6 +120,14 @@ fn mtime(file: &Path) -> std::time::SystemTime {
     std::fs::metadata(file).unwrap().modified().unwrap()
 }
 
+/// Whether yt-dlp reported YouTube's caption endpoint refusing tracks (429s freely, datacenter
+/// IPs especially). A live-environment condition, not a product failure: subtitle tracks are
+/// must-try by design, so subtitle-content assertions degrade to a skip-with-notice while
+/// everything else stays strict.
+fn subs_refused(out: &str) -> bool {
+    out.contains("Unable to download video subtitles")
+}
+
 /// Remux `file` in place down to its primary video + audio — dropping subtitles and the attached
 /// cover — manufacturing the table's "video only" state from a fully-dressed file. (The other
 /// intermediate states are reached through the flags themselves: `--thumbnail` on a bare video
@@ -138,13 +146,18 @@ fn strip_to_bare(file: &Path) {
 #[test]
 #[ignore = "network: downloads from YouTube; needs the bundled yt-dlp/ffmpeg/deno"]
 fn existing_video_states_get_patched_only_where_the_table_says_so() {
-    let _serial = SERIAL.lock().unwrap();
+    let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = scratch("states");
 
     // not downloaded × `dl` → the video lands with subtitles embedded, and no thumbnail.
     let out = dl(&dir, &[]);
     let file = video_file(&dir);
-    assert!(subtitle_count(&file) > 0, "a plain download embeds subtitles:\n{out}");
+    let subs_ok = !subs_refused(&out);
+    if subs_ok {
+        assert!(subtitle_count(&file) > 0, "a plain download embeds subtitles:\n{out}");
+    } else {
+        eprintln!("SKIPPED subtitle-content assertions: YouTube 429'd the caption endpoint this run");
+    }
     assert!(!has_thumbnail(&file), "a plain download must not embed a thumbnail:\n{out}");
 
     // video+subs × `dl` → — (skipped outright, file untouched, no patch passes).
@@ -168,12 +181,15 @@ fn existing_video_states_get_patched_only_where_the_table_says_so() {
     assert_eq!(mtime(&file), before, "no re-embed when the thumbnail is already there");
 
     // video+thumb+subs × `--subtitles` → — (the forced scan finds every expected track present).
-    let before = mtime(&file);
-    let out = dl(&dir, &["--subtitles"]);
-    assert!(out.contains("already downloaded — scanning subtitles"), "{out}");
-    assert!(out.contains("expected subtitle(s) already embedded"), "{out}");
-    assert!(!out.contains("missing subtitle"), "{out}");
-    assert_eq!(mtime(&file), before, "no re-mux when the subtitles are already there");
+    // Only meaningful when the subs actually landed; under a caption 429 the state is video+thumb.
+    if subs_ok {
+        let before = mtime(&file);
+        let out = dl(&dir, &["--subtitles"]);
+        assert!(out.contains("already downloaded — scanning subtitles"), "{out}");
+        assert!(out.contains("expected subtitle(s) already embedded"), "{out}");
+        assert!(!out.contains("missing subtitle"), "{out}");
+        assert_eq!(mtime(&file), before, "no re-mux when the subtitles are already there");
+    }
 
     // video only × `--thumbnail` → dl thumb (reaching the "video+thumb" state through the flag).
     strip_to_bare(&file);
@@ -185,17 +201,23 @@ fn existing_video_states_get_patched_only_where_the_table_says_so() {
     assert_eq!(subtitle_count(&file), 0, "the thumbnail pass must not add subtitles");
 
     // video+thumb × `--subtitles` → dl subs (and the mux must not drop the cover art).
-    let out = dl(&dir, &["--subtitles"]);
-    assert!(out.contains("missing subtitle(s):") && out.contains("embedded"), "{out}");
-    assert!(subtitle_count(&file) > 0, "subtitles patched back in:\n{out}");
-    assert!(has_thumbnail(&file), "the subtitle mux must not drop the cover art");
+    // The patch fetch hits the same throttled endpoint, so it too is gated on captions flowing.
+    if subs_ok {
+        let out = dl(&dir, &["--subtitles"]);
+        assert!(out.contains("missing subtitle(s):") && out.contains("embedded"), "{out}");
+        assert!(subtitle_count(&file) > 0, "subtitles patched back in:\n{out}");
+        assert!(has_thumbnail(&file), "the subtitle mux must not drop the cover art");
+    }
 
     // video only × `--thumbnail --subtitles` → dl subs + dl thumb.
     strip_to_bare(&file);
     let out = dl(&dir, &["--thumbnail", "--subtitles"]);
     assert!(out.contains("missing a thumbnail"), "{out}");
-    assert!(out.contains("missing subtitle(s):"), "{out}");
-    assert!(has_thumbnail(&file) && subtitle_count(&file) > 0, "both patched:\n{out}");
+    assert!(out.contains("missing subtitle(s):"), "the probe still names the expected tracks: {out}");
+    assert!(has_thumbnail(&file), "the thumbnail half patched:\n{out}");
+    if subs_ok {
+        assert!(subtitle_count(&file) > 0, "the subtitle half patched:\n{out}");
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -206,17 +228,20 @@ fn existing_video_states_get_patched_only_where_the_table_says_so() {
 #[test]
 #[ignore = "network: downloads from YouTube; needs the bundled yt-dlp/ffmpeg/deno"]
 fn a_fresh_download_with_both_flags_lands_video_subs_and_thumbnail_in_one_run() {
-    let _serial = SERIAL.lock().unwrap();
+    let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = scratch("fresh_both");
 
     let out = dl(&dir, &["--thumbnail", "--subtitles"]);
     let file = video_file(&dir);
-    assert!(subtitle_count(&file) > 0, "subtitles rode the download:\n{out}");
     assert!(has_thumbnail(&file), "the thumbnail pass ran after the download:\n{out}");
-    // Subtitles arrived inline, so the pass reports them present rather than fetching twice.
-    // (Would flake only if YouTube 429'd a track during the download itself.)
-    assert!(out.contains("expected subtitle(s) already embedded"), "subs fetched once, not twice:\n{out}");
     assert!(out.contains("missing a thumbnail"), "the thumbnail is never part of the download:\n{out}");
+    if subs_refused(&out) {
+        eprintln!("SKIPPED subtitle-content assertions: YouTube 429'd the caption endpoint this run");
+    } else {
+        assert!(subtitle_count(&file) > 0, "subtitles rode the download:\n{out}");
+        // Subtitles arrived inline, so the pass reports them present rather than fetching twice.
+        assert!(out.contains("expected subtitle(s) already embedded"), "subs fetched once, not twice:\n{out}");
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
