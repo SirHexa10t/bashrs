@@ -5,12 +5,24 @@ mod commands {
     use crate::conf::config_file;
     use crate::support::args::NoArgs;
     use crate::support::{exec, theme_code};
+    use clap::Args;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
+    /// Everything after the command, forwarded verbatim to COMPILE.sh — the script owns its
+    /// flag set (and rejects unknowns loudly), so nothing needs re-declaring here when it
+    /// grows one. The cost: clap can't list or TAB-complete the flags; COMPILE.sh's header
+    /// documents them (currently --use-stable-cargo, --use-stable-carstay).
+    #[derive(Args)]
+    pub struct CompileArgs {
+        /// Flags for COMPILE.sh (e.g. --use-stable-cargo, --use-stable-carstay — see its header)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    }
+
     /// Recompile and reinstall bashrs by running the project's COMPILE.sh
     #[after("session_new")] // start a fresh shell after a successful compile
-    pub fn compile(_args: NoArgs) {
+    pub fn compile(_args: CompileArgs) {
         // The project path is captured at build time (`CARGO_MANIFEST_DIR`), so
         // if the project was moved — or COMPILE.sh renamed — since the last
         // compile, report that clearly instead of failing obscurely.
@@ -25,7 +37,7 @@ mod commands {
                 std::process::exit(1);
             }
         };
-        match Command::new("bash").arg(&script).current_dir(project).status() {
+        match Command::new("bash").arg(&script).args(&_args.args).current_dir(project).status() {
             // Signal the wrapper to start a fresh session — only on a real success.
             Ok(status) if status.success() => std::process::exit(crate::conf::RELOAD_EXIT_CODE),
             Ok(status) => {

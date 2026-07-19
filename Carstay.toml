@@ -1,0 +1,18 @@
+# Non-Cargo dependencies as provisioned on this machine — rewritten by `bashrs install-stainless`
+# (COMPILE.sh / bashrs_compile) after every sync, all sections in one move. Commit it
+# alongside code: when an upstream release breaks something, `git log Carstay.toml`
+# names the last-known-good versions — and `./COMPILE.sh --use-stable-carstay` provisions THESE
+# recorded versions instead of the latest releases (the file becomes the input then,
+# and is not rewritten). Values are release tags (ffmpeg: its release channel —
+# same-channel rebuilds share one id); repos record their clone's commit; "system"
+# means the machine provides the tool itself, so nothing was bundled.
+
+[tools]
+ffmpeg = "n8.1"
+yt-dlp = "2026.07.04"
+uv = "0.11.29"
+python = "3.14.6"
+deno = "v2.9.3"
+
+[stainless_comfy]
+contAInerized = "ead32d56f3365dbac0c3b091807632fa5767e07a"

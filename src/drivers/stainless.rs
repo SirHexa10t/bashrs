@@ -3,7 +3,7 @@
 //! `const` table plus functions that turn it into shell lines — no macro, no clap command.
 //!
 //! Two consumers of the one table:
-//! - [`sync`] — run by the separate `stainless_sync` binary from `COMPILE.sh` (never installed):
+//! - [`sync`] — run by the hidden `install-stainless` command from `COMPILE.sh`:
 //!   clone or update each repo.
 //! - [`aliases`] — run by the main binary's [`crate::cli`] generator: emit one alias per repo, asking
 //!   the (freshly cloned) tool itself for its `--help` description to use as the inline comment.
@@ -60,19 +60,46 @@ fn exe_shell(comfy: &Comfy) -> String {
     format!("$HOME/{CLONE_BASE}/{}/{}", repo_name(comfy.repo), comfy.exe)
 }
 
-/// SIDE EFFECTS — the `stainless_sync` binary runs this at compile time: clone each repo if missing,
-/// else best-effort `git pull`. Never aborts; a git failure just warns and the alias is emitted
-/// anyway (pointing at its expected path). The `--help` description is read later, by [`aliases`].
-pub fn sync() {
+/// SIDE EFFECTS — `install-stainless` runs this at compile time: clone each repo if
+/// missing, else best-effort `git pull`. Never aborts; a git failure just warns and the alias is
+/// emitted anyway (pointing at its expected path). The `--help` description is read later, by
+/// [`aliases`]. A `pins` entry (a Carstay.toml revision, in `--use-stable-carstay` mode) puts that clone AT
+/// the recorded commit — fetched explicitly and hard-reset, which discards nothing of the user's:
+/// these clones are read-only mirrors.
+pub fn sync(pins: &[(String, String)]) {
     for comfy in STAINLESS {
         let dir = clone_dir(comfy);
-        if dir.exists() {
-            git(Command::new("git").arg("-C").arg(&dir).args(["pull", "--ff-only"]), comfy.repo);
-        } else {
+        let name = repo_name(comfy.repo);
+        let existed = dir.exists();
+        if !existed {
             if let Some(parent) = dir.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             git(Command::new("git").args(["clone", "--depth", "1", comfy.repo]).arg(&dir), comfy.repo);
+        }
+        let pin = pins.iter().find(|(pinned, _)| pinned == name).map(|(_, rev)| rev.as_str());
+        match pin {
+            Some(rev) if dir.exists() => {
+                eprintln!("stainless: {name} pinned to the recorded revision {rev}");
+                // GitHub serves unadvertised commits by SHA, so a shallow fetch of the exact
+                // revision works even after upstream history moved (or was rewritten).
+                if git(Command::new("git").arg("-C").arg(&dir).args(["fetch", "--depth", "1", "origin", rev]), comfy.repo) {
+                    git(Command::new("git").arg("-C").arg(&dir).args(["reset", "--hard", rev]), comfy.repo);
+                }
+            }
+            None if existed => {
+                // A failed fast-forward usually means upstream history was rewritten (a
+                // force-pushed main). Deliberately NOT auto-reset: the remedy is named and the
+                // decision stays in the user's hands — delete the clone and it re-fetches fresh.
+                let pulled = Command::new("git").arg("-C").arg(&dir).args(["pull", "--ff-only"]).status();
+                if !matches!(pulled, Ok(status) if status.success()) {
+                    eprintln!(
+                        "stainless: could not fast-forward {name} (upstream history rewritten?) — delete {} and re-run COMPILE.sh to re-clone it fresh",
+                        dir.display()
+                    );
+                }
+            }
+            _ => {} // fresh clone with no pin — already at the tip
         }
         // The repo's runtime python packages, into the bundled environment (best-effort, like the
         // clone — `install` explains itself when the environment or uv is missing).
@@ -82,11 +109,35 @@ pub fn sync() {
     }
 }
 
-/// Run a prepared `git` command, warning (never failing the compile) if it doesn't succeed.
-fn git(cmd: &mut Command, repo: &str) {
-    if !matches!(cmd.status(), Ok(status) if status.success()) {
+/// Run a prepared `git` command, warning (never failing the compile) if it doesn't succeed;
+/// reports the verdict for steps that chain (a pinned reset only makes sense after its fetch).
+fn git(cmd: &mut Command, repo: &str) -> bool {
+    let ok = matches!(cmd.status(), Ok(status) if status.success());
+    if !ok {
         eprintln!("stainless: git failed for {repo}; its alias may be stale or point at a missing path");
     }
+    ok
+}
+
+/// Each companion clone's current revision (`git rev-parse HEAD`), in table order — `None` when
+/// the clone is missing or unreadable. Feeds [`crate::drivers::carstay`]'s manifest.
+pub fn clone_revisions() -> Vec<(&'static str, Option<String>)> {
+    STAINLESS
+        .iter()
+        .map(|comfy| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(clone_dir(comfy))
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success());
+            let rev = out
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                .filter(|rev| !rev.is_empty());
+            (repo_name(comfy.repo), rev)
+        })
+        .collect()
 }
 
 /// Probe `<run> <exe> --help` (through a shell, so `$HOME` in `exe` expands) for a description.

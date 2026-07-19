@@ -2,7 +2,7 @@
 //! heavyweight program (ffmpeg, python) work without asking the user to install anything, and so
 //! the *project* controls the versions it relies on (system copies drift — apt lags — and may
 //! lack features we use). Its own pillar (not `support`) because it spans three concerns:
-//! compile-time acquisition ([`fetch`], run by the `stainless_sync` binary), runtime resolution
+//! compile-time acquisition ([`fetch`], run by the `install-stainless` command), runtime resolution
 //! ([`resolve`], used by [`crate::drivers`] and the command categories), and the interactive
 //! side — a shim directory
 //! ([`bin_dir`]) whose PATH prepend is emitted into `sourcefile.sh` ([`shell_setup`], used by
@@ -38,15 +38,19 @@ enum Group {
     Utility,
 }
 
-/// How a tool's bundle comes to exist (and updates).
+/// How a tool's bundle comes to exist (and updates). The URL functions take an optional
+/// version pin (a Carstay.toml value, in `--use-stable-carstay` mode) — `None` means the latest release.
 enum Acquire {
     /// Download a static archive (URL discovered per release, root folder stripped on unpack);
-    /// re-fetched when the published URL changes, tracked by a `.source_url` marker.
-    Archive(fn() -> Option<String>),
+    /// re-fetched when the published URL changes, tracked by a `.source_url` marker. Tools whose
+    /// download URL alone can't name an exact build (ffmpeg's rolling `latest` tag) also carry a
+    /// `dated_tag` resolver — its result is stored beside the bundle and lands in Carstay.toml,
+    /// so `--use-stable-carstay` can restore the exact build, not just the channel.
+    Archive { url: fn(Option<&str>) -> Option<String>, dated_tag: Option<fn() -> Option<String>> },
     /// A single released binary — same URL-discovery and `.source_url` freshness contract as
     /// [`Acquire::Archive`], but the download *is* the program (written to the tool's first
     /// `bins` path, made executable).
-    Binary(fn() -> Option<String>),
+    Binary(fn(Option<&str>) -> Option<String>),
     /// A `uv venv` at the tool's dir — a stable `bin/python3` over an interpreter uv installs
     /// into [`interpreters_dir`]; kept current via `uv python upgrade`.
     UvVenv { python: &'static str },
@@ -57,7 +61,8 @@ const TOOLS: &[Tool] = &[
     Tool {
         dir: "ffmpeg",
         bins: &[("ffmpeg", "bin/ffmpeg"), ("ffprobe", "bin/ffprobe")],
-        acquire: Acquire::Archive(fetch::ffmpeg_url),
+        // BtbN's rolling `latest` URL can't name an exact build — the dated autobuild tag can.
+        acquire: Acquire::Archive { url: fetch::ffmpeg_url, dated_tag: Some(fetch::ffmpeg_dated_tag) },
         group: Group::Utility,
     },
     Tool {
@@ -71,7 +76,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         dir: "uv",
         bins: &[("uv", "uv"), ("uvx", "uvx")],
-        acquire: Acquire::Archive(fetch::uv_url),
+        acquire: Acquire::Archive { url: fetch::uv_url, dated_tag: None },
         group: Group::Language,
     },
     Tool {
@@ -86,7 +91,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         dir: "deno",
         bins: &[("deno", "deno")],
-        acquire: Acquire::Archive(fetch::deno_url),
+        acquire: Acquire::Archive { url: fetch::deno_url, dated_tag: None },
         group: Group::Utility,
     },
 ];
@@ -100,6 +105,17 @@ pub(crate) fn interpreters_dir() -> PathBuf {
 /// `~/.bashrs/tools` — the bundled tools' home.
 pub(crate) fn root() -> PathBuf {
     crate::conf::bashrs_home().join("tools")
+}
+
+/// Each tool's provisioned version, in table order — derived per acquisition mode by
+/// [`fetch::provisioned_version`] (which owns the on-disk markers). `None` means nothing is
+/// bundled — the system installation serves that tool. Feeds [`crate::drivers::carstay`]'s
+/// manifest.
+pub fn versions() -> Vec<(&'static str, Option<String>)> {
+    TOOLS
+        .iter()
+        .map(|tool| (tool.dir, fetch::provisioned_version(tool, &root().join(tool.dir))))
+        .collect()
 }
 
 /// The command to run for `program`: its bundled copy when present — the project-pinned version,

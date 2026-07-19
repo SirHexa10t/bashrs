@@ -67,6 +67,18 @@ pub enum Command {
     /// Emit shell function wrappers for every command (used by COMPILE.sh).
     #[command(hide = true)]
     Generate,
+    /// Install the running binary under ~/.bashrs, write the sourcefile, and wire the shell rc
+    /// files (COMPILE.sh's last step).
+    #[command(hide = true)]
+    InstallShell,
+    /// Provision the non-Rust companions — bundled tools, repos, the Carstay.toml record
+    /// (COMPILE.sh's step before install-shell).
+    #[command(hide = true)]
+    InstallStainless {
+        /// Provision the versions recorded in Carstay.toml instead of the latest releases
+        #[arg(long)]
+        use_stable_carstay: bool,
+    },
     /// Print one command's completable flags (asked by the generated completer at TAB-time).
     #[command(hide = true)]
     CompleteFlags {
@@ -93,6 +105,10 @@ impl Command {
             Command::Style(cmd) => cmd.run(),
             Command::StylizedEcho(cmd) => cmd.run(),
             Command::Generate => print!("{}", wrappers()),
+            Command::InstallShell => crate::conf::install::install_shell(&wrappers()),
+            Command::InstallStainless { use_stable_carstay } => {
+                crate::drivers::install_stainless(use_stable_carstay)
+            }
             Command::CompleteFlags { command } => println!("{}", complete_flags(&command)),
         }
     }
@@ -311,7 +327,7 @@ fn wrappers() -> String {
         }
     }
 
-    // Non-Rust companion repos (cloned by the `stainless_sync` bin), aliased to their launchers.
+    // Non-Rust companion repos (cloned by the hidden `install-stainless` command), aliased to their launchers.
     let comfy = stainless::aliases();
     if !comfy.is_empty() {
         body += &format!("\n# comfy / external tools\n{comfy}");
@@ -670,6 +686,8 @@ mod tests {
     fn wrappers_exclude_the_internal_commands() {
         assert!(!wrappers().contains("generate() {"));
         assert!(!wrappers().contains("complete-flags() {"));
+        assert!(!wrappers().contains("install-shell() {"));
+        assert!(!wrappers().contains("install-stainless() {"));
     }
 
     #[test]

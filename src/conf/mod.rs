@@ -11,6 +11,7 @@
 pub mod config_file;
 pub mod environment;
 pub mod greeting;
+pub mod install;
 pub mod keybinds;
 
 use std::path::PathBuf;

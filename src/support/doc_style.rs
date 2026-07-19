@@ -93,6 +93,12 @@ pub(crate) fn approved(text: &str) -> String {
     _scoped(&_wrap(&[&Weight::Bold, &Basic::Green]), text)
 }
 
+/// Bold blue — a heads-up worth reading that is neither praise nor a problem (version-drift
+/// notices and the like).
+pub(crate) fn notice(text: &str) -> String {
+    _scoped(&_wrap(&[&Weight::Bold, &Basic::Blue]), text)
+}
+
 /// Style `text` with `codes`, keeping nested styles scoped instead of compounded.
 ///
 /// Scopes are encoded in the stream itself, so nesting survives across the separate processes of
