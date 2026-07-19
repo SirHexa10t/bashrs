@@ -182,6 +182,20 @@ fn gated_failures_land_honest_cookie_aware_ledger_lines() {
     let rig = Rig::new("botwall");
     rig.dl("botwall", YT_VIDEO, &[]);
     assert!(rig.ledger().contains("anti-bot/CAPTCHA"), "{}", rig.ledger());
+
+    // DRM, no cookies: the tv-client quirk makes "import cookies" a genuine first fix.
+    let rig = Rig::new("drm_plain");
+    rig.dl("drm", YT_VIDEO, &[]);
+    assert!(rig.ledger().contains("cookies sometimes unlock non-DRM"), "{}", rig.ledger());
+
+    // DRM with a store in play: terminal — no advice the user already took, no retry pretence.
+    let rig = Rig::new("drm_cookies");
+    let site = rig.home.join(".bashrs/user-data/browser_cookies/youtube");
+    fs::create_dir_all(site.join("store")).unwrap();
+    fs::write(site.join("browser.spec"), "firefox").unwrap();
+    fs::write(site.join("store/cookies.sqlite"), "junk").unwrap();
+    rig.dl("drm", YT_VIDEO, &[]);
+    assert!(rig.ledger().contains("DRM-protected even with cookies"), "{}", rig.ledger());
 }
 
 #[test]

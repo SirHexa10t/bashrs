@@ -15,7 +15,7 @@
 #     geo                fail with YouTube's geo-restriction phrasing
 #     geo_unless_xff_us  fail with a geo phrasing unless invoked with `--xff US`
 #     fail_once_then_ok  fail the first download call, succeed on any retry
-#     members|age|botwall  fail with that gate's real phrasing
+#     members|age|botwall|drm  fail with that gate's real phrasing
 #
 # Probe invocations (--print) always succeed: --flat-playlist replays scan.txt, a
 # --playlist-items probe replays probe.txt, and a lone-video probe prints video_probe.txt when
@@ -111,6 +111,9 @@ case "${BASHRS_STUB_MODE:-ok}" in
         exit 1 ;;
     botwall)
         echo "ERROR: [youtube] stubvid0000: Sign in to confirm you're not a bot" >&2
+        exit 1 ;;
+    drm)
+        echo "ERROR: [youtube] stubvid0000: This video is DRM protected" >&2
         exit 1 ;;
     *)
         echo "yt-dlp stub: unknown BASHRS_STUB_MODE '${BASHRS_STUB_MODE}'" >&2

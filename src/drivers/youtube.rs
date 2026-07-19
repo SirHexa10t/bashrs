@@ -1847,17 +1847,19 @@ enum Failure {
     AgeRestricted,
     Sensitive,
     LoginRequired,
+    Drm,
     Other,
 }
 
 fn classify_failure(stderr: &str) -> Failure {
     // Match case-insensitively against the phrasings yt-dlp's extractors actually emit (verified
     // against their source): the geo notices; the anti-bot/CAPTCHA and JS-challenge walls; the
-    // members badge reasons; the YouTube age gate; and the login/private/sensitive gates. Order
-    // matters where phrasings could overlap — the bot-wall is checked before the login/age gates
-    // (YouTube's "…confirm you're not a bot" is a bot-wall, not a login). A missed geo phrasing
-    // costs the geo rescue, so that set errs wide; a bare 403 is left as `Other` on purpose (it's
-    // ambiguous — rate-limit vs. bot vs. transient — and we won't mislabel it).
+    // members badge reasons; the YouTube age gate; the login/private/sensitive gates; and
+    // report_drm's DRM notice. Order matters where phrasings could overlap — the bot-wall is
+    // checked before the login/age gates (YouTube's "…confirm you're not a bot" is a bot-wall,
+    // not a login). A missed geo phrasing costs the geo rescue, so that set errs wide; a bare
+    // 403 is left as `Other` on purpose (it's ambiguous — rate-limit vs. bot vs. transient —
+    // and we won't mislabel it).
     let s = stderr.to_lowercase();
     let has = |needle: &str| s.contains(needle);
     if has("in your country") || has("from your location") || has("in your region") || has("geo restrict") || has("geo_restrict") {
@@ -1872,6 +1874,8 @@ fn classify_failure(stderr: &str) -> Failure {
         Failure::Sensitive
     } else if has("requiring login") || has("log in for access") || has("log into an account") || has("permission to view") || has("account is private") || has("private video") {
         Failure::LoginRequired
+    } else if has("drm protected") || has("drm-protected") || has("protected by drm") {
+        Failure::Drm
     } else {
         Failure::Other
     }
@@ -1929,6 +1933,7 @@ fn diagnose_failure(base: Vec<OsString>, label: &str, rescue: GeoRescue) -> Opti
         Failure::AgeRestricted => Some(dead(age_restricted_line(label, had_cookies))),
         Failure::Sensitive => Some(dead(sensitive_content_line(label, had_cookies))),
         Failure::LoginRequired => Some(dead(login_required_line(label, had_cookies))),
+        Failure::Drm => Some(dead(drm_line(label, had_cookies))),
         Failure::Other => {
             let detail = stderr
                 .lines()
@@ -1951,9 +1956,11 @@ fn dead(line: String) -> String {
 /// Without cookies it's a plain nudge to add them; with cookies the gate is the harder kind — it
 /// needs a signed-in *18+* account, and YouTube age-verifies the browser *session*, so the fix is
 /// to verify in that browser and re-import, not to repeat "add cookies" when the user already did.
+/// The cookies-present line also names the one lever past that (per the cookie research, entitled
+/// cookies are necessary but not always sufficient without a PO token — not integrated yet).
 fn age_restricted_line(label: &str, had_cookies: bool) -> String {
     if had_cookies {
-        format!("{label} — age-restricted despite cookies (use a signed-in 18+ account; play it in that browser once to verify age, then re-import)")
+        format!("{label} — age-restricted despite cookies (use a signed-in 18+ account; play it in that browser once to verify age, then re-import; past that, the last lever is a PO-token provider — not integrated yet)")
     } else {
         format!("{label} — age-restricted (needs cookies from a signed-in 18+ account: dl --cookie-import youtube, then retry)")
     }
@@ -1985,9 +1992,24 @@ fn sensitive_content_line(label: &str, had_cookies: bool) -> String {
 
 /// The ledger line for an anti-bot / CAPTCHA / JS-challenge wall. Unlike the login/age gates this
 /// has no reliable fix — yt-dlp can't solve a human-verification challenge — so the line is honest
-/// that the post may be undownloadable and never tells the user to just try again.
+/// that the post may be undownloadable and never tells the user to just try again. It does name
+/// every real lever, including the one bashrs doesn't wire up yet (a PO-token provider — per the
+/// cookie research, the fourth mitigation besides cookies, IP, and yt-dlp freshness).
 fn bot_wall_line(label: &str) -> String {
-    format!("{label} — blocked by an anti-bot/CAPTCHA challenge yt-dlp can't solve; may be undownloadable (only fresh cookies from a browser where it plays, a matching IP, and current yt-dlp sometimes help)")
+    format!("{label} — blocked by an anti-bot/CAPTCHA challenge yt-dlp can't solve; may be undownloadable (fresh cookies from a browser where it plays, a matching IP, and current yt-dlp sometimes help; the last lever is a PO-token provider — not integrated yet)")
+}
+
+/// The ledger line for DRM-protected content, tailored to whether cookies were already tried.
+/// yt-dlp never circumvents DRM — but per the cookie research, YouTube's `tv` client serves
+/// DRM'd formats to cookie-less requests while ANY cookies (even a logged-out browser session)
+/// surface non-DRM formats. So without cookies, "import and retry" is a genuine fix, not a
+/// platitude; with them, it's the real thing and honesty beats a retry loop.
+fn drm_line(label: &str, had_cookies: bool) -> String {
+    if had_cookies {
+        format!("{label} — DRM-protected even with cookies (yt-dlp doesn't circumvent DRM — undownloadable)")
+    } else {
+        format!("{label} — DRM-protected formats only; cookies sometimes unlock non-DRM variants (on YouTube even a logged-out session works): dl --cookie-import <site>, then retry")
+    }
 }
 
 /// Whether a ledger line refers to video `id` — via the bracketed `[id]` every writer now
@@ -2909,6 +2931,11 @@ con.commit()"#;
         ] {
             assert_eq!(classify_failure(msg), Failure::Members, "{msg}");
         }
+        // DRM — report_drm's phrasing gets its own class, so the cookie quirk advice can fire.
+        assert_eq!(
+            classify_failure("ERROR: [youtube] x: This video is DRM protected"),
+            Failure::Drm
+        );
         // Age — the sign-in gate and the account age-verification wording.
         assert_eq!(classify_failure("ERROR: Sign in to confirm your age"), Failure::AgeRestricted);
         assert_eq!(
@@ -2977,7 +3004,23 @@ con.commit()"#;
         let with = age_restricted_line("[dQw4w9WgXcQ]", true);
         assert!(with.contains("despite cookies"), "the cookies-present case names the harder gate");
         assert!(with.contains("18+") && with.contains("verify age"), "points at the real fix");
+        assert!(with.contains("PO-token"), "names the lever past cookies (necessary ≠ sufficient)");
+        assert!(!without.contains("PO-token"), "the plain case keeps the simple fix simple");
         assert!(ledger_line_refers(&with, "dQw4w9WgXcQ"), "still carries the scrub key");
+    }
+
+    #[test]
+    fn the_drm_line_reaches_for_cookies_first_and_is_terminal_with_them() {
+        // The tv-client quirk: cookie-less requests get DRM'd formats, ANY cookies (even a
+        // logged-out session) surface non-DRM ones — so cookies are a genuine first fix.
+        let without = drm_line("[dQw4w9WgXcQ]", false);
+        assert!(without.contains("DRM-protected"), "names the gate");
+        assert!(without.contains("--cookie-import"), "cookies are the one real lever");
+        let with = drm_line("[dQw4w9WgXcQ]", true);
+        assert!(with.contains("even with cookies"), "won't repeat advice already taken");
+        assert!(with.contains("doesn't circumvent"), "honest that this is terminal");
+        assert!(!with.to_lowercase().contains("retry"), "no futile retry once cookies were tried");
+        assert!(ledger_line_refers(&with, "dQw4w9WgXcQ"), "carries the scrub key");
     }
 
     #[test]
@@ -3010,6 +3053,7 @@ con.commit()"#;
         assert!(line.contains("anti-bot") || line.contains("CAPTCHA"), "names the difficulty");
         assert!(line.contains("undownloadable"), "is honest it may not be possible");
         assert!(!line.to_lowercase().contains("retry"), "must not tell the user to just download again");
+        assert!(line.contains("PO-token"), "names every real lever, including the unintegrated one");
         assert!(ledger_line_refers(&line, "dQw4w9WgXcQ"), "carries the scrub key");
     }
 
