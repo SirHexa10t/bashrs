@@ -606,6 +606,123 @@ mod commands {
         argv
     }
 
+    // --- media_remove_vocals ----------------------------------------------------
+
+    /// Copy an audio or video file with the vocals removed — center-channel cancellation, the
+    /// bass band preserved; video, subtitles, and cover art pass through untouched
+    pub fn remove_vocals(args: RemoveVocalsArgs) {
+        match _remove_vocals(&args) {
+            Ok(output) => println!("wrote {}", output.display()),
+            Err(msg) => {
+                eprintln!("media_remove_vocals: {msg}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    #[derive(Args)]
+    pub struct RemoveVocalsArgs {
+        /// Input file (audio, or video with audio)
+        pub input: PathBuf,
+        /// Output path (defaults to `<input>_novocals.<ext>` beside the input)
+        pub output: Option<PathBuf>,
+        /// Overwrite output file if it exists
+        #[arg(short = 'y', long)]
+        pub overwrite: bool,
+    }
+
+    /// The vocal-removal graph. Vocals sit dead-center in a stereo mix, so subtracting the
+    /// channels from each other cancels them (the karaoke trick) — but bass is usually
+    /// center-panned too, so the low band (≤120 Hz) is split off first and carried through
+    /// intact, and only the rest goes through the cancellation. Off-center content (most
+    /// instruments) survives both paths. The crossover is four stacked 2-pole filters per side
+    /// (≈48 dB/octave): a single gentle slope measurably leaked centered vocals through the
+    /// bass path at only ~-22 dB — the behaviour test caught it.
+    const DEVOCAL_FILTER: &str = "[0:a]asplit[bass_in][mids_in];\
+         [bass_in]lowpass=f=120,lowpass=f=120,lowpass=f=120,lowpass=f=120[bass];\
+         [mids_in]highpass=f=120,highpass=f=120,highpass=f=120,highpass=f=120,\
+         pan=stereo|c0=c0-c1|c1=c1-c0[karaoke];\
+         [bass][karaoke]amix=inputs=2:normalize=0[novocals]";
+
+    /// The checks and the ffmpeg run behind [`remove_vocals`] — split off so failure paths
+    /// return instead of exiting. Cheap, tool-free refusals come first; the stereo check needs
+    /// a probe (cancellation is a two-channel trick: mono has no center to subtract, and
+    /// surround carries its own dedicated center channel this filter doesn't address).
+    fn _remove_vocals(args: &RemoveVocalsArgs) -> Result<PathBuf, String> {
+        let output = args.output.clone().unwrap_or_else(|| _novocals_output(&args.input));
+        if output == args.input {
+            return Err("the output is the input itself — pick another name".to_string());
+        }
+        if !args.overwrite && output.exists() {
+            return Err(format!(
+                "'{}' already exists — pass -y/--overwrite to replace it",
+                output.display()
+            ));
+        }
+        match _audio_channels(&args.input)? {
+            2 => {}
+            1 => {
+                return Err(
+                    "mono audio has no center channel to cancel — vocal removal works on stereo mixes"
+                        .to_string(),
+                )
+            }
+            n => {
+                return Err(format!(
+                    "{n}-channel audio isn't supported — downmix to stereo first (surround keeps \
+                     its voice in a dedicated center channel, a different removal than this one)"
+                ))
+            }
+        }
+        if run_reporting_code(tools::resolve("ffmpeg"), _remove_vocals_argv(&args.input, &output)) != 0 {
+            return Err("ffmpeg failed (its message above has the reason)".to_string());
+        }
+        Ok(output)
+    }
+
+    /// ffmpeg argv for the de-vocal run: the filtered audio replaces the original, while video
+    /// (including an attached cover), subtitles, and attachments are stream-copied when present
+    /// (`?`-maps). `-y` is safe here — the exists/overwrite policy was already enforced.
+    fn _remove_vocals_argv(input: &Path, output: &Path) -> Vec<OsString> {
+        let mut argv: Vec<OsString> = ["-v", "error", "-y", "-i"].map(OsString::from).to_vec();
+        argv.push(input.as_os_str().to_owned());
+        argv.extend(
+            [
+                "-filter_complex", DEVOCAL_FILTER,
+                "-map", "[novocals]",
+                "-map", "0:v?", "-c:v", "copy",
+                "-map", "0:s?", "-c:s", "copy",
+                "-map", "0:t?", "-c:t", "copy",
+            ]
+            .map(OsString::from),
+        );
+        argv.push(output.as_os_str().to_owned());
+        argv
+    }
+
+    /// The first audio stream's channel count, by ffprobe. A file with no audio stream at all
+    /// reads as an error (there is nothing to de-vocal in it).
+    fn _audio_channels(input: &Path) -> Result<u32, String> {
+        let mut argv: Vec<OsString> =
+            ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=channels", "-of", "csv=p=0"]
+                .map(OsString::from)
+                .to_vec();
+        argv.push(input.as_os_str().to_owned());
+        let out = capture_stdout(tools::resolve("ffprobe"), argv)
+            .ok_or_else(|| "could not read the file (ffprobe failed)".to_string())?;
+        out.trim().parse().map_err(|_| "the file has no audio stream".to_string())
+    }
+
+    /// The default de-vocal output: the input's name with a `_novocals` mark, same directory.
+    fn _novocals_output(input: &Path) -> PathBuf {
+        let stem = input.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let name = match input.extension() {
+            Some(ext) => format!("{stem}_novocals.{}", ext.to_string_lossy()),
+            None => format!("{stem}_novocals"),
+        };
+        input.with_file_name(name)
+    }
+
     // --- media_hmerge_imgs ----------------------------------------------------
 
     /// Merge images side by side onto one canvas — as tall as the tallest input, as wide as all
@@ -1147,6 +1264,178 @@ mod commands {
             let args = MetadataArgs { file: PathBuf::from("clip.mkv") };
             let argv = strs(&_metadata_argv(&args));
             assert!(argv.contains(&"format=filename,format_name,size,duration,bit_rate".to_string()), "{argv:?}");
+        }
+
+        #[test]
+        fn novocals_output_marks_the_name_beside_the_input() {
+            assert_eq!(_novocals_output(Path::new("a/song.mp3")), PathBuf::from("a/song_novocals.mp3"));
+            assert_eq!(_novocals_output(Path::new("bare")), PathBuf::from("bare_novocals"));
+        }
+
+        #[test]
+        fn remove_vocals_argv_filters_audio_and_copies_everything_else() {
+            let argv = strs(&_remove_vocals_argv(Path::new("in.mkv"), Path::new("out.mkv")));
+            assert_eq!(argv.last().unwrap(), "out.mkv");
+            assert!(argv.contains(&"[novocals]".to_string()), "the filtered audio is mapped");
+            let filter = argv.iter().find(|a| a.contains("pan=stereo")).expect("the karaoke pan");
+            assert!(filter.contains("lowpass=f=120"), "bass is split off and kept: {filter}");
+            assert!(filter.contains("c0=c0-c1"), "center cancellation: {filter}");
+            for (map, codec) in [("0:v?", "-c:v"), ("0:s?", "-c:s"), ("0:t?", "-c:t")] {
+                assert!(argv.contains(&map.to_string()), "optional {map} rides along");
+                assert!(argv.contains(&codec.to_string()), "{codec} copy, no re-encode");
+            }
+        }
+
+        #[test]
+        fn remove_vocals_refuses_bad_outputs_before_touching_any_tool() {
+            let onto_itself = RemoveVocalsArgs {
+                input: PathBuf::from("x.mp3"),
+                output: Some(PathBuf::from("x.mp3")),
+                overwrite: false,
+            };
+            assert!(_remove_vocals(&onto_itself).unwrap_err().contains("input itself"));
+
+            let dir = std::env::temp_dir().join(format!("bashrs_devocal_{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let taken = dir.join("taken.mp3");
+            std::fs::write(&taken, b"x").unwrap();
+            let onto_existing = RemoveVocalsArgs {
+                input: PathBuf::from("in.mp3"),
+                output: Some(taken),
+                overwrite: false,
+            };
+            assert!(_remove_vocals(&onto_existing).unwrap_err().contains("already exists"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Skip-with-notice for the behavioural de-vocal tests (they need real ffmpeg/ffprobe,
+        /// resolved the same way the command resolves them).
+        fn ffmpeg_or_skip(test: &str) -> bool {
+            let works = ["ffmpeg", "ffprobe"].iter().all(|tool| {
+                std::process::Command::new(crate::tools::resolve(tool))
+                    .arg("-version")
+                    .output()
+                    .is_ok_and(|out| out.status.success())
+            });
+            if !works {
+                eprintln!("SKIPPED {test}: no usable ffmpeg/ffprobe available");
+            }
+            works
+        }
+
+        /// A 2-second wav synthesized from an ffmpeg lavfi source expression.
+        fn build_audio(source: &str, out: &Path) {
+            let ok = std::process::Command::new(crate::tools::resolve("ffmpeg"))
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i", source])
+                .arg(out)
+                .status()
+                .is_ok_and(|status| status.success());
+            assert!(ok, "could not synthesize {source}");
+        }
+
+        /// The file's `mean_volume` in dB, per ffmpeg's volumedetect.
+        fn mean_volume(file: &Path) -> f32 {
+            let out = std::process::Command::new(crate::tools::resolve("ffmpeg"))
+                .arg("-i")
+                .arg(file)
+                .args(["-af", "volumedetect", "-f", "null", "-"])
+                .output()
+                .expect("run ffmpeg");
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .find_map(|line| line.split("mean_volume:").nth(1))
+                .and_then(|rest| rest.trim().strip_suffix(" dB").and_then(|db| db.trim().parse().ok()))
+                .expect("volumedetect reported a mean")
+        }
+
+        fn devocal(input: &Path) -> PathBuf {
+            let args = RemoveVocalsArgs { input: input.to_path_buf(), output: None, overwrite: true };
+            _remove_vocals(&args).expect("de-vocal run works")
+        }
+
+        #[test]
+        fn centered_content_cancels_while_side_content_and_bass_survive() {
+            // The physics of the trick, measured: a dead-center tone (how vocals are mixed)
+            // must cancel to near-silence; off-center tones (instruments) and center BASS
+            // (kept via the crossover) must come through at comparable loudness.
+            if !ffmpeg_or_skip("de-vocal behaviour") {
+                return;
+            }
+            let dir = std::env::temp_dir().join(format!("bashrs_devocal_beh_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let vocal = dir.join("vocal.wav"); // identical L/R = perfectly centered, 440 Hz
+            build_audio("aevalsrc=sin(440*2*PI*t)|sin(440*2*PI*t):d=2", &vocal);
+            let out = devocal(&vocal);
+            assert!(
+                mean_volume(&out) < mean_volume(&vocal) - 40.0,
+                "a centered tone must all but vanish: {} → {} dB",
+                mean_volume(&vocal),
+                mean_volume(&out)
+            );
+
+            let side = dir.join("side.wav"); // different tones per channel = off-center music
+            build_audio("aevalsrc=sin(300*2*PI*t)|sin(600*2*PI*t):d=2", &side);
+            let out = devocal(&side);
+            assert!(
+                mean_volume(&out) > mean_volume(&side) - 10.0,
+                "off-center content must survive: {} → {} dB",
+                mean_volume(&side),
+                mean_volume(&out)
+            );
+
+            let bass = dir.join("bass.wav"); // centered like a vocal, but below the crossover
+            build_audio("aevalsrc=sin(80*2*PI*t)|sin(80*2*PI*t):d=2", &bass);
+            let out = devocal(&bass);
+            assert!(
+                mean_volume(&out) > mean_volume(&bass) - 8.0,
+                "center bass rides the kept low band: {} → {} dB",
+                mean_volume(&bass),
+                mean_volume(&out)
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn devocaling_a_video_copies_the_video_stream_and_refuses_mono() {
+            if !ffmpeg_or_skip("de-vocal on video / mono") {
+                return;
+            }
+            let dir = std::env::temp_dir().join(format!("bashrs_devocal_vid_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let clip = dir.join("clip.mkv");
+            let ok = std::process::Command::new(crate::tools::resolve("ffmpeg"))
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=blue:s=64x64:d=2"])
+                .args(["-f", "lavfi", "-i", "aevalsrc=sin(440*2*PI*t)|sin(440*2*PI*t):d=2"])
+                .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+                .arg(&clip)
+                .status()
+                .is_ok_and(|status| status.success());
+            assert!(ok, "could not build the clip");
+            let out = devocal(&clip);
+            let codec = std::process::Command::new(crate::tools::resolve("ffprobe"))
+                .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0"])
+                .arg(&out)
+                .output()
+                .expect("probe");
+            assert_eq!(
+                String::from_utf8_lossy(&codec.stdout).trim(),
+                "h264",
+                "the video stream is copied through, not re-encoded away"
+            );
+            assert!(mean_volume(&out) < -40.0, "the centered tone is gone from the video's audio");
+
+            let mono = dir.join("mono.wav");
+            build_audio("sine=frequency=440:duration=1", &mono);
+            let args = RemoveVocalsArgs { input: mono, output: None, overwrite: true };
+            assert!(
+                _remove_vocals(&args).unwrap_err().contains("stereo"),
+                "mono is refused with the honest reason"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[test]

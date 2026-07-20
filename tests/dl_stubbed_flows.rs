@@ -143,6 +143,18 @@ fn a_generic_geo_block_sweeps_xff_regions_and_stops_at_the_first_win() {
 }
 
 #[test]
+fn a_finished_download_says_so_in_green() {
+    let rig = Rig::new("done_line");
+    let out = rig.dl("ok", YT_VIDEO, &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("stubvid0000: downloaded"),
+        "the run must end with an explicit success, not yt-dlp's last postprocessor line: {}",
+        text(&out)
+    );
+}
+
+#[test]
 fn a_transient_failure_succeeds_on_the_diagnostic_retry() {
     let rig = Rig::new("retry");
     let out = rig.dl("fail_once_then_ok", YT_VIDEO, &[]);

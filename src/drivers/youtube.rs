@@ -331,6 +331,10 @@ pub(crate) fn download_video(url: &str, into: &Path, env: Env) -> i32 {
             if let Some(id) = &probe_id {
                 finish_media(into, id, &picks, env);
             }
+            // The explicit happy ending — yt-dlp's own output stops at its last postprocessor
+            // ("[Metadata] …"), which reads unfinished.
+            let done = probe_id.as_deref().or(url_id.as_deref()).unwrap_or(url);
+            println!("{}", doc_style::approved(&format!("{done}: downloaded")));
         }
         probe_id.or(url_id)
     } else if env.subtitles {
@@ -578,14 +582,13 @@ fn mark_auto_titles(root: &Path, id: &str, picks: &[Pick], env: Env) {
             file.as_os_str().to_owned(),
         ],
     ) else {
+        eprintln!(
+            "dl: could not read {}'s subtitle titles (ffprobe) — auto-generated stamps skipped",
+            file.display()
+        );
         return;
     };
-    let mut retitle: Vec<(usize, String)> = Vec::new(); // (subtitle-stream order, new title)
-    for (order, title) in listing.lines().enumerate() {
-        if let Some(pick) = autos.iter().find(|pick| pick.name == title.trim()) {
-            retitle.push((order, stamped_title(&pick.name)));
-        }
-    }
+    let retitle = auto_title_stamps(&listing, picks);
     if retitle.is_empty() {
         return;
     }
@@ -596,6 +599,10 @@ fn mark_auto_titles(root: &Path, id: &str, picks: &[Pick], env: Env) {
     let stamped = file.with_extension("stamping.mkv");
     let mut argv: Vec<OsString> = ["-v", "error", "-y", "-i"].map(OsString::from).to_vec();
     argv.push(file.as_os_str().to_owned());
+    // NOTE: a bare `-map 0 -c copy` remux DEMOTES an attached cover (see [`mux_subtitles`],
+    // which extracts and re-attaches for exactly that reason). Safe here only by call order:
+    // this runs straight after a fresh download, before any `--thumbnail` pass could have
+    // attached one — keep it that way, or adopt the mux's cover-carry.
     argv.extend(["-map", "0", "-c", "copy"].map(OsString::from));
     for (order, title) in &retitle {
         argv.push(format!("-metadata:s:s:{order}").into());
@@ -614,6 +621,32 @@ fn mark_auto_titles(root: &Path, id: &str, picks: &[Pick], env: Env) {
         let _ = std::fs::remove_file(&stamped);
         eprintln!("dl: could not stamp auto-subtitle titles in {}", file.display());
     }
+}
+
+/// The (subtitle-stream order, stamped title) rewrites for `listing` — ffprobe's one-title-per-
+/// line output, in stream order. A title matching an auto pick's probed name is stamped
+/// directly; but yt-dlp names tracks per invocation, and the probe and the download are TWO
+/// invocations — the same `ja-orig` track has arrived titled "Japanese" in one session and
+/// "Japanese (Original)" in another, so name-matching alone silently misses. When every pick
+/// is machine-made anyway (nothing manual was requested), every stream is therefore stamped
+/// regardless of its name, keeping whatever title it carries. Mixed manual+auto picks stay
+/// name-matched — with unrecognizable names there is no safe way to tell the tracks apart.
+/// Already-marked titles are left alone, so re-stamping is idempotent.
+fn auto_title_stamps(listing: &str, picks: &[Pick]) -> Vec<(usize, String)> {
+    let autos: Vec<&Pick> = picks.iter().filter(|pick| pick.auto).collect();
+    let all_auto = autos.len() == picks.len();
+    let mut stamps = Vec::new();
+    for (order, title) in listing.lines().enumerate() {
+        let title = title.trim();
+        if title.ends_with("(auto-generated)") {
+            continue;
+        }
+        if autos.iter().any(|pick| pick.name == title) || all_auto {
+            let base = if title.is_empty() { "subtitles" } else { title };
+            stamps.push((order, stamped_title(base)));
+        }
+    }
+    stamps
 }
 
 /// Fold the kept `.vtt` sidecars into an audio file's metadata: each becomes a tag named
@@ -2253,6 +2286,43 @@ mod tests {
             ["en"]
         );
         assert!(sub_picks_for(&[], &[], None).is_empty(), "nothing available, nothing requested");
+    }
+
+    #[test]
+    fn auto_stamps_survive_ytdlps_per_session_naming_drift() {
+        let pick = |name: &str, auto: bool| Pick { key: "x".into(), name: name.into(), auto };
+        // The regression that shipped unstamped tracks: the probe said "Japanese", the download
+        // embedded "Japanese (Original)" — different invocations, different names. With every
+        // pick machine-made, every stream is stamped anyway, keeping its own title.
+        let all_auto = [pick("Japanese", true), pick("English", true)];
+        assert_eq!(
+            auto_title_stamps("Japanese (Original)\nEnglish\n", &all_auto),
+            [
+                // `stamped_title` drops YouTube's " (Original)" qualifier on purpose — the
+                // auto-generated marker makes it redundant noise.
+                (0, "Japanese (auto-generated)".to_string()),
+                (1, "English (auto-generated)".to_string())
+            ]
+        );
+        // Mixed manual+auto: only a name-matched auto track can be told apart — the manual one
+        // must never be mislabelled, even at the cost of missing a renamed auto track.
+        let mixed = [pick("English", false), pick("Japanese", true)];
+        assert_eq!(
+            auto_title_stamps("English\nJapanese\n", &mixed),
+            [(1, "Japanese (auto-generated)".to_string())]
+        );
+        assert_eq!(
+            auto_title_stamps("English\nJapanese (Original)\n", &mixed),
+            [],
+            "an unrecognizable auto name in a mixed set stays untouched — no safe discrimination"
+        );
+        // Idempotence: a already-stamped title is never double-marked.
+        assert_eq!(auto_title_stamps("Japanese (auto-generated)\n", &all_auto[..1]), []);
+        // An untitled stream still gets a readable mark.
+        assert_eq!(
+            auto_title_stamps("\n", &all_auto[..1]),
+            [(0, "subtitles (auto-generated)".to_string())]
+        );
     }
 
     #[test]
