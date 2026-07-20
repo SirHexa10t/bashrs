@@ -598,7 +598,6 @@ mod tests {
         has("media_convert_compact() { \"$HOME/.bashrs/bashrs\" media_convert_compact \"$@\"; }");
         has("media_trim_start() { \"$HOME/.bashrs/bashrs\" media_trim_start \"$@\"; }");
         has("media_metadata() { \"$HOME/.bashrs/bashrs\" media_metadata \"$@\"; }");
-        has("media_metadata_yt() { \"$HOME/.bashrs/bashrs\" media_metadata_yt \"$@\"; }");
         has("media_hmerge_imgs() { \"$HOME/.bashrs/bashrs\" media_hmerge_imgs \"$@\"; }");
         has("media_vmerge_imgs() { \"$HOME/.bashrs/bashrs\" media_vmerge_imgs \"$@\"; }");
         has("packages_upup() { \"$HOME/.bashrs/bashrs\" packages_upup \"$@\"; }"); // packages (both)

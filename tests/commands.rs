@@ -134,6 +134,104 @@ fn media_commands_propagate_failure_as_a_nonzero_exit() {
     assert!(!metadata.status.success(), "an unreadable file must exit non-zero");
 }
 
+#[test]
+fn pro_run_forwards_every_arg_to_the_program_except_its_own_help() {
+    // A minimal crate whose program echoes its argv and cwd — whatever pro_run forwards must
+    // come out the other side, one argv entry each (the spaced value proves the quoting-proof
+    // "$@" ride; the spaced PROJECT path proves the {dir} substitution's quoting).
+    let dir = std::env::temp_dir().join(format!("bashrs pro_run {}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"argecho\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/main.rs"),
+        "fn main() { println!(\"ARGS={:?} CWD={:?}\", std::env::args().skip(1).collect::<Vec<_>>(), std::env::current_dir().unwrap()); }",
+    )
+    .unwrap();
+    let run_in = |cwd: &Path, args: &[&str]| -> (bool, String) {
+        let out = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("run bashrs");
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.success(), all)
+    };
+    let run = |args: &[&str]| run_in(&dir, args);
+
+    // Everything — flags included — lands in the program's argv…
+    let (ok, out) = run(&["pro_run", "-x", "--flag", "value with space"]);
+    assert!(ok, "{out}");
+    assert!(out.contains(r#"ARGS=["-x", "--flag", "value with space"]"#), "{out}");
+    // …except -h/--help, which stay pro_run's own…
+    let (ok, help) = run(&["pro_run", "-h"]);
+    assert!(ok, "{help}");
+    assert!(help.contains("Usage:") && !help.contains("ARGS="), "-h is pro_run's help: {help}");
+    // …unless escaped past clap with `--`, which forwards even those.
+    let (ok, out) = run(&["pro_run", "--", "-h"]);
+    assert!(ok, "{out}");
+    assert!(out.contains(r#"ARGS=["-h"]"#), "{out}");
+
+    // A leading --pdir picks the project from anywhere; the rest still forwards — and the
+    // PROGRAM runs in the caller's own directory, not the project's (the regression that bit:
+    // a cwd-sensitive program must behave exactly as if its binary were invoked directly).
+    let neutral = std::env::temp_dir().canonicalize().unwrap();
+    let (ok, out) = run_in(&neutral, &["pro_run", "--pdir", dir.to_str().unwrap(), "-x"]);
+    assert!(ok, "{out}");
+    assert!(out.contains(r#"ARGS=["-x"]"#), "ran via --pdir from elsewhere: {out}");
+    assert!(
+        out.contains(&format!("CWD={:?}", neutral)),
+        "the program keeps the caller's cwd, not the project's: {out}"
+    );
+    // After the first forwarded token, even a `--pdir` belongs to the program.
+    let (ok, out) = run(&["pro_run", "foo", "--pdir", "zzz"]);
+    assert!(ok, "{out}");
+    assert!(out.contains(r#"ARGS=["foo", "--pdir", "zzz"]"#), "{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pro_test_survives_a_relative_dir_across_its_two_steps() {
+    // CMake is the build-then-test toolchain: pro_test cd's per step (process-global), and a
+    // RELATIVE dir once resolved the second cd against the first's result (myproj/myproj) —
+    // the build ran, then "cannot enter" killed ctest. Reproduced and fixed; this pins it.
+    let works = Command::new("cmake").arg("--version").output().is_ok_and(|o| o.status.success())
+        && Command::new("ctest").arg("--version").output().is_ok_and(|o| o.status.success());
+    if !works {
+        eprintln!("SKIPPED pro_test relative-dir: no cmake/ctest on this machine");
+        return;
+    }
+    let parent = std::env::temp_dir().join(format!("bashrs_pro_test_{}", std::process::id()));
+    let project = parent.join("cmproj");
+    let _ = std::fs::remove_dir_all(&parent);
+    std::fs::create_dir_all(&project).unwrap();
+    // Compiler-free on purpose (LANGUAGES NONE): the double-cd defect is about directories,
+    // not compilation, and this keeps the test runnable on machines without a C toolchain.
+    std::fs::write(
+        project.join("CMakeLists.txt"),
+        "cmake_minimum_required(VERSION 3.16)\nproject(smoke LANGUAGES NONE)\nenable_testing()\nadd_test(NAME smoke COMMAND /bin/true)\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+        .args(["pro_test", "cmproj"])
+        .current_dir(&parent)
+        .output()
+        .expect("run bashrs");
+    let all =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!all.contains("cannot enter"), "the second step must re-enter the SAME dir: {all}");
+    assert!(all.contains("100% tests passed"), "ctest actually ran: {all}");
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
 /// Compile-time guard that the fixture path stays valid if this file grows path-dependent tests.
 #[allow(dead_code)]
 fn _manifest_dir() -> &'static Path {

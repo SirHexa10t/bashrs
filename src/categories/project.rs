@@ -11,9 +11,9 @@
 //  ┌──────────────────────────────────────────┬───────────────────────────────────────┬───────────────────────────┬───────────────────────┬────────────────────────────────────┐
 //  │            Toolchain (marker)            │                compile                │           test            │          run          │          update_packages           │
 //  ├──────────────────────────────────────────┼───────────────────────────────────────┼───────────────────────────┼───────────────────────┼────────────────────────────────────┤
-//  │ Rust (Cargo.toml)                        │ cargo build (--release/--tiny)        │ cargo test --all-features │ cargo run             │ cargo update                       │
+//  │ Rust (Cargo.toml)                        │ cargo build (--release/--tiny)        │ cargo test --all-features │ cargo run (manifest)  │ cargo update                       │
 //  ├──────────────────────────────────────────┼───────────────────────────────────────┼───────────────────────────┼───────────────────────┼────────────────────────────────────┤
-//  │ Go (go.mod)                              │ go build ./...                        │ go test ./...             │ go run .              │ go get -u ./... && go mod tidy     │
+//  │ Go (go.mod)                              │ go build ./...                        │ go test ./...             │ build, run the binary │ go get -u ./... && go mod tidy     │
 //  ├──────────────────────────────────────────┼───────────────────────────────────────┼───────────────────────────┼───────────────────────┼────────────────────────────────────┤
 //  │ Node (package.json, pm by lockfile)      │ <pm> run build                        │ <pm> test                 │ <pm> start            │ <pm> update                        │
 //  ├──────────────────────────────────────────┼───────────────────────────────────────┼───────────────────────────┼───────────────────────┼────────────────────────────────────┤
@@ -35,7 +35,7 @@
 //  ├──────────────────────────────────────────┼───────────────────────────────────────┼───────────────────────────┼───────────────────────┼────────────────────────────────────┤
 //  │ Ruby (Gemfile)                           │ —                                     │ bundle exec rake test     │ ruby <entry> ❓        │ bundle update                      │
 //  ├──────────────────────────────────────────┼───────────────────────────────────────┼───────────────────────────┼───────────────────────┼────────────────────────────────────┤
-//  │ Zig (build.zig)                          │ zig build                             │ zig build test            │ zig build run         │ ❓ (young pkg mgmt)                 │
+//  │ Zig (build.zig)                          │ zig build                             │ zig build test            │ zig build run (b-file)│ ❓ (young pkg mgmt)                 │
 //  ├──────────────────────────────────────────┼───────────────────────────────────────┼───────────────────────────┼───────────────────────┼────────────────────────────────────┤
 //  │ Perl (cpanfile/Makefile.PL)              │ perl -c <main>                        │ prove -l t/               │ perl <main> ❓         │ cpanm --installdeps .              │
 //  └──────────────────────────────────────────┴───────────────────────────────────────┴───────────────────────────┴───────────────────────┴────────────────────────────────────┘
@@ -93,7 +93,7 @@ mod commands {
             tiny: Step::Run(RUST_TINY),
             test: Step::Run("cargo test --all-features"),
             test_needs_build: false,
-            run: Step::Run("cargo run"),
+            run: Step::Run("cargo run --manifest-path {dir}/Cargo.toml --"),
             update: Step::Run("cargo update"),
         },
         Toolchain {
@@ -104,7 +104,11 @@ mod commands {
             tiny: Step::Run("go build -trimpath -ldflags='-s -w'"), // Go's smallest native build
             test: Step::Run("go test ./..."),
             test_needs_build: false,
-            run: Step::Run("go run ."),
+            // Go has no remote-target flag (`go -C` would chdir the program too), but the
+            // output path is ours to pick: build inside a subshell-cd (leaving a
+            // `.bashrs_pro_run` artifact in the project, refreshed each run), then execute it
+            // from the caller's own directory — full cwd parity with a direct invocation.
+            run: Step::Run("( cd {dir} && go build -o .bashrs_pro_run . ) && {dir}/.bashrs_pro_run"),
             update: Step::Run("go get -u ./... && go mod tidy"),
         },
         // Node — build/test/run are the package manager's scripts; the build mode is up to the
@@ -150,7 +154,7 @@ mod commands {
             tiny: Step::Run("npm run build"),
             test: Step::Run("npm test"),
             test_needs_build: false,
-            run: Step::Run("npm start"),
+            run: Step::Run("npm start --"),
             update: Step::Run("npm update"),
         },
         Toolchain {
@@ -249,7 +253,7 @@ mod commands {
             tiny: Step::Run("zig build -Doptimize=ReleaseSmall"),
             test: Step::Run("zig build test"),
             test_needs_build: false,
-            run: Step::Run("zig build run"),
+            run: Step::Run("zig build --build-file {dir}/build.zig run --"),
             update: Step::Note("package management is young — add a dependency with:  zig fetch --save <url>"),
         },
         Toolchain {
@@ -305,7 +309,12 @@ mod commands {
 
     /// Run the test suite of the project in DIR (default `.`)
     pub fn test(args: DirArgs) {
+        // Two steps may run here, and each cd's to `dir` (the cd is process-global) — a
+        // RELATIVE dir would resolve the second time against the first cd's result
+        // (`myproj/myproj`). Pin it to an absolute path once; an unresolvable one falls
+        // through unchanged, keeping the normal "cannot enter" diagnostics.
         let dir = Path::new(&args.dir);
+        let dir = &dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
         let Some(tc) = _detect(dir) else { return };
         println!("Detected {}", tc.name);
         // Some test runners (e.g. CMake's ctest) expect an already-built tree — do the
@@ -316,13 +325,29 @@ mod commands {
         _run(tc.test, dir);
     }
 
-    /// Build and run the project in DIR (default `.`)
-    pub fn run(args: DirArgs) {
-        let dir = Path::new(&args.dir);
+    /// Build and run a project (default: the current directory's), handing every argument on
+    /// to the program
+    pub fn run(args: RunArgs) {
+        let dir = Path::new(&args.pdir);
         if let Some(tc) = _detect(dir) {
             println!("Detected {}", tc.name);
-            _run(tc.run, dir);
+            _run_with(tc.run, dir, &args.args);
         }
+    }
+
+    /// Everything given to `pro_run` becomes the program's own argv — except `-h`/`--help` and
+    /// a *leading* `--pdir`, which stay this command's (put `--` first to forward even those).
+    /// Once the first forwarded token has appeared, later tokens are the program's verbatim —
+    /// even one spelled `--pdir`.
+    #[derive(Args)]
+    pub struct RunArgs {
+        /// Project directory to build/run from, given before the forwarded args — the program
+        /// itself still runs in YOUR current directory (where the toolchain allows: cargo does)
+        #[arg(long, default_value = ".")]
+        pdir: String,
+        /// Arguments for the program being run, forwarded verbatim
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     }
 
     /// Upgrade the dependencies of the project in DIR (default `.`)
@@ -392,15 +417,48 @@ mod commands {
     /// Run a resolved step in `dir`, returning whether it succeeded (a Note always does). Runs
     /// via `bash -c` so the stored `&&`/env-prefixed snippets work.
     fn _run(step: Step, dir: &Path) -> bool {
+        _run_with(step, dir, &[])
+    }
+
+    /// Like [`_run`], with `forward`ed args appended to the step's command — they ride bash's
+    /// own positional mechanism (`"$@"`), so each one reaches the program as a single argv
+    /// entry no matter what it contains (quoting-proof). The run-step commands whose runner
+    /// would otherwise eat leading flags end in `--` in the table (cargo, npm, zig), putting
+    /// everything forwarded on the program's side of the separator.
+    ///
+    /// A command containing `{dir}` targets the project WITHOUT cd'ing (cargo's
+    /// `--manifest-path`): the program then runs in the caller's own directory — parity with
+    /// invoking the binary directly, which matters to cwd-sensitive programs (one that writes
+    /// its output "here", say). Steps without the placeholder genuinely need the project as
+    /// cwd (`go run .`, `npm start`, …), so they cd into it.
+    fn _run_with(step: Step, dir: &Path, forward: &[String]) -> bool {
         match step {
-            Step::Run(cmd) => {
-                if let Err(err) = std::env::set_current_dir(dir) {
-                    eprintln!("pro: cannot enter '{}': {err}", dir.display());
-                    return false;
-                }
-                println!("running:  {cmd}");
+            Step::Run(template) => {
+                let cmd: String = if template.contains("{dir}") {
+                    template.replace("{dir}", &_shell_quote(&dir.to_string_lossy()))
+                } else {
+                    if let Err(err) = std::env::set_current_dir(dir) {
+                        eprintln!("pro: cannot enter '{}': {err}", dir.display());
+                        return false;
+                    }
+                    template.to_string()
+                };
+                let cmd = cmd.as_str();
+                let shown = if forward.is_empty() {
+                    cmd.to_string()
+                } else {
+                    format!("{cmd} {}", forward.join(" "))
+                };
+                println!("running:  {shown}");
                 let started = Instant::now();
-                let ok = exec::run_reporting("bash", ["-c", cmd]);
+                let ok = if forward.is_empty() {
+                    exec::run_reporting("bash", ["-c", cmd])
+                } else {
+                    let with_args = format!("{cmd} \"$@\"");
+                    let mut argv = vec!["-c", &with_args, "bashrs"];
+                    argv.extend(forward.iter().map(String::as_str));
+                    exec::run_reporting("bash", argv)
+                };
                 if ok {
                     println!("finished in {:.1}s", started.elapsed().as_secs_f32());
                 }
@@ -411,6 +469,12 @@ mod commands {
                 true
             }
         }
+    }
+
+    /// `text` as one single-quoted shell word (embedded `'` spelled `'\''`) — how a `{dir}`
+    /// lands inside a `bash -c` command line without word-splitting or expansion.
+    fn _shell_quote(text: &str) -> String {
+        format!("'{}'", text.replace('\'', r"'\''"))
     }
 
     // ——— pro_readme support ————————————————————————————————————————————————
@@ -587,6 +651,73 @@ mod commands {
             assert_eq!(detect(&["Cargo.toml", "Makefile"]), Some("Rust"));
             // uv beats a bare pyproject
             assert_eq!(detect(&["uv.lock", "pyproject.toml"]), Some("Python (uv)"));
+        }
+
+        #[test]
+        fn shell_quoting_survives_spaces_and_embedded_quotes() {
+            assert_eq!(_shell_quote("/plain/path"), "'/plain/path'");
+            assert_eq!(_shell_quote("/with space/x"), "'/with space/x'");
+            assert_eq!(_shell_quote("it's"), r"'it'\''s'");
+        }
+
+        #[test]
+        fn compiled_toolchains_run_steps_keep_the_callers_cwd_via_dir_templates() {
+            // Each targets the project without cd'ing, its own way: cargo by manifest, zig by
+            // build file, go by building to a known path and executing that path directly.
+            let step = |name: &str| match TOOLCHAINS.iter().find(|tc| tc.name == name) {
+                Some(Toolchain { run: Step::Run(cmd), .. }) => *cmd,
+                _ => panic!("no runnable {name} row"),
+            };
+            let rust = step("Rust");
+            assert!(rust.contains("--manifest-path {dir}/Cargo.toml"), "{rust}");
+            assert!(rust.ends_with(" --"), "user args stay on the program's side: {rust}");
+            let zig = step("Zig");
+            assert!(zig.contains("--build-file {dir}/build.zig"), "{zig}");
+            assert!(zig.ends_with(" --"), "{zig}");
+            let go = step("Go");
+            assert!(go.contains("( cd {dir} && go build"), "the cd stays in a subshell: {go}");
+            assert!(go.ends_with("{dir}/.bashrs_pro_run"), "the program runs by full path: {go}");
+        }
+
+        #[test]
+        fn every_run_template_stays_valid_shell_after_dir_substitution() {
+            // The exact substitution _run_with performs, against a hostile path — then bash's
+            // own parser (-n: syntax check only, nothing executes) judges the result. Guards
+            // every future table edit against quoting typos.
+            let dir = _shell_quote("/spa ced/it's");
+            for tc in TOOLCHAINS {
+                if let Step::Run(cmd) = tc.run {
+                    let cmd = format!("{} \"$@\"", cmd.replace("{dir}", &dir));
+                    let ok = std::process::Command::new("bash")
+                        .args(["-n", "-c", &cmd])
+                        .status()
+                        .is_ok_and(|status| status.success());
+                    assert!(ok, "{}'s substituted run step isn't valid shell: {cmd}", tc.name);
+                    assert!(!cmd.contains("{dir}"), "unsubstituted placeholder left: {cmd}");
+                }
+            }
+        }
+
+        #[test]
+        fn flag_eating_runners_separate_the_programs_args_in_their_run_step() {
+            // `pro_run` appends the user's args to the run command; runners that would claim
+            // leading flags for themselves must carry the `--` separator in the table, so the
+            // args land on the program's side. The others hand trailing args over natively.
+            for (name, needs_separator) in
+                [("Rust", true), ("(npm)", true), ("Zig", true), ("Go", false)]
+            {
+                let tc = TOOLCHAINS
+                    .iter()
+                    .find(|tc| tc.name.contains(name))
+                    .unwrap_or_else(|| panic!("no toolchain matching {name}"));
+                if let Step::Run(cmd) = tc.run {
+                    assert_eq!(
+                        cmd.ends_with(" --"),
+                        needs_separator,
+                        "{name}'s run step: {cmd}"
+                    );
+                }
+            }
         }
 
         #[test]
