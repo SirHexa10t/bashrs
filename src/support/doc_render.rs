@@ -32,8 +32,8 @@ pub(crate) fn render_doc(doc: &str) -> String {
     use minimad::{CompositeStyle, Line};
     let mut out = String::new();
     for line in &minimad::parse_text(doc, minimad::Options::default()).lines {
-        if let Line::Normal(composite) = line {
-            match composite.style {
+        match line {
+            Line::Normal(composite) => match composite.style {
                 // Heading — bold blue via `_header` (the `gg`/`lll` title look), but inline marks
                 // are kept and restyled *within* the title: `_header` wraps through
                 // `doc_style::_scoped`, which re-asserts the heading colour after each nested span
@@ -67,11 +67,40 @@ pub(crate) fn render_doc(doc: &str) -> String {
                 // Paragraphs and anything else (incl. pre-drawn box-table rows): only inline spans
                 // are styled, so fixed-layout text survives verbatim.
                 _ => _emit_spans(&mut out, composite),
-            }
+            },
+            // Markdown pipe tables. minimad parses these as their own line kinds (NOT Normal), so
+            // without these arms every row is silently dropped — reconstruct `| cell | … |` with
+            // each cell's inline spans styled. Not width-aligned (that needs a whole-table pass,
+            // which would break the one-output-line-per-source-line contract); readable and, above
+            // all, present.
+            Line::TableRow(row) => _emit_table_row(&mut out, &row.cells),
+            Line::TableRule(rule) => _emit_table_rule(&mut out, rule.cells.len()),
+            // HorizontalRule / CodeFence: our docs use neither — emit the bare newline below.
+            _ => {}
         }
         out.push('\n');
     }
     out
+}
+
+/// A parsed table row as `| cell | cell | … |`, each cell's inline spans styled.
+fn _emit_table_row(out: &mut String, cells: &[minimad::Composite]) {
+    out.push('|');
+    for cell in cells {
+        out.push(' ');
+        _emit_spans(out, cell);
+        out.push_str(" |");
+    }
+}
+
+/// A table's header rule as `| --- | --- | … |`, one per column.
+fn _emit_table_rule(out: &mut String, columns: usize) {
+    for _ in 0..columns {
+        out.push_str("| --- ");
+    }
+    if columns > 0 {
+        out.push('|');
+    }
 }
 
 /// The composite's text with no styling — for elements coloured as a whole (headings, quotes).
@@ -246,6 +275,18 @@ mod tests {
         assert!(out.contains(&format!("{}www.foo.org{RESET}", doc_style::link_url())), "www url: {out:?}");
         // a bare domain with no scheme/www is left plain
         assert!(!render_doc("visit example.com now").contains(&doc_style::link_url()), "bare domain untouched");
+    }
+
+    #[test]
+    fn markdown_pipe_tables_render_instead_of_vanishing() {
+        // minimad parses `| … |` as TableRow/TableRule (not Normal); before these were handled,
+        // every such row was dropped. Header + rule + a data row must all survive, cells intact.
+        let table = "| Voice | Hz |\n|---|---|\n| **whistle** | 3322 |\n";
+        let out = render_doc(table);
+        assert!(out.contains("Voice") && out.contains("Hz"), "header cells survive: {out:?}");
+        assert!(out.contains("whistle") && out.contains("3322"), "data cells survive: {out:?}");
+        assert_eq!(out.lines().count(), 3, "one output line per source line (header, rule, row)");
+        assert!(out.lines().nth(1).unwrap().contains("---"), "the rule renders as a rule");
     }
 
     #[test]

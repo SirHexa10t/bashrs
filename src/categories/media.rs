@@ -1,5 +1,6 @@
 #[bashrs_macros::category(command = MediaCommand, prefix = "media_")]
 mod commands {
+    use crate::support::doc_render;
     use crate::support::doc_style::_header;
     use crate::support::exec::{capture_stdout, run_reporting_code};
     use crate::tools;
@@ -608,9 +609,13 @@ mod commands {
 
     // --- media_remove_vocals ----------------------------------------------------
 
-    /// Copy an audio or video file with the vocals removed — center-channel cancellation, the
-    /// bass band preserved; video, subtitles, and cover art pass through untouched
+    /// Copy an audio or video file with the vocals removed — center-channel cancellation over a
+    /// tunable frequency band; video, subtitles, and cover art pass through untouched
     pub fn remove_vocals(args: RemoveVocalsArgs) {
+        if args.range_help {
+            print!("{}", doc_render::render_doc(RANGE_HELP));
+            return;
+        }
         match _remove_vocals(&args) {
             Ok(output) => println!("wrote {}", output.display()),
             Err(msg) => {
@@ -620,37 +625,90 @@ mod commands {
         }
     }
 
+    /// The vocal-frequency reference `--range-help` prints (rendered like the `dl -c` page):
+    /// how to place --from/--to, then the per-voice/per-genre fundamental tables to place them by.
+    const RANGE_HELP: &str = include_str!("templates/remove_vocals_ranges.md");
+
     #[derive(Args)]
     pub struct RemoveVocalsArgs {
         /// Input file (audio, or video with audio)
-        pub input: PathBuf,
+        #[arg(required_unless_present = "range_help")]
+        pub input: Option<PathBuf>,
         /// Output path (defaults to `<input>_novocals.<ext>` beside the input)
         pub output: Option<PathBuf>,
+        /// Cancel above this Hz; bass below it is kept. Accepted 0-500 (--range-help)
+        #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u32).range(0..=500))]
+        pub from: u32,
+        /// Cancel up to this Hz; treble above it is kept. Accepted: above --from, ≤18000 (--range-help)
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=18000))]
+        pub to: Option<u32>,
+        /// Print the vocal-frequency reference for choosing --from/--to, then exit
+        #[arg(long)]
+        pub range_help: bool,
         /// Overwrite output file if it exists
         #[arg(short = 'y', long)]
         pub overwrite: bool,
     }
 
-    /// The vocal-removal graph. Vocals sit dead-center in a stereo mix, so subtracting the
-    /// channels from each other cancels them (the karaoke trick) — but bass is usually
-    /// center-panned too, so the low band (≤120 Hz) is split off first and carried through
-    /// intact, and only the rest goes through the cancellation. Off-center content (most
-    /// instruments) survives both paths. The crossover is four stacked 2-pole filters per side
-    /// (≈48 dB/octave): a single gentle slope measurably leaked centered vocals through the
-    /// bass path at only ~-22 dB — the behaviour test caught it.
-    const DEVOCAL_FILTER: &str = "[0:a]asplit[bass_in][mids_in];\
-         [bass_in]lowpass=f=120,lowpass=f=120,lowpass=f=120,lowpass=f=120[bass];\
-         [mids_in]highpass=f=120,highpass=f=120,highpass=f=120,highpass=f=120,\
-         pan=stereo|c0=c0-c1|c1=c1-c0[karaoke];\
-         [bass][karaoke]amix=inputs=2:normalize=0[novocals]";
+    /// The vocal-removal graph for a cancellation band of `from`..`to` Hz. Vocals sit dead-center
+    /// in a stereo mix, so subtracting the channels cancels them (the karaoke trick) — but only
+    /// the chosen band is cancelled: everything below `from` (bass, usually center-panned too)
+    /// and above `to` (cymbals, "air") is split off and carried through intact. Each crossover
+    /// edge is four stacked 2-pole filters (≈48 dB/octave): a single gentle slope measurably
+    /// leaked centered vocals across the seam at only ~-22 dB — the behaviour test caught it.
+    fn _devocal_filter(from: u32, to: Option<u32>) -> String {
+        // Four stacked 2-pole filters ≈ a 48 dB/octave crossover edge.
+        let steep = |kind: &str, hz: u32| vec![format!("{kind}=f={hz}"); 4].join(",");
+        let low = from > 0; // keep everything below `from`? (a `from` of 0 keeps no low band)
+        let high = to.is_some(); // keep everything above `to`?
+
+        // Fan the input out: one branch per kept band, plus the mids that get cancelled.
+        let inputs: Vec<&str> = std::iter::once("mids_in")
+            .chain(low.then_some("low_in"))
+            .chain(high.then_some("high_in"))
+            .collect();
+        let labels = |names: &[&str]| names.iter().map(|n| format!("[{n}]")).collect::<String>();
+        let mut chains =
+            vec![format!("[0:a]asplit={}{}", inputs.len(), labels(&inputs))];
+
+        // The cancelled band: bandlimit the mids to `from`..`to`, then subtract L−R / R−L.
+        let mut mids = format!("[mids_in]{}", steep("highpass", from.max(1)));
+        if let Some(to) = to {
+            mids.push_str(&format!(",{}", steep("lowpass", to)));
+        }
+        mids.push_str(",pan=stereo|c0=c0-c1|c1=c1-c0[karaoke]");
+        chains.push(mids);
+
+        // The carried-through bands, mixed back in with the cancelled mids at unity gain.
+        let mut keeps = vec!["karaoke"];
+        if low {
+            chains.push(format!("[low_in]{}[low]", steep("lowpass", from)));
+            keeps.push("low");
+        }
+        if let Some(to) = to {
+            chains.push(format!("[high_in]{}[high]", steep("highpass", to)));
+            keeps.push("high");
+        }
+        chains.push(format!("{}amix=inputs={}:normalize=0[novocals]", labels(&keeps), keeps.len()));
+        chains.join(";")
+    }
 
     /// The checks and the ffmpeg run behind [`remove_vocals`] — split off so failure paths
     /// return instead of exiting. Cheap, tool-free refusals come first; the stereo check needs
     /// a probe (cancellation is a two-channel trick: mono has no center to subtract, and
     /// surround carries its own dedicated center channel this filter doesn't address).
     fn _remove_vocals(args: &RemoveVocalsArgs) -> Result<PathBuf, String> {
-        let output = args.output.clone().unwrap_or_else(|| _novocals_output(&args.input));
-        if output == args.input {
+        let input = args.input.as_ref().ok_or("no input file given")?;
+        if let Some(to) = args.to {
+            if to <= args.from {
+                return Err(format!(
+                    "--to ({to} Hz) must be above --from ({} Hz) — the cancellation band is from…to",
+                    args.from
+                ));
+            }
+        }
+        let output = args.output.clone().unwrap_or_else(|| _novocals_output(input));
+        if &output == input {
             return Err("the output is the input itself — pick another name".to_string());
         }
         if !args.overwrite && output.exists() {
@@ -659,7 +717,7 @@ mod commands {
                 output.display()
             ));
         }
-        match _audio_channels(&args.input)? {
+        match _audio_channels(input)? {
             2 => {}
             1 => {
                 return Err(
@@ -674,7 +732,8 @@ mod commands {
                 ))
             }
         }
-        if run_reporting_code(tools::resolve("ffmpeg"), _remove_vocals_argv(&args.input, &output)) != 0 {
+        let filter = _devocal_filter(args.from, args.to);
+        if run_reporting_code(tools::resolve("ffmpeg"), _remove_vocals_argv(input, &output, &filter)) != 0 {
             return Err("ffmpeg failed (its message above has the reason)".to_string());
         }
         Ok(output)
@@ -683,12 +742,12 @@ mod commands {
     /// ffmpeg argv for the de-vocal run: the filtered audio replaces the original, while video
     /// (including an attached cover), subtitles, and attachments are stream-copied when present
     /// (`?`-maps). `-y` is safe here — the exists/overwrite policy was already enforced.
-    fn _remove_vocals_argv(input: &Path, output: &Path) -> Vec<OsString> {
+    fn _remove_vocals_argv(input: &Path, output: &Path, filter: &str) -> Vec<OsString> {
         let mut argv: Vec<OsString> = ["-v", "error", "-y", "-i"].map(OsString::from).to_vec();
         argv.push(input.as_os_str().to_owned());
         argv.extend(
             [
-                "-filter_complex", DEVOCAL_FILTER,
+                "-filter_complex", filter,
                 "-map", "[novocals]",
                 "-map", "0:v?", "-c:v", "copy",
                 "-map", "0:s?", "-c:s", "copy",
@@ -1272,14 +1331,25 @@ mod commands {
             assert_eq!(_novocals_output(Path::new("bare")), PathBuf::from("bare_novocals"));
         }
 
+        /// A RemoveVocalsArgs with the band defaults, for the pure checks.
+        fn devocal_args(input: &str, output: Option<&str>) -> RemoveVocalsArgs {
+            RemoveVocalsArgs {
+                input: Some(PathBuf::from(input)),
+                output: output.map(PathBuf::from),
+                from: 120,
+                to: None,
+                range_help: false,
+                overwrite: false,
+            }
+        }
+
         #[test]
         fn remove_vocals_argv_filters_audio_and_copies_everything_else() {
-            let argv = strs(&_remove_vocals_argv(Path::new("in.mkv"), Path::new("out.mkv")));
+            let filter = _devocal_filter(120, None);
+            let argv = strs(&_remove_vocals_argv(Path::new("in.mkv"), Path::new("out.mkv"), &filter));
             assert_eq!(argv.last().unwrap(), "out.mkv");
             assert!(argv.contains(&"[novocals]".to_string()), "the filtered audio is mapped");
-            let filter = argv.iter().find(|a| a.contains("pan=stereo")).expect("the karaoke pan");
-            assert!(filter.contains("lowpass=f=120"), "bass is split off and kept: {filter}");
-            assert!(filter.contains("c0=c0-c1"), "center cancellation: {filter}");
+            assert!(argv.contains(&filter), "the built filter graph is passed through");
             for (map, codec) in [("0:v?", "-c:v"), ("0:s?", "-c:s"), ("0:t?", "-c:t")] {
                 assert!(argv.contains(&map.to_string()), "optional {map} rides along");
                 assert!(argv.contains(&codec.to_string()), "{codec} copy, no re-encode");
@@ -1287,25 +1357,59 @@ mod commands {
         }
 
         #[test]
-        fn remove_vocals_refuses_bad_outputs_before_touching_any_tool() {
-            let onto_itself = RemoveVocalsArgs {
-                input: PathBuf::from("x.mp3"),
-                output: Some(PathBuf::from("x.mp3")),
-                overwrite: false,
-            };
+        fn the_devocal_filter_bands_track_from_and_to() {
+            // Default: a bass-keep below `from`, cancellation above it, no ceiling.
+            let default = _devocal_filter(120, None);
+            assert!(default.contains("c0=c0-c1"), "center cancellation is always present");
+            assert!(default.contains("lowpass=f=120"), "bass kept below --from: {default}");
+            assert!(default.contains("highpass=f=120"), "mids cancelled from --from up: {default}");
+            assert!(!default.contains("high_in"), "no treble-keep band without --to: {default}");
+            assert_eq!(default.matches("asplit=2").count(), 1, "two branches: mids + low");
+
+            // --to adds a treble-keep band and bounds the cancelled mids on top.
+            let bounded = _devocal_filter(180, Some(9000));
+            assert!(bounded.contains("asplit=3"), "three branches: mids + low + high: {bounded}");
+            assert!(bounded.contains("highpass=f=9000"), "treble kept above --to: {bounded}");
+            assert!(bounded.contains("lowpass=f=9000"), "mids cancelled only up to --to: {bounded}");
+            assert!(bounded.contains("highpass=f=180") && bounded.contains("lowpass=f=180"));
+
+            // --from 0: no bass-keep band at all, cancellation runs from the bottom.
+            let full_low = _devocal_filter(0, None);
+            assert!(full_low.contains("asplit=1"), "only the mids branch: {full_low}");
+            assert!(!full_low.contains("[low]"), "no low keep when --from is 0: {full_low}");
+            // Every band edge is the steep 4-pole crossover (guards the anti-leak slope).
+            assert_eq!(default.matches("lowpass=f=120").count(), 4, "4-pole low edge: {default}");
+        }
+
+        #[test]
+        fn remove_vocals_refuses_bad_inputs_before_touching_any_tool() {
+            let onto_itself = devocal_args("x.mp3", Some("x.mp3"));
             assert!(_remove_vocals(&onto_itself).unwrap_err().contains("input itself"));
+
+            let mut inverted = devocal_args("in.mp3", Some("out.mp3"));
+            inverted.from = 200;
+            inverted.to = Some(150);
+            assert!(_remove_vocals(&inverted).unwrap_err().contains("must be above"), "to<=from is refused");
 
             let dir = std::env::temp_dir().join(format!("bashrs_devocal_{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let taken = dir.join("taken.mp3");
             std::fs::write(&taken, b"x").unwrap();
-            let onto_existing = RemoveVocalsArgs {
-                input: PathBuf::from("in.mp3"),
-                output: Some(taken),
-                overwrite: false,
-            };
+            let onto_existing = devocal_args("in.mp3", taken.to_str());
             assert!(_remove_vocals(&onto_existing).unwrap_err().contains("already exists"));
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn range_help_connects_the_knobs_to_the_frequency_tables() {
+            // The reference is useless for THIS command if it never names the knobs, and the
+            // knobs are useless without the pitch data to place them by — both must be present.
+            assert!(RANGE_HELP.contains("--from") && RANGE_HELP.contains("--to"), "names the knobs");
+            assert!(RANGE_HELP.contains("Fundamental (Hz)"), "carries the pitch reference");
+            // Renders through the same path as `dl -c` without mangling — headings coloured,
+            // table rows intact.
+            let rendered = doc_render::render_doc(RANGE_HELP);
+            assert!(rendered.contains("Whistle register"), "table content survives rendering");
         }
 
         /// Skip-with-notice for the behavioural de-vocal tests (they need real ffmpeg/ffprobe,
@@ -1349,7 +1453,19 @@ mod commands {
         }
 
         fn devocal(input: &Path) -> PathBuf {
-            let args = RemoveVocalsArgs { input: input.to_path_buf(), output: None, overwrite: true };
+            devocal_band(input, 120, None)
+        }
+
+        /// De-vocal `input` with an explicit cancellation band, returning the output path.
+        fn devocal_band(input: &Path, from: u32, to: Option<u32>) -> PathBuf {
+            let args = RemoveVocalsArgs {
+                input: Some(input.to_path_buf()),
+                output: None,
+                from,
+                to,
+                range_help: false,
+                overwrite: true,
+            };
             _remove_vocals(&args).expect("de-vocal run works")
         }
 
@@ -1398,6 +1514,60 @@ mod commands {
         }
 
         #[test]
+        fn the_band_edges_actually_move_what_gets_cancelled() {
+            // The whole point of the knobs: a centered tone that the DEFAULT band cancels must
+            // SURVIVE once it's placed outside a narrowed band — proving --from and --to relocate
+            // the cancellation, not just decorate the help.
+            if !ffmpeg_or_skip("de-vocal band tuning") {
+                return;
+            }
+            let dir = std::env::temp_dir().join(format!("bashrs_devocal_band_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            // Explicit distinct outputs: the default output name is derived from the INPUT, so
+            // two runs over one input would collide and the second would overwrite the first.
+            let run = |input: &Path, out: &str, from: u32, to: Option<u32>| -> PathBuf {
+                let out = dir.join(out);
+                let args = RemoveVocalsArgs {
+                    input: Some(input.to_path_buf()),
+                    output: Some(out),
+                    from,
+                    to,
+                    range_help: false,
+                    overwrite: true,
+                };
+                _remove_vocals(&args).expect("de-vocal run works")
+            };
+
+            // A centered 150 Hz tone: the default band (from=120) cancels it; raising --from to
+            // 200 moves it into the kept low band, so it survives.
+            let tone = dir.join("t.wav");
+            build_audio("aevalsrc=sin(150*2*PI*t)|sin(150*2*PI*t):d=2", &tone);
+            let cancelled = run(&tone, "cancelled.wav", 120, None);
+            let kept = run(&tone, "kept.wav", 200, None);
+            assert!(
+                mean_volume(&kept) > mean_volume(&cancelled) + 12.0, // a 4x+ amplitude gap: unmistakable
+                "raising --from past the tone must spare it: default {} dB vs --from 200 {} dB",
+                mean_volume(&cancelled),
+                mean_volume(&kept)
+            );
+
+            // A centered 12 kHz tone ("cymbal"): the default (no ceiling) cancels it; a --to of
+            // 9000 puts it in the kept treble band, so it survives.
+            let hi = dir.join("hi.wav");
+            build_audio("aevalsrc=sin(12000*2*PI*t)|sin(12000*2*PI*t):d=2", &hi);
+            let hi_cancelled = run(&hi, "hi_cancelled.wav", 120, None);
+            let hi_kept = run(&hi, "hi_kept.wav", 120, Some(9000));
+            assert!(
+                mean_volume(&hi_kept) > mean_volume(&hi_cancelled) + 12.0,
+                "a --to ceiling must spare a tone above it: no-ceiling {} dB vs --to 9000 {} dB",
+                mean_volume(&hi_cancelled),
+                mean_volume(&hi_kept)
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
         fn devocaling_a_video_copies_the_video_stream_and_refuses_mono() {
             if !ffmpeg_or_skip("de-vocal on video / mono") {
                 return;
@@ -1430,7 +1600,14 @@ mod commands {
 
             let mono = dir.join("mono.wav");
             build_audio("sine=frequency=440:duration=1", &mono);
-            let args = RemoveVocalsArgs { input: mono, output: None, overwrite: true };
+            let args = RemoveVocalsArgs {
+                input: Some(mono),
+                output: None,
+                from: 120,
+                to: None,
+                range_help: false,
+                overwrite: true,
+            };
             assert!(
                 _remove_vocals(&args).unwrap_err().contains("stereo"),
                 "mono is refused with the honest reason"

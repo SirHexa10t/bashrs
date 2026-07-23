@@ -18,3 +18,12 @@ synonym finder
 
 karaoke function (mix of `dl` and `media_mute_human_voice`)
 
+Add-in filemanager's conf files
+    applies during installation; initial choice for the inclusion of these files: false (off).
+    Explain that it supports Nemo(?) specifically
+        Maybe broaden the support range?
+
+Add Spotify to `dl`
+
+
+

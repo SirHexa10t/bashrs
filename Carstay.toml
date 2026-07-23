@@ -8,11 +8,11 @@
 # means the machine provides the tool itself, so nothing was bundled.
 
 [tools]
-ffmpeg = "n8.1 @ autobuild-2026-07-19-13-12"
+ffmpeg = "n8.1"
 yt-dlp = "2026.07.04"
-uv = "0.11.29"
+uv = "0.11.31"
 python = "3.14.6"
 deno = "v2.9.3"
 
 [stainless_comfy]
-contAInerized = "ead32d56f3365dbac0c3b091807632fa5767e07a"
+contAInerized = "67901d0ba31d3c663c8007740ccf9525af354a02"
