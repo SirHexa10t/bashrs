@@ -73,6 +73,11 @@ pub struct GgBase {
     /// searching, leaving a sorted `deep_search_<timestamp>_sorted` once done (`gg --save`).
     #[arg(short = 's', long = "save")]
     pub(crate) save: bool,
+    /// Replace every match with this string, IN PLACE: matched files/dirs are renamed and matched
+    /// lines rewritten (a literal swap of each matched span). Shows what would change and asks
+    /// before touching anything; there is no undo. Skips `--delve`-decoded content.
+    #[arg(long = "re", value_name = "REPLACEMENT")]
+    pub(crate) re: Option<String>,
 }
 
 /// The full `gg` argument set: the base plus the context knob the numbered variants pin.

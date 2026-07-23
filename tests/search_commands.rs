@@ -273,3 +273,20 @@ fn hg_filters_piped_history_lines() {
     let text = stdout(&bashrs(&["hg", "cargo"], None, Some(history)));
     assert!(text.contains("502  cargo build") && !text.contains("ls -la"), "{text}");
 }
+
+#[test]
+fn gg_re_previews_but_refuses_to_modify_non_interactively() {
+    // `--re` is destructive and undo-less, so it only mutates on an interactive `y`. Here stdin is
+    // a pipe (never a tty) carrying "y" — the gate must STILL refuse and leave the tree untouched.
+    let tree = Tree::empty("re");
+    fs::write(tree.root.join("finger.txt"), b"a fin here").unwrap();
+    let out = bashrs(&["gg", "fin", "--re", "lon"], Some(&tree.root), Some(b"y\n"));
+    let err = stderr(&out);
+    assert!(err.contains("--re would replace"), "a preview is shown first: {err}");
+    assert!(err.contains("finger.txt → "), "the rename is previewed: {err}");
+    assert!(err.contains("refusing to modify files non-interactively"), "and it refuses: {err}");
+    // Nothing on disk changed — neither name nor content.
+    assert!(tree.root.join("finger.txt").exists(), "not renamed");
+    assert!(!tree.root.join("longer.txt").exists(), "no renamed twin appeared");
+    assert_eq!(fs::read(tree.root.join("finger.txt")).unwrap(), b"a fin here", "content untouched");
+}

@@ -19,9 +19,10 @@ synonym finder
 karaoke function (mix of `dl` and `media_mute_human_voice`)
 
 Add-in filemanager's conf files
-    applies during installation; initial choice for the inclusion of these files: false (off).
+    applies during installation; initial choice in conf/templates/configrs.toml for the inclusion of these files: false (off).
     Explain that it supports Nemo(?) specifically
         Maybe broaden the support range?
+    Maybe also include browser extensions - they need to be copied into OS drive (not hyperlinked!(?)) in order to hold between resets
 
 Add Spotify to `dl`
 

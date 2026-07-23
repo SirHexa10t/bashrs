@@ -331,7 +331,13 @@ mod commands {
         let dir = Path::new(&args.pdir);
         if let Some(tc) = _detect(dir) {
             println!("Detected {}", tc.name);
-            _run_with(tc.run, dir, &args.args);
+            // `--h2` forwards a leading `-h` so the PROGRAM prints its help (pro_run's own `-h`
+            // is clap's). Prepended, so it lands before any other forwarded args.
+            let mut forwarded = args.args;
+            if args.h2 {
+                forwarded.insert(0, "-h".to_string());
+            }
+            _run_with(tc.run, dir, &forwarded);
         }
     }
 
@@ -345,6 +351,9 @@ mod commands {
         /// itself still runs in YOUR current directory (where the toolchain allows: cargo does)
         #[arg(long, default_value = ".")]
         pdir: String,
+        /// Pass `-h` to the program being run, so you get ITS help (pro_run's own `-h` is clap's)
+        #[arg(long)]
+        h2: bool,
         /// Arguments for the program being run, forwarded verbatim
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,

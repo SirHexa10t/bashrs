@@ -94,8 +94,8 @@ pub(crate) const G_FAMILY: SearchFamily = SearchFamily {
     base_args: "GrepBase",
     runner: "_grep",
     extra_attrs: "",
-    bare_desc: "Case-insensitive search (literal, or regex with -E), colouring matches",
-    ctx_desc: ("Case-insensitive search, showing ", " lines of context around each match"),
+    bare_desc: "Case-insensitive grep-search (literal, or regex with -E), colouring matches",
+    ctx_desc: ("Case-insensitive grep-search, showing ", " lines of context around each match"),
 };
 
 #[allow(dead_code)]
@@ -106,7 +106,7 @@ pub(crate) const GG_FAMILY: SearchFamily = SearchFamily {
     base_args: "GgBase",
     runner: "_gg",
     extra_attrs: "    #[trailing_newline]\n",
-    bare_desc: "Recursively search a directory for expression(s) — filenames, then file contents",
+    bare_desc: "Roughly `find`+`grep`: Recursively search a directory for expression(s) — filenames, then file contents",
     ctx_desc: ("Recursive search, showing ", " lines of context around each file-content match"),
 };
 

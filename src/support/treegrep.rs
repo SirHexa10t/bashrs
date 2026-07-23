@@ -405,21 +405,164 @@ fn field(out: &mut impl WriteColor, color: &ColorSpec, bytes: &[u8]) -> io::Resu
     out.reset()
 }
 
-/// Write `bytes` with each of `matcher`'s match spans coloured `spec` — the one span-splitting loop
-/// behind both the filename listing and the match-line highlighting.
-fn write_spans(out: &mut impl WriteColor, matcher: &RegexMatcher, bytes: &[u8], spec: &ColorSpec) -> io::Result<()> {
+/// Every match span of `matcher` in `bytes`, as `(start, end)` byte offsets — the shared span
+/// collector behind the highlighter and the `--re` replacer.
+fn match_spans(matcher: &RegexMatcher, bytes: &[u8]) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let _ = matcher.find_iter(bytes, |m| {
         spans.push((m.start(), m.end()));
         true
     });
+    spans
+}
+
+/// Write `bytes` with each of `matcher`'s match spans coloured `spec` — the one span-splitting loop
+/// behind both the filename listing and the match-line highlighting.
+fn write_spans(out: &mut impl WriteColor, matcher: &RegexMatcher, bytes: &[u8], spec: &ColorSpec) -> io::Result<()> {
     let mut last = 0;
-    for (start, end) in spans {
+    for (start, end) in match_spans(matcher, bytes) {
         out.write_all(&bytes[last..start])?;
         field(out, spec, &bytes[start..end])?;
         last = end;
     }
     out.write_all(&bytes[last..])
+}
+
+// ——— `--re` in-place replacement ————————————————————————————————————————
+// A deliberately separate, destructive phase (never interleaved with the streaming search): plan
+// every change first — so the caller can preview and confirm — then apply. Read-only collection
+// parallelises like the search; the mutating apply is serial and never clobbers.
+
+/// Replace every match of `matcher` in `bytes` with `replacement` (a literal swap of each matched
+/// span). `None` when nothing matched — the signal that this name/file is unaffected. Also returns
+/// how many spans were replaced, for the preview.
+fn replace_matches(matcher: &RegexMatcher, bytes: &[u8], replacement: &[u8]) -> Option<(Vec<u8>, usize)> {
+    let spans = match_spans(matcher, bytes);
+    if spans.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut last = 0;
+    for (start, end) in &spans {
+        out.extend_from_slice(&bytes[last..*start]);
+        out.extend_from_slice(replacement);
+        last = *end;
+    }
+    out.extend_from_slice(&bytes[last..]);
+    Some((out, spans.len()))
+}
+
+/// The changes `--re` would make: files/dirs to rename and files whose contents to rewrite.
+pub(crate) struct ReplacePlan {
+    /// `(from, to)` — a name whose match spans, replaced, yield a different name.
+    pub(crate) renames: Vec<(PathBuf, PathBuf)>,
+    /// `(path, new contents, occurrences replaced)`.
+    pub(crate) rewrites: Vec<(PathBuf, Vec<u8>, usize)>,
+}
+
+impl ReplacePlan {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.renames.is_empty() && self.rewrites.is_empty()
+    }
+}
+
+/// Walk `roots` and gather every replacement `--re <replacement>` would make against `expressions`
+/// (literal, or `-E` regex) — WITHOUT changing anything. Names whose match spans differ once
+/// replaced become renames; non-binary files with matching content become rewrites (their whole
+/// new contents computed here). `None` on a bad expression. Read-only, so it walks in parallel like
+/// the search; binary files (NUL) are skipped, matching the search's own binary detection.
+pub(crate) fn plan_replacements(
+    expressions: &[String],
+    roots: &[PathBuf],
+    regex: bool,
+    replacement: &str,
+) -> Option<ReplacePlan> {
+    let matcher = match streamgrep::build_matcher(expressions, regex) {
+        Ok(matcher) => matcher,
+        Err(err) => {
+            eprintln!("gg: invalid expression: {err}");
+            return None;
+        }
+    };
+    let repl = replacement.as_bytes();
+    let renames: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
+    let rewrites: Mutex<Vec<(PathBuf, Vec<u8>, usize)>> = Mutex::new(Vec::new());
+    if roots.is_empty() {
+        return Some(ReplacePlan { renames: Vec::new(), rewrites: Vec::new() });
+    }
+    walk(roots).build_parallel().run(|| {
+        let (renames, rewrites, matcher) = (&renames, &rewrites, &matcher);
+        Box::new(move |result| {
+            if let Ok(entry) = result {
+                plan_entry(&entry, matcher, repl, renames, rewrites);
+            }
+            WalkState::Continue
+        })
+    });
+    let mut renames = renames.into_inner().unwrap_or_default();
+    let mut rewrites = rewrites.into_inner().unwrap_or_default();
+    renames.sort();
+    rewrites.sort_by(|(a, ..), (b, ..)| a.cmp(b));
+    Some(ReplacePlan { renames, rewrites })
+}
+
+/// Plan one walk entry: a rename if its name matches, a rewrite if its (non-binary) contents do.
+fn plan_entry(
+    entry: &DirEntry,
+    matcher: &RegexMatcher,
+    repl: &[u8],
+    renames: &Mutex<Vec<(PathBuf, PathBuf)>>,
+    rewrites: &Mutex<Vec<(PathBuf, Vec<u8>, usize)>>,
+) {
+    // Rename: only UTF-8 names (a non-UTF-8 name never matched the name search either).
+    if let Some(name) = entry.file_name().to_str() {
+        if let Some((new_name, _)) = replace_matches(matcher, name.as_bytes(), repl) {
+            if let Ok(new_name) = String::from_utf8(new_name) {
+                let from = entry.path().to_path_buf();
+                let to = from.with_file_name(new_name);
+                if to != from {
+                    renames.lock().unwrap().push((from, to));
+                }
+            }
+        }
+    }
+    // Rewrite: readable, non-binary files whose contents match.
+    if entry.file_type().is_some_and(|ft| ft.is_file()) {
+        if let Ok(bytes) = std::fs::read(entry.path()) {
+            if !bytes.contains(&0) {
+                if let Some((new, count)) = replace_matches(matcher, &bytes, repl) {
+                    rewrites.lock().unwrap().push((entry.path().to_path_buf(), new, count));
+                }
+            }
+        }
+    }
+}
+
+/// Apply a [`ReplacePlan`]: rewrite file contents first (paths are still original), then rename —
+/// deepest path first, so a renamed parent never strands its children's paths, and never over an
+/// existing target. Returns `(files rewritten, paths renamed, problems)`.
+pub(crate) fn apply_replacements(plan: &ReplacePlan) -> (usize, usize, Vec<String>) {
+    let mut problems = Vec::new();
+    let mut rewritten = 0;
+    for (path, bytes, _) in &plan.rewrites {
+        match std::fs::write(path, bytes) {
+            Ok(()) => rewritten += 1,
+            Err(err) => problems.push(format!("rewrite {}: {err}", path.display())),
+        }
+    }
+    let mut renames = plan.renames.clone();
+    renames.sort_by_key(|(from, _)| std::cmp::Reverse(from.components().count()));
+    let mut renamed = 0;
+    for (from, to) in &renames {
+        if to.exists() {
+            problems.push(format!("rename {} → {}: target exists — skipped", from.display(), to.display()));
+        } else if let Err(err) = std::fs::rename(from, to) {
+            problems.push(format!("rename {} → {}: {err}", from.display(), to.display()));
+        } else {
+            renamed += 1;
+        }
+    }
+    (rewritten, renamed, problems)
 }
 
 /// A line without its trailing `\n` / `\r\n`.
@@ -579,6 +722,76 @@ mod tests {
         let coloured = b"\x1b[35mf\x1b[0m:\x1b[33m2\x1b[0m:a \x1b[30m\x1b[41mmatch\x1b[0m here\n";
         assert_eq!(strip_ansi(coloured), b"f:2:a match here\n".to_vec());
         assert_eq!(strip_ansi(b"plain, no escapes"), b"plain, no escapes".to_vec());
+    }
+
+    /// A case-insensitive literal matcher for `pattern`, like `gg`'s default.
+    fn lit(pattern: &str) -> RegexMatcher {
+        grep::regex::RegexMatcherBuilder::new().case_insensitive(true).build(pattern).unwrap()
+    }
+
+    #[test]
+    fn replace_matches_swaps_every_span_and_reports_the_count() {
+        let m = lit("fin");
+        let (out, count) = replace_matches(&m, b"finger and a fin", b"lon").unwrap();
+        assert_eq!(out, b"longer and a lon", "every span replaced, rest verbatim");
+        assert_eq!(count, 2);
+        // Case-insensitive, like the search — an uppercased match is still replaced.
+        assert_eq!(replace_matches(&m, b"FINGER", b"lon").unwrap().0, b"lonGER");
+        assert!(replace_matches(&m, b"no match here", b"lon").is_none(), "no match → None");
+    }
+
+    #[test]
+    fn plan_and_apply_rewrite_contents_then_rename_deepest_first() {
+        let dir = std::env::temp_dir().join(format!("bashrs_re_apply_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("finger")).unwrap();
+        std::fs::write(dir.join("finger/finfile.txt"), b"a fin here").unwrap();
+        std::fs::write(dir.join("fin.log"), b"fin fin").unwrap();
+        std::fs::write(dir.join("other.txt"), b"no match").unwrap();
+
+        let plan = plan_replacements(&["fin".to_string()], std::slice::from_ref(&dir), false, "lon").unwrap();
+        // Names: finger→longer, finfile.txt→lonfile.txt, fin.log→lon.log (other.txt untouched).
+        assert_eq!(plan.renames.len(), 3, "{:?}", plan.renames);
+        // Contents: finfile.txt (1) and fin.log (2); other.txt has no match.
+        assert_eq!(plan.rewrites.len(), 2, "{:?}", plan.rewrites);
+
+        let (rewritten, renamed, problems) = apply_replacements(&plan);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!((rewritten, renamed), (2, 3));
+        // The deepest-first rename let the child rename before its parent moved out from under it.
+        assert_eq!(std::fs::read(dir.join("longer/lonfile.txt")).unwrap(), b"a lon here");
+        assert_eq!(std::fs::read(dir.join("lon.log")).unwrap(), b"lon lon");
+        assert_eq!(std::fs::read(dir.join("other.txt")).unwrap(), b"no match", "a non-match is untouched");
+        assert!(!dir.join("finger").exists() && !dir.join("fin.log").exists(), "originals gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_never_clobbers_an_existing_rename_target() {
+        let dir = std::env::temp_dir().join(format!("bashrs_re_collide_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fin.txt"), b"x").unwrap(); // name matches → wants to become lon.txt
+        std::fs::write(dir.join("lon.txt"), b"y").unwrap(); // …but that already exists
+
+        let plan = plan_replacements(&["fin".to_string()], std::slice::from_ref(&dir), false, "lon").unwrap();
+        let (_, renamed, problems) = apply_replacements(&plan);
+        assert_eq!(renamed, 0, "the colliding rename is skipped");
+        assert!(problems.iter().any(|p| p.contains("target exists")), "{problems:?}");
+        assert!(dir.join("fin.txt").exists(), "the source is left in place");
+        assert_eq!(std::fs::read(dir.join("lon.txt")).unwrap(), b"y", "the existing target is untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_skips_binary_files_for_content_rewrite() {
+        let dir = std::env::temp_dir().join(format!("bashrs_re_binary_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("data.bin"), b"fin\x00fin").unwrap(); // NUL → binary
+        let plan = plan_replacements(&["fin".to_string()], std::slice::from_ref(&dir), false, "lon").unwrap();
+        assert!(plan.rewrites.is_empty(), "a NUL-bearing file is not rewritten: {:?}", plan.rewrites);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

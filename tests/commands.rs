@@ -179,6 +179,11 @@ fn pro_run_forwards_every_arg_to_the_program_except_its_own_help() {
     let (ok, out) = run(&["pro_run", "--", "-h"]);
     assert!(ok, "{out}");
     assert!(out.contains(r#"ARGS=["-h"]"#), "{out}");
+    // `--h2` is the shorthand for that: it forwards a leading `-h` so the PROGRAM's help prints,
+    // not pro_run's. It's pro_run's own flag, so it never reaches the program's argv itself.
+    let (ok, out) = run(&["pro_run", "--h2"]);
+    assert!(ok, "{out}");
+    assert!(out.contains(r#"ARGS=["-h"]"#), "--h2 forwards -h to the program: {out}");
 
     // A leading --pdir picks the project from anywhere; the rest still forwards — and the
     // PROGRAM runs in the caller's own directory, not the project's (the regression that bit:

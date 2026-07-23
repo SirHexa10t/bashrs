@@ -56,7 +56,7 @@ mod commands {
     }
 
     /// Recursive search with `--delve` always on — also looks inside binaries we can decode (video
-    /// subtitle tracks, `.torrent` text). The loud, all-caps sibling of `gg`, à la `UPUP`.
+    /// subtitle tracks, `.torrent` text). Please: no `--re`.
     #[name("GG")]
     #[trailing_newline]
     pub fn gg_delve(args: GgArgs) {
@@ -125,6 +125,11 @@ mod commands {
         let roots = [args.base.directory.clone()];
         let denied = treegrep::search(&expressions, &roots, &opts);
         _offer_root_rescan(&expressions, &denied, &opts);
+        // `--re`: after the results are on screen, offer to replace every match in place. A
+        // distinct, confirmed, destructive phase — never entangled with the read-only search.
+        if let Some(replacement) = &args.base.re {
+            _replace_matches(&expressions, &roots, args.base.regex, replacement);
+        }
         // Runs once, after both passes have appended their sorted sections to the `_sorted` sibling.
         // The live (arrival-order) file is the crash-safety net: only once the sorted copy verifiably
         // exists is it removed, and the notice points at what remains.
@@ -175,6 +180,60 @@ mod commands {
         // tuning and the exact denied paths (as a slice).
         let paths: Vec<PathBuf> = denied.iter().cloned().collect();
         GgElevatedRescan::reexec(expressions, &paths, opts.context, opts.delve, !opts.line_number, opts.regex, opts.save.as_deref());
+    }
+
+    /// The `--re` phase: plan every in-place replacement, show what it would touch, and apply it
+    /// only on an interactive `y`. Destructive and undo-less, so the preview + confirm is the whole
+    /// point — and a non-interactive run refuses rather than mutate unattended.
+    fn _replace_matches(expressions: &[String], roots: &[PathBuf], regex: bool, replacement: &str) {
+        use std::io::{IsTerminal, Write};
+        let Some(plan) = treegrep::plan_replacements(expressions, roots, regex, replacement) else {
+            return;
+        };
+        if plan.is_empty() {
+            eprintln!("\n--re: nothing to replace.");
+            return;
+        }
+        eprintln!("\n--re would replace every match with \"{replacement}\", in place:");
+        _preview("rename", plan.renames.iter().map(|(f, t)| format!("{} → {}", f.display(), t.display())));
+        _preview(
+            "rewrite",
+            plan.rewrites.iter().map(|(p, _, n)| {
+                format!("{} ({n} occurrence{})", p.display(), if *n == 1 { "" } else { "s" })
+            }),
+        );
+        if !std::io::stdin().is_terminal() {
+            eprintln!("--re: refusing to modify files non-interactively.");
+            return;
+        }
+        eprint!("Apply these changes? [y/N] ");
+        let _ = std::io::stderr().flush();
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err() || !answer.trim().eq_ignore_ascii_case("y") {
+            eprintln!("--re: aborted — nothing changed.");
+            return;
+        }
+        let (rewritten, renamed, problems) = treegrep::apply_replacements(&plan);
+        for problem in &problems {
+            eprintln!("--re: {problem}");
+        }
+        eprintln!("--re: rewrote {rewritten} file(s), renamed {renamed} path(s).");
+    }
+
+    /// Print a capped preview list (up to 10, like the root-rescan prompt), one `kind: item` per
+    /// line, so a huge change set can't scroll the confirm prompt off-screen.
+    fn _preview(kind: &str, items: impl Iterator<Item = String>) {
+        let items: Vec<String> = items.collect();
+        if items.is_empty() {
+            return;
+        }
+        let shown = if items.len() > 10 { 9 } else { items.len() };
+        for item in items.iter().take(shown) {
+            eprintln!("  {kind}: {item}");
+        }
+        if items.len() > shown {
+            eprintln!("  [{} more {kind}(s) omitted]", items.len() - shown);
+        }
     }
 }
 
