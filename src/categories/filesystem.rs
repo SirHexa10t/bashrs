@@ -55,7 +55,8 @@ mod commands {
     /// Column labels, matched to `LS_FLAGS` (the 7 metadata columns, then the name).
     const HEADER: &[&str] =
         &["Blocks", "Permissions", "Hard-Links", "Owner", "Group", "Size", "Date_Modified", "Filename"];
-    /// Spaces between aligned columns (matches `table_formatter`'s default).
+    /// Column spacing for these listings — a run of this many spaces both divides the input
+    /// columns and separates the output ones (matches `table_formatter`'s default).
     const TABLE_SEPARATOR: usize = 2;
 
     // ——— Formatting (pure) ————————————————————————————————————————————————
@@ -73,9 +74,13 @@ mod commands {
             )
             .collect();
         // The fallback is unreachable: only `sort` can error, and it's off.
+        // divide_by / join_with are delimiter strings now, not counts: a run of TABLE_SEPARATOR
+        // spaces both splits the input (`\s{2,}|\t+` — our rows are tab-delimited) and spaces the
+        // output. Fallback stays unreachable: sort is off and the delimiter is valid.
+        let gap = " ".repeat(TABLE_SEPARATOR);
         let opts = table_formatter::FormatOptions {
-            separator: TABLE_SEPARATOR,
-            threshold: TABLE_SEPARATOR,
+            divide_by: gap.clone(),
+            join_with: gap,
             ..Default::default()
         };
         table_formatter::format_table(&rows, &opts).unwrap_or(rows)
@@ -245,13 +250,9 @@ mod commands {
             }
             lines.push(_usage_row(&total, "(total)"));
         }
-        // The fallback is unreachable: only `sort` can error, and it's off.
-        let opts = table_formatter::FormatOptions {
-            separator: 2,
-            threshold: 2,
-            trim_trailing: true,
-            ..Default::default()
-        };
+        // Default delimiters (2-space split/join) — the old separator:2/threshold:2. Fallback
+        // unreachable: sort is off and the defaults are valid.
+        let opts = table_formatter::FormatOptions { trim_trailing: true, ..Default::default() };
         for line in table_formatter::format_table(&lines, &opts).unwrap_or(lines) {
             println!("{line}");
         }

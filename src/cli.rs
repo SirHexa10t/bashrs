@@ -314,12 +314,9 @@ fn wrappers() -> String {
             // adds to comment-less rows. The fallback is unreachable: only `sort` can error,
             // and it's off.
             body += &format!("\n# {label}\n");
-            let opts = table_formatter::FormatOptions {
-                separator: 2,
-                threshold: 2,
-                trim_trailing: true,
-                ..Default::default()
-            };
+            // Default delimiters (2-space split/join); `trim_trailing` drops the padding added to
+            // comment-less rows. Fallback unreachable: sort is off and the defaults are valid.
+            let opts = table_formatter::FormatOptions { trim_trailing: true, ..Default::default() };
             for line in table_formatter::format_table(&lines, &opts).unwrap_or(lines) {
                 body.push_str(&line);
                 body.push('\n');

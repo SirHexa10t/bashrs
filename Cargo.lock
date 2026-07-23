@@ -894,8 +894,8 @@ dependencies = [
 
 [[package]]
 name = "table_formatter"
-version = "2.0.0"
-source = "git+https://github.com/SirHexa10t/table_formatter.git?branch=main#db39ae502f65748c4927a7b1b7a5dcde762207dc"
+version = "3.0.0"
+source = "git+https://github.com/SirHexa10t/table_formatter.git?branch=main#47f990a3a84a9086b44f8dbb6efe3a41b140d680"
 dependencies = [
  "clap",
  "console 0.16.4",

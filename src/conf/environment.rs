@@ -48,10 +48,11 @@ pub fn settings() -> String {
             }
         })
         .collect();
-    // The fallback is unreachable: only `sort` can error, and it's off.
+    // divide_by "   " (3 spaces) splits code from its `# comment` on the 3-space gap — the old
+    // threshold:3 — while join_with keeps the default 2-space output gap. Fallback unreachable:
+    // sort is off and the delimiters are valid.
     let opts = table_formatter::FormatOptions {
-        separator: 2,
-        threshold: 3,
+        divide_by: "   ".to_string(),
         trim_trailing: true,
         ..Default::default()
     };

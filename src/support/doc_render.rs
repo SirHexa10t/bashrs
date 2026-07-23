@@ -7,9 +7,11 @@
 //! marks are honoured even inside a heading — a `**word**` in a title restyles in place, then the
 //! title colour resumes.
 //!
-//! Line-based on purpose — exactly one output line per source line — so pre-drawn box tables and
-//! other fixed-layout blocks pass through without reflow (minimad parses them as plain text, since
-//! box-drawing chars aren't Markdown), and the "line count preserved" contract holds.
+//! Line-based on purpose — exactly one output line per source line. Pre-drawn box tables and
+//! other fixed-layout blocks pass through untouched (minimad parses them as plain text, since
+//! box-drawing chars aren't Markdown). The one reflowed block is a markdown *pipe* table: its
+//! rows are collected and column-aligned through `table_formatter` (the `table` command's engine,
+//! splitting/joining on " | "), still one output line per source row.
 //!
 //! minimad is deliberately simple and line-oriented, which shapes two things worth knowing when
 //! authoring the `.md`: nested bullets go **one** level deep — `  -` (two spaces) is a sub-bullet,
@@ -30,9 +32,23 @@ const BULLETS: [&str; 3] = ["• ", "◦ ", "▪ "];
 /// through with only its inline spans styled. One output line per source line.
 pub(crate) fn render_doc(doc: &str) -> String {
     use minimad::{CompositeStyle, Line};
+    let parsed = minimad::parse_text(doc, minimad::Options::default());
+    let lines = &parsed.lines;
     let mut out = String::new();
-    for line in &minimad::parse_text(doc, minimad::Options::default()).lines {
-        match line {
+    let mut i = 0;
+    while i < lines.len() {
+        match &lines[i] {
+            // A markdown pipe-table block: gather the contiguous run and align it as a unit
+            // through `table_formatter` (the `table` command's engine), splitting/joining on the
+            // " | " the rows are already written in — one column-width pass, in one place.
+            Line::TableRow(_) | Line::TableRule(_) => {
+                let start = i;
+                while i < lines.len() && matches!(lines[i], Line::TableRow(_) | Line::TableRule(_)) {
+                    i += 1;
+                }
+                _emit_table(&mut out, &lines[start..i]);
+                continue;
+            }
             Line::Normal(composite) => match composite.style {
                 // Heading — bold blue via `_header` (the `gg`/`lll` title look), but inline marks
                 // are kept and restyled *within* the title: `_header` wraps through
@@ -68,39 +84,64 @@ pub(crate) fn render_doc(doc: &str) -> String {
                 // are styled, so fixed-layout text survives verbatim.
                 _ => _emit_spans(&mut out, composite),
             },
-            // Markdown pipe tables. minimad parses these as their own line kinds (NOT Normal), so
-            // without these arms every row is silently dropped — reconstruct `| cell | … |` with
-            // each cell's inline spans styled. Not width-aligned (that needs a whole-table pass,
-            // which would break the one-output-line-per-source-line contract); readable and, above
-            // all, present.
-            Line::TableRow(row) => _emit_table_row(&mut out, &row.cells),
-            Line::TableRule(rule) => _emit_table_rule(&mut out, rule.cells.len()),
             // HorizontalRule / CodeFence: our docs use neither — emit the bare newline below.
             _ => {}
         }
         out.push('\n');
+        i += 1;
     }
     out
 }
 
-/// A parsed table row as `| cell | cell | … |`, each cell's inline spans styled.
-fn _emit_table_row(out: &mut String, cells: &[minimad::Composite]) {
-    out.push('|');
-    for cell in cells {
-        out.push(' ');
-        _emit_spans(out, cell);
-        out.push_str(" |");
+/// Render a contiguous markdown pipe-table block, aligned through `table_formatter`. Each row is
+/// rebuilt as a `| cell | … |` line with its inline spans styled (bold/links/etc.), then the whole
+/// block is handed to `format_table` splitting and joining on " | " — the shape the rows are
+/// already in — so column widths are found once, by the shared engine, measured on *display*
+/// width (ANSI- and emoji-aware). `emit_frame` keeps the outer `| … |` border; the `|---|` rule
+/// aligns like any other row. (Alignment, not wrapping: a row wider than the terminal overflows.)
+fn _emit_table(out: &mut String, block: &[minimad::Line]) {
+    use minimad::Line;
+    let lines: Vec<String> = block
+        .iter()
+        .map(|line| match line {
+            Line::TableRow(row) => _table_row(&row.cells),
+            Line::TableRule(rule) => _table_rule(rule.cells.len()),
+            _ => String::new(),
+        })
+        .collect();
+    let opts = table_formatter::FormatOptions {
+        divide_by: " | ".to_string(),
+        join_with: " | ".to_string(),
+        emit_frame: true,
+        ..Default::default()
+    };
+    for aligned in table_formatter::format_table(&lines, &opts).unwrap_or(lines) {
+        out.push_str(&aligned);
+        out.push('\n');
     }
 }
 
-/// A table's header rule as `| --- | --- | … |`, one per column.
-fn _emit_table_rule(out: &mut String, columns: usize) {
+/// One table row as `| cell | cell | … |`, each cell's inline spans styled.
+fn _table_row(cells: &[minimad::Composite]) -> String {
+    let mut out = String::from("|");
+    for cell in cells {
+        out.push(' ');
+        _emit_spans(&mut out, cell);
+        out.push_str(" |");
+    }
+    out
+}
+
+/// A header rule as `| --- | --- | … |`, one per column — aligned like any other row.
+fn _table_rule(columns: usize) -> String {
+    let mut out = String::new();
     for _ in 0..columns {
         out.push_str("| --- ");
     }
     if columns > 0 {
         out.push('|');
     }
+    out
 }
 
 /// The composite's text with no styling — for elements coloured as a whole (headings, quotes).
@@ -278,15 +319,23 @@ mod tests {
     }
 
     #[test]
-    fn markdown_pipe_tables_render_instead_of_vanishing() {
-        // minimad parses `| … |` as TableRow/TableRule (not Normal); before these were handled,
-        // every such row was dropped. Header + rule + a data row must all survive, cells intact.
-        let table = "| Voice | Hz |\n|---|---|\n| **whistle** | 3322 |\n";
+    fn markdown_pipe_tables_align_via_table_formatter() {
+        // minimad parses `| … |` as TableRow/TableRule (not Normal); these were once dropped
+        // entirely. Now the block goes through table_formatter (split/join on " | "): content
+        // survives, `**` is styled away, every row shares one display width (the alignment), and
+        // the frame is kept.
+        let table = "| Voice | Hz |\n|---|---|\n| **whistle register** | 3322 |\n";
         let out = render_doc(table);
-        assert!(out.contains("Voice") && out.contains("Hz"), "header cells survive: {out:?}");
-        assert!(out.contains("whistle") && out.contains("3322"), "data cells survive: {out:?}");
-        assert_eq!(out.lines().count(), 3, "one output line per source line (header, rule, row)");
-        assert!(out.lines().nth(1).unwrap().contains("---"), "the rule renders as a rule");
+        let rows: Vec<&str> = out.lines().collect();
+        assert_eq!(rows.len(), 3, "one output line per source line (header, rule, data)");
+        assert!(out.contains("Voice") && out.contains("whistle register") && out.contains("3322"));
+        assert!(!out.contains("**"), "the bold markers are consumed, not shown: {out:?}");
+        let w = |s: &str| console::measure_text_width(s);
+        assert_eq!(w(rows[0]), w(rows[2]), "header and data align to one width: {out:?}");
+        assert_eq!(w(rows[0]), w(rows[1]), "the rule shares that width");
+        for row in &rows {
+            assert!(row.starts_with('|') && row.ends_with('|'), "framed row: {row:?}");
+        }
     }
 
     #[test]
