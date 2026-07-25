@@ -11,7 +11,7 @@
 //! `sync` runs first in `COMPILE.sh`, so the clones exist when `aliases` probes them. The clone is
 //! the only shared artifact — nothing copies the tool's own `--help` into a side file to go stale.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// One of your own non-Rust repos (a future external kind would be a sibling struct in this table).
@@ -28,6 +28,33 @@ struct Comfy {
     /// PyPI packages the tool needs at runtime — installed into the bundled python environment
     /// by [`sync`], via [`super::python`].
     python_deps: &'static [&'static str],
+    /// Extra entry points into this SAME clone — secondary aliases run by the same interpreter,
+    /// from the main executable's directory (so a `-m package.module` finds its package).
+    aux: &'static [Aux],
+    /// Sibling runnable scripts in the same clone, each exposed as flag-variant aliases — run by
+    /// absolute path with no `cd`, exactly like the main alias.
+    scripts: &'static [Script],
+}
+
+/// A secondary alias for a [`Comfy`]'s clone: the same tool, a different entry point. Run by the
+/// repo's own `run` interpreter, from the directory holding its `exe` — so `-m` module invocations
+/// resolve — inside a subshell, leaving the caller's working directory untouched.
+struct Aux {
+    /// Shell function name to expose.
+    alias: &'static str,
+    /// Arguments to the repo's `run` interpreter (e.g. `-m launch.audit`); `"$@"` is appended.
+    args: &'static str,
+}
+
+/// A runnable script in a [`Comfy`]'s clone, exposed as one or more flag-variant aliases. Run by
+/// absolute path like the main alias — no `cd`, so it behaves as if invoked directly: the
+/// interpreter puts the script's own directory on the import path, and the caller's working
+/// directory is preserved. Like the `g`/`g<N>` idea — one file, several fixed-flag verbs.
+struct Script {
+    /// Runnable file, relative to the clone root.
+    exe: &'static str,
+    /// `(alias, extra args)` pairs — each becomes `alias() { <run> "<exe>" <args> "$@"; }`.
+    variants: &'static [(&'static str, &'static str)],
 }
 
 /// The companion repos. Named `STAINLESS` (the general "non-Rust" bucket) though every entry is a
@@ -39,6 +66,13 @@ const STAINLESS: &[Comfy] = &[Comfy {
     exe: "dockerized_claude_code/run.py",
     // The launcher's runtime deps, per its own install_dependencies.sh.
     python_deps: &["prompt_toolkit", "python-dotenv", "rich"],
+    // A second entry point into the same clone: `ai_audit_self` runs the `launch.audit` module.
+    aux: &[Aux { alias: "ai_audit_self", args: "-m launch.audit" }],
+    // `quick_question.py` (beside run.py): `q` asks; `q2`/`q3` pin its --explain / --research modes.
+    scripts: &[Script {
+        exe: "dockerized_claude_code/quick_question.py",
+        variants: &[("q", ""), ("q2", "--explain"), ("q3", "--research")],
+    }],
 }];
 
 /// Clone root, `$HOME`-relative — kept as the "comfy" area (the dir you picked) even though the
@@ -54,10 +88,26 @@ fn clone_dir(comfy: &Comfy) -> PathBuf {
     std::env::home_dir().unwrap_or_default().join(CLONE_BASE).join(repo_name(comfy.repo))
 }
 
-/// The `$HOME`-relative executable path — used verbatim in the alias (portable) and in the `--help`
-/// probe (the shell expands `$HOME`).
+/// A clone-relative path, `$HOME`-relative and shell-ready (the shell expands `$HOME`) — the form
+/// used verbatim in aliases and in the `--help` probe.
+fn clone_path_shell(comfy: &Comfy, rel: &str) -> String {
+    format!("$HOME/{CLONE_BASE}/{}/{}", repo_name(comfy.repo), rel)
+}
+
+/// The `$HOME`-relative executable path — the main alias's target (and the `--help` probe's).
 fn exe_shell(comfy: &Comfy) -> String {
-    format!("$HOME/{CLONE_BASE}/{}/{}", repo_name(comfy.repo), comfy.exe)
+    clone_path_shell(comfy, comfy.exe)
+}
+
+/// The `$HOME`-relative directory holding the executable — where [`Aux`] commands `cd` before
+/// running, so a `-m package.module` finds its package. Falls back to the clone root for an `exe`
+/// that sits there directly.
+fn exe_dir_shell(comfy: &Comfy) -> String {
+    let root = format!("$HOME/{CLONE_BASE}/{}", repo_name(comfy.repo));
+    match Path::new(comfy.exe).parent().and_then(Path::to_str).filter(|dir| !dir.is_empty()) {
+        Some(dir) => format!("{root}/{dir}"),
+        None => root,
+    }
 }
 
 /// SIDE EFFECTS — `install-stainless` runs this at compile time: clone each repo if
@@ -140,33 +190,55 @@ pub fn clone_revisions() -> Vec<(&'static str, Option<String>)> {
         .collect()
 }
 
-/// Probe `<run> <exe> --help` (through a shell, so `$HOME` in `exe` expands) for a description.
-/// The launcher goes through [`crate::tools::resolve`], mirroring the sourcefile's PATH shim — the probe
-/// works even when the launcher is only bundled. Best-effort: any failure yields `None` (no comment).
-fn fetch_about(comfy: &Comfy) -> Option<String> {
-    let run = crate::tools::resolve(comfy.run);
-    let script = format!("\"{}\" \"{}\" --help 2>&1", run.to_string_lossy(), exe_shell(comfy));
+/// Width handed to `--help` probes via `COLUMNS`, so argparse (textwrap) lays a one-paragraph
+/// description on a single line instead of wrapping it. Wrapping can break at a hyphen, which
+/// [`extract_about`] would then rejoin as a spurious space (`~/.claude-agents` → `~/.claude-
+/// agents`); an un-wrapped line has no such ambiguity. Far wider than any real description, so the
+/// result is the same on any terminal.
+const PROBE_COLUMNS: u32 = 10_000;
+
+/// Run a `--help` probe `script` through bash (so `$HOME` expands and a `cd` is possible) and
+/// return its one-line description via [`extract_about`]. Best-effort: a spawn failure, a non-zero
+/// exit, or no extractable description all yield `None` (no comment).
+fn probe_about(script: &str) -> Option<String> {
     let out = Command::new("bash").arg("-c").arg(script).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    extract_about(&String::from_utf8_lossy(&out.stdout))
+    out.status.success().then(|| extract_about(&String::from_utf8_lossy(&out.stdout))).flatten()
 }
 
-/// Pure: the one-line description from `--help` text — the first non-empty line after the (possibly
-/// multi-line) `usage:` block, else the first non-empty non-`usage` line. Tunable; shape your tool's
-/// `--help` to suit.
+/// Probe the main launcher or a sibling [`Script`]: `<run> "<clone-path>" --help`, run by absolute
+/// path (no `cd`), `exe` clone-relative. `run` goes through [`crate::tools::resolve`], mirroring the
+/// sourcefile's PATH shim, so the probe works even when the interpreter is only bundled.
+fn fetch_about(comfy: &Comfy, exe: &str) -> Option<String> {
+    let run = crate::tools::resolve(comfy.run);
+    probe_about(&format!("COLUMNS={PROBE_COLUMNS} \"{}\" \"{}\" --help 2>&1", run.to_string_lossy(), clone_path_shell(comfy, exe)))
+}
+
+/// Probe an [`Aux`] exactly as it runs — `cd` into the exe's directory so a `-m module` resolves,
+/// then `<run> <args> --help`. `extract_about` keeps just the first description line, so a
+/// multi-line `--help` (like `launch.audit`'s) still yields a one-line comment.
+fn fetch_about_aux(comfy: &Comfy, aux: &Aux) -> Option<String> {
+    let run = crate::tools::resolve(comfy.run);
+    probe_about(&format!("cd \"{}\" && COLUMNS={PROBE_COLUMNS} \"{}\" {} --help 2>&1", exe_dir_shell(comfy), run.to_string_lossy(), aux.args))
+}
+
+/// Pure: the one-line description from `--help` text — the first *paragraph* after the (possibly
+/// multi-line) `usage:` block: consecutive non-empty lines joined with spaces. argparse's default
+/// formatter word-wraps a one-paragraph description to the probe's width, so joining the run
+/// recovers the whole sentence (otherwise it'd cut at the first wrapped line); a
+/// `RawDescriptionHelpFormatter` help whose author put a blank after a summary line still yields
+/// just that summary. Falls back to the first paragraph of the whole text when there's no `usage:`.
 fn extract_about(help: &str) -> Option<String> {
     let lines: Vec<&str> = help.lines().map(str::trim).collect();
-    if let Some(blank) = lines.iter().position(|line| line.is_empty()) {
-        if let Some(desc) = lines[blank + 1..].iter().find(|line| !line.is_empty()) {
-            return Some((*desc).to_string());
-        }
-    }
-    lines
+    // The description starts after the usage block (everything up to the first blank line); with no
+    // blank, from the top.
+    let start = lines.iter().position(|line| line.is_empty()).map_or(0, |blank| blank + 1);
+    let paragraph: Vec<&str> = lines[start..]
         .iter()
-        .find(|line| !line.is_empty() && !line.to_ascii_lowercase().starts_with("usage"))
-        .map(|line| (*line).to_string())
+        .skip_while(|line| line.is_empty() || line.to_ascii_lowercase().starts_with("usage"))
+        .take_while(|line| !line.is_empty())
+        .copied()
+        .collect();
+    (!paragraph.is_empty()).then(|| paragraph.join(" "))
 }
 
 /// The main binary's generator runs this. One alias per repo; for a repo that's actually been
@@ -176,8 +248,19 @@ pub(crate) fn aliases() -> String {
     STAINLESS
         .iter()
         .map(|comfy| {
-            let about = clone_dir(comfy).exists().then(|| fetch_about(comfy)).flatten();
-            alias_line(comfy, about.as_deref())
+            // One clone check gates every live `--help` probe (nothing spawns before the first sync).
+            let exists = clone_dir(comfy).exists();
+            let about = exists.then(|| fetch_about(comfy, comfy.exe)).flatten();
+            let mut lines = alias_line(comfy, about.as_deref());
+            for aux in comfy.aux {
+                let about = exists.then(|| fetch_about_aux(comfy, aux)).flatten();
+                lines.push_str(&aux_line(comfy, aux, about.as_deref()));
+            }
+            for script in comfy.scripts {
+                let about = exists.then(|| fetch_about(comfy, script.exe)).flatten();
+                lines.push_str(&script_lines(comfy, script, about.as_deref()));
+            }
+            lines
         })
         .collect()
 }
@@ -186,6 +269,37 @@ pub(crate) fn aliases() -> String {
 fn alias_line(comfy: &Comfy, about: Option<&str>) -> String {
     let comment = about.map(|about| format!("  # {about}")).unwrap_or_default();
     format!("{}() {{ {} \"{}\" \"$@\"; }}{comment}\n", comfy.alias, comfy.run, exe_shell(comfy))
+}
+
+/// Pure: one auxiliary alias line (`about` becomes an inline `#` comment when present) — `cd` to
+/// the executable's directory (in a subshell, so the caller's cwd is unchanged) and run the repo's
+/// interpreter with the aux's own arguments. The `cd`'s own stdout is discarded — a customised `cd`
+/// or a `CDPATH` hit echoes the directory, which would otherwise pollute the tool's output — while
+/// its errors still reach stderr and `&&` still gates the run on a successful `cd`.
+fn aux_line(comfy: &Comfy, aux: &Aux, about: Option<&str>) -> String {
+    let comment = about.map(|about| format!("  # {about}")).unwrap_or_default();
+    format!("{}() {{ (cd \"{}\" >/dev/null && {} {} \"$@\"); }}{comment}\n", aux.alias, exe_dir_shell(comfy), comfy.run, aux.args)
+}
+
+/// Pure: the alias lines for one [`Script`] — one per flag variant, each running the script by
+/// absolute path (no `cd`) with its fixed flags then `"$@"`, like the main alias. An empty-flag
+/// variant emits no stray space. The script's one probed `--help` line (`about`) becomes an inline
+/// comment on every variant, suffixed with the pinned flag so `q2`/`q3` read distinctly from `q`.
+fn script_lines(comfy: &Comfy, script: &Script, about: Option<&str>) -> String {
+    let path = clone_path_shell(comfy, script.exe);
+    script
+        .variants
+        .iter()
+        .map(|(alias, args)| {
+            let flags = if args.is_empty() { String::new() } else { format!(" {args}") };
+            let comment = match about {
+                None => String::new(),
+                Some(about) if args.is_empty() => format!("  # {about}"),
+                Some(about) => format!("  # {about} ({args})"),
+            };
+            format!("{alias}() {{ {} \"{path}\"{flags} \"$@\"; }}{comment}\n", comfy.run)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -198,6 +312,11 @@ mod tests {
         run: "python3",
         exe: "dockerized_claude_code/run.py",
         python_deps: &[],
+        aux: &[Aux { alias: "ai_audit_self", args: "-m launch.audit" }],
+        scripts: &[Script {
+            exe: "dockerized_claude_code/quick_question.py",
+            variants: &[("q", ""), ("q2", "--explain")],
+        }],
     };
 
     #[test]
@@ -218,6 +337,59 @@ mod tests {
     }
 
     #[test]
+    fn aux_line_cds_into_the_exe_dir_and_runs_the_module_in_a_subshell() {
+        // The subshell `(cd … && …)` keeps the caller's cwd; the cd target is the exe's directory,
+        // so `python3 -m launch.audit` can import the `launch` package that lives beside run.py.
+        // The probed `--help` first line rides along as an inline comment.
+        assert_eq!(
+            aux_line(SAMPLE, &SAMPLE.aux[0], Some("Audit the launcher's state")),
+            "ai_audit_self() { (cd \
+             \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code\" >/dev/null \
+             && python3 -m launch.audit \"$@\"); }  # Audit the launcher's state\n"
+        );
+        // No probe (clone absent) → no comment.
+        assert!(
+            aux_line(SAMPLE, &SAMPLE.aux[0], None).ends_with("\"$@\"); }\n"),
+            "no about → no trailing comment"
+        );
+    }
+
+    #[test]
+    fn script_lines_run_by_absolute_path_with_fixed_flags_and_no_cd() {
+        // Each variant is a bare alias like the main one (no `cd`): the script by absolute path,
+        // its fixed flags, then "$@". The probed `--help` line is an inline comment, the pinned
+        // flag named so variants differ; an empty-flag variant leaves no stray space before "$@".
+        let out = script_lines(SAMPLE, &SAMPLE.scripts[0], Some("Ask a quick question"));
+        assert!(
+            out.contains("q() { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" \"$@\"; }  # Ask a quick question\n"),
+            "bare variant + comment: {out}"
+        );
+        assert!(
+            out.contains("q2() { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" --explain \"$@\"; }  # Ask a quick question (--explain)\n"),
+            "flag variant names the pinned flag: {out}"
+        );
+        // No probe (clone absent) → no comment, and still no stray space on the bare variant.
+        assert!(
+            script_lines(SAMPLE, &SAMPLE.scripts[0], None).contains("q() { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" \"$@\"; }\n"),
+            "no about → no comment"
+        );
+    }
+
+    #[test]
+    fn exe_dir_shell_is_the_clone_root_when_the_exe_sits_there() {
+        const FLAT: &Comfy = &Comfy {
+            repo: "https://github.com/x/tool.git",
+            alias: "t",
+            run: "python3",
+            exe: "main.py", // no subdirectory
+            python_deps: &[],
+            aux: &[],
+            scripts: &[],
+        };
+        assert_eq!(exe_dir_shell(FLAT), "$HOME/.bashrs/stainless_comfy/tool");
+    }
+
+    #[test]
     fn extract_about_takes_the_description_after_the_usage_block() {
         // A multi-line `usage:` block precedes the description; the wrapped usage line is skipped.
         let help = "usage: run.py [-h] [--dry-run]\n              [target]\n\nLaunch a containerized agent.\n\npositional arguments:\n  target\n";
@@ -228,5 +400,25 @@ mod tests {
     fn extract_about_falls_back_or_gives_none() {
         assert_eq!(extract_about("A tiny tool.\n").as_deref(), Some("A tiny tool."));
         assert_eq!(extract_about(""), None);
+    }
+
+    #[test]
+    fn extract_about_joins_a_width_wrapped_one_paragraph_description() {
+        // argparse's default formatter word-wraps a single-paragraph description to the probe's
+        // width; the whole paragraph (to the blank before `options:`) is rejoined, not cut at the
+        // first wrapped line — the `q` regression.
+        let help = "usage: q [-h]\n\nAsk one direct question, answered in one shot. Put your\nprompt in quotes. If you need files, use the communal dir\n\noptions:\n  -h, --help\n";
+        assert_eq!(
+            extract_about(help).as_deref(),
+            Some("Ask one direct question, answered in one shot. Put your prompt in quotes. If you need files, use the communal dir"),
+        );
+    }
+
+    #[test]
+    fn extract_about_stops_at_a_blank_within_a_raw_description() {
+        // A RawDescription help (author newlines kept) — a summary line, a blank, then a section:
+        // only the summary paragraph is taken (the `launch.audit` shape).
+        let help = "usage: python -m launch.audit [-h]\n\nAudit the launcher's state.\n\nReports:\n  - things\n";
+        assert_eq!(extract_about(help).as_deref(), Some("Audit the launcher's state."));
     }
 }

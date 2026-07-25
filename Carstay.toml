@@ -10,9 +10,9 @@
 [tools]
 ffmpeg = "n8.1"
 yt-dlp = "2026.07.04"
-uv = "0.11.31"
+uv = "0.11.32"
 python = "3.14.6"
 deno = "v2.9.4"
 
 [stainless_comfy]
-contAInerized = "67901d0ba31d3c663c8007740ccf9525af354a02"
+contAInerized = "995b24cfb3a29eb9c7c1760e7ce1dabd50b382b1"

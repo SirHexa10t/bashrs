@@ -64,12 +64,15 @@ A processing layer over an ordinary human (or synthetic) source — **none open 
 
 | Effect (what it does to pitch) | Why it reads as "robotic" | Signature | The frequencies it lands on |
 |---|---|---|---|
-| **Harmonizer** — forces the sung note to preset scale degrees; stacks pitch-shifted copies | Quantized pitch-shift + stacked harmony voices | Eiffel 65 — "Blue (Da Ba Dee)" | Locked to the track's scale (Blue = G minor: **G3 196 → G4 392 Hz**, stacks to ~**G5 784 Hz**) — a normal tenor octave |
+| **Harmonizer** — forces the sung note to preset scale degrees; stacks pitch-shifted copies | Quantized pitch-shift + stacked harmony voices | Eiffel 65 — "Blue (Da Ba Dee)" | Track is **G minor, 128 BPM** (verified). Output is locked to G-minor scale degrees, so the "vocal" notes are **G3 196 · A3 220 · B♭3 233 · C4 262 · D4 294 · E♭4 311 · F4 349 · G4 392 Hz**, with stacked harmony copies reaching up toward ~G5 (784 Hz). Sits in a normal male-tenor octave |
 | **Auto-Tune (extreme)** — F0 snapped instantly to the nearest semitone | The mechanical stepping/warble between notes, no natural scoop | Cher — "Believe"; T-Pain | The singer's own range, **quantized to the exact 12-TET semitones** (map below) |
 | **Vocoder** — pitch comes wholly from a synth carrier; the voice's own pitch is discarded | A synth "speaking" — inhumanly smooth, no micro-variation | Kraftwerk; Daft Punk | Whatever the carrier plays; the voice adds only a formant envelope (energy to a few kHz) |
-| **Talk box** — pitch from an instrument piped through a tube; the mouth shapes formants | A "talking guitar" — organic formants on a non-vocal pitch source | Bon Jovi; Zapp / Roger Troutman | The instrument's pitch (guitar low **E2 = 82 Hz** upward) |
+| **Talk box** — pitch from an instrument piped through a tube; the mouth shapes formants | A "talking guitar" — organic formants on a non-vocal pitch source | Frampton; Zapp/Roger Troutman; Bon Jovi | The instrument's pitch (guitar low **E2 = 82 Hz** upward) |
 | **Ring modulation** — no pitch tracking; voice × a fixed sine | Metallic/clangy — the spectrum stops being "voice-shaped" | Daleks (*Doctor Who*) | Not on a pitch — voice × a **~30–100 Hz** sine → inharmonic sum/difference sidebands (f ± carrier) |
 | **Speech synthesis / TTS** — rule-generated, usually a flat monotone | Fully synthetic — no human voice at all | DECtalk (Stephen Hawking) | Near-monotone low male pitch, **~120 Hz** (approx), formant-synthesised |
+
+- **None of these open a new pitch *range*.** They either (a) re-map F0 *within* the normal human range — Auto-Tune quantizes to semitones, a harmonizer to scale notes; (b) take the pitch from a *synth or instrument* instead of the voice — vocoder and talk box, so the "range" is whatever the carrier plays; or (c) ignore pitch entirely and add inharmonic content — ring mod. So a vocoded or Auto-Tuned vocal still lives wherever the singer (or carrier) is playing; the robot-ness is a *processing layer*, not a new tessitura.
+- **The "robot" cue lives on the two axes you already have.** Either the **pitch** is made unnaturally exact — quantized (Auto-Tune), locked to a scale (harmonizer), or monotone (TTS), stripping the continuous drift/vibrato that signals "a human is doing this" — **or** the **spectrum** is made unnaturally regular or inharmonic — the vocoder's discrete formant bands, ring mod's non-harmonic sidebands. Human voices sound alive precisely because F0 *and* the formants glide continuously; robotizing freezes one or both.
 
 
 

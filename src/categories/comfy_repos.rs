@@ -5,12 +5,52 @@
 
 #[bashrs_macros::category(command = ComfyReposCommand, prefix = "comfy_")]
 mod commands {
+    use crate::support::comfy_repos::table_fancy_options;
+    use clap::Args;
+    use std::io::{self, BufWriter, Write};
+
     /// Align whitespace-delimited columns into a neat table (table_formatter)
     #[unprefixed]
     pub fn table(args: table_formatter::Args) {
         if let Err(err) = table_formatter::run_with(args) {
             eprintln!("table: {err}");
         }
+    }
+
+    /// `table` in its framed, terminal-width form: `-j " | " --split-lines --space-rows '-'
+    /// --emit-frame` — pipe-joined columns in a border, records ruled apart, wide rows wrapped to
+    /// fit the window (table_formatter)
+    #[unprefixed]
+    pub fn table_fancy(args: TableFancyArgs) {
+        if let Err(err) = _table_fancy(&args.input) {
+            eprintln!("table_fancy: {err}");
+        }
+    }
+
+    /// Read `input`, format it with the shared [`table_fancy_options`] preset, and print it. The
+    /// pinned flags are *not* exposed as arguments (unlike the `backup_*` pattern,
+    /// `table_formatter::Args` keeps its fields private), so the preset — not a mutated arg set —
+    /// is what this command and `doc_render` share.
+    fn _table_fancy(input: &str) -> io::Result<()> {
+        let lines = table_formatter::read_lines(input)?;
+        let table = table_formatter::format_table(&lines, &table_fancy_options())
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+        // One locked, buffered writer for the whole table — mirroring table_formatter's own
+        // printer, where a per-line `println!` would take the lock and syscall for every line.
+        let mut out = BufWriter::new(io::stdout().lock());
+        for line in &table {
+            writeln!(out, "{line}")?;
+        }
+        out.flush()
+    }
+
+    /// What `table_fancy` takes: `table`'s positional input, verbatim — the rest of its shape is
+    /// the pinned preset.
+    #[derive(Args)]
+    pub struct TableFancyArgs {
+        /// Input file path / data (or use stdin if not provided)
+        #[arg(default_value = "-")]
+        input: String,
     }
 
     /// Report what a backup sync would do (new / changed / moved / deleted); changes nothing (filesync diff)

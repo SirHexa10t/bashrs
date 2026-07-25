@@ -531,13 +531,13 @@ mod tests {
 
     #[test]
     fn comfy_commands_follow_naming_standard() {
-        // External tools keep their own upstream name (`table`) or a task-named family — all
-        // unprefixed by design (`backup_*` flattens filesync's subcommands into
-        // directly-completable commands).
+        // External tools keep their own upstream name (`table`, plus its pinned-preset sibling
+        // `table_fancy`) or a task-named family — all unprefixed by design (`backup_*` flattens
+        // filesync's subcommands into directly-completable commands).
         assert_prefixed(
             &command_names::<ComfyReposCommand>(),
             "comfy_",
-            &["table", "backup_diff", "backup_sync", "backup_find_bitrot"],
+            &["table", "table_fancy", "backup_diff", "backup_sync", "backup_find_bitrot"],
         );
     }
 
@@ -691,6 +691,20 @@ mod tests {
         // The alias is emitted whether or not the repo has been cloned yet; only the trailing
         // `--help` comment varies with the environment, so assert just the alias line's stable head.
         assert!(wrappers().contains("ai() { python3 \"$HOME/.bashrs/stainless_comfy/"), "stainless `ai` alias missing");
+        // …and the same clone's auxiliary entry point: `ai_audit_self`, a `-m` module run from the tool's dir.
+        assert!(
+            wrappers().contains("ai_audit_self() { (cd \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code\" >/dev/null && python3 -m launch.audit \"$@\"); }"),
+            "stainless `ai_audit_self` aux alias missing"
+        );
+        // …and the same clone's `quick_question.py` script family: `q` bare, `q3` with a pinned flag.
+        assert!(
+            wrappers().contains("q() { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" \"$@\"; }"),
+            "stainless `q` script alias missing"
+        );
+        assert!(
+            wrappers().contains("q3() { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" --research \"$@\"; }"),
+            "stainless `q3` script alias missing"
+        );
     }
 
     #[test]

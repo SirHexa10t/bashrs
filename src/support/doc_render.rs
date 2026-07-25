@@ -10,8 +10,11 @@
 //! Line-based on purpose — exactly one output line per source line. Pre-drawn box tables and
 //! other fixed-layout blocks pass through untouched (minimad parses them as plain text, since
 //! box-drawing chars aren't Markdown). The one reflowed block is a markdown *pipe* table: its
-//! rows are collected and column-aligned through `table_formatter` (the `table` command's engine,
-//! splitting/joining on " | "), still one output line per source row.
+//! rows are collected and rendered through the shared [`table_fancy_options_at`] preset (the
+//! `table_fancy` command's shape — framed, pipe-joined, record-ruled, split to the window) plus
+//! `-d " | "`, the delimiter the rows are already written in. That split is the one place a source
+//! line can become several output lines: a table wider than the window wraps into it rather than
+//! overflowing, with continuations marked in a `·` gutter.
 //!
 //! minimad is deliberately simple and line-oriented, which shapes two things worth knowing when
 //! authoring the `.md`: nested bullets go **one** level deep — `  -` (two spaces) is a sub-bullet,
@@ -21,6 +24,7 @@
 //! `http(s)://`/`www.` URLs, in place.
 
 use crate::support::doc_style::{self, RESET};
+use crate::support::comfy_repos::table_fancy_options_at;
 
 /// Nested-list glyphs by depth; index saturates at the deepest we style (minimad only reaches the
 /// first two anyway — see the module note on the four-space rule).
@@ -29,8 +33,15 @@ const BULLETS: [&str; 3] = ["• ", "◦ ", "▪ "];
 /// Render a Markdown `doc` to ANSI-coloured text for terminal display (`dl -c`'s site listing).
 /// Markers are stripped; headings, emphasis, inline code, list items and blockquotes are coloured
 /// via `doc_style`'s element helpers; every other line (paragraphs, pre-drawn tables) passes
-/// through with only its inline spans styled. One output line per source line.
+/// through with only its inline spans styled. One output line per source line, except a pipe table
+/// too wide for the terminal, which wraps into it (see [`_emit_table`]).
 pub(crate) fn render_doc(doc: &str) -> String {
+    render_doc_at_width(doc, table_formatter::terminal_width())
+}
+
+/// [`render_doc`] with the table-splitting width pinned instead of probed — for output that must
+/// not depend on the window it ran in (the tests).
+pub(crate) fn render_doc_at_width(doc: &str, width: usize) -> String {
     use minimad::{CompositeStyle, Line};
     let parsed = minimad::parse_text(doc, minimad::Options::default());
     let lines = &parsed.lines;
@@ -46,7 +57,7 @@ pub(crate) fn render_doc(doc: &str) -> String {
                 while i < lines.len() && matches!(lines[i], Line::TableRow(_) | Line::TableRule(_)) {
                     i += 1;
                 }
-                _emit_table(&mut out, &lines[start..i]);
+                _emit_table(&mut out, &lines[start..i], width);
                 continue;
             }
             Line::Normal(composite) => match composite.style {
@@ -93,13 +104,17 @@ pub(crate) fn render_doc(doc: &str) -> String {
     out
 }
 
-/// Render a contiguous markdown pipe-table block, aligned through `table_formatter`. Each row is
-/// rebuilt as a `| cell | … |` line with its inline spans styled (bold/links/etc.), then the whole
-/// block is handed to `format_table` splitting and joining on " | " — the shape the rows are
-/// already in — so column widths are found once, by the shared engine, measured on *display*
-/// width (ANSI- and emoji-aware). `emit_frame` keeps the outer `| … |` border; the `|---|` rule
-/// aligns like any other row. (Alignment, not wrapping: a row wider than the terminal overflows.)
-fn _emit_table(out: &mut String, block: &[minimad::Line]) {
+/// Render a contiguous markdown pipe-table block through the shared [`table_fancy_options_at`]
+/// preset. Each
+/// row is rebuilt as a `| cell | … |` line with its inline spans styled (bold/links/etc.), then the
+/// whole block is handed to `format_table` as `table_fancy` plus `-d " | "` — the delimiter the
+/// rows are already written in. Column widths are therefore found once, by the shared engine,
+/// measured on *display* width (ANSI- and emoji-aware); the `|---|` rule aligns like any other row.
+///
+/// The preset's split at `width` is why a source row can become several output lines: cells
+/// word-wrap within their column and stack, continuations marked in a `·` gutter, all still inside
+/// the frame.
+fn _emit_table(out: &mut String, block: &[minimad::Line], width: usize) {
     use minimad::Line;
     let lines: Vec<String> = block
         .iter()
@@ -109,12 +124,9 @@ fn _emit_table(out: &mut String, block: &[minimad::Line]) {
             _ => String::new(),
         })
         .collect();
-    let opts = table_formatter::FormatOptions {
-        divide_by: " | ".to_string(),
-        join_with: " | ".to_string(),
-        emit_frame: true,
-        ..Default::default()
-    };
+    // The one difference from the `table_fancy` command: these rows arrive pipe-divided (`-d " | "`).
+    let opts =
+        table_formatter::FormatOptions { divide_by: " | ".to_string(), ..table_fancy_options_at(width) };
     for aligned in table_formatter::format_table(&lines, &opts).unwrap_or(lines) {
         out.push_str(&aligned);
         out.push('\n');
@@ -321,21 +333,44 @@ mod tests {
     #[test]
     fn markdown_pipe_tables_align_via_table_formatter() {
         // minimad parses `| … |` as TableRow/TableRule (not Normal); these were once dropped
-        // entirely. Now the block goes through table_formatter (split/join on " | "): content
-        // survives, `**` is styled away, every row shares one display width (the alignment), and
-        // the frame is kept.
+        // entirely. Now the block goes through the `table_fancy` preset: content survives, `**` is
+        // styled away, every line shares one display width (the alignment), and the block is
+        // framed — closed by a `-` rule top and bottom, with the records ruled apart between.
         let table = "| Voice | Hz |\n|---|---|\n| **whistle register** | 3322 |\n";
-        let out = render_doc(table);
-        let rows: Vec<&str> = out.lines().collect();
-        assert_eq!(rows.len(), 3, "one output line per source line (header, rule, data)");
+        // Pinned wide, so nothing wraps and the assertion is about alignment, not the window.
+        let out = render_doc_at_width(table, 120);
+        let lines: Vec<&str> = out.lines().collect();
         assert!(out.contains("Voice") && out.contains("whistle register") && out.contains("3322"));
         assert!(!out.contains("**"), "the bold markers are consumed, not shown: {out:?}");
         let w = |s: &str| console::measure_text_width(s);
-        assert_eq!(w(rows[0]), w(rows[2]), "header and data align to one width: {out:?}");
-        assert_eq!(w(rows[0]), w(rows[1]), "the rule shares that width");
-        for row in &rows {
+        for line in &lines {
+            assert_eq!(w(line), w(lines[0]), "every line shares the table width: {line:?}");
+        }
+        let (top, bottom) = (lines[0], lines[lines.len() - 1]);
+        assert!(top.starts_with('-') && bottom.starts_with('-'), "closed top and bottom: {out:?}");
+        // Each source row is still a framed row of its own, in order, between those rules.
+        let rows: Vec<&&str> =
+            lines.iter().filter(|line| line.contains("Voice") || line.contains("3322")).collect();
+        assert_eq!(rows.len(), 2, "header and data each on one line: {out:?}");
+        for row in rows {
             assert!(row.starts_with('|') && row.ends_with('|'), "framed row: {row:?}");
         }
+    }
+
+    #[test]
+    fn a_wide_pipe_table_splits_into_the_width() {
+        // The `table_fancy` preset at work: a pipe table wider than the window wraps into it —
+        // every output line inside the budget and still framed, continuations in the `·` gutter,
+        // content intact. This is the deliberate exception to one-line-per-source-line.
+        let table = "| Voice | Note |\n|---|---|\n| a very long descriptive voice name here | C1 |\n";
+        let width = 32;
+        let out = render_doc_at_width(table, width);
+        for line in out.lines() {
+            assert!(console::measure_text_width(line) <= width, "line over {width}: {line:?}");
+        }
+        assert!(out.lines().count() > table.lines().count(), "the wide row wrapped to extra lines");
+        assert!(out.contains('·'), "continuation gutter present: {out:?}");
+        assert!(out.contains("voice name"), "content survives the split: {out:?}");
     }
 
     #[test]

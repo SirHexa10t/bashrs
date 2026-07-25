@@ -204,6 +204,29 @@ fn pro_run_forwards_every_arg_to_the_program_except_its_own_help() {
 }
 
 #[test]
+fn table_fancy_is_the_framed_terminal_width_table_preset() {
+    // `table_fancy` must stay exactly `table -j " | " --split-lines --space-rows '-' --emit-frame`.
+    // Both are run over the same input at a pinned $COLUMNS (the width --split-lines resolves to),
+    // so the comparison is deterministic and pins the preset to the invocation it stands for.
+    let input = "name  role  note\nada  pioneer  wrote the first algorithm for a machine\nbob  builder  yes";
+    let width = ("COLUMNS", "60");
+    let fancy = bashrs(&["table_fancy", input], &[width]);
+    let spelled_out = bashrs(
+        &["table", input, "-j", " | ", "--split-lines", "--space-rows", "-", "--emit-frame"],
+        &[width],
+    );
+    assert!(fancy.status.success(), "{}", String::from_utf8_lossy(&fancy.stderr));
+    let shown = String::from_utf8_lossy(&fancy.stdout);
+    assert_eq!(shown, String::from_utf8_lossy(&spelled_out.stdout), "preset drifted from its flags");
+    // …and that shape is: framed rows, none wider than the window, wrapped where needed.
+    for line in shown.lines() {
+        assert!(line.starts_with('|') || line.starts_with('-'), "framed or a rule: {line:?}");
+        assert!(line.chars().count() <= 60, "wider than $COLUMNS: {line:?}");
+    }
+    assert!(shown.lines().count() > 3, "the long row wrapped: {shown}");
+}
+
+#[test]
 fn pro_test_survives_a_relative_dir_across_its_two_steps() {
     // CMake is the build-then-test toolchain: pro_test cd's per step (process-global), and a
     // RELATIVE dir once resolved the second cd against the first's result (myproj/myproj) —

@@ -613,6 +613,7 @@ mod commands {
     /// tunable frequency band; video, subtitles, and cover art pass through untouched
     pub fn remove_vocals(args: RemoveVocalsArgs) {
         if args.range_help {
+            // The frequency tables render `table_fancy`-style, sized to the live window.
             print!("{}", doc_render::render_doc(RANGE_HELP));
             return;
         }
@@ -1407,8 +1408,9 @@ mod commands {
             assert!(RANGE_HELP.contains("--from") && RANGE_HELP.contains("--to"), "names the knobs");
             assert!(RANGE_HELP.contains("Fundamental (Hz)"), "carries the pitch reference");
             // Renders through the same path as `dl -c` without mangling — headings coloured,
-            // table rows intact.
-            let rendered = doc_render::render_doc(RANGE_HELP);
+            // table rows intact. Width pinned wide: at a narrow one the `table_fancy` preset wraps
+            // cell text (by design), which would break a contiguous-phrase assertion.
+            let rendered = doc_render::render_doc_at_width(RANGE_HELP, 200);
             assert!(rendered.contains("Whistle register"), "table content survives rendering");
         }
 
