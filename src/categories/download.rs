@@ -8,7 +8,7 @@ mod commands {
     use std::path::{Path, PathBuf};
 
     use crate::support::exec::{capture_stdout, run_reporting};
-    use crate::drivers::youtube;
+    use crate::drivers::ytdlp;
     use crate::support::browsers;
     use crate::support::doc_render;
     use crate::support::doc_style::{self, _header};
@@ -135,9 +135,11 @@ mod commands {
 
     /// `~/.bashrs/user-data/browser_cookies` — the base holding one subdir per imported site
     /// (`<key>/store/` + `<key>/browser.spec`). `--cookie-import` writes a site's subdir; each
-    /// `dl <url>` run reads the subdir matching the URL's site.
+    /// `dl <url>` run reads the subdir matching the URL's site. The dir NAME belongs to
+    /// [`browsers`] (the store's on-disk shape is its concern); only the join onto the
+    /// user-data root happens here.
     fn _cookie_store_dir() -> PathBuf {
-        crate::conf::user_data_dir().join("browser_cookies")
+        crate::conf::user_data_dir().join(browsers::ROOT_SUBDIR)
     }
 
     /// The `--cookie-import <target>` action: resolve the target site, scan for browser cookie
@@ -176,7 +178,7 @@ mod commands {
             }
         };
         // Cherry-pick: only the target site's cookies are copied — never the whole DB.
-        let Some(matched) = youtube::filter_cookie_db(store, &store_dir, &site.domains) else {
+        let Some(matched) = ytdlp::filter_cookie_db(store, &store_dir, &site.domains) else {
             let _ = browsers::forget(&site_dir);
             eprintln!("dl: could not filter the cookie store (is the bundled python available?)");
             return false;
@@ -207,7 +209,7 @@ mod commands {
     /// the check can't run.
     fn _warn_if_cookies_expired(site_dir: &Path, site: &browsers::SiteTarget) {
         let Some((db, kind)) = browsers::imported_db(site_dir) else { return };
-        if youtube::cookies_expired(&db, kind) == Some(true) {
+        if ytdlp::cookies_expired(&db, kind) == Some(true) {
             eprintln!(
                 "{}",
                 doc_style::problematic(&format!(
@@ -228,7 +230,7 @@ mod commands {
         // browser already flushed to the DB, so a sign-in from moments ago may not be in it yet.
         let wal_note = || println!("note: if a fresh sign-in isn't recognized, fully quit the browser and re-import");
         let Some(spec) = browsers::imported_spec(site_dir) else { return true };
-        match youtube::readable_cookie_count(&spec, site_dir) {
+        match ytdlp::readable_cookie_count(&spec, site_dir) {
             Some(n) if n > 0 => {
                 println!("validated — {n} {} cookie(s) readable; dl runs on {} will use them", site.label, site.label);
                 wal_note();
@@ -284,7 +286,7 @@ mod commands {
     /// one video downloaded flat into `--into`, the same quality knobs and failure ledger, minus
     /// the folder trees (a generic page gives no channel/playlist structure to build them from).
     /// `-c` lists what "any other site" tends to cover. The machinery lives in
-    /// [`crate::drivers::youtube`]; this stays the thin argument shell.
+    /// [`crate::drivers::ytdlp`]; this stays the thin argument shell.
     #[name("dl")]
     pub fn dl(args: DlArgs) {
         let DlArgs { url, into, single, cookies, no_cookies, audio, res, allow_ipv6, thumbnail, subtitles, taglist, cookie_import, compatibility_help, extra } = args;
@@ -293,7 +295,7 @@ mod commands {
             return;
         }
         if taglist {
-            std::process::exit(youtube::taglist());
+            std::process::exit(ytdlp::taglist());
         }
         if let Some(target) = &cookie_import {
             let imported = _import_cookies(target);
@@ -308,8 +310,8 @@ mod commands {
             eprintln!("dl: cannot create {}: {err}", into.display());
             std::process::exit(1);
         }
-        let ffmpeg = youtube::bundled_ffmpeg_dir();
-        let deno = youtube::bundled_deno();
+        let ffmpeg = ytdlp::bundled_ffmpeg_dir();
+        let deno = ytdlp::bundled_deno();
         // Auto-select the per-site store matching this URL's host — a prior `--cookie-import` for
         // this site is the standing default; an explicit `--cookies` file wins, and `--no-cookies`
         // opts out of stored cookies entirely (download anonymously).
@@ -321,7 +323,7 @@ mod commands {
         if imported.is_some() {
             _warn_if_cookies_expired(&site_dir, &site);
         }
-        let env = youtube::Env {
+        let env = ytdlp::Env {
             ffmpeg_dir: ffmpeg.as_deref(),
             cookies: cookies.as_deref(),
             cookies_from_browser: imported.as_deref(),
@@ -345,19 +347,19 @@ mod commands {
 
     /// The YouTube path: classify the URL and hand off to the matching driver entry — a lone
     /// video, a playlist (with its unplayable report), or a whole channel (tabs → folders).
-    fn _youtube(url: &str, into: &Path, env: youtube::Env, single: bool) -> i32 {
-        match youtube::classify(url, single) {
-            youtube::Link::Video => youtube::download_video(url, into, env),
-            youtube::Link::Playlist { id } => youtube::download_playlist(url, &id, into, env),
-            youtube::Link::Channel { root } => youtube::download_channel(&root, into, env),
+    fn _youtube(url: &str, into: &Path, env: ytdlp::Env, single: bool) -> i32 {
+        match ytdlp::classify(url, single) {
+            ytdlp::Link::Video => ytdlp::download_video(url, into, env),
+            ytdlp::Link::Playlist { id } => ytdlp::download_playlist(url, &id, into, env),
+            ytdlp::Link::Channel { root } => ytdlp::download_channel(&root, into, env),
         }
     }
 
     /// The generic path for every other site: one flat download into `into` — we can't tell a
     /// playlist from a channel from a lone page, so there's no folder tree — reusing the same
     /// quality knobs, archive, and failure ledger as the YouTube path.
-    fn _video(url: &str, into: &Path, env: youtube::Env) -> i32 {
-        youtube::download_generic(url, into, env)
+    fn _video(url: &str, into: &Path, env: ytdlp::Env) -> i32 {
+        ytdlp::download_generic(url, into, env)
     }
 
     /// Whether `url`'s host is YouTube — any subdomain of `youtube.com` / `youtube-nocookie.com`,
@@ -443,7 +445,8 @@ mod commands {
 
     /// What `dl -c` prints: [`COMPATIBILITY`] rendered to ANSI-coloured text by
     /// [`doc_render::render_doc`] — markers stripped, headings/emphasis/code/lists/quotes coloured
-    /// via the shared theme, pre-drawn tables and body passed through untouched.
+    /// via the shared theme, prose passed through line-for-line, and the pipe tables re-laid out
+    /// `table_fancy`-style to fit the terminal.
     fn _compatibility_help() -> String {
         doc_render::render_doc(COMPATIBILITY)
     }
@@ -453,18 +456,11 @@ mod commands {
         use super::*;
 
         #[test]
-        fn compatibility_help_renders_the_markdown_doc_with_colour_and_intact_lines() {
-            let out = _compatibility_help();
-            // The doc is rendered markdown → coloured (ANSI escapes present).
-            assert!(out.contains('\x1b'), "expected colour from the markdown render");
-            // Line-based render: never reflows, so it has exactly one output line per source
-            // line — pre-drawn tables and indented blocks survive intact.
-            assert_eq!(out.lines().count(), COMPATIBILITY.lines().count(), "line count must be preserved");
-            // A representative box-drawing table row (if the doc has one) passes through verbatim,
-            // borders and spacing untouched.
-            if let Some(row) = COMPATIBILITY.lines().find(|l| l.contains('│')) {
-                assert!(out.contains(row), "table row reflowed/mangled: {row:?}");
-            }
+        fn compatibility_doc_renders_within_the_shared_invariants() {
+            // The rendering guarantees (colour; prose 1:1; framed, window-bounded tables; no
+            // leaked markers) are pinned once in `doc_render::assert_render_invariants` — here
+            // the REAL doc, emoji, CJK and long rows included, is run through them.
+            doc_render::assert_render_invariants(COMPATIBILITY);
         }
 
         #[test]

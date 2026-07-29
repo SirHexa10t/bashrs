@@ -26,10 +26,13 @@ use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkConte
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use termcolor::{Buffer, BufferWriter, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
-use crate::support::delve;
 use crate::support::doc_style::_header;
 use crate::support::shell;
 use crate::support::streamgrep;
+
+// This module's own `--delve` binary-format decoders — a private child, since the whole crate
+// reaches them only through `scan_file`'s delve branch below.
+mod delve;
 
 /// Options mapped from the `gg` flags (the search roots are passed to [`search`] separately).
 pub struct Options {
@@ -37,7 +40,7 @@ pub struct Options {
     /// Lines of context to show around each file-content match (0 = none).
     pub context: usize,
     /// Also search *inside* files normally skipped as binary, by decoding known formats — subtitle
-    /// tracks, torrent text (`--delve`; see [`crate::support::delve`]).
+    /// tracks, torrent text (`--delve`; see [`delve`]).
     pub delve: bool,
     /// Treat the expression(s) as regular expressions instead of literal text (`-E`).
     pub regex: bool,

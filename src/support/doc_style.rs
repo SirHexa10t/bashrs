@@ -1,4 +1,4 @@
-//! The styling engine — SGR-escape assembly, scope-aware wrapping, and the markdown element styles.
+//! The styling engine — SGR-escape assembly, scope-aware wrapping, and the status vocabulary.
 //! The one place raw ANSI escapes are built, shared by the `recho` command matrix
 //! ([`crate::categories::autogen_styles`]), the hand-written style commands
 //! ([`crate::categories::styles`], e.g. `errcho`), and anything needing a styled string: `lll`'s
@@ -6,11 +6,15 @@
 //!
 //! A nested colour/style restores the enclosing one when it ends (rather than clearing to the
 //! terminal default), and every span starts from a clean slate so styles don't compound — see
-//! [`_scoped`]. Styles are assembled from [`crate::support::theme`]'s `Style`s: [`_wrap`] joins their
-//! SGR sub-codes, and the element helpers (`heading`, `bold`, `code`, …) name the roles `dl -c`'s
-//! renderer paints.
+//! [`_scoped`]. Styles are assembled from [`crate::support::theme`]'s `Style`s: [`_wrap`] joins
+//! their SGR sub-codes, and the status helpers ([`problematic`], [`approved`], [`notice`],
+//! [`broken_link_text`]) name the roles every caller shares.
+//!
+//! The *markdown* element palette (heading, bold, code, link, …) is not here: only
+//! [`crate::support::doc_render`] ever painted those roles, so they live with the renderer that
+//! owns markdown structure.
 
-use crate::support::theme::{Basic, Md, Style, Underline, Weight};
+use crate::support::theme::{Basic, Style, Weight};
 
 /// Ends a styled span, restoring the terminal to its default.
 pub(crate) const RESET: &str = "\x1b[0m";
@@ -33,45 +37,6 @@ pub(crate) fn _wrap(styles: &[&dyn Style]) -> String {
 /// titles both use it, so the style is defined once and composed from theme styles like the rest.
 pub(crate) fn _header(text: &str) -> String {
     _scoped(&_wrap(&[&Weight::Bold, &Basic::Blue]), text)
-}
-
-// --- markdown element styles (the palette `dl -c`'s renderer paints) ----------------------------
-
-/// Heading — bold blue, via the shared [`_header`] look. Takes the already-inline-styled `inner`
-/// so a `**word**` within a title restyles in place ([`_scoped`] re-asserts the heading colour
-/// after each nested span).
-pub(crate) fn heading(inner: &str) -> String {
-    _header(inner)
-}
-
-/// **Bold** → bold yellow.
-pub(crate) fn bold() -> String {
-    _wrap(&[&Weight::Bold, &Basic::Yellow])
-}
-
-/// *Italic* → italic + bright magenta.
-pub(crate) fn italic() -> String {
-    _wrap(&[&Md::Italic, &Md::BrightMagenta])
-}
-
-/// Inline code and indented code blocks → orange (a red-ish tone the palette otherwise underuses).
-pub(crate) fn code() -> String {
-    _wrap(&[&Basic::Orange])
-}
-
-/// Blockquote → dim (dim reads as an aside; the palette has no grey colour).
-pub(crate) fn quote() -> String {
-    _wrap(&[&Weight::Dark])
-}
-
-/// A Markdown link's visible text → blue (plain, so it reads distinctly from a bold-blue heading).
-pub(crate) fn link_text() -> String {
-    _wrap(&[&Basic::Blue])
-}
-
-/// A link's URL (Markdown or bare) → bright cyan, underlined — the "this is a link" look.
-pub(crate) fn link_url() -> String {
-    _wrap(&[&Underline::Underlined, &Md::BrightCyan])
 }
 
 /// Style `text` as a broken/dangling link — bold red — so `lll` flags a Windows `.lnk` shortcut
@@ -126,6 +91,7 @@ pub(crate) fn _scoped(codes: &str, text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::support::theme::Underline; // only the multi-style `_wrap` case needs it
 
     // ANSI shorthands for readable expectations.
     const RED: &str = "\x1b[1;31m";
@@ -157,14 +123,9 @@ mod tests {
     }
 
     #[test]
-    fn element_styles_paint_the_expected_colours() {
-        assert_eq!(bold(), _wrap(&[&Weight::Bold, &Basic::Yellow]));
-        assert_eq!(italic(), "\x1b[3;95m"); // italic + bright magenta
-        assert_eq!(code(), "\x1b[38;5;208m"); // orange
-        assert_eq!(quote(), "\x1b[2m"); // dim
-        assert_eq!(link_text(), "\x1b[34m"); // blue
-        assert_eq!(link_url(), "\x1b[4;96m"); // underline + bright cyan
-        assert!(heading("Hi").contains("Hi") && heading("Hi").ends_with(RESET));
+    fn status_styles_paint_the_expected_colours() {
+        // The vocabulary every caller shares. (The markdown palette these once sat beside is
+        // tested in `doc_render`, which now owns it.)
         assert!(broken_link_text("x").contains(&_wrap(&[&Weight::Bold, &Basic::Red]))); // bold red
         assert_eq!(problematic("x"), format!("{RESET}{RED}x{RESET}")); // bold red, scoped
         assert_eq!(approved("x"), format!("{RESET}{GREEN}x{RESET}")); // bold green, scoped

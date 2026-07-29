@@ -274,7 +274,8 @@ fn ensure_shims(tool: &Tool) {
 /// The venv-aware shim script: `exec` the binary by its real in-venv path (`$HOME`-based, so a
 /// symlinked `~/.bashrs` keeps working), preserving pyvenv.cfg discovery.
 fn venv_shim(tool_dir: &str, rel: &str) -> String {
-    format!("#!/bin/sh\nexec \"$HOME/.bashrs/tools/{tool_dir}/{rel}\" \"$@\"\n")
+    let root = super::TOOLS_ROOT_SHELL;
+    format!("#!/bin/sh\nexec \"{root}/{tool_dir}/{rel}\" \"$@\"\n")
 }
 
 /// Download `url` and unpack the archive's contents into `dir` — tarballs via `tar` (root

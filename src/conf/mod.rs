@@ -45,10 +45,35 @@ pub(crate) fn user_data_dir() -> PathBuf {
     bashrs_home().join("user-data")
 }
 
+/// `~/.bashrs/sourcefile.sh` — the generated shell file. Derived here so its writer
+/// ([`install::install_shell`]) and its reader (`bashrs_sourcefile`) can't drift apart; the
+/// unexpanded `$HOME/…` form the rc files are wired with is [`install`]'s own concern.
+pub(crate) fn sourcefile() -> PathBuf {
+    bashrs_home().join("sourcefile.sh")
+}
+
+/// `~/.bashrs/stainless_comfy` — where the companion repos are cloned
+/// ([`crate::drivers::stainless`]). The Rust-side spelling lives here with the other
+/// `~/.bashrs/<subdir>` names; the generated aliases keep their own `$HOME/…` literal, expanded
+/// by the shell at use time.
+pub(crate) fn clones_dir() -> PathBuf {
+    bashrs_home().join("stainless_comfy")
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn bashrs_home_is_the_dot_dir_under_home() {
         assert!(super::bashrs_home().ends_with(".bashrs"));
+    }
+
+    #[test]
+    fn the_named_paths_all_hang_off_that_one_root() {
+        // Every `~/.bashrs/<subdir>` name is spelled here exactly once, so a rename of the root —
+        // or of any subdir — is a one-line change rather than a hunt across layers.
+        let home = super::bashrs_home();
+        assert_eq!(super::sourcefile(), home.join("sourcefile.sh"));
+        assert_eq!(super::user_data_dir(), home.join("user-data"));
+        assert_eq!(super::clones_dir(), home.join("stainless_comfy"));
     }
 }

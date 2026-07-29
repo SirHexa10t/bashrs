@@ -1,9 +1,13 @@
-//! The command-line interface and `sourcefile.sh` generator — the orchestration
-//! that ties [`crate::categories`] together with [`crate::conf`], [`crate::tools`], and
-//! [`crate::support`]. It parses and dispatches commands (`Cli` / `Command`) and
-//! builds the sourced shell file (`wrappers`).
+//! The `sourcefile.sh` generator and its completion data — the crate root's *assembly* half
+//! (parsing/dispatch is [`super`], which serves this module's output through the hidden
+//! `generate`, `install-shell` and `complete-flags` commands). Nothing here leaks downward:
+//! each subsystem *contributes* its shell surface — categories their command wrappers and
+//! `#[shell_body]` functions, [`crate::tools`] its PATH line, [`crate::drivers::stainless`]
+//! its aliases, [`crate::conf`] the environment/keybinds/greeting — and this module gathers
+//! them into the one sourced file, plus the per-command flag lists TAB-completion asks for.
 
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::Subcommand;
+use super::hide_pinned;
 use crate::categories::autogen_lookup::{GgCommand, GrepCommand};
 use crate::categories::autogen_styles::StylizedEchoCommand;
 use crate::categories::bashrs::BashrsCommand;
@@ -12,143 +16,38 @@ use crate::categories::download::DownloadCommand;
 use crate::categories::filesystem::FilesystemCommand;
 use crate::categories::git::GitCommand;
 use crate::categories::lookup::LookupCommand;
-use crate::categories::media::MediaCommand;
+use crate::categories::media::audio_fx::MediaAudioFxCommand;
+use crate::categories::media::images::MediaImagesCommand;
+use crate::categories::media::metadata::MediaMetadataCommand;
+use crate::categories::media::transcode::MediaTranscodeCommand;
 use crate::categories::packages::PackagesCommand;
 use crate::categories::project::ProjectCommand;
 use crate::categories::python::PythonCommand;
-use crate::categories::styles::StyleCommand;
 use crate::categories::session;
+use crate::categories::styles::StyleCommand;
 use crate::conf::{config_file, environment, greeting, keybinds};
 use crate::conf::RELOAD_EXIT_CODE;
 use crate::drivers::stainless;
 use crate::tools;
 
-#[derive(Parser)]
-#[command(name = "bashrs", about = "Rust-based bashrc")]
-pub struct Cli {
-    #[command(subcommand)]
-    pub command: Command,
-}
-
-/// Top-level command set. Each category is flattened so its commands appear
-/// directly (e.g. `bashrs lss`), matching the shell functions we generate.
-#[derive(Subcommand)]
-pub enum Command {
-    #[command(flatten)]
-    Bashrs(BashrsCommand),
-    #[command(flatten)]
-    Filesystem(FilesystemCommand),
-    #[command(flatten)]
-    Git(GitCommand),
-    #[command(flatten)]
-    Download(DownloadCommand),
-    #[command(flatten)]
-    Media(MediaCommand),
-    #[command(flatten)]
-    ComfyRepos(ComfyReposCommand),
-    #[command(flatten)]
-    Packages(PackagesCommand),
-    #[command(flatten)]
-    Project(ProjectCommand),
-    #[command(flatten)]
-    Python(PythonCommand),
-    #[command(flatten)]
-    Lookup(LookupCommand),
-    #[command(flatten)]
-    Grep(GrepCommand),
-    #[command(flatten)]
-    Treegrep(GgCommand),
-    // Two enums, one logical `style` category: hand-written commands (`errcho`) and the
-    // generated `recho` matrix. Both flatten to bare top-level commands.
-    #[command(flatten)]
-    Style(StyleCommand),
-    #[command(flatten)]
-    StylizedEcho(StylizedEchoCommand),
-    /// Emit shell function wrappers for every command (used by COMPILE.sh).
-    #[command(hide = true)]
-    Generate,
-    /// Install the running binary under ~/.bashrs, write the sourcefile, and wire the shell rc
-    /// files (COMPILE.sh's last step).
-    #[command(hide = true)]
-    InstallShell,
-    /// Provision the non-Rust companions — bundled tools, repos, the Carstay.toml record
-    /// (COMPILE.sh's step before install-shell).
-    #[command(hide = true)]
-    InstallStainless {
-        /// Provision the versions recorded in Carstay.toml instead of the latest releases
-        #[arg(long)]
-        use_stable_carstay: bool,
-    },
-    /// Print one command's completable flags (asked by the generated completer at TAB-time).
-    #[command(hide = true)]
-    CompleteFlags {
-        /// The shell function name being completed (a command's clap name or visible alias).
-        command: String,
-    },
-}
-
-impl Command {
-    pub fn run(self) {
-        match self {
-            Command::Bashrs(cmd) => cmd.run(),
-            Command::Filesystem(cmd) => cmd.run(),
-            Command::Git(cmd) => cmd.run(),
-            Command::Download(cmd) => cmd.run(),
-            Command::Media(cmd) => cmd.run(),
-            Command::ComfyRepos(cmd) => cmd.run(),
-            Command::Packages(cmd) => cmd.run(),
-            Command::Project(cmd) => cmd.run(),
-            Command::Python(cmd) => cmd.run(),
-            Command::Lookup(cmd) => cmd.run(),
-            Command::Grep(cmd) => cmd.run(),
-            Command::Treegrep(cmd) => cmd.run(),
-            Command::Style(cmd) => cmd.run(),
-            Command::StylizedEcho(cmd) => cmd.run(),
-            Command::Generate => print!("{}", wrappers()),
-            Command::InstallShell => crate::conf::install::install_shell(&wrappers()),
-            Command::InstallStainless { use_stable_carstay } => {
-                crate::drivers::install_stainless(use_stable_carstay)
-            }
-            Command::CompleteFlags { command } => println!("{}", complete_flags(&command)),
-        }
-    }
-}
-
-/// Flags a command forces on, hidden from its help and completion — still *accepted*, since
-/// passing one is a harmless no-op (it's already on). Keyed by clap name and arg ID (the field
-/// name). The `g<N>`/`gg<N>` variants aren't listed: they REMOVE their pinned `-C` outright by
-/// taking the `*Base` argument structs (see [`crate::support::args`]).
-const HIDDEN_PINNED: &[(&str, &[&str])] = &[
-    ("GG", &["delve"]),
-    ("GGG", &["delve", "save", "regex"]),
-    ("backup_find_bitrot", &["eager_checksum"]),
-];
-
-/// Hide each [`HIDDEN_PINNED`] flag on its command. Applied everywhere the command tree is built —
-/// parsing ([`parse`]) and generation ([`category_commands`]) — so help, wrappers, and completion
-/// all tell one truth. Commands absent from `cmd` are skipped (each category holds only its own).
-fn hide_pinned(mut cmd: clap::Command) -> clap::Command {
-    for &(name, args) in HIDDEN_PINNED {
-        if cmd.find_subcommand(name).is_none() {
-            continue; // don't let `mut_subcommand` conjure the command into the wrong category
-        }
-        cmd = cmd.mut_subcommand(name, |sub| {
-            args.iter().fold(sub, |sub, arg| sub.mut_arg(*arg, |a| a.hide(true)))
-        });
-    }
-    cmd
-}
-
-/// Parse argv against the adjusted command tree ([`hide_pinned`]) — the binary's normal entry,
-/// called by [`crate::run`] once the re-exec handlers have passed on the invocation.
-pub fn parse() -> Cli {
-    let mut matches = hide_pinned(Cli::command()).get_matches();
-    Cli::from_arg_matches_mut(&mut matches).unwrap_or_else(|err| err.exit())
-}
-
 /// A category's pure-shell command (`#[shell_body]`): `(name, body, comment)` — emitted as a
 /// plain function, since its work (e.g. `cd`) must run in the calling shell, not the binary.
 type ShellFn = (&'static str, &'static str, &'static str);
+
+/// One label's clap group, from a flat list of the category enums that make it up: fold each
+/// enum's subcommands into one `clap::Command`, and concatenate their shell functions. Written as
+/// a macro because each enum is a distinct *type* — a runtime list would need them erased to fn
+/// pointers twice over, once per half. Replaces the right-drifting nest of `augment_subcommands`
+/// calls a multi-enum group would otherwise be.
+macro_rules! category_group {
+    ($label:literal, $($enum:ty),+ $(,)?) => {
+        ($label,
+         [$(<$enum>::augment_subcommands as fn(clap::Command) -> clap::Command),+]
+             .iter()
+             .fold(clap::Command::new($label), |cmd, augment| augment(cmd)),
+         [$(<$enum>::shell_functions()),+].concat())
+    };
+}
 
 /// The command categories: the label grouping them in the generated `sourcefile.sh`, the clap
 /// graph, and the category's pure-shell commands. One row per category — never per command.
@@ -162,8 +61,8 @@ fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 11] {
             GitCommand::shell_functions().to_vec()),
         ("download", DownloadCommand::augment_subcommands(clap::Command::new("download")),
             DownloadCommand::shell_functions().to_vec()),
-        ("media", MediaCommand::augment_subcommands(clap::Command::new("media")),
-            MediaCommand::shell_functions().to_vec()),
+        category_group!("media", MediaTranscodeCommand, MediaMetadataCommand,
+                                 MediaAudioFxCommand, MediaImagesCommand),
         ("packages", PackagesCommand::augment_subcommands(clap::Command::new("packages")),
             PackagesCommand::shell_functions().to_vec()),
         ("project", ProjectCommand::augment_subcommands(clap::Command::new("project")),
@@ -171,14 +70,9 @@ fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 11] {
         ("python", PythonCommand::augment_subcommands(clap::Command::new("python")),
             PythonCommand::shell_functions().to_vec()),
         // One `lookup` group: `hg` (history search) plus the generated g-family.
-        ("lookup", GgCommand::augment_subcommands(GrepCommand::augment_subcommands(
-            LookupCommand::augment_subcommands(clap::Command::new("lookup")),
-        )), [GgCommand::shell_functions(), GrepCommand::shell_functions(),
-             LookupCommand::shell_functions()].concat()),
+        category_group!("lookup", LookupCommand, GrepCommand, GgCommand),
         // One `style` group spanning both style enums: hand-written + generated.
-        ("style", StylizedEchoCommand::augment_subcommands(
-            StyleCommand::augment_subcommands(clap::Command::new("style")),
-        ), [StylizedEchoCommand::shell_functions(), StyleCommand::shell_functions()].concat()),
+        category_group!("style", StyleCommand, StylizedEchoCommand),
         ("comfy_repos", ComfyReposCommand::augment_subcommands(clap::Command::new("comfy_repos")),
             ComfyReposCommand::shell_functions().to_vec()),
     ];
@@ -189,7 +83,7 @@ fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 11] {
 /// alias, so `upup` completes like `packages_upup`). Positionals and hidden flags (the pinned ones
 /// — [`HIDDEN_PINNED`]) are omitted; an unknown name yields nothing, so the completer simply offers
 /// no flags. Backs the hidden `complete-flags` command the generated completer calls at TAB-time.
-fn complete_flags(name: &str) -> String {
+pub(super) fn complete_flags(name: &str) -> String {
     for (_, category, _) in category_commands() {
         for sub in category.get_subcommands() {
             if sub.get_name() != name && !sub.get_visible_aliases().any(|alias| alias == name) {
@@ -227,7 +121,10 @@ const WRAPPER_HOOKS: &[(WrapperLookup, WrapperLookup)] = &[
     (BashrsCommand::wrapper_suffix, BashrsCommand::wrapper_prefix),
     (FilesystemCommand::wrapper_suffix, FilesystemCommand::wrapper_prefix),
     (GitCommand::wrapper_suffix, GitCommand::wrapper_prefix),
-    (MediaCommand::wrapper_suffix, MediaCommand::wrapper_prefix),
+    (MediaTranscodeCommand::wrapper_suffix, MediaTranscodeCommand::wrapper_prefix),
+    (MediaMetadataCommand::wrapper_suffix, MediaMetadataCommand::wrapper_prefix),
+    (MediaAudioFxCommand::wrapper_suffix, MediaAudioFxCommand::wrapper_prefix),
+    (MediaImagesCommand::wrapper_suffix, MediaImagesCommand::wrapper_prefix),
     (PackagesCommand::wrapper_suffix, PackagesCommand::wrapper_prefix),
     (ProjectCommand::wrapper_suffix, ProjectCommand::wrapper_prefix),
     (PythonCommand::wrapper_suffix, PythonCommand::wrapper_prefix),
@@ -238,6 +135,37 @@ const WRAPPER_HOOKS: &[(WrapperLookup, WrapperLookup)] = &[
     (StylizedEchoCommand::wrapper_suffix, StylizedEchoCommand::wrapper_prefix),
     (ComfyReposCommand::wrapper_suffix, ComfyReposCommand::wrapper_prefix),
 ];
+
+/// The completion lines for the comfy/external aliases — `(alias, space-joined flags)` rows
+/// contributed by [`stainless::aliases`], whose flag lists were probed from each tool's own
+/// `--help` at generate time (the binary can't answer for them: they aren't clap commands, so
+/// `complete-flags` knows nothing about them). Rendered as a sibling of `_bashrs_complete`
+/// inside the same bash-only block, with the same contract: flags only once `-` is typed,
+/// filenames otherwise (`-o default`). Empty input renders nothing — a sourcefile generated
+/// before the first repo sync simply has no comfy completion.
+fn comfy_complete_block(entries: &[(String, String)]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    let arms: String = entries
+        .iter()
+        .map(|(alias, flags)| format!("            {alias}) flags=\"{flags}\" ;;\n"))
+        .collect();
+    let names: Vec<&str> = entries.iter().map(|(alias, _)| alias.as_str()).collect();
+    format!(
+        "\x20   _bashrs_comfy_complete() {{\n\
+         \x20       local cur=${{COMP_WORDS[COMP_CWORD]}}\n\
+         \x20       [[ $cur == -* ]] || return 0\n\
+         \x20       local flags=\"\"\n\
+         \x20       case \"${{COMP_WORDS[0]}}\" in\n\
+         {arms}\
+         \x20       esac\n\
+         \x20       COMPREPLY=($(compgen -W \"$flags\" -- \"$cur\"))\n\
+         \x20   }}\n\
+         \x20   complete -F _bashrs_comfy_complete -o default {}\n",
+        names.join(" ")
+    )
+}
 
 /// The shell appended (after `&&`) to a command's wrapper — e.g. to restart the
 /// shell after a command that changes the environment.
@@ -259,7 +187,7 @@ fn wrapper_prefix(name: &str) -> Option<&'static str> {
 /// so an alias is purely a shell-side convenience and never has to resolve as a
 /// clap alias. The binary path is inlined into each function rather than held in
 /// a shared variable, so sourcing leaves nothing behind in the user's shell.
-fn wrappers() -> String {
+pub(super) fn wrappers() -> String {
     // Quoted so `$HOME` expands at call time and paths with spaces stay intact.
     const BIN: &str = "\"$HOME/.bashrs/bashrs\"";
 
@@ -325,7 +253,7 @@ fn wrappers() -> String {
     }
 
     // Non-Rust companion repos (cloned by the hidden `install-stainless` command), aliased to their launchers.
-    let comfy = stainless::aliases();
+    let (comfy, comfy_completions) = stainless::aliases();
     if !comfy.is_empty() {
         body += &format!("\n# comfy / external tools\n{comfy}");
     }
@@ -362,8 +290,9 @@ fn wrappers() -> String {
          \x20       [[ $cur == -* ]] && COMPREPLY=($(compgen -W \"$({BIN} complete-flags \"${{COMP_WORDS[0]}}\")\" -- \"$cur\"))\n\
          \x20   }}\n\
          \x20   complete -F _bashrs_complete -o default {}\n\
-         fi\n",
-        completion_names.join(" ")
+         {}fi\n",
+        completion_names.join(" "),
+        comfy_complete_block(&comfy_completions)
     );
 
     // A load greeting — after the `gecho`/`boecho` wrappers it calls are defined.
@@ -401,53 +330,8 @@ fn wrappers() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::{Command as ClapCommand, CommandFactory};
-
-    fn command_names<E: Subcommand>() -> Vec<String> {
-        E::augment_subcommands(ClapCommand::new("test"))
-            .get_subcommands()
-            .map(|c| c.get_name().to_string())
-            .collect()
-    }
-
-    /// Every command in a category must carry its category prefix, unless it is
-    /// explicitly listed as an unprefixed exception. This keeps the naming
-    /// standard from silently eroding as commands are added.
-    fn assert_prefixed(names: &[String], prefix: &str, unprefixed: &[&str]) {
-        for name in names {
-            assert!(
-                name.starts_with(prefix) || unprefixed.contains(&name.as_str()),
-                "command `{name}` must start with `{prefix}` or be a declared unprefixed exception in {unprefixed:?}",
-            );
-        }
-    }
-
-    #[test]
-    fn cli_definition_is_valid() {
-        Cli::command().debug_assert();
-        hide_pinned(Cli::command()).debug_assert(); // the adjusted tree the binary actually parses
-    }
-
-    #[test]
-    fn hidden_pinned_flags_are_real_and_hidden() {
-        // `mut_arg` silently CREATES a missing arg, so a drifted field name would ghost a fresh
-        // hidden arg instead of hiding the real flag — the long/short assertion catches that.
-        let cmd = hide_pinned(Cli::command());
-        for &(name, args) in HIDDEN_PINNED {
-            let sub = cmd.find_subcommand(name).unwrap_or_else(|| panic!("`{name}` not found"));
-            for id in args {
-                let arg = sub
-                    .get_arguments()
-                    .find(|a| a.get_id().as_str() == *id)
-                    .unwrap_or_else(|| panic!("`{name}` has no arg `{id}`"));
-                assert!(arg.is_hide_set(), "`{name}`'s `{id}` should be hidden");
-                assert!(
-                    arg.get_long().is_some() || arg.get_short().is_some(),
-                    "`{name}`'s `{id}` looks like a ghost created by `mut_arg` — the arg ID drifted"
-                );
-            }
-        }
-    }
+    use crate::cli::Cli;
+    use clap::CommandFactory;
 
     #[test]
     fn complete_flags_reflect_each_variant() {
@@ -501,86 +385,21 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_commands_follow_naming_standard() {
-        // `lll` is a bare `ls`-like verb (à la `ll`), intentionally unprefixed — the same
-        // kind of exception the style echoes and `UPUP` take from the `<category>_` norm.
-        assert_prefixed(&command_names::<FilesystemCommand>(), "fs_", &["lll"]);
-    }
-
-    #[test]
-    fn git_commands_follow_naming_standard() {
-        assert_prefixed(&command_names::<GitCommand>(), "git_", &[]);
-    }
-
-    #[test]
-    fn media_commands_follow_naming_standard() {
-        assert_prefixed(&command_names::<MediaCommand>(), "media_", &[]);
-    }
-
-    #[test]
-    fn packages_commands_follow_naming_standard() {
-        // `upup` is prefixed (with a bare `upup` alias); `UPUP` is a deliberate
-        // custom name (the loud "update everything"). Everything else is prefixed.
-        assert_prefixed(&command_names::<PackagesCommand>(), "packages_", &["UPUP"]);
-    }
-
-    #[test]
-    fn project_commands_follow_naming_standard() {
-        assert_prefixed(&command_names::<ProjectCommand>(), "pro_", &[]);
-    }
-
-    #[test]
-    fn comfy_commands_follow_naming_standard() {
-        // External tools keep their own upstream name (`table`, plus its pinned-preset sibling
-        // `table_fancy`) or a task-named family — all unprefixed by design (`backup_*` flattens
-        // filesync's subcommands into directly-completable commands).
-        assert_prefixed(
-            &command_names::<ComfyReposCommand>(),
-            "comfy_",
-            &["table", "table_fancy", "backup_diff", "backup_sync", "backup_find_bitrot"],
+    fn comfy_completion_renders_gated_case_arms_or_nothing() {
+        // One case arm per alias, registered on its own completer with the same `-` gate and
+        // filename fallback as `_bashrs_complete`; pinned-flag filtering happens upstream
+        // (stainless), so this renders rows verbatim. No rows → no block at all.
+        let rows = [("q".to_string(), "--explain --research -h --help".to_string()),
+                    ("ai".to_string(), "--dry-run".to_string())];
+        let block = comfy_complete_block(&rows);
+        assert!(block.contains("q) flags=\"--explain --research -h --help\" ;;"), "{block}");
+        assert!(block.contains("ai) flags=\"--dry-run\" ;;"), "{block}");
+        assert!(block.contains("[[ $cur == -* ]] || return 0"), "flags only after `-`: {block}");
+        assert!(
+            block.contains("complete -F _bashrs_comfy_complete -o default q ai"),
+            "both aliases registered: {block}"
         );
-    }
-
-    #[test]
-    fn python_commands_follow_naming_standard() {
-        // `py` is the bare inline evaluator, à la the classic bashrc alias.
-        assert_prefixed(&command_names::<PythonCommand>(), "py_", &[]);
-    }
-
-    #[test]
-    fn lookup_commands_follow_naming_standard() {
-        // `hg` mirrors the classic `history | grep` alias; `GG` is the loud all-caps sibling of `gg`
-        // (recursive search with `--delve` forced), and `GGG` is `GG` with `--save`/`-E` too — all
-        // bare, memorable exceptions à la `UPUP`.
-        assert_prefixed(&command_names::<LookupCommand>(), "lookup_", &["hg", "GG", "GGG"]);
-    }
-
-    #[test]
-    fn grep_family_are_bare_verbs() {
-        // The generated `g`/`g3`/… shortcuts are intentionally bare, like the style echoes.
-        for name in command_names::<GrepCommand>() {
-            assert!(!name.starts_with("lookup_"), "grep command `{name}` should be bare, not prefixed");
-        }
-    }
-
-    #[test]
-    fn gg_family_are_bare_verbs() {
-        // The generated `gg`/`gg2`/… recursive-search shortcuts are intentionally bare too.
-        for name in command_names::<GgCommand>() {
-            assert!(!name.starts_with("lookup_"), "gg command `{name}` should be bare, not prefixed");
-        }
-    }
-
-    #[test]
-    fn style_commands_are_bare_verbs() {
-        // Style commands — both the hand-written `StyleCommand` and the generated
-        // `StylizedEchoCommand` — are intentionally unprefixed: short, memorable echo
-        // verbs, never `style_`-prefixed. The inverse of the usual standard, by design.
-        let names =
-            command_names::<StyleCommand>().into_iter().chain(command_names::<StylizedEchoCommand>());
-        for name in names {
-            assert!(!name.starts_with("style_"), "style command `{name}` should be bare, not prefixed");
-        }
+        assert_eq!(comfy_complete_block(&[]), "", "no rows, no block");
     }
 
     #[test]
@@ -761,58 +580,5 @@ mod tests {
             })
             .collect();
         assert_eq!(dispatchable, grouped, "every CLI command must belong to exactly one category");
-    }
-}
-
-/// Exercises the naming modes of the `#[category]` macro on a throwaway category,
-/// so the `#[prefixed]` / `#[unprefixed]` / `#[name]` logic is covered directly.
-#[cfg(test)]
-#[allow(dead_code)] // the generated `run`/handlers aren't invoked, only introspected
-mod macro_naming_modes {
-    use clap::{Command as ClapCommand, Subcommand};
-
-    #[bashrs_macros::category(command = ProbeCommand, prefix = "p_")]
-    mod probe {
-        use clap::Args;
-
-        /// prefixed by default
-        pub fn alpha(_args: Alpha) {}
-        #[derive(Args)]
-        pub struct Alpha {}
-
-        /// unprefixed only
-        #[unprefixed]
-        pub fn beta(_args: Beta) {}
-        #[derive(Args)]
-        pub struct Beta {}
-
-        /// both forms
-        #[prefixed]
-        #[unprefixed]
-        pub fn gamma(_args: Gamma) {}
-        #[derive(Args)]
-        pub struct Gamma {}
-
-        /// explicit custom name
-        #[name("custom-delta")]
-        pub fn delta(_args: Delta) {}
-        #[derive(Args)]
-        pub struct Delta {}
-    }
-
-    #[test]
-    fn each_mode_yields_the_expected_name_and_aliases() {
-        let built = ProbeCommand::augment_subcommands(ClapCommand::new("probe"));
-        let aliases = |name: &str| {
-            built
-                .get_subcommands()
-                .find(|c| c.get_name() == name)
-                .map(|c| c.get_visible_aliases().map(str::to_string).collect::<Vec<_>>())
-        };
-        assert_eq!(aliases("p_alpha"), Some(vec![]), "default: prefixed only");
-        assert_eq!(aliases("beta"), Some(vec![]), "#[unprefixed]: bare name, no prefix");
-        assert_eq!(aliases("p_gamma"), Some(vec!["gamma".to_string()]), "both: prefixed + bare alias");
-        assert_eq!(aliases("custom-delta"), Some(vec![]), "#[name]: exact name, no prefix or alias");
-        assert_eq!(aliases("p_delta"), None, "#[name] overrides the prefix");
     }
 }

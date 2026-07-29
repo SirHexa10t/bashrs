@@ -1,11 +1,11 @@
 //! Rendering an embedded Markdown doc to ANSI-coloured terminal text via `minimad`'s line-based
 //! parser and our own emit through [`crate::support::doc_style`]'s named style vocabulary. The
 //! hand-built, *marker-stripping* counterpart to [`crate::support::theme_code`]'s synoptic
-//! highlighting: `#`, `**`, `` ` `` and friends are consumed, not shown, and every element is
-//! coloured via [`crate::support::doc_style`]'s element helpers — this module owns the *structure*
-//! (what a heading, bullet, quote or code line becomes), `doc_style` owns the colours. Inline
-//! marks are honoured even inside a heading — a `**word**` in a title restyles in place, then the
-//! title colour resumes.
+//! highlighting: `#`, `**`, `` ` `` and friends are consumed, not shown. This module owns both
+//! halves of a markdown element — the *structure* (what a heading, bullet, quote or code line
+//! becomes) and the *palette* it's painted in (below), the latter assembled from `doc_style`'s
+//! escape machinery like every other style in the crate. Inline marks are honoured even inside a
+//! heading — a `**word**` in a title restyles in place, then the title colour resumes.
 //!
 //! Line-based on purpose — exactly one output line per source line. Pre-drawn box tables and
 //! other fixed-layout blocks pass through untouched (minimad parses them as plain text, since
@@ -23,8 +23,52 @@
 //! `[text](url)` (text blue, URL bright-cyan underlined, markers dropped) and bare
 //! `http(s)://`/`www.` URLs, in place.
 
-use crate::support::doc_style::{self, RESET};
 use crate::support::comfy_repos::table_fancy_options_at;
+use crate::support::doc_style::{_header, _wrap, RESET};
+use crate::support::theme::{Basic, Md, Underline, Weight};
+
+// --- the markdown element palette -----------------------------------------------------------
+// The colour each markdown role is painted in. It lives here, with the module that decides *what*
+// a heading or a link is, rather than in `doc_style` — which owns escape assembly and the status
+// vocabulary that every other caller shares, and of whose importers only this one ever painted a
+// markdown role. Built from `doc_style`'s `_wrap`/`_header` like every other style in the crate.
+
+/// Heading — bold blue, via the shared [`_header`] look. Takes the already-inline-styled `inner`
+/// so a `**word**` within a title restyles in place (`_scoped` re-asserts the heading colour
+/// after each nested span).
+fn heading(inner: &str) -> String {
+    _header(inner)
+}
+
+/// **Bold** → bold yellow.
+fn bold() -> String {
+    _wrap(&[&Weight::Bold, &Basic::Yellow])
+}
+
+/// *Italic* → italic + bright magenta.
+fn italic() -> String {
+    _wrap(&[&Md::Italic, &Md::BrightMagenta])
+}
+
+/// Inline code and indented code blocks → orange (a red-ish tone the palette otherwise underuses).
+fn code() -> String {
+    _wrap(&[&Basic::Orange])
+}
+
+/// Blockquote → dim (dim reads as an aside; the palette has no grey colour).
+fn quote() -> String {
+    _wrap(&[&Weight::Dark])
+}
+
+/// A Markdown link's visible text → blue (plain, so it reads distinctly from a bold-blue heading).
+fn link_text() -> String {
+    _wrap(&[&Basic::Blue])
+}
+
+/// A link's URL (Markdown or bare) → bright cyan, underlined — the "this is a link" look.
+fn link_url() -> String {
+    _wrap(&[&Underline::Underlined, &Md::BrightCyan])
+}
 
 /// Nested-list glyphs by depth; index saturates at the deepest we style (minimad only reaches the
 /// first two anyway — see the module note on the four-space rule).
@@ -32,7 +76,7 @@ const BULLETS: [&str; 3] = ["• ", "◦ ", "▪ "];
 
 /// Render a Markdown `doc` to ANSI-coloured text for terminal display (`dl -c`'s site listing).
 /// Markers are stripped; headings, emphasis, inline code, list items and blockquotes are coloured
-/// via `doc_style`'s element helpers; every other line (paragraphs, pre-drawn tables) passes
+/// from this module's own palette; every other line (paragraphs, pre-drawn tables) passes
 /// through with only its inline spans styled. One output line per source line, except a pipe table
 /// too wide for the terminal, which wraps into it (see [`_emit_table`]).
 pub(crate) fn render_doc(doc: &str) -> String {
@@ -67,7 +111,7 @@ pub(crate) fn render_doc_at_width(doc: &str, width: usize) -> String {
                 // closes — so `**word**` in a heading shows bold-yellow, then the blue resumes.
                 CompositeStyle::Header(_) => {
                     let inner: String = composite.compounds.iter().map(_inline).collect();
-                    out.push_str(&doc_style::heading(&inner));
+                    out.push_str(&heading(&inner));
                 }
                 // Bullet: `depth` is the leading-space count, two per level.
                 CompositeStyle::ListItem(depth) => {
@@ -84,12 +128,12 @@ pub(crate) fn render_doc_at_width(doc: &str, width: usize) -> String {
                 }
                 // Blockquote → dim (the vocabulary has no grey).
                 CompositeStyle::Quote => {
-                    out.push_str(&format!("{}{}{RESET}", doc_style::quote(), _plain(composite)));
+                    out.push_str(&format!("{}{}{RESET}", quote(), _plain(composite)));
                 }
                 // Indented (four-space) code block → cyan, indent restored (minimad strips it).
                 // Our docs use this only for the legend block; a line here is literal by intent.
                 CompositeStyle::Code => {
-                    out.push_str(&format!("    {}{}{RESET}", doc_style::code(), _plain(composite)));
+                    out.push_str(&format!("    {}{}{RESET}", code(), _plain(composite)));
                 }
                 // Paragraphs and anything else (incl. pre-drawn box-table rows): only inline spans
                 // are styled, so fixed-layout text survives verbatim.
@@ -174,11 +218,11 @@ fn _emit_spans(out: &mut String, composite: &minimad::Composite) {
 fn _inline(compound: &minimad::Compound) -> String {
     let s = compound.as_str();
     let style = if compound.code {
-        doc_style::code()
+        code()
     } else if compound.bold {
-        doc_style::bold()
+        bold()
     } else if compound.italic {
-        doc_style::italic()
+        italic()
     } else {
         return _linkify(s);
     };
@@ -208,7 +252,7 @@ fn _linkify(s: &str) -> String {
             if let Some(close) = after.find(']') {
                 if let Some(url_on) = after[close + 1..].strip_prefix('(') {
                     if let Some(end) = url_on.find(')') {
-                        out.push_str(&doc_style::link_text());
+                        out.push_str(&link_text());
                         out.push_str(&after[..close]); // link text
                         out.push_str(RESET);
                         out.push(' ');
@@ -247,9 +291,66 @@ fn _url_len(s: &str) -> usize {
 
 /// Append `url` in the theme's link-URL style (bright cyan, underlined), then a reset.
 fn _push_url(out: &mut String, url: &str) {
-    out.push_str(&doc_style::link_url());
+    out.push_str(&link_url());
     out.push_str(url);
     out.push_str(RESET);
+}
+
+/// Test-only: assert the invariants every embedded markdown doc must satisfy when rendered —
+/// the patterns that must survive (colour; one output line per prose line; tables framed,
+/// balanced and window-bounded; cell content intact) and the patterns that must not emerge
+/// (`**`, `](`, a leading `#`). Each doc's owner calls this over its own template — the
+/// [`crate::support::shell::captured`] pattern of a support helper other modules' tests lean
+/// on — so the mechanics are pinned once, here, while every real document still gets
+/// exercised where it lives. One constraint: the table/prose classifier reads an all-dash
+/// line as a table rule, so docs must not use `---` horizontal rules.
+#[cfg(test)]
+pub(crate) fn assert_render_invariants(doc: &str) {
+    let out = render_doc(doc);
+    // The same resolver `render_doc` probes, so the width expectation can't drift.
+    let width = table_formatter::terminal_width();
+
+    assert!(out.contains('\x1b'), "expected colour from the markdown render");
+    // Markdown markers are consumed, not printed — `**` spans restyle, `[text](url)` joins
+    // rewrite, `#` heading markers drop.
+    assert!(!out.contains("**"), "bold markers leaked into the render");
+    assert!(!out.contains("]("), "a markdown link joiner leaked into the render");
+    assert!(out.lines().all(|l| !l.starts_with('#')), "a heading marker survived");
+
+    // A rendered table line is a framed row (`|…|`) or a rule the frame/row-spacing draws;
+    // everything else is prose, which the line-based render never reflows.
+    let is_table = |l: &str| l.starts_with('|') || (!l.is_empty() && l.chars().all(|c| c == '-'));
+
+    // Prose passes through 1:1 — headings, bullets, code blocks and blanks included. Only the
+    // tables may change shape.
+    let src_prose = doc.lines().filter(|l| !l.starts_with('|')).count();
+    let out_prose = out.lines().filter(|l| !is_table(l)).count();
+    assert_eq!(out_prose, src_prose, "non-table lines must map one-to-one");
+
+    // Table checks only apply to a doc that has pipe tables.
+    if doc.lines().any(|l| l.starts_with('|')) {
+        let table_lines: Vec<&str> = out.lines().filter(|l| is_table(l)).collect();
+        assert!(!table_lines.is_empty(), "the doc's pipe tables must render framed");
+        for line in &table_lines {
+            assert!(
+                table_formatter::visible_len(line) <= width,
+                "table line exceeds the window ({width}): {line:?}"
+            );
+            assert!(!line.starts_with('|') || line.ends_with('|'), "unbalanced framed line: {line:?}");
+        }
+        // Content survives the re-layout — the probe token is read from the doc itself (first
+        // data row, first cell, first word, emphasis markers trimmed), so it tracks edits; a
+        // single short word sits under any sane column cap, so cell wrapping can't split it.
+        let token = doc
+            .lines()
+            .filter(|l| l.starts_with('|'))
+            .nth(1)
+            .and_then(|row| row.split('|').nth(1))
+            .and_then(|cell| cell.split_whitespace().next())
+            .map(|word| word.trim_matches(|c| c == '*' || c == '`' || c == '_'))
+            .expect("a doc with a pipe table should have a data row");
+        assert!(out.contains(token), "table content lost in the re-layout: {token:?}");
+    }
 }
 
 #[cfg(test)]
@@ -258,6 +359,19 @@ mod tests {
 
     /// The heading style (bold blue) as a raw escape, for asserting headings carry it.
     const HEADING: &str = "\x1b[1;34m";
+
+    #[test]
+    fn the_markdown_palette_paints_the_expected_colours() {
+        // The element colours themselves, pinned beside the renderer that paints them (they moved
+        // here from `doc_style`, whose other eight importers never used one).
+        assert_eq!(bold(), _wrap(&[&Weight::Bold, &Basic::Yellow]));
+        assert_eq!(italic(), "\x1b[3;95m"); // italic + bright magenta
+        assert_eq!(code(), "\x1b[38;5;208m"); // orange
+        assert_eq!(quote(), "\x1b[2m"); // dim
+        assert_eq!(link_text(), "\x1b[34m"); // blue
+        assert_eq!(link_url(), "\x1b[4;96m"); // underline + bright cyan
+        assert!(heading("Hi").contains("Hi") && heading("Hi").ends_with(RESET));
+    }
 
     #[test]
     fn headings_lose_their_markers_and_are_coloured() {
@@ -273,7 +387,7 @@ mod tests {
         // colour must resume afterward (the mid-style restyle via `_scoped`).
         let out = render_doc("# risks run the **other** direction");
         let head = HEADING; // the heading's bold blue (shared _header style)
-        let bold = doc_style::bold(); // the doc bold style
+        let bold = bold(); // the doc bold style
         assert!(out.contains(&format!("{bold}other{RESET}")), "the bold word is re-marked: {out:?}");
         assert!(out.contains(&format!("{RESET}{head} direction")), "heading colour resumes after: {out:?}");
     }
@@ -282,9 +396,9 @@ mod tests {
     fn inline_emphasis_markers_are_stripped_and_coloured() {
         let out = render_doc("plain **bold** and `code` and *italic* here");
         assert!(!out.contains('*') && !out.contains('`'), "markers stripped: {out:?}");
-        assert!(out.contains(&format!("{}bold{RESET}", doc_style::bold())), "bold uses the theme: {out:?}");
-        assert!(out.contains(&format!("{}code{RESET}", doc_style::code())), "code uses the theme: {out:?}");
-        assert!(out.contains(&format!("{}italic{RESET}", doc_style::italic())), "italic uses the theme: {out:?}");
+        assert!(out.contains(&format!("{}bold{RESET}", bold())), "bold uses the theme: {out:?}");
+        assert!(out.contains(&format!("{}code{RESET}", code())), "code uses the theme: {out:?}");
+        assert!(out.contains(&format!("{}italic{RESET}", italic())), "italic uses the theme: {out:?}");
     }
 
     #[test]
@@ -307,15 +421,15 @@ mod tests {
     fn blockquotes_are_dimmed_without_the_marker() {
         let out = render_doc("> quoted");
         assert!(!out.contains('>'), "quote marker stripped: {out:?}");
-        assert!(out.contains(&format!("{}quoted{RESET}", doc_style::quote())), "dim quote: {out:?}");
+        assert!(out.contains(&format!("{}quoted{RESET}", quote())), "dim quote: {out:?}");
     }
 
     #[test]
     fn links_are_recoloured_and_lose_their_markers() {
         let out = render_doc("see [ImprovedTube #623](https://example.com/x) here");
         assert!(!out.contains("]("), "the `](` link joiner is gone: {out:?}");
-        assert!(out.contains(&format!("{}ImprovedTube #623{RESET}", doc_style::link_text())), "text blue: {out:?}");
-        assert!(out.contains(&format!("{}https://example.com/x{RESET}", doc_style::link_url())), "url cyan: {out:?}");
+        assert!(out.contains(&format!("{}ImprovedTube #623{RESET}", link_text())), "text blue: {out:?}");
+        assert!(out.contains(&format!("{}https://example.com/x{RESET}", link_url())), "url cyan: {out:?}");
         // a bracket that isn't a real link is left alone
         assert!(render_doc("array[0] = 1").contains("array[0] = 1"), "non-link bracket preserved");
     }
@@ -323,11 +437,11 @@ mod tests {
     #[test]
     fn bare_urls_are_styled_in_place() {
         let out = render_doc("see https://example.com/x and www.foo.org, ok");
-        assert!(out.contains(&format!("{}https://example.com/x{RESET}", doc_style::link_url())), "http url: {out:?}");
+        assert!(out.contains(&format!("{}https://example.com/x{RESET}", link_url())), "http url: {out:?}");
         // trailing comma is prose, trimmed off the styled URL
-        assert!(out.contains(&format!("{}www.foo.org{RESET}", doc_style::link_url())), "www url: {out:?}");
+        assert!(out.contains(&format!("{}www.foo.org{RESET}", link_url())), "www url: {out:?}");
         // a bare domain with no scheme/www is left plain
-        assert!(!render_doc("visit example.com now").contains(&doc_style::link_url()), "bare domain untouched");
+        assert!(!render_doc("visit example.com now").contains(&link_url()), "bare domain untouched");
     }
 
     #[test]
@@ -342,7 +456,7 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert!(out.contains("Voice") && out.contains("whistle register") && out.contains("3322"));
         assert!(!out.contains("**"), "the bold markers are consumed, not shown: {out:?}");
-        let w = |s: &str| console::measure_text_width(s);
+        let w = table_formatter::visible_len; // the engine's own width measure (ANSI-aware)
         for line in &lines {
             assert_eq!(w(line), w(lines[0]), "every line shares the table width: {line:?}");
         }
@@ -366,7 +480,7 @@ mod tests {
         let width = 32;
         let out = render_doc_at_width(table, width);
         for line in out.lines() {
-            assert!(console::measure_text_width(line) <= width, "line over {width}: {line:?}");
+            assert!(table_formatter::visible_len(line) <= width, "line over {width}: {line:?}");
         }
         assert!(out.lines().count() > table.lines().count(), "the wide row wrapped to extra lines");
         assert!(out.contains('·'), "continuation gutter present: {out:?}");
@@ -394,5 +508,16 @@ mod tests {
     #[test]
     fn empty_input_yields_empty_output() {
         assert_eq!(render_doc(""), "");
+    }
+
+    #[test]
+    fn the_shared_invariants_hold_for_a_doc_of_every_element() {
+        // The checker the embedded docs' owners call (`assert_render_invariants`), exercised on
+        // a synthetic doc covering every element — so the helper keeps a home test here even as
+        // the real templates evolve, and a checker regression can't hide behind a passing doc.
+        assert_render_invariants(
+            "# Title\n\nprose with **bold** and [a link](https://x.y)\n- bullet\n\n\
+             | Name | N |\n| **alpha** | 1 |\n| beta | 2 |\n",
+        );
     }
 }

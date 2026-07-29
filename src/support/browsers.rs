@@ -5,8 +5,8 @@
 //! other site's (banking, email, …) off bashrs's disk. This module owns the pure parts: finding
 //! browser stores, the target-site registry + host resolution ([`resolve_target`]), and the
 //! per-site store layout ([`reset_site`] / [`write_spec`] / [`imported_spec`] / [`forget`]). The
-//! actual domain-filtered copy runs the bundled python and so lives a layer up, in the driver
-//! ([`crate::drivers::youtube::filter_cookie_db`]) — `support` sits below `tools`.
+//! actual domain-filtered copy runs the bundled python and so lives layers up, in the driver
+//! ([`crate::drivers::ytdlp::filter_cookie_db`]) — `support` sits below `tools` and `drivers`.
 //!
 //! Where a browser keeps its cookies is a product of three things: the browser family (Firefox
 //! stores a plaintext `cookies.sqlite`; Chromium keeps an encrypted `Cookies` DB — under
@@ -122,6 +122,12 @@ const FAMILIES: &[Family] = &[
 /// below their top dir (`tbb/<arch>/…/TorBrowser/Data/Browser/<profile>/`); a little headroom
 /// covers layout drift without letting a mispointed root wander a large tree.
 const SEARCH_MAX_DEPTH: usize = 10;
+
+/// The cookie-import base's directory name under `conf::user_data_dir()` — one subdir per
+/// imported site. Spelled here with the rest of the store's on-disk shape (this module owns
+/// every operation on that tree); the caller composes it onto the user-data root, keeping
+/// `support` free of `conf`.
+pub(crate) const ROOT_SUBDIR: &str = "browser_cookies";
 
 /// Where `dl` keeps the imported copy, under the given cookies root.
 const STORE_SUBDIR: &str = "store";

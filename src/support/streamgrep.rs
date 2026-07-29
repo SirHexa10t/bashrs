@@ -98,27 +98,10 @@ fn match_color() -> ColorSpecs {
 pub(crate) fn build_matcher(expressions: &[String], regex: bool) -> Result<RegexMatcher, grep::regex::Error> {
     let pattern = expressions
         .iter()
-        .map(|expr| if regex { format!("(?:{expr})") } else { escape_literal(expr) })
+        .map(|expr| if regex { format!("(?:{expr})") } else { regex::escape(expr) })
         .collect::<Vec<_>>()
         .join("|");
     RegexMatcherBuilder::new().case_insensitive(true).build(&pattern)
-}
-
-/// Escape regex metacharacters so PATTERN matches literally (`-F`). Mirrors `regex::escape`
-/// without the `regex` facade crate, which would fatten the shared regex build `bashrs` links via
-/// `synoptic`.
-pub(crate) fn escape_literal(pattern: &str) -> String {
-    const META: &[char] = &[
-        '\\', '.', '+', '*', '?', '(', ')', '|', '[', ']', '{', '}', '^', '$', '#', '&', '-', '~',
-    ];
-    let mut escaped = String::with_capacity(pattern.len());
-    for ch in pattern.chars() {
-        if META.contains(&ch) {
-            escaped.push('\\');
-        }
-        escaped.push(ch);
-    }
-    escaped
 }
 
 #[cfg(test)]

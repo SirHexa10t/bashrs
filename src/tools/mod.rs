@@ -149,15 +149,23 @@ pub(crate) fn bin_dir() -> PathBuf {
 /// sourced last in the rc chain, it replaces any same-named function the user's own rc defined
 /// earlier (the `unalias` clears an alias shadow likewise). An activated venv still wins either
 /// way, and a machine with no bundle falls through to its PATH python.
+/// The tools root as the *generated shell* spells it — `$HOME` expanded at use time (so a
+/// symlinked `~/.bashrs` keeps working). The one shell-side spelling of the directory
+/// [`root`] owns on the Rust side, shared by the PATH/shim setup below and the shim scripts
+/// [`fetch`] writes.
+const TOOLS_ROOT_SHELL: &str = "$HOME/.bashrs/tools";
+
 pub(crate) fn shell_setup() -> String {
-    "case \":$PATH:\" in *\":$HOME/.bashrs/tools/bin:\"*) ;; *) export PATH=\"$HOME/.bashrs/tools/bin:$PATH\";; esac  \
-     # bundled tools (python3, ffmpeg, …) win by PATH — as arguments and in shebangs\n\
-     unalias python3 2>/dev/null || true  \
-     # own line, on purpose: an active alias would mangle the function definition at parse time\n\
-     python3() { if [ -z \"$VIRTUAL_ENV\" ] && [ -x \"$HOME/.bashrs/tools/bin/python3\" ]; \
-     then \"$HOME/.bashrs/tools/bin/python3\" \"$@\"; else command python3 \"$@\"; fi; }  \
-     # defined last so it beats older same-named rc definitions; a venv (or a missing bundle) falls through to PATH\n"
-        .to_string()
+    let root = TOOLS_ROOT_SHELL;
+    format!(
+        "case \":$PATH:\" in *\":{root}/bin:\"*) ;; *) export PATH=\"{root}/bin:$PATH\";; esac  \
+         # bundled tools (python3, ffmpeg, …) win by PATH — as arguments and in shebangs\n\
+         unalias python3 2>/dev/null || true  \
+         # own line, on purpose: an active alias would mangle the function definition at parse time\n\
+         python3() {{ if [ -z \"$VIRTUAL_ENV\" ] && [ -x \"{root}/bin/python3\" ]; \
+         then \"{root}/bin/python3\" \"$@\"; else command python3 \"$@\"; fi; }}  \
+         # defined last so it beats older same-named rc definitions; a venv (or a missing bundle) falls through to PATH\n"
+    )
 }
 
 #[cfg(test)]

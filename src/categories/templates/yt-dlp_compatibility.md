@@ -16,27 +16,16 @@ An "extractor" is not a "site": the single `pbs` entry covers 100+ US member sta
 
 # 2. Major video platforms, worldwide
 
-┌──────────────────────────────────┬───────────────┬───────────────────────────────────────────────────────────────────────────────────┐
-│             Platform             │  Extractors   │                                       Notes                                       │
-├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
-│ Vimeo 🔑                         │ 11            │ incl. On Demand, review pages, user likes                                         │
-├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
-│ Dailymotion 🔑                   │ 4             │ video / playlist / search / user                                                  │
-├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
-│ Niconico 🔑                      │ 6             │ video, live (ニコニコ生放送), playlists, series, tags; history needs cookies      │
-├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
-│ Bilibili                         │ 19            │ video, bangumi (anime), audio, courses ("cheese"), search, favorites, user spaces │
-├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
-│ iQIYI / iq.com                   │ 2             │ Chinese + international sites                                                     │
-├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
-│ Youku                            │ 2             │ 优酷 videos + shows                                                               │
-├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
-│ Douyin / Weibo / XiaoHongShu     │ 1 / 3 / 1     │ Chinese TikTok, microblog video, RED                                              │
-├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
-│ VK 🔑 / Rutube / OK.ru / Smotrim │ 3 / 7 / 1 / 4 │ the main Russian platforms                                                        │
-├──────────────────────────────────┼───────────────┼───────────────────────────────────────────────────────────────────────────────────┤
-│ Globo 🔑                         │ 1             │ Brazil's largest broadcaster                                                      │
-└──────────────────────────────────┴───────────────┴───────────────────────────────────────────────────────────────────────────────────┘
+|             Platform             |  Extractors   |                                       Notes                                       |
+| Vimeo 🔑                         | 11            | incl. On Demand, review pages, user likes                                         |
+| Dailymotion 🔑                   | 4             | video / playlist / search / user                                                  |
+| Niconico 🔑                      | 6             | video, live (ニコニコ生放送), playlists, series, tags; history needs cookies        |
+| Bilibili                         | 19            | video, bangumi (anime), audio, courses ("cheese"), search, favorites, user spaces |
+| iQIYI / iq.com                   | 2             | Chinese + international sites                                                     |
+| Youku                            | 2             | 优酷 videos + shows                                                                |
+| Douyin / Weibo / XiaoHongShu     | 1 / 3 / 1     | Chinese TikTok, microblog video, RED                                              |
+| VK 🔑 / Rutube / OK.ru / Smotrim | 3 / 7 / 1 / 4 | the main Russian platforms                                                        |
+| Globo 🔑                         | 1             | Brazil's largest broadcaster                                                      |
 
 
 # 3. Live streaming

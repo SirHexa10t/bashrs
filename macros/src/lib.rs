@@ -531,11 +531,14 @@ fn expand_elevated(func: ItemFn) -> syn::Result<TokenStream2> {
                         return ::std::eprintln!("cannot locate self to re-run as root: {}", err)
                     }
                 };
-                let mut cmd = crate::support::superuser::command();
+                // `crate::elevation` is the host crate's declared anchor for this expansion (an
+                // alias in its `lib.rs`) — not the elevation module's real path, so that module
+                // can move without this macro changing.
+                let mut cmd = crate::elevation::command();
                 cmd.arg(exe).arg(Self::MARKER);
                 #(#pushes)*
                 let _ = cmd.status();
-                crate::support::superuser::revoke();
+                crate::elevation::revoke();
             }
 
             /// Child side: if this process is the elevated re-exec (its `argv[1]` is the marker),

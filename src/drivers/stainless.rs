@@ -75,8 +75,10 @@ const STAINLESS: &[Comfy] = &[Comfy {
     }],
 }];
 
-/// Clone root, `$HOME`-relative — kept as the "comfy" area (the dir you picked) even though the
-/// module is the general stainless one.
+/// Clone root as the *generated shell* spells it — the sanctioned `$HOME`-relative literal, kept
+/// for the alias lines the shell expands at use time (the Rust-side spelling of this same
+/// directory is [`crate::conf::clones_dir`]). Named the "comfy" area (the dir you picked) even
+/// though the module is the general stainless one.
 const CLONE_BASE: &str = ".bashrs/stainless_comfy";
 
 /// `https://…/contAInerized(.git)(/)` → `contAInerized`.
@@ -85,7 +87,7 @@ fn repo_name(repo: &str) -> &str {
 }
 
 fn clone_dir(comfy: &Comfy) -> PathBuf {
-    std::env::home_dir().unwrap_or_default().join(CLONE_BASE).join(repo_name(comfy.repo))
+    crate::conf::clones_dir().join(repo_name(comfy.repo))
 }
 
 /// A clone-relative path, `$HOME`-relative and shell-ready (the shell expands `$HOME`) — the form
@@ -198,27 +200,29 @@ pub fn clone_revisions() -> Vec<(&'static str, Option<String>)> {
 const PROBE_COLUMNS: u32 = 10_000;
 
 /// Run a `--help` probe `script` through bash (so `$HOME` expands and a `cd` is possible) and
-/// return its one-line description via [`extract_about`]. Best-effort: a spawn failure, a non-zero
-/// exit, or no extractable description all yield `None` (no comment).
-fn probe_about(script: &str) -> Option<String> {
+/// return its full text. One probe serves both consumers — [`extract_about`] for the alias's
+/// inline comment and [`extract_flags`] for its TAB completion — so each tool starts (a python
+/// interpreter, at compile time) once, not twice. Best-effort: a spawn failure or a non-zero exit
+/// yields `None` (no comment, no completion).
+fn probe_help(script: &str) -> Option<String> {
     let out = Command::new("bash").arg("-c").arg(script).output().ok()?;
-    out.status.success().then(|| extract_about(&String::from_utf8_lossy(&out.stdout))).flatten()
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Probe the main launcher or a sibling [`Script`]: `<run> "<clone-path>" --help`, run by absolute
 /// path (no `cd`), `exe` clone-relative. `run` goes through [`crate::tools::resolve`], mirroring the
 /// sourcefile's PATH shim, so the probe works even when the interpreter is only bundled.
-fn fetch_about(comfy: &Comfy, exe: &str) -> Option<String> {
+fn fetch_help(comfy: &Comfy, exe: &str) -> Option<String> {
     let run = crate::tools::resolve(comfy.run);
-    probe_about(&format!("COLUMNS={PROBE_COLUMNS} \"{}\" \"{}\" --help 2>&1", run.to_string_lossy(), clone_path_shell(comfy, exe)))
+    probe_help(&format!("COLUMNS={PROBE_COLUMNS} \"{}\" \"{}\" --help 2>&1", run.to_string_lossy(), clone_path_shell(comfy, exe)))
 }
 
 /// Probe an [`Aux`] exactly as it runs — `cd` into the exe's directory so a `-m module` resolves,
 /// then `<run> <args> --help`. `extract_about` keeps just the first description line, so a
 /// multi-line `--help` (like `launch.audit`'s) still yields a one-line comment.
-fn fetch_about_aux(comfy: &Comfy, aux: &Aux) -> Option<String> {
+fn fetch_help_aux(comfy: &Comfy, aux: &Aux) -> Option<String> {
     let run = crate::tools::resolve(comfy.run);
-    probe_about(&format!("cd \"{}\" && COLUMNS={PROBE_COLUMNS} \"{}\" {} --help 2>&1", exe_dir_shell(comfy), run.to_string_lossy(), aux.args))
+    probe_help(&format!("cd \"{}\" && COLUMNS={PROBE_COLUMNS} \"{}\" {} --help 2>&1", exe_dir_shell(comfy), run.to_string_lossy(), aux.args))
 }
 
 /// Pure: the one-line description from `--help` text — the first *paragraph* after the (possibly
@@ -241,28 +245,79 @@ fn extract_about(help: &str) -> Option<String> {
     (!paragraph.is_empty()).then(|| paragraph.join(" "))
 }
 
-/// The main binary's generator runs this. One alias per repo; for a repo that's actually been
-/// cloned, it asks the tool itself (`--help`, live) for the description to use as an inline comment.
-/// The clone check keeps it from spawning anything before the first `sync` (or during tests).
-pub(crate) fn aliases() -> String {
-    STAINLESS
-        .iter()
-        .map(|comfy| {
-            // One clone check gates every live `--help` probe (nothing spawns before the first sync).
-            let exists = clone_dir(comfy).exists();
-            let about = exists.then(|| fetch_about(comfy, comfy.exe)).flatten();
-            let mut lines = alias_line(comfy, about.as_deref());
-            for aux in comfy.aux {
-                let about = exists.then(|| fetch_about_aux(comfy, aux)).flatten();
-                lines.push_str(&aux_line(comfy, aux, about.as_deref()));
+/// Pure: the flags a `--help` text advertises, in appearance order. An option line (argparse
+/// style) is an indented line starting with `-`; its flag tokens sit before the two-space gap
+/// that separates them from the description (`-n N, --count N   how many`). Metavars are skipped
+/// (no leading `-`), a `--foo=BAR` spelling keeps only `--foo`, and duplicates collapse. Usage
+/// lines never start with `-` after trimming, so their `[-h]` noise never enters. The probes run
+/// under a huge `COLUMNS`, so descriptions don't wrap into lines that could mimic option lines.
+fn extract_flags(help: &str) -> Vec<String> {
+    let mut flags: Vec<String> = Vec::new();
+    for line in help.lines() {
+        let trimmed = line.trim_start();
+        if !line.starts_with(char::is_whitespace) || !trimmed.starts_with('-') {
+            continue;
+        }
+        // Only the flag column: everything before the first 2-space run (the description gap).
+        let column = trimmed.split("  ").next().unwrap_or(trimmed);
+        for token in column.split([',', ' ']) {
+            let flag = token.split('=').next().unwrap_or(token);
+            let valid = flag.len() > 1
+                && flag.starts_with('-')
+                && flag.chars().skip(1).all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if valid && !flags.iter().any(|f| f == flag) {
+                flags.push(flag.to_string());
             }
-            for script in comfy.scripts {
-                let about = exists.then(|| fetch_about(comfy, script.exe)).flatten();
-                lines.push_str(&script_lines(comfy, script, about.as_deref()));
+        }
+    }
+    flags
+}
+
+/// The main binary's generator runs this. One alias per repo entry point; for a repo that's
+/// actually been cloned, each entry point's own `--help` is probed ONCE, live, and read twice:
+/// the description becomes the alias's inline comment, the flag list its TAB completion (the
+/// second element — `(alias, space-joined flags)` rows the sourcefile's completion block renders;
+/// a flagless or unprobed alias contributes no row). A [`Script`] variant's pinned flags are
+/// dropped from its own row, like the CLI's `HIDDEN_PINNED`: `q2` never offers the `--explain`
+/// it already passes. The clone check keeps it from spawning anything before the first `sync`
+/// (or during tests).
+pub(crate) fn aliases() -> (String, Vec<(String, String)>) {
+    let mut lines = String::new();
+    let mut completions: Vec<(String, String)> = Vec::new();
+    let mut complete = |alias: &str, flags: &[String], pinned: &str| {
+        let offered: Vec<&str> = flags
+            .iter()
+            .map(String::as_str)
+            .filter(|flag| !pinned.split_whitespace().any(|p| p == *flag))
+            .collect();
+        if !offered.is_empty() {
+            completions.push((alias.to_string(), offered.join(" ")));
+        }
+    };
+    for comfy in STAINLESS {
+        // One clone check gates every live `--help` probe (nothing spawns before the first sync).
+        let exists = clone_dir(comfy).exists();
+        let help = exists.then(|| fetch_help(comfy, comfy.exe)).flatten();
+        let about = help.as_deref().and_then(extract_about);
+        lines.push_str(&alias_line(comfy, about.as_deref()));
+        complete(comfy.alias, &help.as_deref().map(extract_flags).unwrap_or_default(), "");
+        for aux in comfy.aux {
+            let help = exists.then(|| fetch_help_aux(comfy, aux)).flatten();
+            let about = help.as_deref().and_then(extract_about);
+            lines.push_str(&aux_line(comfy, aux, about.as_deref()));
+            complete(aux.alias, &help.as_deref().map(extract_flags).unwrap_or_default(), "");
+        }
+        for script in comfy.scripts {
+            let help = exists.then(|| fetch_help(comfy, script.exe)).flatten();
+            let about = help.as_deref().and_then(extract_about);
+            lines.push_str(&script_lines(comfy, script, about.as_deref()));
+            let flags = help.as_deref().map(extract_flags).unwrap_or_default();
+            for (alias, pinned) in script.variants {
+                complete(alias, &flags, pinned);
             }
-            lines
-        })
-        .collect()
+        }
+    }
+    (lines, completions)
 }
 
 /// Pure: one alias definition line (`about` becomes an inline `#` comment when present).
@@ -412,6 +467,26 @@ mod tests {
             extract_about(help).as_deref(),
             Some("Ask one direct question, answered in one shot. Put your prompt in quotes. If you need files, use the communal dir"),
         );
+    }
+
+    #[test]
+    fn extract_flags_reads_argparse_option_lines_only() {
+        // Short+long pairs split on the comma; metavars (no dash) drop; `--foo=BAR` keeps the
+        // flag; the usage line and prose (unindented, or not dash-led) contribute nothing; and
+        // a flag repeated across lines lands once.
+        let help = "usage: q [-h] [--explain] [-n N]\n\n\
+                    Ask one direct question. Try --explain for more — this prose line is not indented.\n\n\
+                    options:\n\
+                    \x20 -h, --help            show this help message and exit\n\
+                    \x20 --explain             explain the answer too\n\
+                    \x20 -n N, --count N       how many answers\n\
+                    \x20 --format=STYLE        output style\n\
+                    \x20 --explain             (a duplicate row, kept once)\n";
+        assert_eq!(
+            extract_flags(help),
+            ["-h", "--help", "--explain", "-n", "--count", "--format"]
+        );
+        assert!(extract_flags("no options here\n").is_empty());
     }
 
     #[test]

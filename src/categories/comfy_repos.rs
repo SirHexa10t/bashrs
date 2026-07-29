@@ -76,10 +76,15 @@ mod commands {
     }
 
     /// Run one filesync invocation — every `backup_*` command funnels here, each wrapping one
-    /// subcommand (which gives each its own flag completion; filesync never runs bare). `run`
-    /// reports its own errors; the exit code is surfaced so `backup_sync … && next` composes.
+    /// subcommand (which gives each its own flag completion; filesync never runs bare). Entered
+    /// through `run_with_sudo_prompt`, not plain `run`, so `backup_*` starts exactly like the
+    /// standalone binary: an interactive unprivileged run asks for sudo once, up front (the
+    /// re-exec re-runs `bashrs backup_… <args>` verbatim, so the round trip lands back here as
+    /// root and proceeds); `--unelevated`, already-root, and tty-less runs are never prompted.
+    /// filesync reports its own errors; the exit code is surfaced so `backup_sync … && next`
+    /// composes.
     fn _filesync(command: filesync::Command) {
-        let code = filesync::run(filesync::Cli { command });
+        let code = filesync::run_with_sudo_prompt(filesync::Cli { command });
         if code != 0 {
             std::process::exit(code.into());
         }

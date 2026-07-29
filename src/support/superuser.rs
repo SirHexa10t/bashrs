@@ -1,6 +1,11 @@
 //! One anchor for privilege escalation — the elevation command and the helpers around it.
 //! Everything that runs something as root goes through here, so switching tools (e.g. to `doas`)
 //! is a one-line change to [`CMD`] instead of a hunt for every literal `sudo`.
+//!
+//! Two callers, only one of them visible to a search: `packages_*` names this module directly, and
+//! every `#[bashrs_macros::elevated]` routine calls [`command`]/[`revoke`] from its generated
+//! `reexec`. The macro reaches them through [`crate::elevation`] — the crate-root alias that exists
+//! so this module's own path isn't baked into the macro crate.
 
 use std::process::Command;
 

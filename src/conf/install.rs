@@ -46,15 +46,16 @@ pub fn install_shell(content: &str) {
         Ok(None) => {} // already running as the installed copy — nothing to move
         Err(msg) => die(msg),
     }
-    let sourcefile = home.join("sourcefile.sh");
+    let sourcefile = super::sourcefile();
     if let Err(err) = std::fs::write(&sourcefile, content) {
         die(format!("could not write {}: {err}", sourcefile.display()));
     }
     println!("Generated {}", sourcefile.display());
 
-    let home = std::env::home_dir().unwrap_or_default();
+    // The user's own home now, not `~/.bashrs` — a different directory, so a distinct name.
+    let user_home = super::home();
     let mut any_present = false;
-    for rc in [home.join(".bashrc"), home.join(".zshrc")] {
+    for rc in [user_home.join(".bashrc"), user_home.join(".zshrc")] {
         match wire_rc(&rc) {
             Ok(Wired::Absent) => {}
             Ok(Wired::AlreadyPresent) => {

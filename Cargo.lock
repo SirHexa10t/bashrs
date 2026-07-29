@@ -80,12 +80,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
-name = "autocfg"
-version = "1.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
-
-[[package]]
 name = "bashrs"
 version = "0.1.0"
 dependencies = [
@@ -98,6 +92,7 @@ dependencies = [
  "libc",
  "lofty",
  "minimad",
+ "regex",
  "serde_json",
  "synoptic",
  "table_formatter",
@@ -338,7 +333,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "filesync"
 version = "0.1.0"
-source = "git+https://github.com/SirHexa10t/backup_sync.git?branch=main#d82d140de14d731988c24887ad1e2db3f149d202"
+source = "git+https://github.com/SirHexa10t/backup_sync.git?branch=main#b5e98c2ae574ad035323f8d6254ff682ee339dbb"
 dependencies = [
  "blake3",
  "clap",
@@ -638,15 +633,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
-name = "num-traits"
-version = "0.2.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
-dependencies = [
- "autocfg",
-]
-
-[[package]]
 name = "number_prefix"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -672,15 +658,6 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
-
-[[package]]
-name = "ordered-float"
-version = "5.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7d950ca161dc355eaf28f82b11345ed76c6e1f6eb1f4f4479e0323b9e2fbd0e"
-dependencies = [
- "num-traits",
-]
 
 [[package]]
 name = "paste"
@@ -894,12 +871,11 @@ dependencies = [
 
 [[package]]
 name = "table_formatter"
-version = "4.0.0"
-source = "git+https://github.com/SirHexa10t/table_formatter.git?branch=main#b2f6e5ac6a6736ed05409ee847405be5bbeac199"
+version = "5.1.0"
+source = "git+https://github.com/SirHexa10t/table_formatter.git?branch=main#8b2f41aa63c04d0e8795b794d33c8a078aec18a1"
 dependencies = [
  "clap",
  "console 0.16.4",
- "ordered-float",
  "rayon",
  "regex",
 ]

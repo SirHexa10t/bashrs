@@ -26,7 +26,6 @@ Vocals are cancelled only BETWEEN --from and --to (Hz); everything below --from 
 # Table 1 — the pitch continuum (speech 🗣 + singing 🎤), low → high
 
 | Voice / genre (correct term) | Mode | Typical note range | **Fundamental (Hz)** | Notable |
-|---|---|---|---|---|
 | **Death growl — "Batman sings death metal"** (guttural) | 🎤 | ~C1–C3, indeterminate | **~50–150 Hz** (sounds lower via subharmonics) | False-fold vibration; noise-dominated, not cleanly pitched |
 | **Basso profondo / oktavist** (Russian Orthodox) | 🎤 | A1–E4; extremes to C1 | **~55–330 Hz**; down to **33 Hz** | Lowest *true pitched* singing on Earth |
 | **Vocal fry / "Batman" gravel** (creak register) | 🗣 | sub-bass creak | **~20–50 Hz** | Irregular pulses; the gritty/authoritative rasp |
@@ -50,7 +49,6 @@ Vocals are cancelled only BETWEEN --from and --to (Hz); everything below --from 
 # Table 2 — special cases (no single pitch, or synthetic)
 
 | Voice / genre | Frequency behaviour |
-|---|---|
 | **Whisper** 🗣 | **No fundamental at all** — vocal folds don't vibrate. Turbulent broadband noise shaping the formants; energy mostly **~500 Hz–4 kHz**, rolling off below 500 Hz. |
 | **Tuvan throat singing (*khoomei*; *sygyt*/*kargyraa*)** 🎤 | **Biphonic** — a low drone (**~100–150 Hz**, kargyraa lower) *and* a whistling overtone melody (**1–3.5 kHz**) at the same instant. |
 | **Vocaloid (e.g., Hatsune Miku)** 🤖 | Optimum **A3–E5 (220–659 Hz)**, extends to ~C6 (1,047 Hz); synthesized, so **no physical floor or ceiling** — quality just degrades outside the band. |
@@ -63,7 +61,6 @@ Vocals are cancelled only BETWEEN --from and --to (Hz); everything below --from 
 A processing layer over an ordinary human (or synthetic) source — **none open a new pitch range**. The "robot" cue is either unnaturally *exact pitch* (quantized/monotone) or unnaturally *regular/inharmonic spectrum*.
 
 | Effect (what it does to pitch) | Why it reads as "robotic" | Signature | The frequencies it lands on |
-|---|---|---|---|
 | **Harmonizer** — forces the sung note to preset scale degrees; stacks pitch-shifted copies | Quantized pitch-shift + stacked harmony voices | Eiffel 65 — "Blue (Da Ba Dee)" | Track is **G minor, 128 BPM** (verified). Output is locked to G-minor scale degrees, so the "vocal" notes are **G3 196 · A3 220 · B♭3 233 · C4 262 · D4 294 · E♭4 311 · F4 349 · G4 392 Hz**, with stacked harmony copies reaching up toward ~G5 (784 Hz). Sits in a normal male-tenor octave |
 | **Auto-Tune (extreme)** — F0 snapped instantly to the nearest semitone | The mechanical stepping/warble between notes, no natural scoop | Cher — "Believe"; T-Pain | The singer's own range, **quantized to the exact 12-TET semitones** (map below) |
 | **Vocoder** — pitch comes wholly from a synth carrier; the voice's own pitch is discarded | A synth "speaking" — inhumanly smooth, no micro-variation | Kraftwerk; Daft Punk | Whatever the carrier plays; the voice adds only a formant envelope (energy to a few kHz) |

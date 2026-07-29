@@ -1,8 +1,10 @@
 //! Binary-format decoders behind `gg --delve`: pull searchable text out of files `gg` would
-//! otherwise skip as binary, by understanding their structure rather than scanning raw bytes. One
-//! decoder per format; [`extract`] dispatches by extension, so adding a format is a decoder plus a
-//! dispatch arm. Files with no decoder return `None` and stay skipped (no raw `strings`-style
-//! fallback — that's the noisy, slow approach `gg` deliberately avoids).
+//! otherwise skip as binary, by understanding their structure rather than scanning raw bytes. A
+//! private child of [`super`] (treegrep) — the one module that calls it, from `scan_file`'s delve
+//! branch; `pub(super)` keeps it that way by construction. One decoder per format; [`extract`]
+//! dispatches by extension, so adding a format is a decoder plus a dispatch arm. Files with no
+//! decoder return `None` and stay skipped (no raw `strings`-style fallback — that's the noisy,
+//! slow approach `gg` deliberately avoids).
 //!
 //! - `.torrent` — bencode: the human-readable string values (name, file paths, tracker URLs),
 //!   skipping the binary `pieces` SHA-1 blob.
@@ -21,7 +23,7 @@ use std::path::Path;
 /// (each becomes one searchable "line"). Returns `None` only when the extension isn't one we decode
 /// — so callers keep skipping such files rather than raw-scanning them. A decodable file that fails
 /// to parse yields `Some(empty)`, never a fall-through to a raw scan of (potentially huge) binary.
-pub(crate) fn extract(path: &Path) -> Option<Vec<u8>> {
+pub(super) fn extract(path: &Path) -> Option<Vec<u8>> {
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "torrent" => Some(std::fs::read(path).map(|bytes| bencode_text(&bytes)).unwrap_or_default()),
         "mkv" | "mka" | "mks" | "webm" => Some(

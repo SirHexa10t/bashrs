@@ -4,10 +4,11 @@
 //! The crate is layered; **imports must only point left**:
 //!
 //! ```text
-//! support  <     conf      <     tools      <  categories, cli
-//!            (configrs.toml,  (fetch reads the
-//!             exports, keys,   config; stainless
-//!             greeting)        repos; tool shims)
+//! support  <     conf      <     tools     <    drivers    <  categories, cli
+//!            (configrs.toml,  (fetch reads   (what commands
+//!             exports, keys,   the config;    the tools: yt-dlp,
+//!             greeting)        tool shims)    the python env,
+//!                                             the companion repos)
 //! ```
 //!
 //! Higher layers never leak downward. Instead, each subsystem *contributes* its shell surface as
@@ -23,6 +24,14 @@ pub mod support;
 pub mod tools;
 
 use crate::categories::lookup::GgElevatedRescan;
+
+/// The one in-crate path the `#[bashrs_macros::elevated]` macro names by string: its expansion
+/// emits `crate::elevation::command()` / `::revoke()`. That edge crosses a crate boundary as text,
+/// so no compiler sees it until the macro expands — this alias is the single declared anchor for
+/// it. **Moving [`support::superuser`] means re-pointing this line, and nothing else**; without it,
+/// the module's own path would be part of the macro's contract and a rename would fail inside a
+/// generated block, pointing at the wrong file.
+pub(crate) use support::superuser as elevation;
 
 /// The binary's internal self-invocations: the `sudo` re-execs that `#[elevated]` routines spawn to
 /// run part of themselves as root. Each routine's `try_handle` — which claims the run iff its marker

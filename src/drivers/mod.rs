@@ -8,7 +8,7 @@
 pub mod python;
 pub mod carstay;
 pub mod stainless;
-pub(crate) mod youtube;
+pub(crate) mod ytdlp;
 
 /// SIDE EFFECTS — COMPILE.sh's companion-provisioning step (the hidden `install-stainless`
 /// command, run from the freshly built binary before `install-shell`): bundle/update the
