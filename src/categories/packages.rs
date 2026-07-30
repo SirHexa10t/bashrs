@@ -20,11 +20,15 @@ mod commands {
         _upgrade(_toolchains_active()); // toolchains self-update as the user; none elevate, so nothing to revoke
     }
 
-    /// Update everything: package managers, then dev toolchains
+    /// Update everything: package managers, then dev toolchains, then bashrs's own bundled
+    /// tools and companion repos (the same provisioning COMPILE.sh runs)
     #[name("UPUP")]
     pub fn upgrade_all(_args: NoArgs) {
         upup(NoArgs {});
         update_toolchains(NoArgs {});
+        // The bundled side last: tools, yt-dlp's python helpers, companion repos — recorded in
+        // Carstay.toml with the usual revert notice, exactly as COMPILE.sh provisions them.
+        crate::drivers::install_stainless(false);
     }
 
     /// List installed packages, grouped under their package manager
@@ -88,7 +92,9 @@ mod commands {
     const TOOLCHAINS: &[Manager] = &[
         Manager { probe: "rustup", steps: &[&["rustup", "update"]], ..DEFAULTS },
         Manager { probe: "ghcup", steps: &[&["ghcup", "upgrade"]], ..DEFAULTS },
-        Manager { probe: "uv", steps: &[&["uv", "self", "update"]], ..DEFAULTS },
+        // No `uv` row: uv is a bundled tool here (the PATH shim resolves to bashrs's copy, which
+        // `uv self update` refuses — it only updates standalone-installer binaries). The bundled
+        // copy is version-managed by the tools sync instead: COMPILE.sh, and `UPUP`'s final step.
         Manager { probe: "poetry", steps: &[&["poetry", "self", "update"]], ..DEFAULTS },
         Manager { probe: "pnpm", steps: &[&["pnpm", "self-update"]], ..DEFAULTS },
         Manager { probe: "stack", steps: &[&["stack", "upgrade"]], ..DEFAULTS },

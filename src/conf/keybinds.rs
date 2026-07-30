@@ -10,6 +10,7 @@
 pub fn bindings() -> &'static [(&'static str, &'static str)] {
     &[
         (r"\en", "session_new"),       // ALT+N → start a fresh shell session
+        (r"\e\C-n", "session_bare"),   // CTRL+ALT+N → fresh session WITHOUT bashrs (one-shot; any new shell arms again)
         (r"\eh", "bashrs_sourcefile"), // ALT+H → run bashrs_sourcefile
         (r"\ew", "bashrs_configure"),  // ALT+W → open the configuration file
         (r"\eq", "bashrs_compile"),    // ALT+Q → run bashrs_compile

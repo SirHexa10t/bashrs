@@ -77,6 +77,29 @@ fn the_sourcefile_arms_fully_in_interactive_shells() {
 }
 
 #[test]
+fn a_bare_session_defines_nothing_and_consumes_its_flag() {
+    // `session_bare` starts an interactive shell with _BASHRS_BARE exported; the sourcefile must
+    // return before defining ANYTHING — and eat the flag on the way out, leaving the bare shell's
+    // environment clean. One-shot semantics, exercised for real: the second source (no manual
+    // unset — the guard already consumed the flag) arms the full surface again.
+    let (file, home) = sourcefile_and_home("bare");
+    let script = format!(
+        "HOME='{0}'; _BASHRS_BARE=1; source '{1}' 2>/dev/null; echo status:$?; \
+         echo \"lll-bare:$(type -t lll)\"; echo \"flag-after:[${{_BASHRS_BARE:-gone}}]\"; \
+         source '{1}' 2>/dev/null; echo \"lll-back:$(type -t lll)\"",
+        home.display(),
+        file.display()
+    );
+    let out = Command::new("bash").args(["--norc", "-i", "-c", &script]).output().expect("bash -i");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("status:0"), "the bare-session return must be quiet success: {text}");
+    assert!(!text.contains("lll-bare:function"), "a bare session must get NO bashrs surface: {text}");
+    assert!(text.contains("flag-after:[gone]"), "the guard must consume the flag: {text}");
+    assert!(text.contains("lll-back:function"), "the very next source arms fully — no manual unset: {text}");
+    let _ = std::fs::remove_dir_all(file.parent().unwrap());
+}
+
+#[test]
 fn the_python3_function_replaces_earlier_rc_definitions() {
     // A leftover `python3` function from the user's own rc, then the sourcefile sourced last —
     // the exact shadowing that once resurfaced a stale pydev definition. The bashrs function must

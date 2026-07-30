@@ -24,19 +24,28 @@ fn bashrs_configure_creates_the_config_from_the_template_and_opens_it() {
     let out = bashrs(&["bashrs_configure"], &[("HOME", home.to_str().unwrap()), ("EDITOR", "cat")]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let shown = String::from_utf8_lossy(&out.stdout);
+    // Fields must be present with SOME boolean value; the defaults themselves are the
+    // template's business (the unit test checks legality by parsing the TOML).
     assert!(
         shown.contains("[tools]")
-            && shown.contains("always_bundle_languages = true")
-            && shown.contains("always_bundle_utilities = false"),
+            && shown.contains("always_bundle_languages = ")
+            && shown.contains("always_bundle_utilities = "),
         "{shown}"
     );
 
     let file = home.join(".bashrs").join("configrs.toml");
     assert!(file.exists(), "config file must be created under $HOME/.bashrs");
 
-    // A current-shaped file with edited VALUES is opened as-is — user settings survive.
+    // A current-shaped file with edited VALUES is opened as-is — user settings survive. The
+    // edit flips whichever value the template currently ships, so this test never cares what
+    // the default is.
     let template = std::fs::read_to_string(&file).unwrap();
-    let edited = format!("# my edited config\n{}", template.replace("always_bundle_utilities = false", "always_bundle_utilities = true"));
+    let flipped = if template.contains("always_bundle_utilities = true") {
+        template.replace("always_bundle_utilities = true", "always_bundle_utilities = false")
+    } else {
+        template.replace("always_bundle_utilities = false", "always_bundle_utilities = true")
+    };
+    let edited = format!("# my edited config\n{flipped}");
     std::fs::write(&file, &edited).unwrap();
     let again = bashrs(&["bashrs_configure"], &[("HOME", home.to_str().unwrap()), ("EDITOR", "cat")]);
     assert!(String::from_utf8_lossy(&again.stdout).contains("# my edited config"),

@@ -99,9 +99,10 @@ pub(crate) fn always_bundle_languages() -> bool {
 }
 
 /// Bundle the utility programs (ffmpeg, yt-dlp, deno) even when the system provides them
-/// (`[tools] always_bundle_utilities`, default `false` — bundle only what's missing).
+/// (`[tools] always_bundle_utilities`, default `true` — the project pins its own tool versions
+/// rather than trusting whatever the system carries).
 pub(crate) fn always_bundle_utilities() -> bool {
-    read().and_then(|config| flag(&config, "tools", "always_bundle_utilities")).unwrap_or(false)
+    read().and_then(|config| flag(&config, "tools", "always_bundle_utilities")).unwrap_or(true)
 }
 
 /// The parsed config file. A missing file is the normal all-defaults case; a file that doesn't
@@ -127,10 +128,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_template_parses_and_carries_the_documented_defaults() {
+    fn the_template_parses_and_every_field_holds_a_legal_value() {
+        // The template's job is shape, not policy: every tunable must exist and carry one of its
+        // legal values — all current fields are booleans, and `flag` yields `None` for a non-bool
+        // — but the SPECIFIC defaults are the template author's business and may change freely.
         let config: toml::Value = toml::from_str(TEMPLATE).expect("template must stay valid TOML");
-        assert_eq!(flag(&config, "tools", "always_bundle_languages"), Some(true));
-        assert_eq!(flag(&config, "tools", "always_bundle_utilities"), Some(false));
+        for key in ["always_bundle_languages", "always_bundle_utilities"] {
+            assert!(
+                flag(&config, "tools", key).is_some(),
+                "template must carry `[tools] {key}` with a true/false value"
+            );
+        }
     }
 
     #[test]

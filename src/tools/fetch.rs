@@ -159,12 +159,27 @@ fn download_binary(url: &str, dest: &Path) -> Result<(), String> {
 /// the venv, created against the minor version, follows transparently, and its site-packages
 /// survive (package updates are `py_update`'s job, not this one's). A `pin` (`--use-stable-carstay`)
 /// creates against the recorded exact version instead, and never upgrades an existing one.
+/// Self-healing: an environment that exists but no longer *runs* ([`venv_is_dead`] — the
+/// moved-disk case) is wiped and recreated here, so migrating `~/.bashrs` to another machine
+/// needs no manual cleanup beyond re-running the compile.
 fn sync_python_venv(python: &str, dir: &Path, pin: Option<&str>) -> bool {
     if dir.exists() && !dir.join("pyvenv.cfg").exists() {
         // The pre-uv layout (an unpacked python-build-standalone archive): replace it. The repo
         // dependencies are reinstalled by the stainless sync that follows; manually installed
         // packages need a `py_install` again.
         eprintln!("tools: migrating the bundled python to a uv-managed environment");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    if venv_is_dead(dir) {
+        // Presence isn't health: a venv bakes absolute paths in at creation (pyvenv.cfg's
+        // `home`, the inner `bin/python3` symlink), so a `~/.bashrs` disk moved to another
+        // machine — different username or mount point — can leave one that exists but no longer
+        // runs. Rebuild it from scratch (against the pin, when recording): the repo python
+        // dependencies are reinstalled by the stainless sync that follows this; manually
+        // `py_install`ed packages need installing again.
+        eprintln!(
+            "tools: the bundled python environment no longer runs (a moved ~/.bashrs disk?) — rebuilding it"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
     if !dir.join("pyvenv.cfg").exists() {
@@ -189,6 +204,15 @@ fn sync_python_venv(python: &str, dir: &Path, pin: Option<&str>) -> bool {
         eprintln!("tools: could not check for a python upgrade — keeping the current one");
     }
     false
+}
+
+/// A venv that *exists* but whose interpreter no longer answers — dead, not merely absent (an
+/// absent one is simply "not created yet" and takes the creation path). The verdict comes from
+/// actually running `bin/python3 --version`, not from inspecting files: dangling absolute paths
+/// (the moved-disk case), a deleted interpreter under `interpreters/`, or a corrupt binary all
+/// fail the same honest way.
+fn venv_is_dead(dir: &Path) -> bool {
+    dir.join("pyvenv.cfg").exists() && python_version(dir).is_none()
 }
 
 /// The venv interpreter's version (`Python 3.14.2` → `3.14.2`), `None` when it isn't bundled.
@@ -489,6 +513,45 @@ fn release_tag(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fixture venv dir: `pyvenv.cfg` present, and `bin/python3` either a working stub (a
+    /// script answering `--version` like a real interpreter) or a dangling symlink (the exact
+    /// artifact a `~/.bashrs` disk moved to another machine leaves behind).
+    fn venv_fixture(tag: &str, python: Option<&str>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bashrs_venv_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("pyvenv.cfg"), "home = /somewhere/interpreters/bin\n").unwrap();
+        match python {
+            Some(script) => {
+                use std::os::unix::fs::PermissionsExt;
+                let bin = dir.join("bin/python3");
+                std::fs::write(&bin, script).unwrap();
+                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            // The moved-disk casualty: a symlink whose absolute target no longer exists.
+            None => std::os::unix::fs::symlink("/no/such/interpreter/python3", dir.join("bin/python3")).unwrap(),
+        }
+        dir
+    }
+
+    #[test]
+    fn a_venv_is_dead_only_when_present_but_unrunnable() {
+        // Healthy: the interpreter answers → not dead.
+        let ok = venv_fixture("ok", Some("#!/bin/sh\necho 'Python 9.9.9'\n"));
+        assert!(!venv_is_dead(&ok), "an answering interpreter is healthy");
+        assert_eq!(python_version(&ok).as_deref(), Some("9.9.9"));
+        // Dead: pyvenv.cfg exists, but bin/python3 dangles (stale absolute paths) → rebuild.
+        let dead = venv_fixture("dead", None);
+        assert!(venv_is_dead(&dead), "a dangling interpreter must read as dead");
+        // Absent: no pyvenv.cfg at all is NOT dead — it's "not created yet" (the creation path).
+        let missing = std::env::temp_dir().join(format!("bashrs_venv_none_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(!venv_is_dead(&missing), "absence is not death");
+        for dir in [ok, dead] {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 
     #[test]
     fn version_identity_is_the_release_tag_recorded_verbatim() {

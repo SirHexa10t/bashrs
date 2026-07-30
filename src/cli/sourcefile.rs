@@ -318,6 +318,11 @@ pub(super) fn wrappers() -> String {
         // that don't maintain PS1's invariant (non-interactive zsh keeps a default PS1).
         // `return 0` explicitly, so the early-out doesn't parrot the caller's stale status.
         out += "\ncase $- in *i*) ;; *) return 0 ;; esac  # interactive shells only — non-interactive contexts must inherit nothing\n";
+        // The bashrs-free escape hatch: `session_bare` starts a shell with this flag exported,
+        // and this guard CONSUMES it — unset, then return — so the shell comes up without the
+        // surface and without the flag lingering in its environment. One-shot by design: any
+        // later shell (or re-sourcing this file by hand) arms bashrs again.
+        out += "[ -n \"$_BASHRS_BARE\" ] && { unset _BASHRS_BARE ; return 0; }  # session_bare: skip bashrs for THIS shell, flag consumed (any new shell arms again)\n";
         // Bail early (before defining anything) if the binary isn't present. `return 0`, not a
         // bare `return`: bare would silently forward the failed test's status 1 to whatever
         // sourced this file, and a not-yet-installed bashrs is a quiet no-op, not an error.
@@ -442,7 +447,15 @@ mod tests {
     fn wrappers_include_session_function_and_bash_guarded_keybind() {
         let script = wrappers();
         assert!(script.contains("session_new() { exec bash; }"), "session_new missing");
+        assert!(script.contains("session_bare() { _BASHRS_BARE=1 exec bash; }"), "session_bare missing");
+        // The one-shot guard: consume the flag AND return, so a bare session starts with a clean
+        // environment and the very next shell arms bashrs again.
+        assert!(
+            script.contains("[ -n \"$_BASHRS_BARE\" ] && { unset _BASHRS_BARE ; return 0; }"),
+            "the flag-consuming bare guard must sit at the sourcefile's top"
+        );
         assert!(script.contains(r#"bind '"\en": "session_new\n"'"#), "ALT+N keybind missing");
+        assert!(script.contains(r#"bind '"\e\C-n": "session_bare\n"'"#), "CTRL+ALT+N keybind missing");
         assert!(script.contains(r#"bind '"\eh": "bashrs_sourcefile\n"'"#), "ALT+H keybind missing");
         assert!(script.contains(r#"bind '"\ew": "bashrs_configure\n"'"#), "ALT+W keybind missing");
         assert!(script.contains(r#"bind '"\eq": "bashrs_compile\n"'"#), "ALT+Q keybind missing");
