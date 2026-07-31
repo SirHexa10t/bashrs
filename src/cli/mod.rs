@@ -17,6 +17,7 @@ use crate::categories::media::audio_fx::MediaAudioFxCommand;
 use crate::categories::media::images::MediaImagesCommand;
 use crate::categories::media::metadata::MediaMetadataCommand;
 use crate::categories::media::transcode::MediaTranscodeCommand;
+use crate::categories::network::NetworkCommand;
 use crate::categories::packages::PackagesCommand;
 use crate::categories::project::ProjectCommand;
 use crate::categories::python::PythonCommand;
@@ -56,6 +57,8 @@ pub enum Command {
     MediaImages(MediaImagesCommand),
     #[command(flatten)]
     ComfyRepos(ComfyReposCommand),
+    #[command(flatten)]
+    Network(NetworkCommand),
     #[command(flatten)]
     Packages(PackagesCommand),
     #[command(flatten)]
@@ -109,6 +112,7 @@ impl Command {
             Command::MediaAudioFx(cmd) => cmd.run(),
             Command::MediaImages(cmd) => cmd.run(),
             Command::ComfyRepos(cmd) => cmd.run(),
+            Command::Network(cmd) => cmd.run(),
             Command::Packages(cmd) => cmd.run(),
             Command::Project(cmd) => cmd.run(),
             Command::Python(cmd) => cmd.run(),

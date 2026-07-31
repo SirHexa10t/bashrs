@@ -84,6 +84,27 @@ where
     }
 }
 
+/// Run `program` with `args` reading NO standard input, capturing stdout — and returning it
+/// whatever the exit status. Both departures serve probes ([`crate::support::net`]): `openssl
+/// s_client` forwards stdin to the socket and would sit waiting on the terminal forever without
+/// `/dev/null`, and it exits non-zero on an unverifiable certificate while still printing the
+/// certificate the report wants. `None` only on a spawn failure (reported).
+pub(crate) fn capture_without_input<P, I, S>(program: P, args: I) -> Option<String>
+where
+    P: AsRef<OsStr>,
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let program = program.as_ref();
+    match Command::new(program).args(args).stdin(std::process::Stdio::null()).output() {
+        Ok(out) => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Err(err) => {
+            eprintln!("could not run {}: {err}", program.to_string_lossy());
+            None
+        }
+    }
+}
+
 /// Run `program` with `args`, capturing BOTH streams — for callers that must inspect the
 /// failure text before deciding whether the user should see it (e.g. distinguishing "channel
 /// has no such tab" from a real network error). Returns `(succeeded, stdout, stderr)`; `None`

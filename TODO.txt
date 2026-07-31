@@ -24,7 +24,11 @@ Add-in filemanager's conf files
         Maybe broaden the support range?
     Maybe also include browser extensions - they need to be copied into OS drive (not hyperlinked!(?)) in order to hold between resets
 
+Similarly, add-in plugins-management (saving to HOME so that the browser won't forget them)?
+
+
 Add Spotify to `dl`
 
+taking inventory of games-library
 
 

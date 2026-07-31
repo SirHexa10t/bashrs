@@ -12,6 +12,7 @@ pub mod filesystem;
 pub mod git;
 pub mod lookup;
 pub mod media;
+pub mod network;
 pub mod packages;
 pub mod project;
 pub mod python;

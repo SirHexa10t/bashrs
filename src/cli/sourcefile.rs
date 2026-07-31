@@ -20,6 +20,7 @@ use crate::categories::media::audio_fx::MediaAudioFxCommand;
 use crate::categories::media::images::MediaImagesCommand;
 use crate::categories::media::metadata::MediaMetadataCommand;
 use crate::categories::media::transcode::MediaTranscodeCommand;
+use crate::categories::network::NetworkCommand;
 use crate::categories::packages::PackagesCommand;
 use crate::categories::project::ProjectCommand;
 use crate::categories::python::PythonCommand;
@@ -51,7 +52,7 @@ macro_rules! category_group {
 
 /// The command categories: the label grouping them in the generated `sourcefile.sh`, the clap
 /// graph, and the category's pure-shell commands. One row per category — never per command.
-fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 11] {
+fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 12] {
     let categories = [
         ("bashrs", BashrsCommand::augment_subcommands(clap::Command::new("bashrs")),
             BashrsCommand::shell_functions().to_vec()),
@@ -63,6 +64,8 @@ fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 11] {
             DownloadCommand::shell_functions().to_vec()),
         category_group!("media", MediaTranscodeCommand, MediaMetadataCommand,
                                  MediaAudioFxCommand, MediaImagesCommand),
+        ("network", NetworkCommand::augment_subcommands(clap::Command::new("network")),
+            NetworkCommand::shell_functions().to_vec()),
         ("packages", PackagesCommand::augment_subcommands(clap::Command::new("packages")),
             PackagesCommand::shell_functions().to_vec()),
         ("project", ProjectCommand::augment_subcommands(clap::Command::new("project")),
@@ -125,6 +128,7 @@ const WRAPPER_HOOKS: &[(WrapperLookup, WrapperLookup)] = &[
     (MediaMetadataCommand::wrapper_suffix, MediaMetadataCommand::wrapper_prefix),
     (MediaAudioFxCommand::wrapper_suffix, MediaAudioFxCommand::wrapper_prefix),
     (MediaImagesCommand::wrapper_suffix, MediaImagesCommand::wrapper_prefix),
+    (NetworkCommand::wrapper_suffix, NetworkCommand::wrapper_prefix),
     (PackagesCommand::wrapper_suffix, PackagesCommand::wrapper_prefix),
     (ProjectCommand::wrapper_suffix, ProjectCommand::wrapper_prefix),
     (PythonCommand::wrapper_suffix, PythonCommand::wrapper_prefix),
