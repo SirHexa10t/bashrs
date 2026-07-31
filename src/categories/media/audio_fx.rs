@@ -5,7 +5,7 @@
 #[bashrs_macros::category(command = MediaAudioFxCommand, prefix = "media_")]
 mod commands {
     use crate::support::doc_render;
-    use crate::support::exec::{capture_stdout, run_reporting_code};
+    use crate::support::exec::capture_stdout;
     use crate::tools;
     use clap::Args;
     use std::ffi::OsString;
@@ -138,7 +138,7 @@ mod commands {
             }
         }
         let filter = _devocal_filter(args.from, args.to);
-        if run_reporting_code(tools::resolve("ffmpeg"), _remove_vocals_argv(input, &output, &filter)) != 0 {
+        if super::_run_ffmpeg(_remove_vocals_argv(input, &output, &filter)) != 0 {
             return Err("ffmpeg failed (its message above has the reason)".to_string());
         }
         Ok(output)
@@ -295,7 +295,7 @@ mod commands {
 
         /// A 2-second wav synthesized from an ffmpeg lavfi source expression.
         fn build_audio(source: &str, out: &Path) {
-            let ok = std::process::Command::new(crate::tools::resolve("ffmpeg"))
+            let ok = std::process::Command::new(crate::tools::resolve("ffmpeg")).stdin(std::process::Stdio::null())
                 .args(["-v", "error", "-y", "-f", "lavfi", "-i", source])
                 .arg(out)
                 .status()
@@ -305,7 +305,7 @@ mod commands {
 
         /// The file's `mean_volume` in dB, per ffmpeg's volumedetect.
         fn mean_volume(file: &Path) -> f32 {
-            let out = std::process::Command::new(crate::tools::resolve("ffmpeg"))
+            let out = std::process::Command::new(crate::tools::resolve("ffmpeg")).stdin(std::process::Stdio::null())
                 .arg("-i")
                 .arg(file)
                 .args(["-af", "volumedetect", "-f", "null", "-"])
@@ -443,7 +443,7 @@ mod commands {
             std::fs::create_dir_all(&dir).unwrap();
 
             let clip = dir.join("clip.mkv");
-            let ok = std::process::Command::new(crate::tools::resolve("ffmpeg"))
+            let ok = std::process::Command::new(crate::tools::resolve("ffmpeg")).stdin(std::process::Stdio::null())
                 .args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=blue:s=64x64:d=2"])
                 .args(["-f", "lavfi", "-i", "aevalsrc=sin(440*2*PI*t)|sin(440*2*PI*t):d=2"])
                 .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])

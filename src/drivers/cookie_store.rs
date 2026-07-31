@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::path::Path;
 
 use crate::support::exec::capture_output;
-use super::failures::{capture_ytdlp};
+use vidl::ask_ytdlp;
 
 /// Pare a browser's cookie DB down to only `domains`' cookies, writing the filtered copy into
 /// `store_dir` for `--cookie-import`. The privacy crux: an import keeps *just* the target site's
@@ -120,7 +120,7 @@ pub(crate) fn readable_cookie_count(spec: &str, cookies_root: &Path) -> Option<u
         "--cookies".into(),
         probe.clone().into_os_string(),
     ];
-    capture_ytdlp(argv)?; // None only if yt-dlp couldn't be launched at all
+    ask_ytdlp(argv)?; // None only if yt-dlp couldn't be launched at all
     let dump = std::fs::read_to_string(&probe).ok();
     let _ = std::fs::remove_file(&probe); // the decrypted dump must not linger
     Some(count_cookie_dump(&dump?))
@@ -139,8 +139,15 @@ fn count_cookie_dump(dump: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    use crate::drivers::ytdlp::testutil::{scratch_dir};
+
+    /// A clean temp directory for one test — the fixture DBs and filtered copies land here.
+    /// Local now: the shared helper it used to borrow left with the `vidl` crate.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bashrs_cookies_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     /// Skip-with-notice: the resolved python3 when it can do sqlite work, else `None` after
     /// printing a visible SKIP line — the test then passes vacuously instead of failing on a

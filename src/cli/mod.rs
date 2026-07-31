@@ -253,12 +253,13 @@ mod tests {
     #[test]
     fn comfy_commands_follow_naming_standard() {
         // External tools keep their own upstream name (`table`, plus its pinned-preset sibling
-        // `table_fancy`) or a task-named family — all unprefixed by design (`backup_*` flattens
-        // filesync's subcommands into directly-completable commands).
+        // `table_fancy`), the verb they have always had here (`dl`, over the `vidl` crate), or a
+        // task-named family — all unprefixed by design (`backup_*` flattens filesync's
+        // subcommands into directly-completable commands).
         assert_prefixed(
             &command_names::<ComfyReposCommand>(),
             "comfy_",
-            &["table", "table_fancy", "backup_diff", "backup_sync", "backup_find_bitrot"],
+            &["table", "table_fancy", "backup_diff", "backup_sync", "backup_find_bitrot", "dl"],
         );
     }
 

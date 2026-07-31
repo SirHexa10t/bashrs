@@ -12,10 +12,40 @@ pub mod images;
 pub mod metadata;
 pub mod transcode;
 
-use crate::support::exec::run_reporting_code;
 use crate::tools;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+
+/// Run the bundled ffmpeg and pass its exit code back.
+///
+/// The one place `media` launches ffmpeg, because of the stdin handling. ffmpeg reads stdin for
+/// interactive keys (`q` to quit) and briefly puts the terminal into raw mode — `ECHO`, `ICANON`,
+/// `IXON` and friends off — restoring what it saved on exit. One ffmpeg is invisible; two
+/// overlapping interleave, the second saving the *already-raw* state and restoring that, and the
+/// terminal is left with no echo until `stty sane`. Both halves of the answer live here: a null
+/// stdin (which also covers any ffmpeg a child spawns) and `-nostdin` in the argv, which says the
+/// same thing somewhere a reader can see it.
+///
+/// NOT folded into [`crate::support::exec`]: its runners deliberately hand the terminal to the
+/// child, because they also launch editors, git and package managers that must be able to prompt.
+/// This is an ffmpeg rule, so it lives with the ffmpeg callers. `ffprobe` needs neither half — it
+/// never reads stdin, rejects `-nostdin` outright, and is only ever run through a capturing
+/// runner (which nulls stdin already).
+fn _run_ffmpeg(argv: Vec<OsString>) -> i32 {
+    let mut full: Vec<OsString> = vec!["-nostdin".into()];
+    full.extend(argv);
+    match std::process::Command::new(tools::resolve("ffmpeg"))
+        .stdin(std::process::Stdio::null())
+        .args(full)
+        .status()
+    {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(err) => {
+            eprintln!("could not run ffmpeg: {err}");
+            1
+        }
+    }
+}
 
 /// The tail every ffmpeg-writing command shares: refuse writing onto the input itself, run,
 /// and pass ffmpeg's exit code through — it keeps ignorable warnings out of its status (a
@@ -25,7 +55,7 @@ fn _run_writing(command: &str, input: &Path, output: &Path, argv: Vec<OsString>)
         eprintln!("{command}: the output is the input itself ({})", input.display());
         std::process::exit(1);
     }
-    let code = run_reporting_code(tools::resolve("ffmpeg"), argv);
+    let code = _run_ffmpeg(argv);
     if code != 0 {
         std::process::exit(code);
     }

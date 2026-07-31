@@ -3,7 +3,7 @@
 
 #[bashrs_macros::category(command = MediaImagesCommand, prefix = "media_")]
 mod commands {
-    use crate::support::exec::{capture_stdout, run_reporting_code};
+    use crate::support::exec::capture_stdout;
     use crate::tools;
     use clap::{Args, ValueEnum};
     use std::ffi::OsString;
@@ -165,10 +165,7 @@ mod commands {
         // input's `pad` sees only its own dimensions), so it's probed up front via ffprobe.
         let Some(canvas) = _max_dimension(axis, &inputs) else { std::process::exit(1) };
         let output = output.unwrap_or_else(|| _default_merge_output(axis, &inputs));
-        let code = run_reporting_code(
-            tools::resolve("ffmpeg"),
-            _merge_argv(axis, &inputs, &output, overwrite, offset, canvas),
-        );
+        let code = super::_run_ffmpeg(_merge_argv(axis, &inputs, &output, overwrite, offset, canvas));
         if code != 0 {
             std::process::exit(code);
         }

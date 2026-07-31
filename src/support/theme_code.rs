@@ -60,12 +60,6 @@ fn _code_colour(kind: &str) -> Option<&'static str> {
     })
 }
 
-/// Style `text` as an argument/flag name (a code term) → green. For contexts that aren't full
-/// syntax highlighting but still want a flag to read as code, e.g. the yt-dlp `taglist`.
-pub(crate) fn argname(text: &str) -> String {
-    paint("argname", text)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,11 +69,6 @@ mod tests {
         assert_eq!(paint("string", "hi"), "\x1b[32mhi\x1b[0m");
         assert_eq!(paint("comment", "// x"), "\x1b[90m// x\x1b[0m");
         assert_eq!(paint("no_such_kind", "raw"), "raw"); // graceful: printed uncoloured
-    }
-
-    #[test]
-    fn argname_styles_a_flag_as_green_code() {
-        assert_eq!(argname("--audio-format"), "\x1b[32m--audio-format\x1b[0m");
     }
 
     #[test]

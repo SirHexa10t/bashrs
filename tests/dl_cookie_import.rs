@@ -150,6 +150,20 @@ impl Rig {
     fn site_dir(&self, key: &str) -> PathBuf {
         self.home.join(".bashrs/user-data/browser_cookies").join(key)
     }
+
+    /// Every yt-dlp invocation the run made, one argv per line.
+    fn calls(&self) -> String {
+        fs::read_to_string(self.stub.join("calls.log")).unwrap_or_default()
+    }
+
+    /// Seed a ready-made store for `site`, skipping the import flow. Its contents are never read
+    /// by the stub — what matters downstream is only that a store EXISTS to be selected.
+    fn seed_store(&self, site: &str) {
+        let dir = self.site_dir(site);
+        fs::create_dir_all(dir.join("store")).unwrap();
+        fs::write(dir.join("browser.spec"), "firefox").unwrap();
+        fs::write(dir.join("store/cookies.sqlite"), "junk").unwrap();
+    }
 }
 
 impl Drop for Rig {
@@ -412,3 +426,90 @@ fn a_browser_on_path_without_stores_prompts_a_sign_in_instead() {
         text(&out)
     );
 }
+
+/// The other half of the cookie-store contract: having imported one, `dl` must USE it by default
+/// on that site — and `--no-cookies` must keep it out of every yt-dlp call. Tested here rather
+/// than with the download flows because the store is what's under test, not the download.
+#[test]
+fn an_imported_store_is_the_standing_default_and_no_cookies_suppresses_it() {
+    let with_store = |tag: &str, flags: &[&str]| {
+        let rig = Rig::new(tag, None);
+        rig.seed_store("youtube");
+        let mut args = vec!["dl", "https://www.youtube.com/watch?v=stubvid0000", "--into"];
+        let into = rig.into.display().to_string();
+        args.push(&into);
+        args.extend_from_slice(flags);
+        let out = rig.run("ok", &args, None);
+        assert!(out.status.success(), "{}", text(&out));
+        rig.calls()
+    };
+    let used = with_store("cookies_on", &[]);
+    assert!(used.contains("--cookies-from-browser"), "the store is the standing default:\n{used}");
+    let suppressed = with_store("cookies_off", &["--no-cookies"]);
+    assert!(
+        !suppressed.contains("--cookies-from-browser"),
+        "--no-cookies must keep the store out of every yt-dlp call:\n{suppressed}"
+    );
+}
+
+/// Precedence among the three ways cookies can reach yt-dlp. `dl` decides only ONE of them — the
+/// auto-selected store — so anything the user names explicitly has to win, and win intact. This
+/// is the seam where bashrs hands off to vidl, and the only place the ordering is stated.
+#[test]
+fn an_explicitly_named_cookie_source_beats_the_auto_selected_store() {
+    let run = |tag: &str, flags: &[&str]| {
+        let rig = Rig::new(tag, None);
+        rig.seed_store("youtube");
+        let mut args = vec!["dl", "https://www.youtube.com/watch?v=stubvid0000", "--into"];
+        let into = rig.into.display().to_string();
+        args.push(&into);
+        args.extend_from_slice(flags);
+        let out = rig.run("ok", &args, None);
+        assert!(out.status.success(), "{}", text(&out));
+        rig.calls()
+    };
+
+    // A --cookies file: the store must not also be sent, or yt-dlp gets two conflicting sources.
+    let file = run("prec_file", &["--cookies", "/tmp/nonexistent-jar.txt"]);
+    assert!(file.contains("--cookies /tmp/nonexistent-jar.txt"), "the file is passed:\n{file}");
+    assert!(
+        !file.contains("--cookies-from-browser"),
+        "an explicit jar must suppress the auto-selected store:\n{file}"
+    );
+
+    // An explicit --cookies-from-browser: passed through verbatim, NOT replaced by the store's
+    // own spec (which would silently point at a different profile than the user asked for).
+    let spec = run("prec_spec", &["--cookies-from-browser", "chrome:/somewhere/else"]);
+    assert!(
+        spec.contains("--cookies-from-browser chrome:/somewhere/else"),
+        "the user's spec reaches yt-dlp unchanged:\n{spec}"
+    );
+    assert!(
+        !spec.contains("browser_cookies/youtube"),
+        "the auto-selected store must not override an explicit spec:\n{spec}"
+    );
+}
+
+/// `--no-cookies` is refused alongside every way of asking FOR cookies, rather than silently
+/// picking a winner — the flags contradict each other and a quiet resolution would send (or
+/// withhold) a session against the user's stated intent.
+#[test]
+fn no_cookies_conflicts_with_every_way_of_supplying_them() {
+    let rig = Rig::new("conflicts", None);
+    for other in [
+        vec!["--cookies", "/tmp/j.txt"],
+        vec!["--cookies-from-browser", "firefox"],
+        vec!["--cookie-import", "youtube"],
+    ] {
+        let mut args = vec!["dl", "https://www.youtube.com/watch?v=stubvid0000", "--no-cookies"];
+        args.extend_from_slice(&other);
+        let out = rig.run("ok", &args, None);
+        assert!(!out.status.success(), "--no-cookies {other:?} must be rejected");
+        let text = text(&out);
+        assert!(
+            text.contains("cannot be used with"),
+            "clap should name the conflict for --no-cookies {other:?}:\n{text}"
+        );
+    }
+}
+
