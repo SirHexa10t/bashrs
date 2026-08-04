@@ -24,7 +24,7 @@ use crate::categories::network::NetworkCommand;
 use crate::categories::packages::PackagesCommand;
 use crate::categories::project::ProjectCommand;
 use crate::categories::python::PythonCommand;
-use crate::categories::session;
+use crate::categories::session::SessionCommand;
 use crate::categories::styles::StyleCommand;
 use crate::conf::{config_file, environment, greeting, keybinds};
 use crate::conf::RELOAD_EXIT_CODE;
@@ -52,7 +52,7 @@ macro_rules! category_group {
 
 /// The command categories: the label grouping them in the generated `sourcefile.sh`, the clap
 /// graph, and the category's pure-shell commands. One row per category — never per command.
-fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 12] {
+fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 13] {
     let categories = [
         ("bashrs", BashrsCommand::augment_subcommands(clap::Command::new("bashrs")),
             BashrsCommand::shell_functions().to_vec()),
@@ -72,6 +72,10 @@ fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 12] {
             ProjectCommand::shell_functions().to_vec()),
         ("python", PythonCommand::augment_subcommands(clap::Command::new("python")),
             PythonCommand::shell_functions().to_vec()),
+        // `session_new`/`session_bare` are `#[shell_body]` (they `exec` the calling shell);
+        // `session_sudo` is an ordinary command with a generated wrapper.
+        ("session", SessionCommand::augment_subcommands(clap::Command::new("session")),
+            SessionCommand::shell_functions().to_vec()),
         // One `lookup` group: `hg` (history search) plus the generated g-family.
         category_group!("lookup", LookupCommand, GrepCommand, GgCommand),
         // One `style` group spanning both style enums: hand-written + generated.
@@ -265,10 +269,9 @@ pub(super) fn wrappers() -> String {
     // Bundled tools (fetched and kept current by the same bin): their shim dir wins by PATH.
     body += &format!("\n# bundled tools\n{}", tools::shell_setup());
 
-    // Environment settings, session functions, keybinds: raw shell run when
-    // sourcefile.sh is sourced.
+    // Environment settings and keybinds: raw shell run when sourcefile.sh is sourced.
+    // (The session commands are a category now — emitted above with the rest.)
     body += &format!("\n# environment\n{}", environment::settings());
-    body += &format!("\n# session\n{}", session::functions());
 
     let binds: String = keybinds::bindings()
         .iter()

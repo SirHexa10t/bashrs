@@ -384,7 +384,9 @@ fn to_pascal_case(s: &str) -> String {
 /// `internal_cli` module used to spell out by hand. Applied to a free function whose parameters are
 /// the data to forward to the elevated run, it emits a sibling unit struct named in PascalCase after
 /// the function, with two `pub(crate)` methods:
-/// - `reexec(…)` — the *parent* side: spawn `<superuser> <self> <marker> <args-as-flags>`, then revoke.
+/// - `reexec(…)` — the *parent* side: spawn `<superuser> <self> <marker> <args-as-flags>`, then
+///   revoke only an elevation this run itself earned. Already-root callers skip the round-trip
+///   and run the function directly.
 /// - `try_handle() -> bool` — the *child* side: if `argv[1]` is the marker, parse the flags back with
 ///   `clap` and run the function as root; returns whether it handled the invocation.
 ///
@@ -468,6 +470,7 @@ fn expand_elevated(func: ItemFn) -> syn::Result<TokenStream2> {
     let mut params = Vec::new(); // reexec signature (parent side)
     let mut pushes = Vec::new(); // reexec body: build the argv
     let mut forwards = Vec::new(); // try_handle: parsed fields passed to the function
+    let mut directs = Vec::new(); // reexec's already-root shortcut: borrowed params back to owned args
 
     for input in &func.sig.inputs {
         let FnArg::Typed(PatType { pat, ty, .. }) = input else {
@@ -489,22 +492,32 @@ fn expand_elevated(func: ItemFn) -> syn::Result<TokenStream2> {
         if type_ident(ty).as_deref() == Some("bool") {
             params.push(quote!(#name: bool));
             pushes.push(quote!(if #name { cmd.arg(#flag); }));
+            directs.push(quote!(#name));
         } else if let Some(inner) = element_of(ty, "Vec") {
             let value = arg_value(&inner);
             params.push(quote!(#name: &[#inner]));
             pushes.push(quote!(for __v in #name { cmd.arg(#flag).arg(#value); }));
+            directs.push(quote!(#name.to_vec()));
         } else if let Some(inner) = element_of(ty, "Option") {
             let value = arg_value(&inner);
-            let param_inner = if is_osstr(&inner) { osstr_ref(&inner) } else { quote!(#inner) };
-            params.push(quote!(#name: ::core::option::Option<#param_inner>));
+            if is_osstr(&inner) {
+                let param_inner = osstr_ref(&inner);
+                params.push(quote!(#name: ::core::option::Option<#param_inner>));
+                directs.push(quote!(#name.map(::std::borrow::ToOwned::to_owned)));
+            } else {
+                params.push(quote!(#name: ::core::option::Option<#inner>));
+                directs.push(quote!(#name));
+            }
             pushes.push(quote!(if let ::core::option::Option::Some(__v) = #name { cmd.arg(#flag).arg(#value); }));
         } else if is_osstr(ty) {
             let borrowed = osstr_ref(ty);
             params.push(quote!(#name: #borrowed));
             pushes.push(quote!(cmd.arg(#flag).arg(#name);));
+            directs.push(quote!(::std::borrow::ToOwned::to_owned(#name)));
         } else {
             params.push(quote!(#name: #ty));
             pushes.push(quote!(cmd.arg(#flag).arg(#name.to_string());));
+            directs.push(quote!(#name));
         }
     }
 
@@ -522,15 +535,23 @@ fn expand_elevated(func: ItemFn) -> syn::Result<TokenStream2> {
         impl #command {
             const MARKER: &'static str = #marker;
 
-            /// Parent side: re-exec this binary under the superuser, forwarding each argument as the
-            /// flag(s) the child parses back, then drop the elevation.
+            /// Parent side: re-exec this binary under the superuser, forwarding each argument as
+            /// the flag(s) the child parses back, then drop any elevation this run itself earned
+            /// (a sudo ticket the user already held is theirs and stays).
+            ///
+            /// Already root (a root shell, an elevated parent)? Then there is nothing to ask for
+            /// and no ticket to manage — the routine runs directly, no child process at all.
             pub(crate) fn reexec(#(#params),*) {
+                if crate::elevation::is_root() {
+                    return #fn_ident(#(#directs),*);
+                }
                 let exe = match ::std::env::current_exe() {
                     ::core::result::Result::Ok(exe) => exe,
                     ::core::result::Result::Err(err) => {
                         return ::std::eprintln!("cannot locate self to re-run as root: {}", err)
                     }
                 };
+                let had_ticket = crate::elevation::ticket_exists();
                 // `crate::elevation` is the host crate's declared anchor for this expansion (an
                 // alias in its `lib.rs`) — not the elevation module's real path, so that module
                 // can move without this macro changing.
@@ -538,7 +559,7 @@ fn expand_elevated(func: ItemFn) -> syn::Result<TokenStream2> {
                 cmd.arg(exe).arg(Self::MARKER);
                 #(#pushes)*
                 let _ = cmd.status();
-                crate::elevation::revoke();
+                crate::elevation::revoke_ours(had_ticket);
             }
 
             /// Child side: if this process is the elevated re-exec (its `argv[1]` is the marker),

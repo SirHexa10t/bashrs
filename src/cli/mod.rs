@@ -21,6 +21,7 @@ use crate::categories::network::NetworkCommand;
 use crate::categories::packages::PackagesCommand;
 use crate::categories::project::ProjectCommand;
 use crate::categories::python::PythonCommand;
+use crate::categories::session::SessionCommand;
 use crate::categories::styles::StyleCommand;
 
 // The generator half of the crate root: everything `sourcefile.sh` and TAB-completion need,
@@ -65,6 +66,8 @@ pub enum Command {
     Project(ProjectCommand),
     #[command(flatten)]
     Python(PythonCommand),
+    #[command(flatten)]
+    Session(SessionCommand),
     #[command(flatten)]
     Lookup(LookupCommand),
     #[command(flatten)]
@@ -116,6 +119,7 @@ impl Command {
             Command::Packages(cmd) => cmd.run(),
             Command::Project(cmd) => cmd.run(),
             Command::Python(cmd) => cmd.run(),
+            Command::Session(cmd) => cmd.run(),
             Command::Lookup(cmd) => cmd.run(),
             Command::Grep(cmd) => cmd.run(),
             Command::Treegrep(cmd) => cmd.run(),
@@ -259,8 +263,15 @@ mod tests {
         assert_prefixed(
             &command_names::<ComfyReposCommand>(),
             "comfy_",
-            &["table", "table_fancy", "backup_diff", "backup_sync", "backup_find_bitrot", "dl"],
+            &["table", "table_fancy", "backup_diff", "backup_sync", "backup_find_bitrot", "dl", "clicker", "clicker_doctor", "clicker_benchmark"],
         );
+    }
+
+    #[test]
+    fn session_commands_follow_naming_standard() {
+        // All three carry the prefix in an explicit `#[name]`, because the bare fn names
+        // (`new`, `bare`, `sudo`) would be terrible commands on their own.
+        assert_prefixed(&command_names::<SessionCommand>(), "session_", &[]);
     }
 
     #[test]

@@ -85,6 +85,54 @@ mod commands {
         _filesync(filesync::Command::Diff(args));
     }
 
+    /// Hold or toggle a key (default F9) to click — or to repeat a keyboard key — at a chosen
+    /// rate, wherever the mouse already is; F8 quits. Works on X11, Wayland and the console
+    /// alike; on X11 it needs no privileges at all. If device access is needed and missing,
+    /// the error walks you through the fix (sequencer clicker)
+    #[unprefixed]
+    pub fn clicker(args: sequencer::ClickerArgs) {
+        _sequencer(sequencer::Command::Clicker(args));
+    }
+
+    /// Measure what this machine can really deliver: writes key presses as fast as asked
+    /// (or flat out, with no `--cps`) while reading its own virtual device back, printing the
+    /// live rate as it goes. The gap between written and delivered is the honest ceiling —
+    /// a rate counted from the sending loop alone would never show it (sequencer bench)
+    #[unprefixed]
+    pub fn clicker_benchmark(args: sequencer::BenchArgs) {
+        _sequencer(sequencer::Command::Bench(args));
+    }
+
+    /// Check everything `clicker` needs — the uinput module loaded, /dev/uinput writable,
+    /// /dev/input readable — and print the exact commands to fix whatever is missing. Exit 0
+    /// means ready (sequencer doctor)
+    #[unprefixed]
+    pub fn clicker_doctor(args: sequencer::DoctorArgs) {
+        _sequencer(sequencer::Command::Doctor(args));
+    }
+
+    /// Run one sequencer invocation — the funnel for the `sequencer`-backed commands, each
+    /// wrapping one subcommand (flag completion per command; sequencer never runs bare), the
+    /// same shape as [`_filesync`]. Logging must be initialized first, exactly as the upstream
+    /// binary's `main` does — the sent-rate report, the chosen backend, and drop warnings all
+    /// ride tracing, so skipping it would run the clicker mute.
+    ///
+    /// Entered through `run_with_sudo_prompt` — upstream's session mode — though on an X11
+    /// session it never asks: clicks go through XTEST and hotkeys through key grabs, so no
+    /// input device is opened and there is nothing for sudo to unlock. Elsewhere (Wayland, a
+    /// console) an unprivileged run without the udev/group setup explains itself, asks once,
+    /// re-execs `bashrs clicker …` verbatim under sudo, and the elevated process sheds root
+    /// the moment the devices are open. The hint names `clicker_doctor` so the advice printed
+    /// is a command this shell can actually run.
+    fn _sequencer(command: sequencer::Command) {
+        let global = command.global();
+        let _ = sequencer::init_logging(global.verbose, global.quiet);
+        let code = sequencer::run_with_sudo_prompt(&command.into(), "clicker_doctor");
+        if code != 0 {
+            std::process::exit(code.into());
+        }
+    }
+
     /// Run one filesync invocation — every `backup_*` command funnels here, each wrapping one
     /// subcommand (which gives each its own flag completion; filesync never runs bare). Entered
     /// through `run_with_sudo_prompt`, not plain `run`, so `backup_*` starts exactly like the

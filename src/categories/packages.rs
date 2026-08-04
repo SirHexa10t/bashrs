@@ -11,8 +11,11 @@ mod commands {
     #[prefixed]
     #[unprefixed]
     pub fn upup(_args: NoArgs) {
+        // Probed before the first elevated step; a ticket the user held going in is theirs
+        // to keep, so only an elevation this run itself earned is dropped afterwards.
+        let had_ticket = superuser::ticket_exists();
         _upgrade(_managers_active());
-        superuser::revoke(); // drop the elevation the package steps just earned
+        superuser::revoke_ours(had_ticket);
     }
 
     /// Update the development toolchains (rustup, uv, ...) that are installed

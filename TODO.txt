@@ -32,3 +32,20 @@ Add Spotify to `dl`
 taking inventory of games-library
 
 
+Add in key-bind programming and auto-clicking tool `sequencer`
+
+USB-cable speed-tester 
+    diagnosis for:
+        full-functionality (no inner tears)
+        transfer-speed (and concluded USB version)
+    should take into account the limit on the ports which were used (is this easy to do?)
+    should also cover usb-drives? (make sure to fully flood the cache?) ; or maybe just recommend a program that does that.
+    can it be done by connecting 2 of the computer's ports with the same cable?
+
+android de-bloating
+
+
+
+
+
+

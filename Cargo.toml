@@ -12,6 +12,10 @@ bashrs-macros = { path = "macros" }
 table_formatter = { git = "https://github.com/SirHexa10t/table_formatter.git", branch = "main" }
 filesync = { git = "https://github.com/SirHexa10t/backup_sync.git", branch = "main" }
 vidl = { git = "https://github.com/SirHexa10t/vidl.git", branch = "main" }   # the yt-dlp driver behind `dl`
+# `package =` because that repo is a workspace (core / input / cli) rather than one crate, and
+# `-cli` is the one holding the embeddable surface. Renamed here so every companion repo reads
+# the same way at the call site.
+sequencer = { package = "sequencer-cli", git = "https://github.com/SirHexa10t/sequencer.git", branch = "main" }   # synthetic input — the autoclicker behind `clicker`
 synoptic = "2"
 libc = "0.2"
 toml = "1.1"
