@@ -541,6 +541,9 @@ fn expand_elevated(func: ItemFn) -> syn::Result<TokenStream2> {
             ///
             /// Already root (a root shell, an elevated parent)? Then there is nothing to ask for
             /// and no ticket to manage — the routine runs directly, no child process at all.
+            // Arity is the user's function's, forwarded one parameter per flag; the macro
+            // cannot reduce it and the author already accepted it on their own signature.
+            #[allow(clippy::too_many_arguments)]
             pub(crate) fn reexec(#(#params),*) {
                 if crate::elevation::is_root() {
                     return #fn_ident(#(#directs),*);

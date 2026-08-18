@@ -13,6 +13,7 @@ use crate::categories::autogen_styles::StylizedEchoCommand;
 use crate::categories::bashrs::BashrsCommand;
 use crate::categories::comfy_repos::ComfyReposCommand;
 use crate::categories::download::DownloadCommand;
+use crate::categories::exposed_helpers::ExposedHelpersCommand;
 use crate::categories::filesystem::FilesystemCommand;
 use crate::categories::git::GitCommand;
 use crate::categories::lookup::LookupCommand;
@@ -24,6 +25,7 @@ use crate::categories::network::NetworkCommand;
 use crate::categories::packages::PackagesCommand;
 use crate::categories::project::ProjectCommand;
 use crate::categories::python::PythonCommand;
+use crate::categories::anti_ai::AntiAiCommand;
 use crate::categories::session::SessionCommand;
 use crate::categories::styles::StyleCommand;
 use crate::conf::{config_file, environment, greeting, keybinds};
@@ -52,8 +54,10 @@ macro_rules! category_group {
 
 /// The command categories: the label grouping them in the generated `sourcefile.sh`, the clap
 /// graph, and the category's pure-shell commands. One row per category — never per command.
-fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 13] {
+fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 15] {
     let categories = [
+        ("anti_ai", AntiAiCommand::augment_subcommands(clap::Command::new("anti_ai")),
+            AntiAiCommand::shell_functions().to_vec()),
         ("bashrs", BashrsCommand::augment_subcommands(clap::Command::new("bashrs")),
             BashrsCommand::shell_functions().to_vec()),
         ("filesystem", FilesystemCommand::augment_subcommands(clap::Command::new("filesystem")),
@@ -62,6 +66,8 @@ fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 13] {
             GitCommand::shell_functions().to_vec()),
         ("download", DownloadCommand::augment_subcommands(clap::Command::new("download")),
             DownloadCommand::shell_functions().to_vec()),
+        ("exposed_helpers", ExposedHelpersCommand::augment_subcommands(clap::Command::new("exposed_helpers")),
+            ExposedHelpersCommand::shell_functions().to_vec()),
         category_group!("media", MediaTranscodeCommand, MediaMetadataCommand,
                                  MediaAudioFxCommand, MediaImagesCommand),
         ("network", NetworkCommand::augment_subcommands(clap::Command::new("network")),

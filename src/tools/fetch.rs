@@ -257,7 +257,7 @@ pub(super) fn provisioned_version(tool: &Tool, dir: &Path) -> Option<String> {
 /// in [`super::interpreters_dir`], and system pythons are never linked against (a venv onto one
 /// would break whenever the system python moves or updates).
 fn uv_managed(args: &[&str]) -> bool {
-    let run = Command::new(super::resolve("uv"))
+    let run = Command::new(super::resolve_uv())
         .args(args)
         .env("UV_PYTHON_INSTALL_DIR", super::interpreters_dir())
         .env("UV_MANAGED_PYTHON", "1")

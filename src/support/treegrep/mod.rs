@@ -32,7 +32,7 @@ use crate::support::streamgrep;
 
 // This module's own `--delve` binary-format decoders — a private child, since the whole crate
 // reaches them only through `scan_file`'s delve branch below.
-mod delve;
+pub(crate) mod delve;
 
 /// Options mapped from the `gg` flags (the search roots are passed to [`search`] separately).
 pub struct Options {
@@ -47,6 +47,10 @@ pub struct Options {
     /// When set, tee results (plain) into this live file and leave a sorted `_sorted` sibling
     /// ([`sorted_path`]) on completion (`gg --save`).
     pub save: Option<PathBuf>,
+    /// Path components to leave out of the walk (`--skip-pattern` / `--lean`). Pruned during
+    /// traversal, so a skipped directory is never read, never searched, and — under `--re` —
+    /// never rewritten.
+    pub skips: Vec<String>,
 }
 
 /// Recursively search `roots` for `expressions` (literal or `-E` regex, case-insensitive, OR'd):
@@ -87,7 +91,7 @@ pub(crate) fn search(expressions: &[String], roots: &[PathBuf], opts: &Options) 
     if save.is_none() {
         section("matching filenames", color);
     }
-    let names = search_filenames(&matcher, roots, &denied);
+    let names = search_filenames(&matcher, roots, &opts.skips, &denied);
     print_filenames(&names, &matcher, color, save.as_ref());
 
     if save.is_none() {
@@ -208,10 +212,11 @@ fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
 fn search_filenames(
     matcher: &RegexMatcher,
     roots: &[PathBuf],
+    skips: &[String],
     denied: &Mutex<BTreeSet<PathBuf>>,
 ) -> Vec<PathBuf> {
     let hits: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-    walk(roots).build_parallel().run(|| {
+    walk(roots, skips).build_parallel().run(|| {
         let hits = &hits;
         Box::new(move |result| {
             name_hit(result, matcher, hits, denied);
@@ -276,7 +281,7 @@ fn search_contents(
     let line_number = opts.line_number;
     let context = opts.context;
 
-    walk(roots).build_parallel().run(|| {
+    walk(roots, &opts.skips).build_parallel().run(|| {
         let ctx = &ctx;
         let mut searcher = build_searcher(line_number, context);
         let mut buffer = ctx.bufwtr.buffer();
@@ -477,6 +482,7 @@ impl ReplacePlan {
 pub(crate) fn plan_replacements(
     expressions: &[String],
     roots: &[PathBuf],
+    skips: &[String],
     regex: bool,
     replacement: &str,
 ) -> Option<ReplacePlan> {
@@ -493,7 +499,7 @@ pub(crate) fn plan_replacements(
     if roots.is_empty() {
         return Some(ReplacePlan { renames: Vec::new(), rewrites: Vec::new() });
     }
-    walk(roots).build_parallel().run(|| {
+    walk(roots, skips).build_parallel().run(|| {
         let (renames, rewrites, matcher) = (&renames, &rewrites, &matcher);
         Box::new(move |result| {
             if let Ok(entry) = result {
@@ -634,12 +640,21 @@ fn flush(buffer: &Buffer, ctx: &Ctx) {
 
 /// A walker configured to search *everything* — hidden and ignored files included (matching the
 /// old `find`/`grep -r`), unlike ripgrep's gitignore-aware default.
-fn walk(roots: &[PathBuf]) -> WalkBuilder {
+fn walk(roots: &[PathBuf], skips: &[String]) -> WalkBuilder {
     let mut builder = WalkBuilder::new(&roots[0]);
     for root in &roots[1..] {
         builder.add(root);
     }
     builder.standard_filters(false);
+    if !skips.is_empty() {
+        // Pruned here rather than filtered per-result: `filter_entry` stops the walk descending
+        // at all, so a skipped `target/` is never even enumerated. The walk root itself is
+        // exempt — naming a directory is the decision to search it.
+        let skips = skips.to_vec();
+        builder.filter_entry(move |entry| {
+            entry.depth() == 0 || !crate::support::args::is_skipped(entry.path(), &skips)
+        });
+    }
     builder
 }
 
@@ -752,7 +767,7 @@ mod tests {
         std::fs::write(dir.join("fin.log"), b"fin fin").unwrap();
         std::fs::write(dir.join("other.txt"), b"no match").unwrap();
 
-        let plan = plan_replacements(&["fin".to_string()], std::slice::from_ref(&dir), false, "lon").unwrap();
+        let plan = plan_replacements(&["fin".to_string()], std::slice::from_ref(&dir), &[], false, "lon").unwrap();
         // Names: finger→longer, finfile.txt→lonfile.txt, fin.log→lon.log (other.txt untouched).
         assert_eq!(plan.renames.len(), 3, "{:?}", plan.renames);
         // Contents: finfile.txt (1) and fin.log (2); other.txt has no match.
@@ -777,7 +792,7 @@ mod tests {
         std::fs::write(dir.join("fin.txt"), b"x").unwrap(); // name matches → wants to become lon.txt
         std::fs::write(dir.join("lon.txt"), b"y").unwrap(); // …but that already exists
 
-        let plan = plan_replacements(&["fin".to_string()], std::slice::from_ref(&dir), false, "lon").unwrap();
+        let plan = plan_replacements(&["fin".to_string()], std::slice::from_ref(&dir), &[], false, "lon").unwrap();
         let (_, renamed, problems) = apply_replacements(&plan);
         assert_eq!(renamed, 0, "the colliding rename is skipped");
         assert!(problems.iter().any(|p| p.contains("target exists")), "{problems:?}");
@@ -792,7 +807,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("data.bin"), b"fin\x00fin").unwrap(); // NUL → binary
-        let plan = plan_replacements(&["fin".to_string()], std::slice::from_ref(&dir), false, "lon").unwrap();
+        let plan = plan_replacements(&["fin".to_string()], std::slice::from_ref(&dir), &[], false, "lon").unwrap();
         assert!(plan.rewrites.is_empty(), "a NUL-bearing file is not rewritten: {:?}", plan.rewrites);
         let _ = std::fs::remove_dir_all(&dir);
     }

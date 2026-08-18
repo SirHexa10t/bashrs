@@ -5,11 +5,13 @@
 //! lives in the [`sourcefile`] child.
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use crate::categories::anti_ai::AntiAiCommand;
 use crate::categories::autogen_lookup::{GgCommand, GrepCommand};
 use crate::categories::autogen_styles::StylizedEchoCommand;
 use crate::categories::bashrs::BashrsCommand;
 use crate::categories::comfy_repos::ComfyReposCommand;
 use crate::categories::download::DownloadCommand;
+use crate::categories::exposed_helpers::ExposedHelpersCommand;
 use crate::categories::filesystem::FilesystemCommand;
 use crate::categories::git::GitCommand;
 use crate::categories::lookup::LookupCommand;
@@ -40,6 +42,8 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     #[command(flatten)]
+    AntiAi(AntiAiCommand),
+    #[command(flatten)]
     Bashrs(BashrsCommand),
     #[command(flatten)]
     Filesystem(FilesystemCommand),
@@ -47,6 +51,8 @@ pub enum Command {
     Git(GitCommand),
     #[command(flatten)]
     Download(DownloadCommand),
+    #[command(flatten)]
+    ExposedHelpers(ExposedHelpersCommand),
     // One `media` group, one enum per product (see `categories::media`).
     #[command(flatten)]
     MediaTranscode(MediaTranscodeCommand),
@@ -106,10 +112,12 @@ pub enum Command {
 impl Command {
     pub fn run(self) {
         match self {
+            Command::AntiAi(cmd) => cmd.run(),
             Command::Bashrs(cmd) => cmd.run(),
             Command::Filesystem(cmd) => cmd.run(),
             Command::Git(cmd) => cmd.run(),
             Command::Download(cmd) => cmd.run(),
+            Command::ExposedHelpers(cmd) => cmd.run(),
             Command::MediaTranscode(cmd) => cmd.run(),
             Command::MediaMetadata(cmd) => cmd.run(),
             Command::MediaAudioFx(cmd) => cmd.run(),
@@ -140,8 +148,8 @@ impl Command {
 /// name). The `g<N>`/`gg<N>` variants aren't listed: they REMOVE their pinned `-C` outright by
 /// taking the `*Base` argument structs (see [`crate::support::args`]).
 const HIDDEN_PINNED: &[(&str, &[&str])] = &[
-    ("GG", &["delve"]),
-    ("GGG", &["delve", "save", "regex"]),
+    ("GG", &["delve", "lean"]),
+    ("GGG", &["delve", "save", "regex", "lean"]),
     ("backup_find_bitrot", &["eager_checksum"]),
 ];
 
@@ -272,6 +280,16 @@ mod tests {
         // All three carry the prefix in an explicit `#[name]`, because the bare fn names
         // (`new`, `bare`, `sudo`) would be terrible commands on their own.
         assert_prefixed(&command_names::<SessionCommand>(), "session_", &[]);
+    }
+
+    #[test]
+    fn anti_ai_commands_follow_naming_standard() {
+        assert_prefixed(&command_names::<AntiAiCommand>(), "anti_ai_", &[]);
+    }
+
+    #[test]
+    fn exposed_helper_commands_follow_naming_standard() {
+        assert_prefixed(&command_names::<ExposedHelpersCommand>(), "_", &[]);
     }
 
     #[test]

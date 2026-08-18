@@ -23,7 +23,7 @@ use std::path::Path;
 /// (each becomes one searchable "line"). Returns `None` only when the extension isn't one we decode
 /// — so callers keep skipping such files rather than raw-scanning them. A decodable file that fails
 /// to parse yields `Some(empty)`, never a fall-through to a raw scan of (potentially huge) binary.
-pub(super) fn extract(path: &Path) -> Option<Vec<u8>> {
+pub(crate) fn extract(path: &Path) -> Option<Vec<u8>> {
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "torrent" => Some(std::fs::read(path).map(|bytes| bencode_text(&bytes)).unwrap_or_default()),
         "mkv" | "mka" | "mks" | "webm" => Some(

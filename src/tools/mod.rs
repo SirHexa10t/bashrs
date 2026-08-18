@@ -118,6 +118,33 @@ pub fn versions() -> Vec<(&'static str, Option<String>)> {
         .collect()
 }
 
+/// Where bashrs points uv's cache: beside what the cache feeds, so both share a filesystem.
+///
+/// `~/.bashrs` is commonly a symlink onto another disk, and uv installs by *hardlinking* out
+/// of its cache — links cannot cross filesystems, so uv's stock cache location (`~/.cache/uv`,
+/// on the home disk) degrades every install into a full copy and prints a warning on every
+/// compile. Keeping the cache under [`root`] restores the links, and it travels with the disk:
+/// one less piece of bashrs state a machine migration would strand in `~/.cache`.
+///
+/// `None` when the user has set `UV_CACHE_DIR` themselves — their placement wins. Scoped to
+/// bashrs's own uv invocations on purpose: personal uv work targets home-disk projects, where
+/// the default cache location hardlinks fine.
+fn uv_cache_dir(existing: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    existing.is_none().then(|| root().join("uv-cache"))
+}
+
+/// The bundled `uv`, with its cache pinned onto the bashrs disk (see [`uv_cache_dir`]).
+///
+/// Every place bashrs drives uv resolves it through here rather than through [`resolve`], so
+/// the cache policy exists exactly once. Set process-wide because the exec helpers the callers
+/// use take a program, not an environment — and the variable means nothing to any other child.
+pub(crate) fn resolve_uv() -> OsString {
+    if let Some(dir) = uv_cache_dir(std::env::var_os("UV_CACHE_DIR").as_deref()) {
+        std::env::set_var("UV_CACHE_DIR", dir);
+    }
+    resolve("uv")
+}
+
 /// The command to run for `program`: its bundled copy when present — the project-pinned version,
 /// kept current by `bashrs_compile` — else the bare name, so the system installation (or its
 /// normal "command not found" error) takes over. A program not in the table passes through.
@@ -171,6 +198,24 @@ pub(crate) fn shell_setup() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cache policy, tested as the pure decision — the setter is a thin shell around it,
+    /// and mutating the real environment in a parallel test suite is a race.
+    #[test]
+    fn uv_cache_lands_on_the_bashrs_disk_unless_the_user_placed_it() {
+        let ours = uv_cache_dir(None).expect("unset: bashrs decides");
+        assert!(
+            ours.ends_with("tools/uv-cache"),
+            "beside what it feeds, so hardlinks work across a symlinked ~/.bashrs: {}",
+            ours.display()
+        );
+        assert!(ours.starts_with(crate::conf::bashrs_home()), "and it migrates with the disk");
+        assert_eq!(
+            uv_cache_dir(Some(std::ffi::OsStr::new("/somewhere/mine"))),
+            None,
+            "a user-set UV_CACHE_DIR wins"
+        );
+    }
 
     #[test]
     fn uv_is_listed_before_the_python_venv_that_needs_it() {

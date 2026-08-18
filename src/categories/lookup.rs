@@ -18,17 +18,20 @@ use std::path::PathBuf;
 /// `#[elevated]` wraps this in a `sudo` self-re-exec round-trip: it generates `GgElevatedRescan`,
 /// whose `reexec(…)` (parent, called from `_offer_root_rescan`) spawns `sudo <self> gg-elevated-rescan …`
 /// and whose `try_handle()` (child, called from [`crate::run`]) parses that back and runs this.
+// The parameters ARE the wire format: `#[elevated]` turns each into a `--flag` the child parses
+// back, so bundling them into a struct would take them off the command line the re-exec builds.
 #[bashrs_macros::elevated]
-fn gg_elevated_rescan(expressions: Vec<String>, paths: Vec<PathBuf>, context: usize, delve: bool, no_number: bool, regex: bool, save: Option<PathBuf>) {
+#[allow(clippy::too_many_arguments, reason = "one parameter per forwarded flag; see above")]
+fn gg_elevated_rescan(expressions: Vec<String>, paths: Vec<PathBuf>, context: usize, delve: bool, no_number: bool, regex: bool, save: Option<PathBuf>, skips: Vec<String>) {
     // `save` is the shared `--save` live file (absent when the run isn't saving); the root pass
     // appends to it and to its `_sorted` sibling, exactly like the main pass.
-    let opts = treegrep::Options { line_number: !no_number, context, delve, regex, save };
+    let opts = treegrep::Options { line_number: !no_number, context, delve, regex, save, skips };
     treegrep::search(&expressions, &paths, &opts);
 }
 
 #[bashrs_macros::category(command = LookupCommand, prefix = "lookup_")]
 mod commands {
-    use crate::support::args::{GgArgs, GgBase, GrepArgs};
+    use crate::support::args::{GgArgs, GgBase, GrepArgs, SkipArgs};
     use crate::support::{input, preferences, streamgrep};
     use clap::Args;
 
@@ -55,22 +58,27 @@ mod commands {
         regexp: Vec<String>,
     }
 
-    /// Recursive search with `--delve` always on — also looks inside binaries we can decode (video
-    /// subtitle tracks, `.torrent` text). Please: no `--re`.
+    /// Recursive search with `--delve` and `--lean` always on — looks inside binaries we can
+    /// decode (video subtitle tracks, `.torrent` text), and skips the machine-written
+    /// directories (`_arg_lean_spec` lists them). Please: no `--re`.
     #[name("GG")]
     #[trailing_newline]
     pub fn gg_delve(args: GgArgs) {
-        // Force `--delve`. The flag is hidden from GG's help/completion (see `cli::HIDDEN_PINNED`)
-        // but still accepted; a plain bool, so a caller passing it anyway is a harmless no-op.
-        _gg(&GgArgs { base: GgBase { delve: true, ..args.base }, ..args });
+        // Force `--delve` and `--lean`. Both are hidden from GG's help/completion (see
+        // `cli::HIDDEN_PINNED`) but still accepted; plain bools, so a caller passing one anyway
+        // is a harmless no-op. `--skip-pattern` still adds to what `--lean` already skips.
+        let skip = SkipArgs { lean: true, ..args.base.skip };
+        _gg(&GgArgs { base: GgBase { delve: true, skip, ..args.base }, ..args });
     }
 
     /// `GG` plus the two extras: `--save` (`-s`, leave sorted results in `deep_search_<time>_sorted`)
-    /// and regex (`-E`). The everything-on, all-caps deep search.
+    /// and regex (`-E`). The everything-on, all-caps deep search — `--lean`'s skips apply
+    /// here too (`_arg_lean_spec` lists them).
     #[name("GGG")]
     #[trailing_newline]
     pub fn ggg(args: GgArgs) {
-        _gg(&GgArgs { base: GgBase { delve: true, save: true, regex: true, ..args.base }, ..args });
+        let skip = SkipArgs { lean: true, ..args.base.skip };
+        _gg(&GgArgs { base: GgBase { delve: true, save: true, regex: true, skip, ..args.base }, ..args });
     }
 
     /// Read the input, then filter it in-process with the `grep` crate — case-insensitive, literal
@@ -121,6 +129,7 @@ mod commands {
             delve: args.base.delve,
             regex: args.base.regex,
             save,
+            skips: args.base.skip.skips(),
         };
         let roots = [args.base.directory.clone()];
         let denied = treegrep::search(&expressions, &roots, &opts);
@@ -128,7 +137,7 @@ mod commands {
         // `--re`: after the results are on screen, offer to replace every match in place. A
         // distinct, confirmed, destructive phase — never entangled with the read-only search.
         if let Some(replacement) = &args.base.re {
-            _replace_matches(&expressions, &roots, args.base.regex, replacement);
+            _replace_matches(&expressions, &roots, &args.base.skip.skips(), args.base.regex, replacement);
         }
         // Runs once, after both passes have appended their sorted sections to the `_sorted` sibling.
         // The live (arrival-order) file is the crash-safety net: only once the sorted copy verifiably
@@ -179,15 +188,21 @@ mod commands {
         // `#[elevated]` on `gg_elevated_rescan` generated `GgElevatedRescan`; hand its parent side the
         // tuning and the exact denied paths (as a slice).
         let paths: Vec<PathBuf> = denied.iter().cloned().collect();
-        GgElevatedRescan::reexec(expressions, &paths, opts.context, opts.delve, !opts.line_number, opts.regex, opts.save.as_deref());
+        GgElevatedRescan::reexec(expressions, &paths, opts.context, opts.delve, !opts.line_number, opts.regex, opts.save.as_deref(), &opts.skips);
     }
 
     /// The `--re` phase: plan every in-place replacement, show what it would touch, and apply it
     /// only on an interactive `y`. Destructive and undo-less, so the preview + confirm is the whole
     /// point — and a non-interactive run refuses rather than mutate unattended.
-    fn _replace_matches(expressions: &[String], roots: &[PathBuf], regex: bool, replacement: &str) {
+    fn _replace_matches(
+        expressions: &[String],
+        roots: &[PathBuf],
+        skips: &[String],
+        regex: bool,
+        replacement: &str,
+    ) {
         use std::io::{IsTerminal, Write};
-        let Some(plan) = treegrep::plan_replacements(expressions, roots, regex, replacement) else {
+        let Some(plan) = treegrep::plan_replacements(expressions, roots, skips, regex, replacement) else {
             return;
         };
         if plan.is_empty() {
@@ -234,6 +249,40 @@ mod commands {
         if items.len() > shown {
             eprintln!("  [{} more {kind}(s) omitted]", items.len() - shown);
         }
+    }
+}
+
+#[cfg(test)]
+mod pinned_tests {
+    use crate::support::args::{GgBase, SkipArgs};
+
+    /// A flag listed in `cli::HIDDEN_PINNED` is hidden from a command's help on the promise that
+    /// the command forces it on. Hiding one without setting it is the worst of both: invisible
+    /// AND inactive. `GG` shipped exactly that bug for `--lean`, so it is pinned here.
+    #[test]
+    fn gg_actually_forces_the_flags_it_hides() {
+        let base = GgBase {
+            expressions: vec!["x".to_string()],
+            regexp: Vec::new(),
+            directory: std::path::PathBuf::from("."),
+            no_line_number: false,
+            delve: false,
+            regex: false,
+            save: false,
+            re: None,
+            skip: SkipArgs { skip_pattern: vec!["mine".to_string()], lean: false },
+        };
+        // The same construction `GG` performs on the way to `_gg`.
+        let skip = SkipArgs { lean: true, ..base.skip };
+        assert!(skip.lean, "GG hides --lean, so it must set it");
+        assert!(
+            skip.skips().iter().any(|s| s == "mine"),
+            "and a user's own --skip-pattern still applies on top"
+        );
+        assert!(
+            skip.skips().iter().any(|s| s == ".git/"),
+            "so a GG run really does skip what --lean names"
+        );
     }
 }
 

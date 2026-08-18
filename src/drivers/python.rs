@@ -33,7 +33,7 @@ fn snapshot(python: &Path) {
 fn freeze(python: &Path) -> Option<String> {
     let args: Vec<String> =
         vec!["pip".into(), "freeze".into(), "--python".into(), python.display().to_string()];
-    exec::capture_stdout(crate::tools::resolve("uv"), args)
+    exec::capture_stdout(crate::tools::resolve_uv(), args)
 }
 
 /// Restore the environment to exactly its pre-last-change package set (`uv pip sync`: versions
@@ -53,7 +53,7 @@ pub(crate) fn rollback() -> bool {
         python.display().to_string(),
         snapshot.display().to_string(),
     ];
-    exec::run_reporting(crate::tools::resolve("uv"), args)
+    exec::run_reporting(crate::tools::resolve_uv(), args)
 }
 
 /// Install `packages` into the bundled environment — latest versions, upgrading any already
@@ -92,7 +92,7 @@ fn uv_pip<S: AsRef<str>>(python: &Path, action: &[&str], packages: &[S]) -> bool
     argv.push("--python".into());
     argv.push(python.display().to_string());
     argv.extend(packages.iter().map(|package| package.as_ref().to_string()));
-    exec::run_reporting(crate::tools::resolve("uv"), argv)
+    exec::run_reporting(crate::tools::resolve_uv(), argv)
 }
 
 /// The bare package names in `uv pip freeze` output (`name==version` lines; anything else —

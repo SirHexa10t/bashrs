@@ -9,6 +9,7 @@
 //! privilege escalation ([`superuser`]), the system package-manager registry
 //! ([`package_management`]), and browser cookie-store discovery ([`browsers`]).
 
+pub mod ai_meta;
 pub mod args;
 pub mod browsers;
 pub mod comfy_repos;
@@ -18,6 +19,7 @@ pub mod exec;
 pub mod input;
 pub mod net;
 pub mod package_management;
+pub mod prog_langs;
 pub mod preferences;
 pub mod shell;
 pub mod streamgrep;

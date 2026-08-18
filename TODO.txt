@@ -45,7 +45,39 @@ USB-cable speed-tester
 android de-bloating
 
 
+dl:
+    add subtitle-scrubbing function? (or is it attached in a standard way and can be put in bashrs's `media`?)
+    test if .mkv is truly more compact, verify if it's really less lossy (are we converting to it post-download?)
 
 
+jukebox:
+    <dir-of-playable-media> (default: .)
+    -r (recursively include all media files)
+    --formats <comma-separated-extensions> (overwrite default formats list; default [print bashrs's known formats])
+    --round-trip (use random-that-randomly-visits-each-file-once rather than totally-random)
+    --dirs <comma-separated-strings> (overwrite single-dir scan; jukebox on more than one location) <- too complicated?
+
+    Each time a new track is played, prefix that line with timestamp (up to seconds)
+    Start run by specifying the used seed (assuming that's how we'd determine the random path through tracks)
+
+
+network:
+    discover local network (devices (detail) ; addresses ; other metadata (active? answering on some ports? uptime?))
+
+
+git:
+    bundle git + git-lfs in the program's offered libraries (like Python3)
+    install huggingface ?
+
+
+files:
+    save open window-manager paths (and locations across screens if possible)
+    get bookmarks from nemo, offer `bookmark_cd` function (add "_<num>" for duplicate entries)
+    `gui` function (error message if running headless)
+    mountpoints command + configuration file
+
+add process-killing command (looks-up string, offers matches, allows choosing which in `form`)
+
+y/n , Y/n , y/N functions
 
 
