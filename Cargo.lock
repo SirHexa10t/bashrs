@@ -792,8 +792,8 @@ dependencies = [
 
 [[package]]
 name = "sequencer-cli"
-version = "0.1.0"
-source = "git+https://github.com/SirHexa10t/sequencer.git?branch=main#305ab7c34da670a1353cf10e8537d8ef68965114"
+version = "0.5.0"
+source = "git+https://github.com/SirHexa10t/sequencer.git?branch=main#579c71069e282b47b4bef0bf2c0401195331e12d"
 dependencies = [
  "clap",
  "nix",
@@ -810,16 +810,16 @@ dependencies = [
 
 [[package]]
 name = "sequencer-core"
-version = "0.1.0"
-source = "git+https://github.com/SirHexa10t/sequencer.git?branch=main#305ab7c34da670a1353cf10e8537d8ef68965114"
+version = "0.5.0"
+source = "git+https://github.com/SirHexa10t/sequencer.git?branch=main#579c71069e282b47b4bef0bf2c0401195331e12d"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "sequencer-input"
-version = "0.1.0"
-source = "git+https://github.com/SirHexa10t/sequencer.git?branch=main#305ab7c34da670a1353cf10e8537d8ef68965114"
+version = "0.5.0"
+source = "git+https://github.com/SirHexa10t/sequencer.git?branch=main#579c71069e282b47b4bef0bf2c0401195331e12d"
 dependencies = [
  "evdev",
  "sequencer-core",

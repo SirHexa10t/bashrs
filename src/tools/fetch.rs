@@ -32,28 +32,73 @@ const TAG_MARKER: &str = ".build_tag";
 pub fn sync(pins: &[(String, String)]) -> bool {
     let bundle_languages = config_file::always_bundle_languages();
     let bundle_utilities = config_file::always_bundle_utilities();
+
+    // Plan first, on local information only: a config flag and a PATH probe decide whether this
+    // machine bundles each tool at all, and Carstay names the version when pinned. Settling the
+    // whole set up front costs nothing and keeps these messages in table order.
+    // `None` — not bundled here; `Some(pin)` — bundled, at `pin`'s recorded version if any.
+    let plan: Vec<Option<Option<&str>>> = TOOLS
+        .iter()
+        .map(|tool| {
+            let (always, field) = match tool.group {
+                Group::Language => (bundle_languages, "always_bundle_languages"),
+                Group::Utility => (bundle_utilities, "always_bundle_utilities"),
+            };
+            let probe = tool.bins[0].0;
+            if !always && exec::on_path(probe) {
+                eprintln!(
+                    "tools: {probe} is already on this system — not bundling (override: [tools] {field} in {})",
+                    config_file::CONFIG_FILE
+                );
+                return None;
+            }
+            let pin = pins.iter().find(|(name, _)| name == tool.dir).map(|(_, pin)| pin.as_str());
+            if let Some(pin) = pin {
+                eprintln!("tools: {} pinned to the recorded {pin}", tool.dir);
+            }
+            Some(pin)
+        })
+        .collect();
+
+    // Then discover every release URL at once. This phase IS what an up-to-date sync costs —
+    // one GitHub API call per tool, nothing downloaded — so running the calls serially made the
+    // no-op case pay their sum. They're independent read-only lookups (a `curl` of the releases
+    // API, no shared state), so the wall clock becomes the slowest single call instead.
+    let urls: Vec<Option<String>> = std::thread::scope(|scope| {
+        let handles: Vec<Option<_>> = TOOLS
+            .iter()
+            .zip(&plan)
+            .map(|(tool, planned)| {
+                let pin = (*planned)?;
+                let resolve = match &tool.acquire {
+                    Acquire::Archive { url, .. } => *url,
+                    Acquire::Binary(url) => *url,
+                    // A venv has no published asset to look up — `uv python upgrade` is its
+                    // whole freshness check, and it needs uv on disk, so it stays in the
+                    // ordered phase below.
+                    Acquire::UvVenv { .. } => return None,
+                };
+                Some(scope.spawn(move || resolve(pin)))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.and_then(|handle| handle.join().ok().flatten()))
+            .collect()
+    });
+
+    // Act in table order — load-bearing here even though discovery wasn't: uv must land before
+    // the python venv whose creation runs it, and deno's zip is unpacked by that python. Each
+    // step already holds its URL, so keeping the order now costs a comparison, not a round trip.
     let mut fetched_any = false;
-    for tool in TOOLS {
-        let (always, field) = match tool.group {
-            Group::Language => (bundle_languages, "always_bundle_languages"),
-            Group::Utility => (bundle_utilities, "always_bundle_utilities"),
-        };
-        let probe = tool.bins[0].0;
-        if !always && exec::on_path(probe) {
-            eprintln!(
-                "tools: {probe} is already on this system — not bundling (override: [tools] {field} in {})",
-                config_file::CONFIG_FILE
-            );
-            continue;
-        }
+    for ((tool, planned), url) in TOOLS.iter().zip(&plan).zip(&urls) {
+        let Some(pin) = *planned else { continue };
         let dir = root().join(tool.dir);
-        let pin = pins.iter().find(|(name, _)| name == tool.dir).map(|(_, pin)| pin.as_str());
-        if let Some(pin) = pin {
-            eprintln!("tools: {} pinned to the recorded {pin}", tool.dir);
-        }
         fetched_any |= match &tool.acquire {
-            Acquire::Archive { url, dated_tag } => sync_archive(tool, *url, &dir, pin, *dated_tag),
-            Acquire::Binary(url) => sync_binary(tool, *url, &dir, pin),
+            Acquire::Archive { dated_tag, .. } => {
+                sync_archive(tool, url.as_deref(), &dir, pin, *dated_tag)
+            }
+            Acquire::Binary(_) => sync_binary(tool, url.as_deref(), &dir, pin),
             Acquire::UvVenv { python } => sync_python_venv(python, &dir, pin),
         };
     }
@@ -67,15 +112,17 @@ pub fn sync(pins: &[(String, String)]) -> bool {
 
 /// The freshness check both release modes share: `None` when the bundle at `dir` was already
 /// built from the latest published URL (per its `.source_url` marker) or no URL could be
-/// determined (diagnostics emitted here) — else the URL to (re)build from.
+/// determined (diagnostics emitted here) — else the URL to (re)build from. `url` is the wanted
+/// asset as [`sync`]'s parallel discovery phase resolved it, `None` when that lookup found
+/// nothing; the comparison itself is local.
 fn release_url_if_stale(
     tool: &Tool,
-    url: fn(Option<&str>) -> Option<String>,
+    url: Option<&str>,
     dir: &Path,
     pin: Option<&str>,
 ) -> Option<String> {
     let installed = dir.join(tool.bins[0].1).exists();
-    let Some(url) = url(pin) else {
+    let Some(url) = url else {
         if pin.is_some() {
             eprintln!("tools: could not resolve the recorded {} pin (release gone, or offline) — keeping the bundled one", tool.dir);
         } else if installed {
@@ -86,7 +133,7 @@ fn release_url_if_stale(
         return None;
     };
     let recorded = std::fs::read_to_string(dir.join(SOURCE_MARKER)).unwrap_or_default();
-    (!installed || recorded.trim() != url).then_some(url)
+    (!installed || recorded.trim() != url).then(|| url.to_string())
 }
 
 /// The archive mode: re-fetch when the wanted URL (latest published, or the `pin`ned release in
@@ -95,7 +142,7 @@ fn release_url_if_stale(
 /// (the stale one is dropped first, so a failed lookup can't mislabel the new bundle).
 fn sync_archive(
     tool: &Tool,
-    url: fn(Option<&str>) -> Option<String>,
+    url: Option<&str>,
     dir: &Path,
     pin: Option<&str>,
     dated_tag: Option<fn() -> Option<String>>,
@@ -120,7 +167,7 @@ fn sync_archive(
 
 /// The single-binary mode: same freshness contract as [`sync_archive`], but the download *is*
 /// the program — written to the tool's first `bins` path and made executable.
-fn sync_binary(tool: &Tool, url: fn(Option<&str>) -> Option<String>, dir: &Path, pin: Option<&str>) -> bool {
+fn sync_binary(tool: &Tool, url: Option<&str>, dir: &Path, pin: Option<&str>) -> bool {
     let Some(url) = release_url_if_stale(tool, url, dir, pin) else { return false };
     eprintln!("tools: fetching {} into {}", tool.dir, dir.display());
     match download_binary(&url, &dir.join(tool.bins[0].1)) {

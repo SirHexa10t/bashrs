@@ -187,6 +187,47 @@ fn wrapper_suffix(name: &str) -> Option<&'static str> {
     WRAPPER_HOOKS.iter().find_map(|(suffix, _)| suffix(name))
 }
 
+/// A readline escape sequence as the hotkey a keyboard labels it: `\en` → `Alt+N`,
+/// `\e\C-n` → `Ctrl+Alt+N`. Modifiers in Ctrl, Alt, Shift order; an uppercase key letter in
+/// the sequence means Shift was part of the chord.
+fn hotkey_label(sequence: &str) -> String {
+    let (mut ctrl, mut alt) = (false, false);
+    let mut rest = sequence;
+    loop {
+        if let Some(after) = rest.strip_prefix(r"\e") {
+            alt = true;
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix(r"\C-") {
+            ctrl = true;
+            rest = after;
+        } else {
+            break;
+        }
+    }
+    let mut shift = false;
+    let key = rest
+        .chars()
+        .next()
+        .map(|ch| {
+            shift = ch.is_ascii_uppercase();
+            ch.to_ascii_uppercase()
+        })
+        .unwrap_or('?');
+    let mut parts: Vec<&str> = Vec::new();
+    if ctrl {
+        parts.push("Ctrl");
+    }
+    if alt {
+        parts.push("Alt");
+    }
+    if shift {
+        parts.push("Shift");
+    }
+    parts.push("");
+    let modifiers = parts.join("+");
+    format!("{modifiers}{key}")
+}
+
 /// The shell piped into a command's wrapper (ahead of the binary) — e.g. `hg` searches the
 /// shell history, which only the shell itself can produce, so its wrapper runs `history` and
 /// pipes it in.
@@ -207,6 +248,9 @@ pub(super) fn wrappers() -> String {
 
     let mut body = String::new();
     let mut completion_names: Vec<String> = Vec::new(); // every wrapper + alias, for `complete -F`
+    // Command name → one-line description, harvested while the loop below has them in hand;
+    // the keybind comments look their bound function up here.
+    let mut abouts: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for (label, category, shell_fns) in category_commands() {
         let mut lines: Vec<String> = Vec::new();
         for sub in category.get_subcommands() {
@@ -232,6 +276,9 @@ pub(super) fn wrappers() -> String {
             // A command that consumes a builtin's output (e.g. `hg` ← `history`) has it piped
             // in ahead of the binary; the shell must produce it, since we can't.
             let prefix = wrapper_prefix(real).map(|cmd| format!("{cmd} | ")).unwrap_or_default();
+            if let Some(first_line) = about.strip_prefix("  # ") {
+                abouts.insert(real.to_string(), first_line.to_string());
+            }
             for shell_name in std::iter::once(real).chain(sub.get_visible_aliases()) {
                 lines.push(format!("{shell_name}() {{ {prefix}{BIN} {real} \"$@\"{suffix}; }}{about}"));
                 completion_names.push(shell_name.to_string());
@@ -246,6 +293,9 @@ pub(super) fn wrappers() -> String {
         // running under `set -e` (sourced files inherit it) isn't aborted either. Same gotcha,
         // same cure as the bundled-tools `python3` function.
         for (name, fn_body, comment) in shell_fns {
+            if !comment.is_empty() {
+                abouts.insert(name.to_string(), comment.to_string());
+            }
             let about = if comment.is_empty() { String::new() } else { format!("  # {comment}") };
             lines.push(format!("unalias {name} 2>/dev/null || true"));
             lines.push(format!("{name}() {{ {fn_body}; }}{about}"));
@@ -279,9 +329,20 @@ pub(super) fn wrappers() -> String {
     // (The session commands are a category now — emitted above with the rest.)
     body += &format!("\n# environment\n{}", environment::settings());
 
-    let binds: String = keybinds::bindings()
+    // Same column-alignment as the category blocks: two-plus spaces before `#` is the
+    // table split point, and the bind text itself only ever holds single spaces.
+    let bind_lines: Vec<String> = keybinds::bindings()
         .iter()
-        .map(|(key, func)| format!("    bind '\"{key}\": \"{func}\\n\"'\n"))
+        .map(|(key, func)| {
+            let what = abouts.get(*func).map_or_else(|| (*func).to_string(), Clone::clone);
+            format!("bind '\"{key}\": \"{func}\\n\"'  # {}: {what}", hotkey_label(key))
+        })
+        .collect();
+    let opts = table_formatter::FormatOptions { trim_trailing: true, ..Default::default() };
+    let binds: String = table_formatter::format_table(&bind_lines, &opts)
+        .unwrap_or(bind_lines)
+        .into_iter()
+        .map(|line| format!("    {line}\n"))
         .collect();
     let desktop = keybinds::desktop_restart();
     if !binds.is_empty() || !desktop.is_empty() {
@@ -469,6 +530,18 @@ mod tests {
         );
         assert!(script.contains(r#"bind '"\en": "session_new\n"'"#), "ALT+N keybind missing");
         assert!(script.contains(r#"bind '"\e\C-n": "session_bare\n"'"#), "CTRL+ALT+N keybind missing");
+        // Every bind carries a comment naming the chord as a keyboard labels it, plus what it
+        // runs — sourced from the bound command's own description, so it cannot drift.
+        assert!(script.contains("# Alt+N: Start a fresh shell session"), "bind comment missing");
+        assert!(script.contains("# Ctrl+Alt+N: Fresh shell WITHOUT bashrs"), "chord comment missing");
+        // And the comments sit in one column, like every other block's — the bind texts vary
+        // in length, so equality here means the table alignment actually ran.
+        let comment_columns: std::collections::BTreeSet<usize> = script
+            .lines()
+            .filter(|line| line.trim_start().starts_with("bind "))
+            .filter_map(|line| line.find("  # "))
+            .collect();
+        assert_eq!(comment_columns.len(), 1, "bind comments are not aligned: {comment_columns:?}");
         assert!(script.contains(r#"bind '"\eh": "bashrs_sourcefile\n"'"#), "ALT+H keybind missing");
         assert!(script.contains(r#"bind '"\ew": "bashrs_configure\n"'"#), "ALT+W keybind missing");
         assert!(script.contains(r#"bind '"\eq": "bashrs_compile\n"'"#), "ALT+Q keybind missing");
@@ -495,6 +568,17 @@ mod tests {
         let binary = script.find("[ -f \"$HOME/.bashrs/bashrs\" ] || return 0").expect("binary guard");
         let first_definition = script.find("() {").expect("some wrapper");
         assert!(guard < binary && binary < first_definition, "guards first, cheapest first");
+    }
+
+    /// The chord spelling the comments use: modifiers in Ctrl, Alt, Shift order, key as the
+    /// keyboard labels it, an uppercase letter in the sequence meaning Shift.
+    #[test]
+    fn hotkeys_read_as_a_keyboard_labels_them() {
+        assert_eq!(hotkey_label(r"\en"), "Alt+N");
+        assert_eq!(hotkey_label(r"\e\C-n"), "Ctrl+Alt+N", "Ctrl before Alt");
+        assert_eq!(hotkey_label(r"\C-y"), "Ctrl+Y");
+        assert_eq!(hotkey_label(r"\C-\eY"), "Ctrl+Alt+Shift+Y", "Shift last, from the capital");
+        assert_eq!(hotkey_label(r"\eq"), "Alt+Q");
     }
 
     #[test]

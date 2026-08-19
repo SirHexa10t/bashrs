@@ -119,54 +119,147 @@ fn exe_dir_shell(comfy: &Comfy) -> String {
 /// the recorded commit — fetched explicitly and hard-reset, which discards nothing of the user's:
 /// these clones are read-only mirrors.
 pub fn sync(pins: &[(String, String)]) {
-    for comfy in STAINLESS {
-        let dir = clone_dir(comfy);
-        let name = repo_name(comfy.repo);
-        let existed = dir.exists();
-        if !existed {
-            if let Some(parent) = dir.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            git(Command::new("git").args(["clone", "--depth", "1", comfy.repo]).arg(&dir), comfy.repo);
-        }
-        let pin = pins.iter().find(|(pinned, _)| pinned == name).map(|(_, rev)| rev.as_str());
-        match pin {
-            Some(rev) if dir.exists() => {
-                eprintln!("stainless: {name} pinned to the recorded revision {rev}");
-                // GitHub serves unadvertised commits by SHA, so a shallow fetch of the exact
-                // revision works even after upstream history moved (or was rewritten).
-                if git(Command::new("git").arg("-C").arg(&dir).args(["fetch", "--depth", "1", "origin", rev]), comfy.repo) {
-                    git(Command::new("git").arg("-C").arg(&dir).args(["reset", "--hard", rev]), comfy.repo);
-                }
-            }
-            None if existed => {
-                // A failed fast-forward usually means upstream history was rewritten (a
-                // force-pushed main). Deliberately NOT auto-reset: the remedy is named and the
-                // decision stays in the user's hands — delete the clone and it re-fetches fresh.
-                let pulled = Command::new("git").arg("-C").arg(&dir).args(["pull", "--ff-only"]).status();
-                if !matches!(pulled, Ok(status) if status.success()) {
-                    eprintln!(
-                        "stainless: could not fast-forward {name} (upstream history rewritten?) — delete {} and re-run COMPILE.sh to re-clone it fresh",
-                        dir.display()
-                    );
-                }
-            }
-            _ => {} // fresh clone with no pin — already at the tip
-        }
-        // The repo's runtime python packages, into the bundled environment (best-effort, like the
-        // clone — `install` explains itself when the environment or uv is missing).
-        if !super::python::install(comfy.python_deps) {
-            eprintln!("stainless: {}'s python packages may be missing", repo_name(comfy.repo));
-        }
+    // Git phase, parallel: each repo is its own directory and its own remote, so the clones
+    // and fetches don't contend — the wall clock is the slowest repo instead of the sum.
+    // Every line a repo says is prefixed `stainless/<name>:`, so attribution never depends
+    // on where a line landed in the output.
+    let reports: Vec<Vec<String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = STAINLESS
+            .iter()
+            .map(|comfy| (repo_name(comfy.repo), scope.spawn(move || sync_repo(comfy, pins))))
+            .collect();
+        handles
+            .into_iter()
+            .map(|(name, handle)| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| vec![format!("stainless/{name}: sync thread panicked")])
+            })
+            .collect()
+    });
+    for line in reports.iter().flatten() {
+        eprintln!("{line}");
+    }
+    // Python phase: ONE `uv pip install` for every repo's packages together. They all land in
+    // the same bundled environment, so per-repo calls paid uv's startup, resolve, and
+    // `--upgrade`'s latest-version network check N times over — several seconds each even
+    // with nothing to do — and running them concurrently instead would race on the venv.
+    // Batching is both the fast path and the safe one.
+    let packages: Vec<&str> = {
+        let mut seen = std::collections::BTreeSet::new();
+        STAINLESS
+            .iter()
+            .flat_map(|comfy| comfy.python_deps.iter().copied())
+            .filter(|package| seen.insert(*package))
+            .collect()
+    };
+    if !super::python::install(&packages) {
+        eprintln!("stainless: some companion python packages may be missing (uv's output above names them)");
     }
 }
 
-/// Run a prepared `git` command, warning (never failing the compile) if it doesn't succeed;
-/// reports the verdict for steps that chain (a pinned reset only makes sense after its fetch).
-fn git(cmd: &mut Command, repo: &str) -> bool {
-    let ok = matches!(cmd.status(), Ok(status) if status.success());
+/// One repo's git work — clone, or pin, or fast-forward — with everything worth saying
+/// returned (each line `stainless/<name>:`-prefixed) rather than printed, so the parallel
+/// phase stays attributable.
+///
+/// A pin short-circuits on a purely local HEAD comparison: the wanted revision is already
+/// known, so matching it means there is no reason to touch the network at all. The unpinned
+/// path has no such shortcut on purpose — see the note above its pull.
+fn sync_repo(comfy: &Comfy, pins: &[(String, String)]) -> Vec<String> {
+    let mut log = Vec::new();
+    let dir = clone_dir(comfy);
+    let name = repo_name(comfy.repo);
+    let tag = format!("stainless/{name}");
+    let existed = dir.exists();
+    if !existed {
+        if let Some(parent) = dir.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if git(
+            Command::new("git").args(["clone", "--depth", "1", comfy.repo]).arg(&dir),
+            &tag,
+            &mut log,
+        ) {
+            log.push(format!("{tag}: cloned"));
+        }
+    }
+    let pin = pins.iter().find(|(pinned, _)| pinned == name).map(|(_, rev)| rev.as_str());
+    match pin {
+        Some(rev) if dir.exists() => {
+            if local_head(&dir).as_deref() == Some(rev) {
+                log.push(format!("{tag}: already at the recorded revision {rev}"));
+                return log;
+            }
+            // GitHub serves unadvertised commits by SHA, so a shallow fetch of the exact
+            // revision works even after upstream history moved (or was rewritten).
+            if git(
+                Command::new("git").arg("-C").arg(&dir).args(["fetch", "--depth", "1", "origin", rev]),
+                &tag,
+                &mut log,
+            ) && git(
+                Command::new("git").arg("-C").arg(&dir).args(["reset", "--hard", rev]),
+                &tag,
+                &mut log,
+            ) {
+                log.push(format!("{tag}: pinned to the recorded revision {rev}"));
+            }
+        }
+        None if existed => {
+            // Straight to the pull — no `ls-remote` pre-check. One was tried and measured
+            // slower: against an up-to-date remote `git pull --ff-only` IS a single ref
+            // advertisement that transfers nothing, so asking first merely repeats it — a
+            // wash when current, ~0.5s of pure overhead when a pull turns out to be needed.
+            //
+            // Protocol v0 for the same reason COMPILE.sh polls with it: v2 spends an extra
+            // round trip negotiating capabilities before it can ask for refs, and only earns
+            // that back by filtering a large ref namespace server-side. These clones have a
+            // handful of refs, where v0's single advertisement measures about twice as fast.
+            //
+            // A failed fast-forward usually means upstream history was rewritten (a
+            // force-pushed main). Deliberately NOT auto-reset: the remedy is named and the
+            // decision stays in the user's hands — delete the clone and it re-fetches fresh.
+            let pulled = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["-c", "protocol.version=0", "pull", "--ff-only"])
+                .output();
+            if matches!(&pulled, Ok(out) if out.status.success()) {
+                log.push(format!("{tag}: fast-forwarded"));
+            } else {
+                log.push(format!(
+                    "{tag}: could not fast-forward (upstream history rewritten?) — delete {} and re-run COMPILE.sh to re-clone it fresh",
+                    dir.display()
+                ));
+            }
+        }
+        _ => {} // fresh clone with no pin — already at the tip
+    }
+    log
+}
+
+/// The clone's current commit, if readable.
+fn local_head(dir: &std::path::Path) -> Option<String> {
+    let out = Command::new("git").arg("-C").arg(dir).args(["rev-parse", "HEAD"]).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|sha| !sha.is_empty())
+}
+
+/// Run a prepared `git` command with its output captured (the syncs run in parallel, and
+/// interleaved progress is unreadable), logging a warning — never failing the compile — when
+/// it doesn't succeed. Reports the verdict for steps that chain (a pinned reset only makes
+/// sense after its fetch).
+fn git(cmd: &mut Command, tag: &str, log: &mut Vec<String>) -> bool {
+    let out = cmd.output();
+    let ok = matches!(&out, Ok(out) if out.status.success());
     if !ok {
-        eprintln!("stainless: git failed for {repo}; its alias may be stale or point at a missing path");
+        log.push(format!("{tag}: git failed; the alias may be stale or point at a missing path"));
+        if let Ok(out) = out {
+            if let Some(last) = String::from_utf8_lossy(&out.stderr).lines().last() {
+                log.push(format!("{tag}:   {last}"));
+            }
+        }
     }
     ok
 }
@@ -495,5 +588,55 @@ mod tests {
         // only the summary paragraph is taken (the `launch.audit` shape).
         let help = "usage: python -m launch.audit [-h]\n\nAudit the launcher's state.\n\nReports:\n  - things\n";
         assert_eq!(extract_about(help).as_deref(), Some("Audit the launcher's state."));
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::local_head;
+
+    /// The pinned-revision shortcut skips every network call when this agrees with the recorded
+    /// revision, so it has to name the commit that is actually checked out — and say nothing at
+    /// all, rather than something stale, when the directory isn't a readable clone.
+    #[test]
+    fn local_head_names_the_checked_out_commit_and_nothing_otherwise() {
+        let root = std::env::temp_dir().join(format!("bashrs_head_{}", std::process::id()));
+        let origin = root.join("repo");
+        std::fs::create_dir_all(&origin).unwrap();
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&origin, &["init", "-q", "-b", "main"]);
+        std::fs::write(origin.join("f"), "1").unwrap();
+        run(&origin, &["add", "."]);
+        run(&origin, &["commit", "-q", "-m", "one"]);
+
+        let first = local_head(&origin).expect("a committed repo has a HEAD");
+        assert!(
+            matches!(first.len(), 40 | 64) && first.chars().all(|c| c.is_ascii_hexdigit()),
+            "expected a full commit hash (the form a pin records), got {first:?}"
+        );
+
+        std::fs::write(origin.join("f"), "2").unwrap();
+        run(&origin, &["add", "."]);
+        run(&origin, &["commit", "-q", "-m", "two"]);
+        assert_ne!(
+            local_head(&origin).as_ref(),
+            Some(&first),
+            "a new commit moves HEAD — a comparison blind to that would skip a needed reset"
+        );
+
+        assert_eq!(local_head(&root.join("never-cloned")), None, "no clone, no answer");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
