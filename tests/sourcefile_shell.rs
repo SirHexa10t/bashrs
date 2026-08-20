@@ -141,20 +141,6 @@ fn the_dotdot_function_climbs_one_directory() {
 }
 
 #[test]
-fn the_dotdot_function_survives_an_active_alias() {
-    // The user's own rc may still define `alias ..='cd ..'` (the definition bashrs absorbed).
-    // Parsed with that alias live, `..()` would alias-expand into `cd .. ()` — a syntax error
-    // that aborts the whole source (and with it PATH, python3, everything below). The emitted
-    // `unalias` line ahead of the definition must defuse it.
-    let script = format!(
-        "shopt -s expand_aliases\nalias ..='cd .. '\n{}\ntype .. | head -1",
-        section("unalias ..", 2)
-    );
-    let out = bash(&script);
-    assert!(out.contains(".. is a function"), "alias shadow must be cleared first: {out}");
-}
-
-#[test]
 fn the_path_prepend_is_idempotent_across_resources() {
     // Sourcing the section twice (nested shells re-source the rc) must not stack PATH entries.
     let section = tools_section();

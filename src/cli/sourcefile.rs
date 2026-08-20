@@ -82,8 +82,11 @@ fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 15] {
         // `session_sudo` is an ordinary command with a generated wrapper.
         ("session", SessionCommand::augment_subcommands(clap::Command::new("session")),
             SessionCommand::shell_functions().to_vec()),
-        // One `lookup` group: `hg` (history search) plus the generated g-family.
-        category_group!("lookup", LookupCommand, GrepCommand, GgCommand),
+        // One `lookup` group. The generated `g`/`gg` families come first so the hand-written
+        // commands can follow what they are built on: `GG` is `gg --delve` and `GGG` is `GG`
+        // plus more, which only reads that way listed after `gg`. Within that last enum `hg`
+        // is declared after them, so the history search closes the section.
+        category_group!("lookup", GrepCommand, GgCommand, LookupCommand),
         // One `style` group spanning both style enums: hand-written + generated.
         category_group!("style", StyleCommand, StylizedEchoCommand),
         ("comfy_repos", ComfyReposCommand::augment_subcommands(clap::Command::new("comfy_repos")),
@@ -286,18 +289,20 @@ pub(super) fn wrappers() -> String {
         }
         // The category's pure-shell commands (`#[shell_body]`): inline bodies, no binary call —
         // and no completion registration, which would replace bash's default (filename)
-        // completion with a flagless void. The `unalias` must sit on its own line: a live alias
-        // with the same name (e.g. the user's own rc still carrying `alias ..='cd ..'`) would be
-        // alias-expanded INTO the definition as bash parses it — a syntax error that aborts the
-        // whole source. `|| true` pins the usual no-such-alias failure to status 0, so a caller
-        // running under `set -e` (sourced files inherit it) isn't aborted either. Same gotcha,
-        // same cure as the bundled-tools `python3` function.
+        // completion with a flagless void.
+        //
+        // No `unalias` guard here, deliberately. A live alias of the same name does break the
+        // definition as bash parses it — with `alias ..='cd ..'` already set, `..() {` is read as
+        // `cd ..() {`, a syntax error that aborts the whole sourced file — but every
+        // binary-backed wrapper above carries the same exposure unguarded, so shielding these
+        // few implied a safety the rest of the file does not have. The bundled `python3` shim
+        // keeps its own guard (see [`crate::tools`]): that one name collides often enough to
+        // earn the line.
         for (name, fn_body, comment) in shell_fns {
             if !comment.is_empty() {
                 abouts.insert(name.to_string(), comment.to_string());
             }
             let about = if comment.is_empty() { String::new() } else { format!("  # {comment}") };
-            lines.push(format!("unalias {name} 2>/dev/null || true"));
             lines.push(format!("{name}() {{ {fn_body}; }}{about}"));
         }
         if !lines.is_empty() {

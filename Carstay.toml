@@ -9,7 +9,7 @@
 
 [tools]
 ffmpeg = "n9.0 @ autobuild-2026-08-17-13-05"
-yt-dlp = "2026.07.04"
+yt-dlp = "2026.08.19"
 uv = "0.12.5"
 python = "3.14.6"
 deno = "v2.9.5"

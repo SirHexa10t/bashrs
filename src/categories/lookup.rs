@@ -35,29 +35,6 @@ mod commands {
     use crate::support::{input, preferences, streamgrep};
     use clap::Args;
 
-    /// Search your shell history (case-insensitive, literal) — like `history | grep -iF`
-    #[unprefixed]
-    #[piped("history")]
-    pub fn hg(args: HgArgs) {
-        // The wrapper pipes `history` — a bash builtin only the shell itself can produce —
-        // into our stdin; we read that stream and filter it in-process.
-        let Some(text) = input::bytes_reported("hg", None) else { return };
-        let patterns: Vec<String> = args.pattern.into_iter().chain(args.regexp).collect();
-        streamgrep::filter(&patterns, &text, &streamgrep::Options::default());
-    }
-
-    /// The term to find in your shell history.
-    #[derive(Args)]
-    pub struct HgArgs {
-        /// Term to match (case-insensitive, literal — no regex).
-        #[arg(required_unless_present = "regexp")]
-        pattern: Option<String>,
-        /// Term(s) to match, like `grep -e` — protects a term starting with `-` (e.g. a flag you
-        /// once passed); repeatable (OR'd).
-        #[arg(short = 'e', long = "regexp", value_name = "PATTERN", allow_hyphen_values = true)]
-        regexp: Vec<String>,
-    }
-
     /// Recursive search with `--delve` and `--lean` always on — looks inside binaries we can
     /// decode (video subtitle tracks, `.torrent` text), and skips the machine-written
     /// directories (`_arg_lean_spec` lists them). Please: no `--re`.
@@ -81,6 +58,33 @@ mod commands {
         _gg(&GgArgs { base: GgBase { delve: true, save: true, regex: true, skip, ..args.base }, ..args });
     }
 
+    /// Search your shell history (case-insensitive, literal) — like `history | grep -iF`
+    ///
+    /// Declared last so the generated sourcefile lists it after the `g`/`gg` families and their
+    /// `GG`/`GGG` variants: it searches a different haystack entirely, so it reads better as a
+    /// tail-end sibling than as the thing standing in front of the search families.
+    #[unprefixed]
+    #[piped("history")]
+    pub fn hg(args: HgArgs) {
+        // The wrapper pipes `history` — a bash builtin only the shell itself can produce —
+        // into our stdin; we read that stream and filter it in-process.
+        let Some(text) = input::bytes_reported("hg", None) else { return };
+        let patterns: Vec<String> = args.pattern.into_iter().chain(args.regexp).collect();
+        streamgrep::filter(&patterns, &text, &streamgrep::Options::default());
+    }
+
+    /// The term to find in your shell history.
+    #[derive(Args)]
+    pub struct HgArgs {
+        /// Term to match (case-insensitive, literal — no regex).
+        #[arg(required_unless_present = "regexp")]
+        pattern: Option<String>,
+        /// Term(s) to match, like `grep -e` — protects a term starting with `-` (e.g. a flag you
+        /// once passed); repeatable (OR'd).
+        #[arg(short = 'e', long = "regexp", value_name = "PATTERN", allow_hyphen_values = true)]
+        regexp: Vec<String>,
+    }
+
     /// Read the input, then filter it in-process with the `grep` crate — case-insensitive, literal
     /// by default (`grep -iF`) or as a regex with `-E`, with `-C` context lines around each match,
     /// `-n` line numbers, and `-v` to keep the non-matching lines instead. Matches are coloured only
@@ -98,7 +102,11 @@ mod commands {
         let Some(text) = input::bytes_reported("g", source.as_deref()) else { return };
         let opts = streamgrep::Options {
             context: args.context,
-            line_number: args.base.line_number,
+            // A named input has line numbers worth printing: they point at somewhere you can
+            // actually go, so `g pattern file.rs` numbers its hits the way `gg` already does
+            // (it only ever searches named files). Piped stdin has no such anchor and would
+            // just be numbering a transient stream, so there it stays behind `-n`.
+            line_number: args.base.line_number || source.is_some(),
             regex: args.base.regex,
             invert: args.base.invert,
         };

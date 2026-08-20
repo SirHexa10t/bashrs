@@ -37,11 +37,15 @@ mod commands {
         }
     }
 
-    /// Paths and/or `ls` flags, passed straight through to `ls` (e.g. `-S` to sort by
-    /// size, `-R` to recurse).
+    /// What `lll` accepts beyond the listing style it pins: whatever the user typed, handed to
+    /// `ls` untouched. The field carries the help text — a doc comment on the struct documents
+    /// the type for readers here, but clap only shows the one on the argument itself.
     #[derive(Args)]
     pub struct LllArgs {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Paths and/or `ls` options, forwarded to `ls` exactly as typed (on top of the flags
+        /// `lll` already applies). Any option `ls` accepts works here — `man ls` lists them all;
+        /// common ones are `-S` to sort by size, `-R` to recurse, `-X` to group by extension
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "LS_ARG")]
         pub passthrough: Vec<String>,
     }
 
@@ -206,6 +210,12 @@ mod commands {
 
     // --- fs_usage ---------------------------------------------------------------
 
+    /// Column labels for [`usage`] — title case like `lll`'s [`HEADER`], and rendered through the
+    /// same bold-blue [`_header`], so the two listings read as one family. Joined with the gap
+    /// [`_usage_row`] already puts between its cells, so the label row divides into columns
+    /// exactly the way the data rows do.
+    const USAGE_HEADER: &[&str] = &["Size", "Files", "Inodes", "Name"];
+
     /// Disk usage overview: each entry's allocated size, recursive file count, and inode count,
     /// largest first with a total — like `du`, hardlinked twins counted once
     pub fn usage(args: UsageArgs) {
@@ -236,7 +246,7 @@ mod commands {
         }
         rows.sort_by(|a, b| b.0.bytes.cmp(&a.0.bytes).then_with(|| a.1.cmp(&b.1)));
 
-        let mut lines: Vec<String> = vec!["SIZE  FILES  INODES  NAME".into()];
+        let mut lines: Vec<String> = vec![_header(&USAGE_HEADER.join("  "))];
         lines.extend(rows.iter().map(|(stats, name)| _usage_row(stats, name)));
         if root.is_dir() {
             // The rows plus the root directory's own inode — what `du -s` would report.

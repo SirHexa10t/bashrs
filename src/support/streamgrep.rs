@@ -68,7 +68,7 @@ pub(crate) fn highlight(pattern: &str, text: &[u8]) {
 /// Run `searcher` over `text`, printing matches to `wtr` (`grep`-style). Generic over the sink so
 /// production writes to the terminal ([`stdout`]) while tests capture into an in-memory buffer.
 fn search<W: WriteColor>(matcher: &RegexMatcher, text: &[u8], searcher: &mut Searcher, wtr: W) {
-    let mut printer = StandardBuilder::new().color_specs(match_color()).build(wtr);
+    let mut printer = StandardBuilder::new().color_specs(color_specs()).build(wtr);
     if let Err(err) = searcher.search_slice(matcher, text, printer.sink(matcher)) {
         eprintln!("grep: {err}");
     }
@@ -84,8 +84,11 @@ fn stdout() -> StandardStream {
 /// mirrors the old `GREP_COLORS='mt=7;31'` look (reverse-video red renders as a red background on a
 /// dark terminal). termcolor has no reverse style, and its default foreground is the terminal's
 /// text colour (not black), so we set both background and foreground explicitly.
-fn match_color() -> ColorSpecs {
-    let specs: Vec<UserColorSpec> = ["match:bg:red", "match:fg:black"]
+///
+/// Line numbers are yellow, the colour [`crate::support::treegrep`] already gives them, so a
+/// numbered `g` hit and a numbered `gg` hit read identically.
+fn color_specs() -> ColorSpecs {
+    let specs: Vec<UserColorSpec> = ["match:bg:red", "match:fg:black", "line:fg:yellow"]
         .iter()
         .map(|spec| spec.parse().expect("built-in colour spec is valid"))
         .collect();

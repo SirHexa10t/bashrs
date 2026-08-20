@@ -74,12 +74,15 @@ pub enum Command {
     Python(PythonCommand),
     #[command(flatten)]
     Session(SessionCommand),
-    #[command(flatten)]
-    Lookup(LookupCommand),
+    // Three enums, one logical `lookup` category. The generated families lead so the
+    // hand-written commands can follow what they build on (`GG` is `gg --delve`) — the same
+    // order `sourcefile::category_commands` groups them in, so help and wrappers agree.
     #[command(flatten)]
     Grep(GrepCommand),
     #[command(flatten)]
     Treegrep(GgCommand),
+    #[command(flatten)]
+    Lookup(LookupCommand),
     // Two enums, one logical `style` category: hand-written commands (`errcho`) and the
     // generated `recho` matrix. Both flatten to bare top-level commands.
     #[command(flatten)]
@@ -155,18 +158,23 @@ const HIDDEN_PINNED: &[(&str, &[&str])] = &[
 ];
 
 /// Hide each [`HIDDEN_PINNED`] flag on its command. Applied everywhere the command tree is built —
-/// parsing ([`parse`]) and generation (`sourcefile::category_commands`) — so help, wrappers, and completion
-/// all tell one truth. Commands absent from `cmd` are skipped (each category holds only its own).
-fn hide_pinned(mut cmd: clap::Command) -> clap::Command {
-    for &(name, args) in HIDDEN_PINNED {
-        if cmd.find_subcommand(name).is_none() {
-            continue; // don't let `mut_subcommand` conjure the command into the wrong category
+/// parsing ([`parse`]) and generation (`sourcefile::category_commands`) — so help, wrappers, and
+/// completion all tell one truth.
+///
+/// Walks the subcommands rather than reaching for each pinned name by hand: `mut_subcommand`
+/// removes its target and pushes it back on the end, so naming them dealt every pinned command to
+/// the bottom of its category and split families apart in the generated sourcefile
+/// (`backup_find_bitrot` stranded away from `backup_diff`). Mapping rewrites them where they
+/// stand, and a category that doesn't hold a given command simply never matches it — which is
+/// also what keeps `mut_arg` from conjuring a command into the wrong category.
+fn hide_pinned(cmd: clap::Command) -> clap::Command {
+    cmd.mut_subcommands(|sub| {
+        let pinned = HIDDEN_PINNED.iter().find(|(name, _)| *name == sub.get_name()).map(|&(_, args)| args);
+        match pinned {
+            Some(args) => args.iter().fold(sub, |sub, arg| sub.mut_arg(*arg, |a| a.hide(true))),
+            None => sub,
         }
-        cmd = cmd.mut_subcommand(name, |sub| {
-            args.iter().fold(sub, |sub, arg| sub.mut_arg(*arg, |a| a.hide(true)))
-        });
-    }
-    cmd
+    })
 }
 
 /// Parse argv against the adjusted command tree ([`hide_pinned`]) — the binary's normal entry,
@@ -225,6 +233,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Declaration order is what the generated sourcefile lists commands in, so related ones sit
+    /// together. Hiding a pinned flag must not disturb that — `mut_subcommand` re-appends what it
+    /// touches, which used to strand every pinned command at the bottom of its category.
+    #[test]
+    fn hiding_pinned_flags_leaves_command_order_alone() {
+        let names = |cmd: ClapCommand| {
+            cmd.get_subcommands().map(|sub| sub.get_name().to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(Cli::command()),
+            names(hide_pinned(Cli::command())),
+            "hiding pinned flags reordered the command list"
+        );
     }
 
     /// `autokey_reformat` is `autokey_check` with one upstream flag forced on. They wrap the same

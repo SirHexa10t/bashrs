@@ -97,7 +97,8 @@ pub struct GrepBase {
     /// Term(s) to match, like `grep -e` — protects a term starting with `-`; repeatable (OR'd).
     #[arg(short = 'e', long = "regexp", value_name = "PATTERN", allow_hyphen_values = true)]
     pub(crate) regexp: Vec<String>,
-    /// Show line numbers, like `grep -n`.
+    /// Show line numbers, like `grep -n`. Already on whenever a SOURCE is named; this asks for
+    /// them when reading piped input instead.
     #[arg(short = 'n', long)]
     pub(crate) line_number: bool,
     /// Treat the pattern as a regular expression (à la `grep -E`) rather than literal text.
