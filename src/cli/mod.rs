@@ -151,6 +151,7 @@ const HIDDEN_PINNED: &[(&str, &[&str])] = &[
     ("GG", &["delve", "lean"]),
     ("GGG", &["delve", "save", "regex", "lean"]),
     ("backup_find_bitrot", &["eager_checksum"]),
+    ("autokey_reformat", &["format"]),
 ];
 
 /// Hide each [`HIDDEN_PINNED`] flag on its command. Applied everywhere the command tree is built —
@@ -226,6 +227,41 @@ mod tests {
         }
     }
 
+    /// `autokey_reformat` is `autokey_check` with one upstream flag forced on. They wrap the same
+    /// sequencer subcommand, so their argument surfaces have to stay identical — and once pinning
+    /// is applied the only permitted difference is that the forcing one offers exactly one flag
+    /// fewer. Which flag is deliberately not asserted: the pairing is the contract, not the
+    /// current spelling, so renaming it upstream should not fail this.
+    #[test]
+    fn autokey_reformat_is_autokey_check_plus_one_pinned_flag() {
+        use std::collections::BTreeSet;
+        let sub = |cmd: &'_ ClapCommand, name: &str| {
+            cmd.find_subcommand(name).unwrap_or_else(|| panic!("`{name}` not found")).clone()
+        };
+        let ids = |cmd: &ClapCommand, visible_only: bool| -> BTreeSet<String> {
+            cmd.get_arguments()
+                .filter(|arg| !visible_only || !arg.is_hide_set())
+                .map(|arg| arg.get_id().to_string())
+                .collect()
+        };
+
+        // Before pinning: the same subcommand underneath, so the same arguments.
+        let raw = Cli::command();
+        assert_eq!(
+            ids(&sub(&raw, "autokey_check"), false),
+            ids(&sub(&raw, "autokey_reformat"), false),
+            "both wrap one sequencer subcommand — their arguments must not drift apart"
+        );
+
+        // After pinning: reformat offers one flag fewer, and nothing else moved.
+        let pinned = hide_pinned(Cli::command());
+        let offered = ids(&sub(&pinned, "autokey_check"), true);
+        let forced = ids(&sub(&pinned, "autokey_reformat"), true);
+        assert!(forced.is_subset(&offered), "pinning may only withdraw flags, never add them");
+        let withheld: Vec<&String> = offered.difference(&forced).collect();
+        assert_eq!(withheld.len(), 1, "expected exactly one pinned flag, found {withheld:?}");
+    }
+
     #[test]
     fn filesystem_commands_follow_naming_standard() {
         // `lll` is a bare `ls`-like verb (à la `ll`), intentionally unprefixed — the same
@@ -267,11 +303,18 @@ mod tests {
         // External tools keep their own upstream name (`table`, plus its pinned-preset sibling
         // `table_fancy`), the verb they have always had here (`dl`, over the `vidl` crate), or a
         // task-named family — all unprefixed by design (`backup_*` flattens filesync's
-        // subcommands into directly-completable commands).
+        // subcommands into directly-completable commands, and `autokey_*` does the same for
+        // sequencer's profile and key-naming subcommands).
         assert_prefixed(
             &command_names::<ComfyReposCommand>(),
             "comfy_",
-            &["table", "table_fancy", "backup_diff", "backup_sync", "backup_find_bitrot", "dl", "clicker", "clicker_doctor", "clicker_benchmark"],
+            &[
+                "table", "table_fancy",
+                "backup_diff", "backup_sync", "backup_find_bitrot",
+                "dl",
+                "clicker", "clicker_doctor", "clicker_benchmark",
+                "autokey_check", "autokey_reformat", "autokey_apply", "autokey_unapply", "autokey_detect",
+            ],
         );
     }
 

@@ -21,8 +21,8 @@ die() { printf 'ERROR: %s\n' "$1" >&2; exit 1; }
 # --- Dependency refresh ------------------------------------------------------
 # `cargo update` with no arguments re-resolves the git dependencies too, one repo at a time and
 # serially. Each costs at least a network round trip to conclude nothing changed — and far more
-# than that wherever `api.github.com` is slow to resolve, which is the ten-seconds-per-repo case
-# TROUBLESHOOTING.md documents.
+# than that on a connection where reaching `api.github.com` (cargo's own is-the-tip-still-this
+# check, which it makes before any fetch) is slow.
 #
 # Cargo has no knob for this. Updating sources in parallel is an open request that has not been
 # designed yet, let alone shipped (rust-lang/cargo#15934), and shallow fetches are nightly-only

@@ -601,6 +601,10 @@ mod sync_tests {
     #[test]
     fn local_head_names_the_checked_out_commit_and_nothing_otherwise() {
         let root = std::env::temp_dir().join(format!("bashrs_head_{}", std::process::id()));
+        // Start from nothing even if a previous run died before its cleanup and the pid came
+        // round again: `git init` over a leftover clone would find the commit already made and
+        // fail on an empty commit instead.
+        let _ = std::fs::remove_dir_all(&root);
         let origin = root.join("repo");
         std::fs::create_dir_all(&origin).unwrap();
         let run = |dir: &std::path::Path, args: &[&str]| {

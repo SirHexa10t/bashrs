@@ -90,6 +90,7 @@ mod commands {
     /// alike; on X11 it needs no privileges at all. If device access is needed and missing,
     /// the error walks you through the fix (sequencer clicker)
     #[unprefixed]
+    #[alias("autoclick")]
     pub fn clicker(args: sequencer::ClickerArgs) {
         _sequencer(sequencer::Command::Clicker(args));
     }
@@ -111,6 +112,49 @@ mod commands {
         _sequencer(sequencer::Command::Doctor(args));
     }
 
+    /// Check binds files for problems without applying them: nothing is activated, no profile
+    /// state is touched, and the files are left exactly as they are. `autokey_reformat` is the
+    /// same check with tidying turned on (sequencer profile-check)
+    #[unprefixed]
+    pub fn autokey_check(args: sequencer::ProfileCheckArgs) {
+        _sequencer(sequencer::Command::ProfileCheck(args));
+    }
+
+    /// `autokey_check` that also rewrites: every file that parses is tidied in place with all its
+    /// comments kept, and one that doesn't is reported and left alone. Still activates nothing —
+    /// the rewrite is the only thing it changes (sequencer profile-check --format)
+    #[unprefixed]
+    pub fn autokey_reformat(mut args: sequencer::ProfileCheckArgs) {
+        // Always tidy what parses: a plain bool, so a caller passing it anyway is a no-op
+        // (hidden from this command's help/completion — see `cli::HIDDEN_PINNED`).
+        args.format = true;
+        _sequencer(sequencer::Command::ProfileCheck(args));
+    }
+
+    /// Apply binds profiles: remap keys and run sequences until stopped. Each FILE is linked into
+    /// the active set (naming a directory takes every `.toml` directly inside it, in name order);
+    /// the first invocation becomes the manager and later ones add to it (sequencer profile-apply)
+    #[unprefixed]
+    pub fn autokey_apply(args: sequencer::ProfileApplyArgs) {
+        _sequencer(sequencer::Command::ProfileApply(args));
+    }
+
+    /// Remove profiles from the active set by name (`gaming` or `gaming.toml`); naming none opens
+    /// an interactive picker listing what is currently applied (sequencer profile-unapply)
+    #[unprefixed]
+    pub fn autokey_unapply(args: sequencer::ProfileUnapplyArgs) {
+        _sequencer(sequencer::Command::ProfileUnapply(args));
+    }
+
+    /// Print the name of each key as it is pressed, once per press — how to learn the key names a
+    /// binds profile expects. Reads the input devices, so it is exact; `-n` reads the terminal
+    /// instead, needing no privileges but seeing only keys that type something
+    /// (sequencer detect-key)
+    #[unprefixed]
+    pub fn autokey_detect(args: sequencer::DetectKeyArgs) {
+        _sequencer(sequencer::Command::DetectKey(args));
+    }
+
     /// Run one sequencer invocation — the funnel for the `sequencer`-backed commands, each
     /// wrapping one subcommand (flag completion per command; sequencer never runs bare), the
     /// same shape as [`_filesync`]. Logging must be initialized first, exactly as the upstream
@@ -121,7 +165,7 @@ mod commands {
     /// session it never asks: clicks go through XTEST and hotkeys through key grabs, so no
     /// input device is opened and there is nothing for sudo to unlock. Elsewhere (Wayland, a
     /// console) an unprivileged run without the udev/group setup explains itself, asks once,
-    /// re-execs `bashrs clicker …` verbatim under sudo, and the elevated process sheds root
+    /// re-execs `bashrs <command> …` verbatim under sudo, and the elevated process sheds root
     /// the moment the devices are open. The hint names `clicker_doctor` so the advice printed
     /// is a command this shell can actually run.
     fn _sequencer(command: sequencer::Command) {
