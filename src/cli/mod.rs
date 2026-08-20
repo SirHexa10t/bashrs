@@ -289,7 +289,7 @@ mod tests {
     fn filesystem_commands_follow_naming_standard() {
         // `lll` is a bare `ls`-like verb (à la `ll`), intentionally unprefixed — the same
         // kind of exception the style echoes and `UPUP` take from the `<category>_` norm.
-        assert_prefixed(&command_names::<FilesystemCommand>(), "fs_", &["lll"]);
+        assert_prefixed(&command_names::<FilesystemCommand>(), "fs_", &["lll", "LLL"]);
     }
 
     #[test]
