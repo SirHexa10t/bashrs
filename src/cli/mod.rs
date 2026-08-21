@@ -235,6 +235,18 @@ mod tests {
         }
     }
 
+    /// The one hint that can't be derived from a command's own help: sequencer prints advice
+    /// naming its doctor subcommand, and only this crate knows how that subcommand is spelled
+    /// here. A rename would otherwise leave it pointing at a command that no longer parses.
+    #[test]
+    fn the_sequencer_doctor_hint_names_a_real_command() {
+        let hint = crate::categories::comfy_repos::DOCTOR_COMMAND;
+        assert!(
+            Cli::command().find_subcommand(hint).is_some(),
+            "sequencer would tell the user to run `{hint}`, which this shell does not have"
+        );
+    }
+
     /// Declaration order is what the generated sourcefile lists commands in, so related ones sit
     /// together. Hiding a pinned flag must not disturb that — `mut_subcommand` re-appends what it
     /// touches, which used to strand every pinned command at the bottom of its category.
@@ -310,6 +322,13 @@ mod tests {
     }
 
     #[test]
+    fn network_commands_follow_naming_standard() {
+        // No exceptions: every probe here is a `net_*` verb, and there is no upstream tool whose
+        // own name it should borrow.
+        assert_prefixed(&command_names::<NetworkCommand>(), "net_", &[]);
+    }
+
+    #[test]
     fn packages_commands_follow_naming_standard() {
         // `upup` is prefixed (with a bare `upup` alias); `UPUP` is a deliberate
         // custom name (the loud "update everything"). Everything else is prefixed.
@@ -335,8 +354,8 @@ mod tests {
                 "table", "table_fancy",
                 "backup_diff", "backup_sync", "backup_find_bitrot",
                 "dl",
-                "clicker", "clicker_doctor", "clicker_benchmark",
-                "autokey_check", "autokey_reformat", "autokey_apply", "autokey_unapply", "autokey_detect",
+                "clicker", "clicker_benchmark",
+                "autokey_doctor", "autokey_check", "autokey_reformat", "autokey_apply", "autokey_unapply", "autokey_detect",
             ],
         );
     }

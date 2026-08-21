@@ -104,11 +104,21 @@ mod commands {
         _sequencer(sequencer::Command::Bench(args));
     }
 
-    /// Check everything `clicker` needs — the uinput module loaded, /dev/uinput writable,
-    /// /dev/input readable — and print the exact commands to fix whatever is missing. Exit 0
-    /// means ready (sequencer doctor)
+    /// How *this* shell spells sequencer's `doctor` subcommand.
+    ///
+    /// Unlike the wrapper comments in `sourcefile.sh` — which are each command's own clap `about`,
+    /// read straight from the doc comment above it — this cannot be derived. Upstream prints
+    /// "To stop being asked, `…` prints a one-time setup" from inside its own crate, and has no
+    /// way to know the subcommand it calls `doctor` is reached here as [`autokey_doctor`]. So the
+    /// name is passed in, and a test asserts it still resolves to a real command.
+    pub(crate) const DOCTOR_COMMAND: &str = "autokey_doctor";
+
+    /// Check everything the synthetic-input commands need — the uinput module loaded,
+    /// /dev/uinput writable, /dev/input readable — and print the exact commands to fix whatever
+    /// is missing. One check for the whole family: `clicker` and the `autokey_*` profile
+    /// commands open the same devices. Exit 0 means ready (sequencer doctor)
     #[unprefixed]
-    pub fn clicker_doctor(args: sequencer::DoctorArgs) {
+    pub fn autokey_doctor(args: sequencer::DoctorArgs) {
         _sequencer(sequencer::Command::Doctor(args));
     }
 
@@ -166,12 +176,12 @@ mod commands {
     /// input device is opened and there is nothing for sudo to unlock. Elsewhere (Wayland, a
     /// console) an unprivileged run without the udev/group setup explains itself, asks once,
     /// re-execs `bashrs <command> …` verbatim under sudo, and the elevated process sheds root
-    /// the moment the devices are open. The hint names `clicker_doctor` so the advice printed
-    /// is a command this shell can actually run.
+    /// the moment the devices are open. It is handed [`DOCTOR_COMMAND`] so the advice it prints
+    /// names something this shell can actually run.
     fn _sequencer(command: sequencer::Command) {
         let global = command.global();
         let _ = sequencer::init_logging(global.verbose, global.quiet);
-        let code = sequencer::run_with_sudo_prompt(&command.into(), "clicker_doctor");
+        let code = sequencer::run_with_sudo_prompt(&command.into(), DOCTOR_COMMAND);
         if code != 0 {
             std::process::exit(code.into());
         }

@@ -25,7 +25,7 @@ pub struct SkipArgs {
     pub skip_pattern: Vec<String>,
     /// Skip machine-written data — libraries, compile output, caches (git's included). The
     /// list lives in [`crate::support::prog_langs`]; `_arg_lean_spec` prints it.
-    #[arg(long, help = lean_help())]
+    #[arg(short = 'l', long, help = lean_help())]
     pub lean: bool,
 }
 

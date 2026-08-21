@@ -1,16 +1,28 @@
 //! Network-lookup commands (`net_*`) — a thin report shell over [`crate::support::net`]'s
 //! probing engines (DNS, whois, live connections), the way `gg` sits over `treegrep`.
 //!
-//! `net_excavate` is the one command so far: everything worth knowing about a host or an address,
-//! in one pass. The default run is entirely read-only — DNS queries, a whois record, and the same
-//! two requests a browser would make (TLS handshake, HTTP GET). The two that reach further —
-//! `--trace` (traceroute) and `--ports` (a TCP connect sweep) — are opt-in: they're slow, and a
-//! port sweep is an active probe, so asking for one should be a decision rather than a side effect
-//! of looking up a domain.
+//! Two commands, pointed opposite ways.
+//!
+//! `net_excavate` takes one host or address and reports everything worth knowing about it: a big
+//! `dig`, which is where the name comes from. The default run is entirely read-only — DNS queries,
+//! a whois record, and the same two requests a browser would make (TLS handshake, HTTP GET). The
+//! two that reach further — `--trace` (traceroute) and `--ports` (a TCP connect sweep) — are
+//! opt-in: they're slow, and a port sweep is an active probe, so asking for one should be a
+//! decision rather than a side effect of looking up a domain.
+//!
+//! `net_sonar` takes one measurement — how long the TCP handshake takes — against many of the
+//! internet's busiest hosts at once, and is named for what that is: a ping sent in every
+//! direction, read by how long each one takes to come back. Reachable as `net_health` too, which
+//! is what you are more likely to think of typing when something feels broken.
+//!
+//! Where excavate answers "what is this host?", sonar answers
+//! "is it me, or is it them?": if every provider on every continent has gone slow together, the
+//! common factor is this end of the wire.
 
 #[bashrs_macros::category(command = NetworkCommand, prefix = "net_")]
 mod commands {
-    use crate::support::doc_style::{_header, approved, notice, problematic};
+    use crate::support::doc_style::{self, _header, approved, notice, problematic};
+    use crate::support::theme::{Basic, Weight};
     use crate::support::exec;
     use crate::support::net::{self, dns, probe, rdap, whois, Target};
     use clap::Args;
@@ -65,6 +77,350 @@ mod commands {
         /// Also trace the route there (needs `traceroute`; can take ~30s)
         #[arg(long)]
         pub trace: bool,
+    }
+
+    // --- sonar -------------------------------------------------------------
+
+    /// Time the handshake to the internet's busiest hosts — several endpoints per provider,
+    /// probed in parallel — so "is it me, or is it them?" is answered in one screen
+    #[trailing_newline]
+    #[alias("net_health")]
+    pub fn sonar(args: SonarArgs) {
+        let timeout = std::time::Duration::from_secs(args.timeout.max(1));
+        let workers = args.workers.max(1);
+        let measured = match _live_layout(PROBE_TARGETS) {
+            Some(layout) => _probe_live(PROBE_TARGETS, workers, timeout, &layout),
+            None => _probe_quietly(PROBE_TARGETS, workers, timeout),
+        };
+        println!("{}", _sonar_summary(&measured));
+    }
+
+    /// Probe with the table already on screen, filling each response in as it arrives.
+    ///
+    /// The whole list is printed first, every response cell a dim placeholder, so the wait is
+    /// spent looking at what is being asked rather than at nothing. Each answer then overwrites
+    /// its own cell in place.
+    fn _probe_live(
+        targets: &[ProbeTarget],
+        workers: usize,
+        timeout: std::time::Duration,
+        layout: &LiveLayout,
+    ) -> Vec<probe::Latency> {
+        use std::io::Write;
+        print!("{}", layout.skeleton);
+        let _ = std::io::stdout().flush();
+        // Repainting is one cursor move, one write and one move back; two threads interleaving
+        // those would land a cell on the wrong row, so the whole sequence is taken as a unit.
+        let pen = std::sync::Mutex::new(());
+        let rows = targets.len();
+        _probe_targets(targets, workers, timeout, |index, measured| {
+            let up = rows - index; // the cursor rests one line below the last row
+            let paint = format!(
+                "\x1b[{up}A\x1b[{col}G\x1b[K{cell}\x1b[{up}B\r",
+                col = layout.response_column,
+                cell = _latency_cell(measured),
+            );
+            let _guard = pen.lock();
+            print!("{paint}");
+            let _ = std::io::stdout().flush();
+        })
+    }
+
+    /// Probe with no display at all, then print the finished table in one piece — for a pipe, a
+    /// file, or a window too narrow to hold a row without wrapping (wrapped lines would desync
+    /// the cursor arithmetic above and scatter answers onto the wrong rows).
+    fn _probe_quietly(
+        targets: &[ProbeTarget],
+        workers: usize,
+        timeout: std::time::Duration,
+    ) -> Vec<probe::Latency> {
+        let measured = _probe_targets(targets, workers, timeout, |_, _| {});
+        let mut lines = vec![_header("Provider\tEndpoint\tHost\tResponse")];
+        lines.extend(targets.iter().zip(&measured).map(|(target, latency)| {
+            format!("{}\t{}\t{}\t{}", target.provider, target.endpoint, target.host, _latency_cell(*latency))
+        }));
+        for line in table_formatter::format_table(&lines, &_sonar_table()).unwrap_or(lines) {
+            println!("{line}");
+        }
+        measured
+    }
+
+    /// The pre-printed table and where to write into it.
+    struct LiveLayout {
+        /// Header plus one line per target, every response cell still a placeholder.
+        skeleton: String,
+        /// 1-based column the response cells start at.
+        response_column: usize,
+    }
+
+    /// Lay the table out up front, or decline to.
+    ///
+    /// Columns are measured here rather than by `table_formatter` because the live table has to be
+    /// printed before a single response exists — and it can be, since the three left columns are
+    /// known from the target list and the response is last, so nothing shifts as answers land.
+    ///
+    /// `None` means don't try: not a terminal (a pipe would collect the escape sequences as text),
+    /// or a window too narrow for a row, where wrapping would put the cursor arithmetic a line out
+    /// on every repaint.
+    fn _live_layout(targets: &[ProbeTarget]) -> Option<LiveLayout> {
+        use std::io::IsTerminal;
+        std::io::stdout()
+            .is_terminal()
+            .then(|| _layout(targets, table_formatter::terminal_width()))
+            .flatten()
+    }
+
+    /// The layout arithmetic on its own, given the window width — split out so it can be tested
+    /// without a terminal. It is worth pinning: a response column off by one writes every answer
+    /// into the hostname beside it, and the result still looks like a table.
+    fn _layout(targets: &[ProbeTarget], window: usize) -> Option<LiveLayout> {
+        let widest = |pick: fn(&ProbeTarget) -> &str| {
+            targets.iter().map(|target| pick(target).chars().count()).max().unwrap_or(0)
+        };
+        let (provider, endpoint, host) =
+            (widest(|t| t.provider), widest(|t| t.endpoint), widest(|t| t.host));
+        let gap = TABLE_GAP;
+        let response_column = provider + gap + endpoint + gap + host + gap + 1;
+        // The widest thing a response cell ever holds, so a full row still fits unwrapped.
+        if response_column + WIDEST_RESPONSE > window {
+            return None;
+        }
+        let mut skeleton = _header(&format!(
+            "{:<provider$}{blank:gap$}{:<endpoint$}{blank:gap$}{:<host$}{blank:gap$}Response",
+            "Provider", "Endpoint", "Host", blank = "",
+        ));
+        skeleton.push('\n');
+        for target in targets {
+            skeleton.push_str(&format!(
+                "{:<provider$}{blank:gap$}{:<endpoint$}{blank:gap$}{:<host$}{blank:gap$}{}\n",
+                target.provider,
+                target.endpoint,
+                target.host,
+                doc_style::_scoped(&doc_style::_wrap(&[&Weight::Dark]), PENDING),
+                blank = "",
+            ));
+        }
+        Some(LiveLayout { skeleton, response_column })
+    }
+
+    /// Spaces between columns — `table_formatter`'s default, matched by hand so the live table and
+    /// the piped one line up identically.
+    const TABLE_GAP: usize = 2;
+
+    /// Shown in a response cell that hasn't answered yet.
+    const PENDING: &str = "…";
+
+    /// Longest a response cell gets (`no address`), used to check a row will fit unwrapped.
+    const WIDEST_RESPONSE: usize = 10;
+
+    #[derive(Args)]
+    pub struct SonarArgs {
+        /// How many probes run at once. The default already reaches the floor: probing serially
+        /// takes about seven times as long, and raising it further measures the same figures in
+        /// the same time
+        #[arg(short = 'j', long, default_value_t = PROBE_WORKERS)]
+        pub workers: usize,
+        /// Seconds to wait for a handshake before calling the host unreachable
+        #[arg(short = 't', long, default_value_t = 3)]
+        pub timeout: u64,
+    }
+
+    /// How many probes run at once by default.
+    ///
+    /// A run cannot finish sooner than its slowest single probe, so the wall clock behaves as
+    /// `max(total waiting ÷ workers, slowest probe)` and the useful range ends where those two
+    /// meet. Measured over ten pool sizes the model held to about ten percent (process startup):
+    /// 2428 ms of total waiting with a 340 ms worst host predicted a knee near seven workers and a
+    /// floor of 0.34 s, against measurements of 2.70 s serial, 0.37 s at eight, and 0.35 s at
+    /// everything from ten to all thirty-seven at once.
+    ///
+    /// So the knee belongs to the *target list and the route*, not to the machine — it moves with
+    /// the ratio above. It is not the core count; the CPU is idle throughout, six milliseconds of
+    /// user time against a second of wall clock, because every thread is asleep in a connect.
+    /// Twelve sits comfortably past the knee measured here with room for a network whose spread is
+    /// narrower (which pushes the knee higher), and sleeping threads cost nothing to keep.
+    ///
+    /// Two things that sound plausible and are not true here. The readings do not inflate with
+    /// concurrency: median and slowest came back the same whether one probe ran or all of them.
+    /// And DNS stalls are not provoked by parallelism — a dropped resolver packet costs glibc's
+    /// full ten-second retry, but it strikes about as often at one lookup at a time as at
+    /// thirty-seven, because what governs it is how many names are asked for, not how many at
+    /// once. Resolution stays out of every reported figure ([`probe::latency`]), so a stalled run
+    /// is slow without being wrong.
+    ///
+    /// **To re-derive this number** — worth doing whenever [`PROBE_TARGETS`] changes, and on a
+    /// route very unlike the one it was measured on. A single run answers it, since the knee is
+    /// just total ÷ slowest:
+    ///
+    /// ```text
+    /// bashrs net_sonar -j 1 | sed 's/\x1b\[[0-9;]*m//g' | grep -v answered |
+    ///   grep -oE '[0-9]+ ms$' |
+    ///   awk '{s+=$1; if($1>m) m=$1} END{printf "knee ~ %.0f workers\n", s/m}'
+    /// ```
+    ///
+    /// To verify that rather than trust it, sweep `-j` over 1 2 4 8 12 16 24 and take the
+    /// **minimum** of several runs at each — never the mean or the median. A dropped DNS packet
+    /// adds its flat ten seconds to whichever run it lands on, and averaging lets that masquerade
+    /// as a slow pool size; it fooled a first pass here into reporting noise as a trend.
+    const PROBE_WORKERS: usize = 12;
+
+    /// Port to knock on. 443 everywhere: every one of these providers terminates TLS, and it is
+    /// the port least likely to be filtered between here and them.
+    const PROBE_PORT: u16 = 443;
+
+    /// One endpoint worth timing.
+    struct ProbeTarget {
+        /// Who runs it — the grouping the report reads by.
+        provider: &'static str,
+        /// Which piece of their estate this is, in their own terms.
+        endpoint: &'static str,
+        /// The name to resolve and connect to.
+        host: &'static str,
+    }
+
+    /// The hosts probed, grouped by provider and listed in that order.
+    ///
+    /// Chosen for spread rather than count: within a provider the entries are deliberately
+    /// different *kinds* of endpoint (an API, a CDN edge, object storage) or different regions,
+    /// because that is what separates "this provider is down" from "my route to one continent is
+    /// bad". AWS carries the regional spread, one bucket endpoint per inhabited continent — S3
+    /// answers on a per-region name, which nothing else here does as cleanly.
+    const PROBE_TARGETS: &[ProbeTarget] = &[
+        ProbeTarget { provider: "AWS", endpoint: "S3 · global", host: "s3.amazonaws.com" },
+        ProbeTarget { provider: "AWS", endpoint: "S3 · N. America", host: "s3.us-west-2.amazonaws.com" },
+        ProbeTarget { provider: "AWS", endpoint: "S3 · S. America", host: "s3.sa-east-1.amazonaws.com" },
+        ProbeTarget { provider: "AWS", endpoint: "S3 · Europe", host: "s3.eu-central-1.amazonaws.com" },
+        ProbeTarget { provider: "AWS", endpoint: "S3 · Africa", host: "s3.af-south-1.amazonaws.com" },
+        ProbeTarget { provider: "AWS", endpoint: "S3 · Asia", host: "s3.ap-southeast-1.amazonaws.com" },
+        ProbeTarget { provider: "AWS", endpoint: "S3 · Oceania", host: "s3.ap-southeast-2.amazonaws.com" },
+        ProbeTarget { provider: "Cloudflare", endpoint: "edge", host: "cloudflare.com" },
+        ProbeTarget { provider: "Cloudflare", endpoint: "resolver (1.1.1.1)", host: "one.one.one.one" },
+        ProbeTarget { provider: "Cloudflare", endpoint: "cdnjs", host: "cdnjs.cloudflare.com" },
+        ProbeTarget { provider: "Cloudflare", endpoint: "R2 storage", host: "r2.cloudflarestorage.com" },
+        ProbeTarget { provider: "Google", endpoint: "search", host: "www.google.com" },
+        ProbeTarget { provider: "Google", endpoint: "public DNS", host: "dns.google" },
+        ProbeTarget { provider: "Google", endpoint: "Cloud Storage", host: "storage.googleapis.com" },
+        ProbeTarget { provider: "Google", endpoint: "YouTube", host: "www.youtube.com" },
+        ProbeTarget { provider: "GitHub", endpoint: "web", host: "github.com" },
+        ProbeTarget { provider: "GitHub", endpoint: "API", host: "api.github.com" },
+        ProbeTarget { provider: "GitHub", endpoint: "raw content", host: "raw.githubusercontent.com" },
+        ProbeTarget { provider: "GitHub", endpoint: "release assets", host: "objects.githubusercontent.com" },
+        ProbeTarget { provider: "Microsoft", endpoint: "Azure portal", host: "portal.azure.com" },
+        ProbeTarget { provider: "Microsoft", endpoint: "identity", host: "login.microsoftonline.com" },
+        ProbeTarget { provider: "Microsoft", endpoint: "Office", host: "www.office.com" },
+        ProbeTarget { provider: "Meta", endpoint: "Facebook", host: "www.facebook.com" },
+        ProbeTarget { provider: "Meta", endpoint: "Instagram", host: "www.instagram.com" },
+        ProbeTarget { provider: "Meta", endpoint: "WhatsApp", host: "web.whatsapp.com" },
+        ProbeTarget { provider: "Netflix", endpoint: "web", host: "www.netflix.com" },
+        ProbeTarget { provider: "Netflix", endpoint: "static assets", host: "assets.nflxext.com" },
+        ProbeTarget { provider: "Netflix", endpoint: "help centre", host: "help.netflix.com" },
+        ProbeTarget { provider: "Discord", endpoint: "web", host: "discord.com" },
+        ProbeTarget { provider: "Discord", endpoint: "gateway", host: "gateway.discord.gg" },
+        ProbeTarget { provider: "Discord", endpoint: "CDN", host: "cdn.discordapp.com" },
+        ProbeTarget { provider: "Apple", endpoint: "web", host: "www.apple.com" },
+        ProbeTarget { provider: "Apple", endpoint: "iCloud", host: "www.icloud.com" },
+        ProbeTarget { provider: "Fastly", endpoint: "edge", host: "www.fastly.com" },
+        ProbeTarget { provider: "Fastly", endpoint: "API", host: "api.fastly.com" },
+        ProbeTarget { provider: "Akamai", endpoint: "edge", host: "www.akamai.com" },
+        ProbeTarget { provider: "Akamai", endpoint: "control centre", host: "control.akamai.com" },
+    ];
+
+    /// Response-time bands, fastest first: each entry is the exclusive ceiling in milliseconds for
+    /// its colour, and anything past the last one is red.
+    ///
+    /// The steps follow what the distances actually mean rather than round numbers: a CDN edge in
+    /// your own city, a host in your country, one on your continent, and one an ocean away. Read
+    /// the colour, not the figure — the point is to spot the row that doesn't match its neighbours.
+    const LATENCY_BANDS: &[(u128, Basic)] = &[
+        (20, Basic::Cyan),
+        (60, Basic::Green),
+        (150, Basic::Yellow),
+        (300, Basic::Orange),
+    ];
+
+    /// One response cell, coloured by [`LATENCY_BANDS`]. Anything that didn't answer is red and
+    /// says which way it failed — a refusal, a silence and a name that resolves to nothing are
+    /// three different problems.
+    fn _latency_cell(latency: probe::Latency) -> String {
+        let (text, colour) = match latency {
+            probe::Latency::In(took) => {
+                let ms = took.as_millis();
+                let colour = LATENCY_BANDS
+                    .iter()
+                    .find(|(ceiling, _)| ms < *ceiling)
+                    .map_or(Basic::Red, |(_, colour)| *colour);
+                (if ms == 0 { "<1 ms".to_string() } else { format!("{ms} ms") }, colour)
+            }
+            probe::Latency::Refused => ("refused".to_string(), Basic::Red),
+            probe::Latency::TimedOut => ("no answer".to_string(), Basic::Red),
+            probe::Latency::Unresolved => ("no address".to_string(), Basic::Red),
+        };
+        doc_style::_scoped(&doc_style::_wrap(&[&colour]), &text)
+    }
+
+    /// The closing line: how many answered, and the middle of the distribution. The median rather
+    /// than the mean, because one unreachable continent should not redraw the whole picture.
+    fn _sonar_summary(measured: &[probe::Latency]) -> String {
+        let mut answered: Vec<u128> = measured
+            .iter()
+            .filter_map(|l| match l {
+                probe::Latency::In(took) => Some(took.as_millis()),
+                _ => None,
+            })
+            .collect();
+        answered.sort_unstable();
+        let total = measured.len();
+        match answered.get(answered.len() / 2) {
+            Some(median) => format!("{} of {total} answered · median {median} ms", answered.len()),
+            None => problematic(&format!("none of the {total} hosts answered — the problem is on this side")),
+        }
+    }
+
+    /// Two-space columns, trailing padding trimmed — the same shape the other tables here use.
+    fn _sonar_table() -> table_formatter::FormatOptions {
+        table_formatter::FormatOptions { trim_trailing: true, ..Default::default() }
+    }
+
+    /// Probe every target with at most `workers` handshakes in flight, preserving input order.
+    ///
+    /// A shared cursor rather than a chunk per worker: the hosts differ in latency by more than an
+    /// order of magnitude, so a fixed split would leave most threads idle while one waited on
+    /// Sydney. Each worker keeps its own results and they are merged by index at the end, which
+    /// needs no lock on the hot path.
+    /// `report` is called with each result the moment it lands, from whichever worker got it —
+    /// which is what lets the live table fill in as answers arrive rather than all at once. It
+    /// runs on the worker's thread, so it must be cheap and must serialise its own output.
+    fn _probe_targets(
+        targets: &[ProbeTarget],
+        workers: usize,
+        timeout: std::time::Duration,
+        report: impl Fn(usize, probe::Latency) + Sync,
+    ) -> Vec<probe::Latency> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cursor = AtomicUsize::new(0);
+        let report = &report;
+        let collected: Vec<Vec<(usize, probe::Latency)>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers.min(targets.len()))
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut mine = Vec::new();
+                        loop {
+                            let index = cursor.fetch_add(1, Ordering::Relaxed);
+                            let Some(target) = targets.get(index) else { break mine };
+                            let measured = probe::latency(target.host, PROBE_PORT, timeout);
+                            report(index, measured);
+                            mine.push((index, measured));
+                        }
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|handle| handle.join().unwrap_or_default()).collect()
+        });
+        let mut ordered = vec![probe::Latency::Unresolved; targets.len()];
+        for (index, latency) in collected.into_iter().flatten() {
+            ordered[index] = latency;
+        }
+        ordered
     }
 
     /// How many resolved addresses get the full ownership treatment. A big site answers with a
@@ -727,6 +1083,99 @@ mod commands {
             // A single item that exceeds the width still gets its own line rather than vanishing.
             assert_eq!(_packed(&["x".repeat(80)], 10), vec!["x".repeat(80)]);
             assert!(_packed(&[], 40).is_empty());
+        }
+
+        // ——— sonar ————————————————————————————————————————————————
+
+        /// The colour IS the report — the figures are there to be scanned past. Each band must
+        /// therefore claim exactly the range it documents, including its own upper edge going to
+        /// the next colour rather than staying.
+        #[test]
+        fn each_latency_band_owns_its_range() {
+            let coloured = |ms: u64| {
+                _latency_cell(probe::Latency::In(std::time::Duration::from_millis(ms)))
+            };
+            let is = |cell: &str, colour: Basic| cell.contains(&doc_style::_wrap(&[&colour]));
+            assert!(is(&coloured(0), Basic::Cyan) && is(&coloured(19), Basic::Cyan));
+            assert!(is(&coloured(20), Basic::Green) && is(&coloured(59), Basic::Green));
+            assert!(is(&coloured(60), Basic::Yellow) && is(&coloured(149), Basic::Yellow));
+            assert!(is(&coloured(150), Basic::Orange) && is(&coloured(299), Basic::Orange));
+            assert!(is(&coloured(300), Basic::Red) && is(&coloured(9_000), Basic::Red));
+            // A sub-millisecond answer is real, not missing — say so rather than printing `0 ms`.
+            assert!(coloured(0).contains("<1 ms"));
+        }
+
+        /// Every way of not answering is red, and each says which way — a refusal, a silence and a
+        /// name that resolves to nothing are three different faults with three different fixes.
+        #[test]
+        fn failures_are_red_and_name_their_kind() {
+            for (latency, wording) in [
+                (probe::Latency::Refused, "refused"),
+                (probe::Latency::TimedOut, "no answer"),
+                (probe::Latency::Unresolved, "no address"),
+            ] {
+                let cell = _latency_cell(latency);
+                assert!(cell.contains(wording), "{latency:?} should say `{wording}`: {cell}");
+                assert!(cell.contains(&doc_style::_wrap(&[&Basic::Red])), "{latency:?} must be red");
+            }
+        }
+
+        /// The live table is printed before any answer exists, then written into by cursor
+        /// address. Every row must therefore open its response cell at exactly the column the
+        /// repaint aims for — one off and each answer lands in the hostname beside it, which
+        /// still looks like a table and is entirely wrong.
+        #[test]
+        fn every_live_row_opens_its_cell_at_the_repaint_column() {
+            let layout = _layout(PROBE_TARGETS, 200).expect("a wide window lays out");
+            assert_eq!(
+                layout.skeleton.lines().count(),
+                PROBE_TARGETS.len() + 1,
+                "one header, then every target — the whole list is on screen before probing"
+            );
+            for line in layout.skeleton.lines().skip(1) {
+                let plain = console::strip_ansi_codes(line);
+                let opens_at = plain.chars().count() - PENDING.chars().count() + 1;
+                assert_eq!(opens_at, layout.response_column, "cell starts elsewhere: {plain:?}");
+            }
+        }
+
+        /// In a window too narrow for a row, the line wraps and every repaint after it is a line
+        /// out — answers would scatter onto neighbouring rows. Better to decline and print once.
+        #[test]
+        fn a_narrow_window_declines_the_live_table() {
+            assert!(_layout(PROBE_TARGETS, 40).is_none());
+            assert!(_layout(PROBE_TARGETS, 200).is_some());
+        }
+
+        #[test]
+        fn the_summary_reports_the_median_of_what_answered() {
+            let ms = |n| probe::Latency::In(std::time::Duration::from_millis(n));
+            // Five answers, one dead host: the median is of the five, and the total counts all six.
+            let mixed = [ms(10), ms(400), ms(50), probe::Latency::TimedOut, ms(20), ms(30)];
+            let summary = _sonar_summary(&mixed);
+            assert!(summary.contains("5 of 6 answered"), "{summary}");
+            assert!(summary.contains("median 30 ms"), "an unreachable host must not skew it: {summary}");
+            // Nothing answered at all says where the fault probably is, rather than "median none".
+            assert!(_sonar_summary(&[probe::Latency::TimedOut]).contains("this side"));
+        }
+
+        /// The table earns its keep by *spread* — several distinct endpoints per provider, so a
+        /// bad route to one continent reads differently from a provider being down. A duplicate
+        /// host would be two rows saying the same thing.
+        #[test]
+        fn the_target_list_is_well_formed_and_varied() {
+            let mut hosts = std::collections::BTreeSet::new();
+            let mut per_provider: std::collections::BTreeMap<&str, usize> = Default::default();
+            for target in PROBE_TARGETS {
+                assert!(!target.provider.is_empty() && !target.endpoint.is_empty());
+                assert!(hosts.insert(target.host), "{} is listed twice", target.host);
+                assert!(target.host.contains('.'), "{} is not a hostname", target.host);
+                *per_provider.entry(target.provider).or_default() += 1;
+            }
+            for (provider, count) in &per_provider {
+                assert!(*count >= 2, "{provider} has only {count} endpoint — one says too little");
+            }
+            assert!(per_provider.len() >= 6, "too few providers to tell a local fault from theirs");
         }
 
         #[test]

@@ -129,6 +129,50 @@ pub(crate) fn reach(host: &str, port: u16) -> Reach {
     verdict
 }
 
+/// How long the handshake to a host took, or why there wasn't one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Latency {
+    /// Connected, and this is the round trip it took.
+    In(Duration),
+    /// A RST came back: the host is up, nothing is listening on that port.
+    Refused,
+    /// Nothing came back before the deadline.
+    TimedOut,
+    /// The name resolved to no address to try.
+    Unresolved,
+}
+
+/// Time the TCP handshake to `host:port` — the cheapest honest measure of "how far away is this
+/// service, right now". [`reach`]'s sibling: same connect, but reporting how long rather than
+/// merely whether.
+///
+/// Name resolution happens before the clock starts, deliberately. It is usually answered from
+/// cache, and when it isn't it measures the resolver rather than the host — mixing the two would
+/// make a slow resolver look like a slow provider. What is left is the round trip, which is what
+/// comparing one provider against another actually needs.
+///
+/// Each resolved address is timed on its own, so an unreachable IPv6 address ahead of a working
+/// IPv4 one costs a verdict, not a wrong number.
+pub(crate) fn latency(host: &str, port: u16, timeout: Duration) -> Latency {
+    use std::net::ToSocketAddrs;
+    let Ok(addresses) = (host, port).to_socket_addrs() else { return Latency::Unresolved };
+    let mut verdict = Latency::Unresolved;
+    for address in addresses.take(4) {
+        let started = std::time::Instant::now();
+        match TcpStream::connect_timeout(&address, timeout) {
+            Ok(_) => return Latency::In(started.elapsed()),
+            // A refusal is a definite answer about a live host, so it outranks a silent drop
+            // when a name has several addresses — the same precedence [`reach`] uses.
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                verdict = Latency::Refused;
+            }
+            Err(_) if verdict != Latency::Refused => verdict = Latency::TimedOut,
+            Err(_) => {}
+        }
+    }
+    verdict
+}
+
 /// What a TLS port presented.
 pub(crate) struct Tls {
     pub(crate) protocol: Option<String>,
