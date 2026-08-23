@@ -32,6 +32,7 @@ fn gg_elevated_rescan(expressions: Vec<String>, paths: Vec<PathBuf>, context: us
 #[bashrs_macros::category(command = LookupCommand, prefix = "lookup_")]
 mod commands {
     use crate::support::args::{GgArgs, GgBase, GrepArgs, SkipArgs};
+    use crate::support::prompt::_prompt_yN;
     use crate::support::{input, preferences, streamgrep};
     use clap::Args;
 
@@ -169,7 +170,7 @@ mod commands {
         denied: &std::collections::BTreeSet<PathBuf>,
         opts: &treegrep::Options,
     ) {
-        use std::io::{IsTerminal, Write};
+        use std::io::IsTerminal;
         if denied.is_empty() {
             return;
         }
@@ -187,10 +188,7 @@ mod commands {
         if denied.len() > shown {
             eprintln!("  [{} more paths omitted]", denied.len() - shown);
         }
-        eprint!("Re-scan them as root? [y/N] ");
-        let _ = std::io::stderr().flush();
-        let mut answer = String::new();
-        if std::io::stdin().read_line(&mut answer).is_err() || !answer.trim().eq_ignore_ascii_case("y") {
+        if !_prompt_yN("Re-scan them as root?") {
             return;
         }
         // `#[elevated]` on `gg_elevated_rescan` generated `GgElevatedRescan`; hand its parent side the
@@ -209,7 +207,7 @@ mod commands {
         regex: bool,
         replacement: &str,
     ) {
-        use std::io::{IsTerminal, Write};
+        use std::io::IsTerminal;
         let Some(plan) = treegrep::plan_replacements(expressions, roots, skips, regex, replacement) else {
             return;
         };
@@ -229,10 +227,7 @@ mod commands {
             eprintln!("--re: refusing to modify files non-interactively.");
             return;
         }
-        eprint!("Apply these changes? [y/N] ");
-        let _ = std::io::stderr().flush();
-        let mut answer = String::new();
-        if std::io::stdin().read_line(&mut answer).is_err() || !answer.trim().eq_ignore_ascii_case("y") {
+        if !_prompt_yN("Apply these changes?") {
             eprintln!("--re: aborted — nothing changed.");
             return;
         }

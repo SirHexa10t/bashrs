@@ -21,6 +21,7 @@ use crate::categories::media::metadata::MediaMetadataCommand;
 use crate::categories::media::transcode::MediaTranscodeCommand;
 use crate::categories::network::NetworkCommand;
 use crate::categories::packages::PackagesCommand;
+use crate::categories::processes::ProcessesCommand;
 use crate::categories::project::ProjectCommand;
 use crate::categories::python::PythonCommand;
 use crate::categories::session::SessionCommand;
@@ -68,6 +69,8 @@ pub enum Command {
     Network(NetworkCommand),
     #[command(flatten)]
     Packages(PackagesCommand),
+    #[command(flatten)]
+    Processes(ProcessesCommand),
     #[command(flatten)]
     Project(ProjectCommand),
     #[command(flatten)]
@@ -128,6 +131,7 @@ impl Command {
             Command::ComfyRepos(cmd) => cmd.run(),
             Command::Network(cmd) => cmd.run(),
             Command::Packages(cmd) => cmd.run(),
+            Command::Processes(cmd) => cmd.run(),
             Command::Project(cmd) => cmd.run(),
             Command::Python(cmd) => cmd.run(),
             Command::Session(cmd) => cmd.run(),
@@ -333,6 +337,13 @@ mod tests {
         // `upup` is prefixed (with a bare `upup` alias); `UPUP` is a deliberate
         // custom name (the loud "update everything"). Everything else is prefixed.
         assert_prefixed(&command_names::<PackagesCommand>(), "packages_", &["UPUP"]);
+    }
+
+    #[test]
+    fn processes_commands_follow_naming_standard() {
+        // `murder` is a bare verb, like the `kill` it stands in for — a `proc_` prefix would put
+        // it behind a namespace nobody reaches for in an emergency.
+        assert_prefixed(&command_names::<ProcessesCommand>(), "proc_", &["murder"]);
     }
 
     #[test]

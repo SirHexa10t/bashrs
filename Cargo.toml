@@ -16,6 +16,7 @@ vidl = { git = "https://github.com/SirHexa10t/vidl.git", branch = "main" }   # t
 # `-cli` is the one holding the embeddable surface. Renamed here so every companion repo reads
 # the same way at the call site.
 sequencer = { package = "sequencer-cli", git = "https://github.com/SirHexa10t/sequencer.git", branch = "main" }   # synthetic input — the autoclicker behind `clicker`
+x11rb = { version = "0.13", features = ["res"] }    # X window enumeration for `murder --window` — already in the tree via sequencer, so this adds no new package; `res` asks the X SERVER for each client's true pid (a sandboxed app's self-reported _NET_WM_PID is a pid from inside its namespace)
 synoptic = "2"
 libc = "0.2"
 toml = "1.1"

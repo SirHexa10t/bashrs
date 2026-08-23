@@ -114,14 +114,20 @@ fn missing_env() -> bool {
 
 /// The optional python packages that complete the bundled yt-dlp zipapp (which runs on this
 /// python): `curl_cffi` restores the impersonation support YouTube increasingly demands
-/// (403s/429s without it), and `mutagen` powers thumbnail/tag embedding into audio formats
-/// (ffmpeg covers the video containers). A no-op for whatever is already importable, or when
-/// yt-dlp isn't even bundled.
+/// (403s/429s without it), `mutagen` powers thumbnail/tag embedding into audio formats
+/// (ffmpeg covers the video containers), and `pycryptodomex` decrypts the AES-protected
+/// streams some sites serve (vidl now expects it). A no-op for whatever is already importable,
+/// or when yt-dlp isn't even bundled.
+///
+/// Pairs are `(import name, package name)` because they differ: `pycryptodomex` installs under
+/// that name but is imported as `Cryptodome` — probing the package name would report it missing
+/// on every run and reinstall it forever.
 pub fn ensure_ytdlp_deps() {
     if crate::tools::resolve("yt-dlp") == "yt-dlp" {
         return;
     }
-    let missing: Vec<&str> = [("curl_cffi", "curl_cffi"), ("mutagen", "mutagen")]
+    let missing: Vec<&str> =
+        [("curl_cffi", "curl_cffi"), ("mutagen", "mutagen"), ("Cryptodome", "pycryptodomex")]
         .iter()
         .filter(|(module, _)| {
             !exec::succeeds_quietly(

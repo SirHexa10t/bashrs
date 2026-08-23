@@ -12,12 +12,7 @@ For an up-to-date toolchain, install with **rustup**, the official toolchain man
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-Then put the following sourcing-command in your rc (commonly `~/.bashrc`) for permanence, or in a new shell for single-time use:
-
-```sh
-. "$HOME/.cargo/env"
+. "$HOME/.cargo/env"  # one-time run that adds `~/.cargo/bin` to `PATH`
 ```
 
 ### bashrs
@@ -31,7 +26,7 @@ cd bashrs
 Expect a few minutes on the first run. It would:
  * build from scratch
  * download the bundled tools
- * reset your shell session to source the compiled functions
+ * tell you how to reset your shell session to source the compiled functions (automatic after first run)
  
 
 Re-running `COMPILE.sh` is safe, and is also how you update: `git pull && ./COMPILE.sh`.

@@ -8,7 +8,7 @@
 # means the machine provides the tool itself, so nothing was bundled.
 
 [tools]
-ffmpeg = "n9.0 @ autobuild-2026-08-17-13-05"
+ffmpeg = "n9.0 @ autobuild-2026-08-23-13-03"
 yt-dlp = "2026.08.19"
 uv = "0.12.5"
 python = "3.14.6"

@@ -23,6 +23,7 @@ use crate::categories::media::metadata::MediaMetadataCommand;
 use crate::categories::media::transcode::MediaTranscodeCommand;
 use crate::categories::network::NetworkCommand;
 use crate::categories::packages::PackagesCommand;
+use crate::categories::processes::ProcessesCommand;
 use crate::categories::project::ProjectCommand;
 use crate::categories::python::PythonCommand;
 use crate::categories::anti_ai::AntiAiCommand;
@@ -54,7 +55,7 @@ macro_rules! category_group {
 
 /// The command categories: the label grouping them in the generated `sourcefile.sh`, the clap
 /// graph, and the category's pure-shell commands. One row per category — never per command.
-fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 15] {
+fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 16] {
     let categories = [
         ("anti_ai", AntiAiCommand::augment_subcommands(clap::Command::new("anti_ai")),
             AntiAiCommand::shell_functions().to_vec()),
@@ -74,6 +75,8 @@ fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 15] {
             NetworkCommand::shell_functions().to_vec()),
         ("packages", PackagesCommand::augment_subcommands(clap::Command::new("packages")),
             PackagesCommand::shell_functions().to_vec()),
+        ("processes", ProcessesCommand::augment_subcommands(clap::Command::new("processes")),
+            ProcessesCommand::shell_functions().to_vec()),
         ("project", ProjectCommand::augment_subcommands(clap::Command::new("project")),
             ProjectCommand::shell_functions().to_vec()),
         ("python", PythonCommand::augment_subcommands(clap::Command::new("python")),

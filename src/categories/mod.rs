@@ -16,6 +16,7 @@ pub mod lookup;
 pub mod media;
 pub mod network;
 pub mod packages;
+pub mod processes;
 pub mod project;
 pub mod python;
 pub mod session;
