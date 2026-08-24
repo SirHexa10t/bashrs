@@ -32,7 +32,7 @@ fn gg_elevated_rescan(expressions: Vec<String>, paths: Vec<PathBuf>, context: us
 #[bashrs_macros::category(command = LookupCommand, prefix = "lookup_")]
 mod commands {
     use crate::support::args::{GgArgs, GgBase, GrepArgs, SkipArgs};
-    use crate::support::prompt::_prompt_yN;
+    use terminal_choice::prompt_yN;
     use crate::support::{input, preferences, streamgrep};
     use clap::Args;
 
@@ -188,7 +188,7 @@ mod commands {
         if denied.len() > shown {
             eprintln!("  [{} more paths omitted]", denied.len() - shown);
         }
-        if !_prompt_yN("Re-scan them as root?") {
+        if !prompt_yN("Re-scan them as root?") {
             return;
         }
         // `#[elevated]` on `gg_elevated_rescan` generated `GgElevatedRescan`; hand its parent side the
@@ -227,7 +227,7 @@ mod commands {
             eprintln!("--re: refusing to modify files non-interactively.");
             return;
         }
-        if !_prompt_yN("Apply these changes?") {
+        if !prompt_yN("Apply these changes?") {
             eprintln!("--re: aborted — nothing changed.");
             return;
         }

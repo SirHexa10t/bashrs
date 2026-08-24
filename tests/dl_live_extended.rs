@@ -1,4 +1,4 @@
-//! The one live test bashrs still owns: that the cookie store `dl --cookie-import` writes is
+//! The one live test bashrs still owns: that the cookie store `dl --cookies-extract-for-domain` writes is
 //! readable by the genuine yt-dlp loader. Downloading is the `vidl` crate's business and its
 //! live tests moved there with it; what stays here is the claim bashrs alone makes — that its
 //! filtered, per-site copy of a browser's cookie DB is a thing yt-dlp will actually accept.
@@ -9,7 +9,7 @@
 //! cargo test --test dl_live_extended -- --ignored --test-threads=1 --nocapture
 //! ```
 //!
-//! It skips-with-notice when no store is imported (`dl --cookie-import youtube` sets one up),
+//! It skips-with-notice when no store is imported (`dl --cookies-extract-for-domain youtube` sets one up),
 //! reads the real session ON PURPOSE — that is what it tests — and sends no network requests:
 //! yt-dlp is asked to dump the store to a throwaway file, with no URL to fetch.
 
@@ -56,7 +56,7 @@ fn youtube_store_or_skip(test: &str) -> Option<String> {
     match browser {
         Some(browser) if store.is_dir() => Some(format!("{}:{}", browser.trim(), store.display())),
         _ => {
-            eprintln!("SKIPPED {test}: no imported youtube cookie store (run `dl --cookie-import youtube` first)");
+            eprintln!("SKIPPED {test}: no imported youtube cookie store (run `dl --cookies-extract-for-domain youtube` first)");
             None
         }
     }

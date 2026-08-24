@@ -9,7 +9,7 @@
 #[bashrs_macros::category(command = ProcessesCommand, prefix = "proc_")]
 mod commands {
     use crate::support::doc_style::{self, _header, notice, problematic};
-    use crate::support::prompt::_prompt_yN;
+    use terminal_choice::prompt_yN;
     use crate::support::theme::Weight;
     use clap::Args;
     use std::collections::BTreeMap;
@@ -18,10 +18,14 @@ mod commands {
     /// Find running processes by any part of them — PID, program name, full command line, or the
     /// executable's path — show each match in its process-tree (ancestors above say who owns it,
     /// descendants beneath say what else goes down with it, matched text glowing `grep`-style),
-    /// then offer to terminate the matches: SIGTERM first, SIGKILL only for whatever ignores it
+    /// then offer to terminate the matches: SIGTERM first, SIGKILL only for whatever ignores it.
+    /// With nothing to hunt at all, offers the top CPU and memory consumers as a checklist
     #[unprefixed]
     #[trailing_newline]
     pub fn murder(args: MurderArgs) {
+        if args.patterns.is_empty() && args.window.is_none() {
+            return _pick_hogs();
+        }
         // The window filter resolves first: it is the one part that can be impossible outright
         // (no X display), and that should say so before any scanning happens.
         let by_window = args.window.as_deref().map(|needle| match crate::support::windows::list() {
@@ -67,24 +71,157 @@ mod commands {
         // title it hit.
         let mut needles = args.patterns.clone();
         needles.extend(args.window.clone());
-        for line in _render(&relevant, &needles, args.short) {
-            println!("{line}");
+        // With --choose the FORM is the tree view (printing it twice would just scroll it away);
+        // otherwise the styled report prints and the whole match set is the target.
+        if !args.choose {
+            for line in _render(&relevant, &needles, args.short) {
+                println!("{line}");
+            }
         }
         // The action follows the target's grain. A text hunt names processes, so they get
         // signals; a window hunt names windows, and a signal can only ever hit the whole
         // process — so windows get close requests, and every other window of the app lives.
         match by_window {
-            Some(owned) => _close_windows(&relevant, &owned),
+            Some(owned) => _close_windows(&relevant, &owned, args.choose),
+            None if args.choose => match _choose_matches(&relevant, &needles, args.short) {
+                None => {} // cancelled, or nothing ticked — messaged already
+                // The form WAS the confirmation: ticking boxes and pressing Submit is more
+                // deliberate than a y could ever be, and a second prompt is worse than
+                // redundant — any keystroke still buffered from the form would answer it.
+                Some(chosen) => _kill_confirmed(&_relate(relevant, &chosen)),
+            },
             None => _kill(&relevant),
         }
+    }
+
+    /// The `--choose` tree: the same rows [`_render`] prints, as a form — every match a
+    /// checkbox, every context row a fixed comment, the branch drawing intact because the form
+    /// is `aligned` (comments pick up the checkbox lead-in). Returns the ticked PIDs, or `None`
+    /// after telling the user why there is nothing to do.
+    fn _choose_matches(
+        relevant: &BTreeMap<u32, Process>,
+        needles: &[String],
+        short: bool,
+    ) -> Option<Vec<u32>> {
+        let mut form = terminal_choice::Form::new()
+            .title("murder — tick what dies (context rows are fixed)")
+            .aligned()
+            .comment(_plain_header(relevant));
+        // Consecutive matches pool into one anonymous checkbox group; any context row in
+        // between closes the run — that is what keeps the tree's row order intact.
+        let mut pending: Vec<String> = Vec::new();
+        for (pid, row) in _tree_rows(relevant, needles, short, true) {
+            let process = &relevant[&pid];
+            if process.relation == Relation::Match && !process.protected {
+                pending.push(row);
+                continue;
+            }
+            if !pending.is_empty() {
+                let options: Vec<&str> = pending.iter().map(String::as_str).collect();
+                form = form.checkboxes("", &options);
+                pending.clear();
+            }
+            form = form.comment(row);
+        }
+        if !pending.is_empty() {
+            let options: Vec<&str> = pending.iter().map(String::as_str).collect();
+            form = form.checkboxes("", &options);
+        }
+        if relevant.values().any(|process| process.protected) {
+            form = form.comment("* this shell's own ancestry — never offered");
+        }
+        match terminal_choice::run(&mut form) {
+            Err(err) => {
+                eprintln!("murder: {err}");
+                None
+            }
+            Ok(terminal_choice::Outcome::Cancelled) => {
+                eprintln!("murder: aborted — nothing chosen");
+                None
+            }
+            Ok(terminal_choice::Outcome::Submitted) => {
+                let chosen: Vec<u32> = form
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        terminal_choice::Item::Checkboxes { options, checked, .. } => Some(
+                            options
+                                .iter()
+                                .zip(checked)
+                                .filter(|(_, on)| **on)
+                                .filter_map(|(option, _)| _picked_pid(option)),
+                        ),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect();
+                if chosen.is_empty() {
+                    eprintln!("murder: nothing ticked — nothing to signal");
+                    return None;
+                }
+                Some(chosen)
+            }
+        }
+    }
+
+    /// The tree as PLAIN rows, `(pid, row text)` in display order — what the `--choose` form is
+    /// built from. Same columns, same walk, same command cell as the styled report, minus every
+    /// escape code (a form option carrying colour codes would sabotage the focus highlight).
+    fn _tree_rows(
+        relevant: &BTreeMap<u32, Process>,
+        needles: &[String],
+        short: bool,
+        styled: bool,
+    ) -> Vec<(u32, String)> {
+        let (pid_w, user_w, age_w, cpu_w, mem_w) = _column_widths(relevant.values());
+        let pad = |text: &str, w: usize| {
+            format!("{text}{}", " ".repeat(w.saturating_sub(text.chars().count())))
+        };
+        let fixed = pid_w + user_w + age_w + cpu_w + mem_w + 2 * 5;
+        _tree_order(relevant)
+            .into_iter()
+            .map(|(pid, branch)| {
+                let process = &relevant[&pid];
+                let room = short.then(|| {
+                    table_formatter::terminal_width()
+                        .saturating_sub(fixed + branch.chars().count() + CHOOSE_LEAD)
+                        .max(MIN_COMMAND)
+                });
+                let row = format!(
+                    "{}  {}  {}  {}  {}  {branch}{}",
+                    pad(&_pid_cell(process), pid_w),
+                    pad(&process.user, user_w),
+                    pad(&_age_label(process.age), age_w),
+                    pad(&format!("{:.1}", process.cpu_percent), cpu_w),
+                    pad(&_mem_cell(process), mem_w),
+                    // The form keeps colours these days, so a match's command can glow there
+                    // exactly as it does in the printed report.
+                    match styled {
+                        true => _command_cell(process, needles, room),
+                        false => _command_plain(process, needles, room),
+                    },
+                );
+                (pid, row)
+            })
+            .collect()
+    }
+
+    /// What the form adds in front of every row (focus mark + checkbox), so `--short` inside the
+    /// form clips to the width that is actually left.
+    const CHOOSE_LEAD: usize = 6;
+
+    /// The header the form shows above the tree, padded with the same widths as the rows.
+    fn _plain_header(relevant: &BTreeMap<u32, Process>) -> String {
+        _widths_header(_column_widths(relevant.values()))
     }
 
     #[derive(Args)]
     pub struct MurderArgs {
         /// What to look for: each is a PID, or text appearing in a process's name, command line,
         /// or executable path (case-insensitive). Giving several narrows the hunt — a process
-        /// must match EVERY one of them, each in whichever field it lands
-        #[arg(value_name = "PATTERN", num_args = 1.., required_unless_present = "window")]
+        /// must match EVERY one of them, each in whichever field it lands. Given nothing at all,
+        /// the top CPU and memory consumers are offered as a checklist instead
+        #[arg(value_name = "PATTERN", num_args = 1..)]
         pub patterns: Vec<String>,
         /// Hunt X11 windows instead of processes: match window titles containing this
         /// (case-insensitive) and CLOSE those windows — the titlebar-✕ request, so the owning
@@ -99,6 +236,11 @@ mod commands {
         /// (matched text included)
         #[arg(short = 's', long)]
         pub short: bool,
+        /// Choose interactively which of the matches to act on, instead of all of them: the same
+        /// tree, as a form — matches are checkboxes, context rows are fixed. (With no hunt given
+        /// at all, murder is a picker already, so this adds nothing there)
+        #[arg(short = 'c', long)]
+        pub choose: bool,
     }
 
     /// Why a process is in the report at all.
@@ -149,19 +291,7 @@ mod commands {
         patterns: &[String],
         by_window: Option<&BTreeMap<u32, Vec<(u32, String)>>>,
     ) -> (BTreeMap<u32, Process>, usize) {
-        let users = _users();
-        let boot: f64 = _uptime_seconds();
-        let ticks = _clock_ticks();
-        let self_pid = std::process::id();
-        let ancestry = _ancestry(self_pid);
-        let mut all: BTreeMap<u32, Process> = _pids()
-            .into_iter()
-            // Never match the search itself: `murder firefox` carries "firefox" in its own command
-            // line, so it would find — and offer to kill — the very command doing the asking.
-            .filter(|pid| *pid != self_pid)
-            .filter_map(|pid| _read(pid, &users, boot, ticks, &ancestry))
-            .map(|process| (process.pid, process))
-            .collect();
+        let mut all = _snapshot();
         let matched: Vec<u32> = all
             .values_mut()
             .filter_map(|process| {
@@ -170,6 +300,157 @@ mod commands {
             })
             .collect();
         (_relate(all, &matched), matched.len())
+    }
+
+    /// No hunt given — show where the machine is going instead: the heaviest CPU users and the
+    /// heaviest memory users, each list capped at [`TOP_HOGS`] (shorter when the system simply
+    /// doesn't have that many), as a checklist.
+    ///
+    /// A process can easily top both lists; it appears ONCE, in the CPU group, and the memory
+    /// group is explicitly "beyond those" — two checkboxes for one process would make "checked
+    /// here, unchecked there" a riddle, and the form library rightly refuses duplicate labels.
+    ///
+    /// The ticked processes go down the same ladder every other murder path uses — the form is
+    /// the confirmation, exactly as it is for `--choose` (asking again after a deliberate
+    /// tick-and-Submit would be redundant at best).
+    fn _pick_hogs() {
+        let all = _snapshot();
+        let (by_cpu, by_memory) = _hog_shortlists(&all);
+        if by_cpu.is_empty() && by_memory.is_empty() {
+            eprintln!("murder: nothing offerable is running (kernel threads and this shell's own ancestry are never offered)");
+            return;
+        }
+        // The same columns every other murder view uses, sized over everything offered — the
+        // two lists overlap, so shared widths keep a twin's two rows byte-identical (mirroring
+        // links by exact wording).
+        let widths = _column_widths(by_cpu.iter().chain(by_memory.iter()).copied());
+        let mut form = terminal_choice::Form::new()
+            .title("murder — pick what would die")
+            .comment("Tick what to terminate — Submit is the trigger; Esc leaves everything running.")
+            .comment(_widths_header(widths))
+            .aligned()
+            // A heavy process tops both charts under the SAME wording; mirroring makes its two
+            // boxes one box in two places, so it cannot be doomed under one heading and spared
+            // under the other.
+            .mirror_duplicates();
+        let cpu_options: Vec<String> = by_cpu.iter().map(|p| _hog_row(p, widths)).collect();
+        let memory_options: Vec<String> = by_memory.iter().map(|p| _hog_row(p, widths)).collect();
+        if !cpu_options.is_empty() {
+            let refs: Vec<&str> = cpu_options.iter().map(String::as_str).collect();
+            form = form.checkboxes(CPU_GROUP, &refs);
+        }
+        if !memory_options.is_empty() {
+            let refs: Vec<&str> = memory_options.iter().map(String::as_str).collect();
+            form = form.checkboxes(MEMORY_GROUP, &refs);
+        }
+        match terminal_choice::run(&mut form) {
+            Err(err) => eprintln!("murder: {err}"),
+            Ok(terminal_choice::Outcome::Cancelled) => eprintln!("murder: aborted — nothing chosen"),
+            Ok(terminal_choice::Outcome::Submitted) => {
+                // A mirrored twin reports from both groups; the set collapses it to one kill.
+                let picked: std::collections::BTreeSet<&str> = form
+                    .checked(CPU_GROUP)
+                    .into_iter()
+                    .chain(form.checked(MEMORY_GROUP))
+                    .collect();
+                if picked.is_empty() {
+                    eprintln!("murder: nothing ticked — nothing to signal");
+                    return;
+                }
+                let chosen: Vec<u32> = picked.iter().filter_map(|option| _picked_pid(option)).collect();
+                _kill_confirmed(&_relate(all, &chosen));
+            }
+        }
+    }
+
+    /// How many of each kind of hog the picker offers — "up to": a quiet system offers fewer.
+    const TOP_HOGS: usize = 7;
+    const CPU_GROUP: &str = "Top CPU consumers";
+    const MEMORY_GROUP: &str = "Top memory consumers";
+
+    /// The two shortlists, offerable processes only — nothing [`_triage`] would refuse anyway
+    /// (this shell's ancestry, PID 1, kernel threads), so no box can be ticked in vain.
+    ///
+    /// Each list is honestly its own top: a process leading both charts appears in BOTH, worded
+    /// identically — and the form runs with `mirror_duplicates`, so its two boxes are one box in
+    /// two places. Ticking it under either heading ticks it under the other.
+    fn _hog_shortlists(all: &BTreeMap<u32, Process>) -> (Vec<&Process>, Vec<&Process>) {
+        let mut offerable: Vec<&Process> = all
+            .values()
+            .filter(|p| !p.protected && p.pid != 1 && !p.cmdline.is_empty())
+            .collect();
+        offerable.sort_by(|a, b| {
+            b.cpu_percent.total_cmp(&a.cpu_percent).then_with(|| a.pid.cmp(&b.pid))
+        });
+        let by_cpu: Vec<&Process> = offerable.iter().copied().take(TOP_HOGS).collect();
+        offerable.sort_by(|a, b| {
+            b.rss_kib.unwrap_or(0).cmp(&a.rss_kib.unwrap_or(0)).then_with(|| a.pid.cmp(&b.pid))
+        });
+        let by_memory: Vec<&Process> = offerable.iter().copied().take(TOP_HOGS).collect();
+        (by_cpu, by_memory)
+    }
+
+    /// One checkbox line, in the standard murder columns (PID leads — it is what
+    /// [`_picked_pid`] reads back). The full command, not just the name: the columns are shared
+    /// with every other view, and the command is what a human recognises.
+    fn _hog_row(process: &Process, widths: (usize, usize, usize, usize, usize)) -> String {
+        let (pid_w, user_w, age_w, cpu_w, mem_w) = widths;
+        let pad = |text: &str, w: usize| {
+            format!("{text}{}", " ".repeat(w.saturating_sub(text.chars().count())))
+        };
+        format!(
+            "{}  {}  {}  {}  {}  {}",
+            pad(&_pid_cell(process), pid_w),
+            pad(&process.user, user_w),
+            pad(&_age_label(process.age), age_w),
+            pad(&format!("{:.1}", process.cpu_percent), cpu_w),
+            pad(&_mem_cell(process), mem_w),
+            _command_plain(process, &[], None),
+        )
+    }
+
+    /// The `PID USER AGE %CPU MEM COMMAND` header for a given set of widths — the picker's
+    /// version of [`_plain_header`], which sizes over a relevant-map instead.
+    fn _widths_header(widths: (usize, usize, usize, usize, usize)) -> String {
+        let (pid_w, user_w, age_w, cpu_w, mem_w) = widths;
+        let pad = |text: &str, w: usize| {
+            format!("{text}{}", " ".repeat(w.saturating_sub(text.chars().count())))
+        };
+        format!(
+            "{}  {}  {}  {}  {}  COMMAND",
+            pad("PID", pid_w),
+            pad("USER", user_w),
+            pad("AGE", age_w),
+            pad("%CPU", cpu_w),
+            pad("MEM", mem_w)
+        )
+    }
+
+    /// The pid (or window id) back out of a ticked option line — always the first token, with
+    /// the ancestry star tolerated ([`_pid_cell`] appends it) and colour codes stripped first:
+    /// the `--choose` options carry the grep-style glow, and a pid matched BY pid glows in this
+    /// very token.
+    fn _picked_pid(option: &str) -> Option<u32> {
+        let plain = console::strip_ansi_codes(option).into_owned();
+        plain.split_whitespace().next()?.trim_end_matches('*').parse().ok()
+    }
+
+    /// Everything running right now, read once — the base of both the pattern hunt and the
+    /// no-pattern picker.
+    fn _snapshot() -> BTreeMap<u32, Process> {
+        let users = _users();
+        let boot: f64 = _uptime_seconds();
+        let ticks = _clock_ticks();
+        let self_pid = std::process::id();
+        let ancestry = _ancestry(self_pid);
+        _pids()
+            .into_iter()
+            // Never match the search itself: `murder firefox` carries "firefox" in its own command
+            // line, so it would find — and offer to kill — the very command doing the asking.
+            .filter(|pid| *pid != self_pid)
+            .filter_map(|pid| _read(pid, &users, boot, ticks, &ancestry))
+            .map(|process| (process.pid, process))
+            .collect()
     }
 
     /// Reduce the full process map to the relevant lineage of `matched`, labelling each survivor.
@@ -230,12 +511,9 @@ mod commands {
     /// truncated to the window — because the tail of a long command line (a config path, a
     /// `--profile` name) is often the part that tells two siblings apart.
     fn _render(relevant: &BTreeMap<u32, Process>, needles: &[String], short: bool) -> Vec<String> {
-        let pid_cell = |process: &Process| {
-            format!("{}{}", process.pid, if process.protected { "*" } else { "" })
-        };
         // A match found BY its PID glows there — the command text has nothing to show for it.
         let pid_shown = |process: &Process| {
-            let plain = pid_cell(process);
+            let plain = _pid_cell(process);
             match process.relation == Relation::Match && process.matched.contains(&"pid") {
                 true => plain.replace(
                     &process.pid.to_string(),
@@ -244,19 +522,7 @@ mod commands {
                 false => plain,
             }
         };
-        let width = |pick: &dyn Fn(&Process) -> String, floor: usize| {
-            relevant.values().map(|p| pick(p).chars().count()).max().unwrap_or(0).max(floor)
-        };
-        let cpu_cell = |process: &Process| format!("{:.1}", process.cpu_percent);
-        let mem_cell =
-            |process: &Process| process.rss_kib.map(_mem_label).unwrap_or_else(|| "-".to_string());
-        let (pid_w, user_w, age_w, cpu_w, mem_w) = (
-            width(&|p| pid_cell(p), 3),
-            width(&|p: &Process| p.user.clone(), 4),
-            width(&|p| _age_label(p.age), 3),
-            width(&|p| cpu_cell(p), 4),
-            width(&|p| mem_cell(p), 3),
-        );
+        let (pid_w, user_w, age_w, cpu_w, mem_w) = _column_widths(relevant.values());
         let pad = |text: &str, w: usize| format!("{text}{}", " ".repeat(w.saturating_sub(text.chars().count())));
         let mut lines = vec![_header(&format!(
             "{}  {}  {}  {}  {}  COMMAND",
@@ -277,8 +543,66 @@ mod commands {
             })
         };
 
-        // Parent → children, restricted to the relevant set; roots are those whose parent isn't
-        // in it. Children in PID order, which roughly reads as creation order.
+        for (pid, branch) in _tree_order(relevant) {
+            let process = &relevant[&pid];
+            // Padding is measured on the plain cell; the glow adds no visible width.
+            let pid_pad = " ".repeat(pid_w.saturating_sub(_pid_cell(process).chars().count()));
+            let row = format!(
+                "{}{pid_pad}  {}  {}  {}  {}  {branch}{}",
+                pid_shown(process),
+                pad(&process.user, user_w),
+                pad(&_age_label(process.age), age_w),
+                pad(&format!("{:.1}", process.cpu_percent), cpu_w),
+                pad(&_mem_cell(process), mem_w),
+                _command_cell(process, needles, room(&branch)),
+            );
+            lines.push(match process.relation {
+                // Context is dimmed whole: it explains ownership, and nothing about it changes.
+                Relation::Ancestor => doc_style::_scoped(&doc_style::_wrap(&[&Weight::Dark]), &row),
+                _ => row,
+            });
+        }
+        if relevant.values().any(|process| process.protected) {
+            lines.push(notice("* this shell's own ancestry — murder will refuse to signal these"));
+        }
+        lines
+    }
+
+    /// The PID column's text: the pid, starred when it is this shell's own ancestry.
+    fn _pid_cell(process: &Process) -> String {
+        format!("{}{}", process.pid, if process.protected { "*" } else { "" })
+    }
+
+    /// The MEM column's text — `-` for a kernel thread, which owns no user memory.
+    fn _mem_cell(process: &Process) -> String {
+        process.rss_kib.map(_mem_label).unwrap_or_else(|| "-".to_string())
+    }
+
+    /// Column widths over every relevant row — shared by the styled report, the `--choose`
+    /// form's rows and its header, so all three always agree.
+    fn _column_widths<'a>(
+        rows: impl Iterator<Item = &'a Process> + Clone,
+    ) -> (usize, usize, usize, usize, usize) {
+        let width = |pick: &dyn Fn(&Process) -> String, floor: usize| {
+            rows.clone().map(|p| pick(p).chars().count()).max().unwrap_or(0).max(floor)
+        };
+        (
+            width(&|p| _pid_cell(p), 3),
+            width(&|p: &Process| p.user.clone(), 4),
+            width(&|p| _age_label(p.age), 3),
+            width(&|p| format!("{:.1}", p.cpu_percent), 4),
+            width(&|p| _mem_cell(p), 3),
+        )
+    }
+
+    /// Every relevant process in display order with its branch drawing — the ONE tree walk,
+    /// consumed by the styled report and the `--choose` form alike, so the two views can never
+    /// disagree about shape.
+    ///
+    /// Parent → children restricted to the relevant set; roots are those whose parent isn't in
+    /// it; children in PID order, which roughly reads as creation order. Depth-first with an
+    /// explicit stack: (pid, branch prefix for this row, prefix for its kids).
+    fn _tree_order(relevant: &BTreeMap<u32, Process>) -> Vec<(u32, String)> {
         let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         let mut roots: Vec<u32> = Vec::new();
         for process in relevant.values() {
@@ -287,41 +611,21 @@ mod commands {
                 false => roots.push(process.pid),
             }
         }
-
-        // Depth-first with explicit stack: (pid, branch prefix for this row, prefix for its kids).
+        let mut ordered = Vec::with_capacity(relevant.len());
         let mut stack: Vec<(u32, String, String)> = Vec::new();
         for root in roots.iter().rev() {
             stack.push((*root, String::new(), String::new()));
         }
         while let Some((pid, branch, descend)) = stack.pop() {
-            let process = &relevant[&pid];
-            // Padding is measured on the plain cell; the glow adds no visible width.
-            let pid_pad = " ".repeat(pid_w.saturating_sub(pid_cell(process).chars().count()));
-            let row = format!(
-                "{}{pid_pad}  {}  {}  {}  {}  {branch}{}",
-                pid_shown(process),
-                pad(&process.user, user_w),
-                pad(&_age_label(process.age), age_w),
-                pad(&cpu_cell(process), cpu_w),
-                pad(&mem_cell(process), mem_w),
-                _command_cell(process, needles, room(&branch)),
-            );
-            lines.push(match process.relation {
-                // Context is dimmed whole: it explains ownership, and nothing about it changes.
-                Relation::Ancestor => doc_style::_scoped(&doc_style::_wrap(&[&Weight::Dark]), &row),
-                _ => row,
-            });
             let kids = children.get(&pid).cloned().unwrap_or_default();
             let last = kids.len().saturating_sub(1);
             for (nth, child) in kids.into_iter().enumerate().rev() {
                 let (twig, carry) = if nth == last { ("└─ ", "   ") } else { ("├─ ", "│  ") };
                 stack.push((child, format!("{descend}{twig}"), format!("{descend}{carry}")));
             }
+            ordered.push((pid, branch));
         }
-        if relevant.values().any(|process| process.protected) {
-            lines.push(notice("* this shell's own ancestry — murder will refuse to signal these"));
-        }
-        lines
+        ordered
     }
 
     /// One process's command text: the full command line (or `[name]` for a kernel thread), with
@@ -333,8 +637,18 @@ mod commands {
     /// The whole cell is composed PLAIN first — label, then any hidden-field appendix — then
     /// clipped when `room` says so, then highlighted in one pass. That order is load-bearing:
     /// clipping coloured text would count escape bytes as width, and highlighting before the
-    /// appendix would let a later needle match inside the inserted colour codes.
+    /// appendix would let a later needle match inside the inserted colour codes. The plain half
+    /// stands alone as [`_command_plain`] because the `--choose` form needs exactly it: escape
+    /// codes inside a form option would sabotage the focus highlight.
     fn _command_cell(process: &Process, needles: &[String], room: Option<usize>) -> String {
+        let plain = _command_plain(process, needles, room);
+        match process.relation {
+            Relation::Match => _highlight(&plain, needles),
+            _ => plain, // context rows don't glow: nothing in them "matched"
+        }
+    }
+
+    fn _command_plain(process: &Process, needles: &[String], room: Option<usize>) -> String {
         let mut plain = _command_label(process);
         if process.relation == Relation::Match {
             // A needle the command text doesn't show landed elsewhere — append that field, so
@@ -362,10 +676,7 @@ mod commands {
         if let Some(room) = room {
             plain = _clip(&plain, room);
         }
-        match process.relation {
-            Relation::Match => _highlight(&plain, needles),
-            _ => plain, // context rows don't glow: nothing in them "matched"
-        }
+        plain
     }
 
     /// Cut `text` to `room` columns, marking that something was removed. Counts characters, not
@@ -755,6 +1066,16 @@ mod commands {
     /// **Refusals are printed, not silent** ([`_triage`]): PID 1, the starred ancestry, kernel
     /// threads. A row that appeared in the tree and then wasn't signalled should say why.
     fn _kill(relevant: &BTreeMap<u32, Process>) {
+        _kill_gated(relevant, true)
+    }
+
+    /// The ladder without the `[y/N]` — for a target set the user JUST confirmed through the
+    /// `--choose` form. Triage and its explanations still run; only the second question goes.
+    fn _kill_confirmed(relevant: &BTreeMap<u32, Process>) {
+        _kill_gated(relevant, false)
+    }
+
+    fn _kill_gated(relevant: &BTreeMap<u32, Process>, ask: bool) {
         use std::io::IsTerminal;
         let targets: Vec<&Process> =
             relevant.values().filter(|process| process.relation == Relation::Match).collect();
@@ -783,10 +1104,19 @@ mod commands {
             0 | 1 => String::new(),
             _ => format!(" across {}", _count(_tree_count(relevant, &killable), "process-tree", "process-trees")),
         };
-        let ask = format!("Terminate {}{span}{blast}?", _count(killable.len(), "process", "processes"));
-        if !_prompt_yN(&ask) {
-            eprintln!("murder: aborted — nothing signalled");
-            return;
+        if ask {
+            let question =
+                format!("Terminate {}{span}{blast}?", _count(killable.len(), "process", "processes"));
+            if !prompt_yN(&question) {
+                eprintln!("murder: aborted — nothing signalled");
+                return;
+            }
+        } else {
+            // Form-confirmed: restate what was agreed to, since the form scrolled away.
+            eprintln!(
+                "murder: as chosen — {}{span}{blast}",
+                _count(killable.len(), "process", "processes")
+            );
         }
         let mut waiting: Vec<u32> = Vec::new();
         for process in &killable {
@@ -868,7 +1198,11 @@ mod commands {
     /// usually means the app is asking something ("save changes?") or is hung — and the only
     /// harder verb X offers is against the whole client, which is exactly what the window hunt
     /// exists to avoid. The survivor report says so and points at the process hunt instead.
-    fn _close_windows(relevant: &BTreeMap<u32, Process>, owned: &BTreeMap<u32, Vec<(u32, String)>>) {
+    fn _close_windows(
+        relevant: &BTreeMap<u32, Process>,
+        owned: &BTreeMap<u32, Vec<(u32, String)>>,
+        choose: bool,
+    ) {
         use std::io::IsTerminal;
         let mut targets: Vec<(u32, String)> = Vec::new();
         let mut apps = std::collections::BTreeSet::new();
@@ -892,12 +1226,47 @@ mod commands {
             eprintln!("murder: refusing to close windows non-interactively — run it from a terminal");
             return;
         }
+        if choose {
+            let options: Vec<String> =
+                targets.iter().map(|(id, title)| format!("{id} · {title}")).collect();
+            let refs: Vec<&str> = options.iter().map(String::as_str).collect();
+            let mut form = terminal_choice::Form::new()
+                .title("murder — tick the windows to close")
+                .checkboxes("", &refs);
+            match terminal_choice::run(&mut form) {
+                Err(err) => return eprintln!("murder: {err}"),
+                Ok(terminal_choice::Outcome::Cancelled) => {
+                    return eprintln!("murder: aborted — nothing chosen")
+                }
+                Ok(terminal_choice::Outcome::Submitted) => {
+                    let ticked: std::collections::BTreeSet<u32> = form
+                        .items
+                        .iter()
+                        .filter_map(|item| match item {
+                            terminal_choice::Item::Checkboxes { options, checked, .. } => Some(
+                                options
+                                    .iter()
+                                    .zip(checked)
+                                    .filter(|(_, on)| **on)
+                                    .filter_map(|(option, _)| _picked_pid(option)),
+                            ),
+                            _ => None,
+                        })
+                        .flatten()
+                        .collect();
+                    targets.retain(|(id, _)| ticked.contains(id));
+                    if targets.is_empty() {
+                        return eprintln!("murder: nothing ticked — nothing to close");
+                    }
+                }
+            }
+        }
         let keeps = if apps.len() == 1 { "app keeps" } else { "apps keep" };
         let ask = format!(
             "Close {}? The owning {keeps} running, other windows included",
             _count(targets.len(), "window", "windows")
         );
-        if !_prompt_yN(&ask) {
+        if !prompt_yN(&ask) {
             eprintln!("murder: aborted — nothing closed");
             return;
         }
@@ -1390,6 +1759,163 @@ mod commands {
             assert!(row(&full).contains(&"x".repeat(300)), "unclipped shows everything");
             assert!(!row(&clipped).contains(&"x".repeat(100)), "clipped does not");
             assert!(row(&clipped).contains('…'), "and says something was removed: {:?}", row(&clipped));
+        }
+
+        // ——— the no-pattern picker ————————————————————————————————————————
+
+        fn hog(pid: u32, cpu: f64, rss: Option<u64>) -> Process {
+            let mut process = sample(pid, 1, "some-daemon --running");
+            process.name = "some-daemon".into(); // the comm name is what the checklist shows
+            process.cpu_percent = cpu;
+            process.rss_kib = rss;
+            process
+        }
+
+        /// Each shortlist caps at [`TOP_HOGS`] and is honestly its own top: a monster leading
+        /// both charts appears in BOTH, worded identically — `mirror_duplicates` on the form is
+        /// what makes those two boxes one, so the wording HAS to be the same.
+        #[test]
+        fn hog_shortlists_are_each_their_own_honest_top() {
+            let mut all = BTreeMap::new();
+            for pid in 0..20u32 {
+                // pid 10 is the monster: hottest CPU and biggest memory at once.
+                let cpu = if pid == 10 { 99.0 } else { f64::from(pid) };
+                let rss = if pid == 10 { 9_000_000 } else { 1_000 + u64::from(pid) };
+                all.insert(100 + pid, hog(100 + pid, cpu, Some(rss)));
+            }
+            let (by_cpu, by_memory) = _hog_shortlists(&all);
+            assert_eq!(by_cpu.len(), TOP_HOGS);
+            assert_eq!(by_memory.len(), TOP_HOGS);
+            assert_eq!(by_cpu[0].pid, 110, "the monster leads the CPU list");
+            assert_eq!(by_memory[0].pid, 110, "and the memory list too — no exclusion games");
+            let widths = _column_widths(by_cpu.iter().chain(by_memory.iter()).copied());
+            assert_eq!(
+                _hog_row(by_cpu[0], widths),
+                _hog_row(by_memory[0], widths),
+                "twin entries carry identical wording, or mirroring could not link them"
+            );
+        }
+
+        /// "Up to 7": a quiet system offers what it has — three, one, or nothing — without
+        /// glitching on the shortfall.
+        #[test]
+        fn hog_shortlists_survive_a_nearly_empty_system() {
+            let mut three = BTreeMap::new();
+            for pid in [5u32, 6, 7] {
+                three.insert(pid, hog(pid, f64::from(pid), Some(u64::from(pid) * 100)));
+            }
+            let (by_cpu, by_memory) = _hog_shortlists(&three);
+            assert_eq!(by_cpu.len(), 3, "all three make the CPU list");
+            assert_eq!(by_memory.len(), 3, "and the memory list — mirroring merges the twins");
+
+            let one = BTreeMap::from([(5u32, hog(5, 1.0, None))]);
+            let (by_cpu, by_memory) = _hog_shortlists(&one);
+            assert_eq!((by_cpu.len(), by_memory.len()), (1, 1));
+
+            let none = BTreeMap::new();
+            let (by_cpu, by_memory) = _hog_shortlists(&none);
+            assert!(by_cpu.is_empty() && by_memory.is_empty(), "an empty system offers nothing");
+        }
+
+        /// The picker never offers what the trigger would refuse: no box can be ticked in vain.
+        #[test]
+        fn hogs_exclude_what_could_never_be_killed() {
+            let mut all = BTreeMap::new();
+            all.insert(1, hog(1, 90.0, Some(9_999_999)));
+            let mut own = hog(50, 80.0, Some(8_888_888));
+            own.protected = true;
+            all.insert(50, own);
+            let mut kernel = hog(60, 70.0, None);
+            kernel.cmdline = String::new();
+            all.insert(60, kernel);
+            all.insert(70, hog(70, 1.0, Some(100)));
+            let (by_cpu, by_memory) = _hog_shortlists(&all);
+            assert_eq!(by_cpu.iter().map(|p| p.pid).collect::<Vec<_>>(), [70]);
+            assert_eq!(by_memory.iter().map(|p| p.pid).collect::<Vec<_>>(), [70]);
+        }
+
+        /// The `--choose` form is the tree, re-expressed: matches become checkbox options in an
+        /// anonymous group, context rows become comments, order intact, alignment on — and every
+        /// option's pid reads back out, star and all.
+        #[test]
+        fn the_choose_form_mirrors_the_tree() {
+            let relevant = _relate(world(), &[200, 250]);
+            let needles = needles(&["target"]);
+            let form = {
+                // Reuse the assembly _choose_matches performs, minus the interactive run: build
+                // rows the same way and check the shape a user would face.
+                let mut form = terminal_choice::Form::new().aligned().comment(_plain_header(&relevant));
+                let mut pending: Vec<String> = Vec::new();
+                for (pid, row) in _tree_rows(&relevant, &needles, false, false) {
+                    let process = &relevant[&pid];
+                    if process.relation == Relation::Match && !process.protected {
+                        pending.push(row);
+                        continue;
+                    }
+                    if !pending.is_empty() {
+                        let options: Vec<&str> = pending.iter().map(String::as_str).collect();
+                        form = form.checkboxes("", &options);
+                        pending.clear();
+                    }
+                    form = form.comment(row);
+                }
+                if !pending.is_empty() {
+                    let options: Vec<&str> = pending.iter().map(String::as_str).collect();
+                    form = form.checkboxes("", &options);
+                }
+                form
+            };
+            assert!(form.aligned, "tree columns need the aligned comments");
+            let mut option_pids = Vec::new();
+            let mut comment_rows = 0;
+            for item in &form.items {
+                match item {
+                    terminal_choice::Item::Comment(_) => comment_rows += 1,
+                    terminal_choice::Item::Checkboxes { label, options, .. } => {
+                        assert!(label.is_empty(), "tree groups are anonymous — no heading line");
+                        option_pids.extend(options.iter().filter_map(|o| _picked_pid(o)));
+                    }
+                    other => panic!("nothing else belongs in this form: {other:?}"),
+                }
+            }
+            option_pids.sort_unstable();
+            assert_eq!(
+                option_pids,
+                [200, 250],
+                "exactly the matches are tickable — a descendant is blast radius, not a choice"
+            );
+            assert!(comment_rows >= 4, "header, ancestors AND the descendant stay fixed");
+        }
+
+        /// The pid survives the round trip out of a STARRED pid cell too — `1234*` is how the
+        /// tree spells this shell's own ancestry.
+        #[test]
+        fn picked_pids_tolerate_the_ancestry_star() {
+            assert_eq!(_picked_pid("1234*  claude  3s  0.0  1.2MB  └─ bash"), Some(1234));
+            assert_eq!(_picked_pid("77 · quiet-daemon · 0.0% cpu · -"), Some(77));
+        }
+
+        /// The checkbox line must carry the pid back out — the whole selection rests on it —
+        /// and it wears the standard murder columns, header included.
+        #[test]
+        fn a_ticked_option_reads_back_to_its_pid() {
+            let process = hog(4242, 12.34, Some(51_300));
+            let widths = _column_widths(std::iter::once(&process));
+            let option = _hog_row(&process, widths);
+            assert_eq!(_picked_pid(&option), Some(4242), "{option:?}");
+            assert!(
+                option.contains("some-daemon --running") && option.contains("50.1MB"),
+                "the full command in the standard columns: {option:?}"
+            );
+            let header = _widths_header(widths);
+            assert_eq!(
+                header.find("COMMAND"),
+                option.find("some-daemon"),
+                "header and row share their columns: {header:?} vs {option:?}"
+            );
+            assert_eq!(_picked_pid("not a pid at all"), None);
+            // The -c options glow, and a pid matched BY pid glows in this very token.
+            assert_eq!(_picked_pid("\x1b[30;41m4242\x1b[0m*  me  1s"), Some(4242));
         }
 
         /// A zombie is done — no signal changes anything about it — so the grace-period poll must

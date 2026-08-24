@@ -4,17 +4,15 @@
 //! `#[unprefixed]`, and each reuses the upstream argument structs where it can, so the args are
 //! defined once, upstream.
 //!
-//! `dl` carries more of its own weight than the others: `vidl` downloads videos and nothing else,
-//! so acquiring and vetting browser cookies, injecting bashrs's pinned tool paths, and the
-//! supported-sites page all stay on this side of the boundary.
+//! `dl` carries a little more of its own weight than the others: injecting bashrs's pinned tool
+//! paths, pinning where imported cookies are kept, and the supported-sites page stay on this side
+//! of the boundary. Acquiring the cookies themselves does not — that moved into `vidl`, which owns
+//! the store it reads.
 
 #[bashrs_macros::category(command = ComfyReposCommand, prefix = "comfy_")]
 mod commands {
-    use crate::drivers::cookie_store;
-    use crate::support::browsers;
     use crate::support::comfy_repos::table_fancy_options;
     use crate::support::doc_render;
-    use crate::support::doc_style::{self, _header};
     use clap::Args;
     use std::io::{self, BufWriter, Write};
     use std::path::{Path, PathBuf};
@@ -204,13 +202,13 @@ mod commands {
 
     // --- dl ------------------------------------------------------------------
 
-    /// `~/.bashrs/user-data/browser_cookies` — the base holding one subdir per imported site
-    /// (`<key>/store/` + `<key>/browser.spec`). `--cookie-import` writes a site's subdir; each
-    /// `dl <url>` run reads the subdir matching the URL's site. The dir NAME belongs to
-    /// [`browsers`] (the store's on-disk shape is its concern); only the join onto the
-    /// user-data root happens here.
+    /// `~/.bashrs/user-data/browser_cookies` — the base holding one subdir per imported site.
+    /// `dl` pins this: the store's *shape* and every operation on it belong to `vidl`, but where
+    /// bashrs keeps its data is bashrs's own business. So `vidl`'s two-value
+    /// `--cookies-extract-for-domain <TARGET> <OUTPUT-DIR>` is narrowed here to the target alone
+    /// (`crate::cli::NARROWED_ARGS`) and this supplies the rest.
     fn _cookie_store_dir() -> PathBuf {
-        crate::conf::user_data_dir().join(browsers::ROOT_SUBDIR)
+        crate::conf::user_data_dir().join("browser_cookies")
     }
 
     /// The bundled copy of `name`, when bashrs actually bundles it. `tools::resolve` answers with
@@ -219,144 +217,6 @@ mod commands {
     fn _bundled(name: &str) -> Option<PathBuf> {
         let resolved = crate::tools::resolve(name);
         (resolved != *name).then(|| PathBuf::from(resolved))
-    }
-
-    /// The `--cookie-import <target>` action: resolve the target site, scan for browser cookie
-    /// stores, let the user pick one, and copy *only that site's* cookies into a per-site dir
-    /// under bashrs's data (which a running browser can't lock). Later `dl` runs on that site
-    /// use it automatically. `target` is a site keyword, a domain, or a URL. Returns whether a
-    /// usable store was imported.
-    fn _import_cookies(target: &str) -> bool {
-        // Reject a target we can't map to cookie domains (a bare word like `tiktok2`) up front —
-        // otherwise we'd build an empty store and report a misleading "no cookies found".
-        if !browsers::is_importable_target(target) {
-            eprintln!(
-                "dl: '{target}' isn't a site I can target — pass a keyword ({}), a domain (example.com), or a video URL",
-                browsers::known_site_names()
-            );
-            return false;
-        }
-        let site = browsers::resolve_target(target);
-        let home = crate::conf::home();
-        let stores = browsers::cookie_stores(&home);
-        if stores.is_empty() {
-            if browsers::any_browser_installed(&home) {
-                eprintln!("dl: found browsers but no cookie stores yet — browse (and sign in) once, then retry");
-            } else {
-                eprintln!("dl: no browser cookie stores found on this system");
-            }
-            return false;
-        }
-        let Some(store) = _pick(&stores, &site.label) else { return false };
-        let site_dir = _cookie_store_dir().join(&site.key);
-        let store_dir = match browsers::reset_site(&site_dir) {
-            Ok(dir) => dir,
-            Err(err) => {
-                eprintln!("dl: could not prepare the {} cookie store: {err}", site.label);
-                return false;
-            }
-        };
-        // Cherry-pick: only the target site's cookies are copied — never the whole DB.
-        let Some(matched) = cookie_store::filter_cookie_db(store, &store_dir, &site.domains) else {
-            let _ = browsers::forget(&site_dir);
-            eprintln!("dl: could not filter the cookie store (is the bundled python available?)");
-            return false;
-        };
-        if matched == 0 {
-            let _ = browsers::forget(&site_dir);
-            eprintln!(
-                "dl: no {} cookies in {} — sign in to {} in that browser/profile, then re-import",
-                site.label, store.label, site.label
-            );
-            return false;
-        }
-        if let Err(err) = browsers::write_spec(&site_dir, store.browser) {
-            let _ = browsers::forget(&site_dir);
-            eprintln!("dl: could not record the {} cookie store: {err}", site.label);
-            return false;
-        }
-        println!("imported {matched} {} cookie(s) from {}", site.label, store.label);
-        if site.key == "youtube" {
-            println!("note: YouTube rotates cookies on open tabs — if auth later fails, re-export via a private window (sign in, open only youtube.com/robots.txt, then close it) and re-import");
-        }
-        _report_cookie_check(&site, store.browser, matched, &site_dir)
-    }
-
-    /// Warn (in red) when the imported store a download is about to use holds only expired cookies,
-    /// so a gated fetch that's about to fail for a stale session says so up front — with the
-    /// re-import fix — rather than surfacing as a bare auth error. Silent when the store is fresh or
-    /// the check can't run.
-    fn _warn_if_cookies_expired(site_dir: &Path, site: &browsers::SiteTarget) {
-        let Some((db, kind)) = browsers::imported_db(site_dir) else { return };
-        if cookie_store::cookies_expired(&db, kind) == Some(true) {
-            eprintln!(
-                "{}",
-                doc_style::problematic(&format!(
-                    "dl: the imported {} cookies have expired — re-import with `dl --cookie-import {}`",
-                    site.label, site.key
-                ))
-            );
-        }
-    }
-
-    /// Read the freshly imported (already domain-filtered) store back through yt-dlp to confirm
-    /// the cookies actually *decrypt* — a keyring-locked Chromium store filters fine but reads
-    /// back empty — and report the concrete result, catching that failure now instead of on
-    /// every later run. Returns whether a usable store remains. When the read-back can't run
-    /// (yt-dlp not bundled yet), keeps the store on the provisional count rather than overclaiming.
-    fn _report_cookie_check(site: &browsers::SiteTarget, browser: &str, matched: usize, site_dir: &Path) -> bool {
-        // The WAL caveat holds whenever cookies came through: a copy captures only what the
-        // browser already flushed to the DB, so a sign-in from moments ago may not be in it yet.
-        let wal_note = || println!("note: if a fresh sign-in isn't recognized, fully quit the browser and re-import");
-        let Some(spec) = browsers::imported_spec(site_dir) else { return true };
-        match cookie_store::readable_cookie_count(&spec, site_dir) {
-            Some(n) if n > 0 => {
-                println!("validated — {n} {} cookie(s) readable; dl runs on {} will use them", site.label, site.label);
-                wal_note();
-                true
-            }
-            Some(_) => {
-                // Filtered rows but none decrypt → useless; drop it so future runs don't keep
-                // re-attempting a doomed read (a locked Chromium keyring can even prompt).
-                let _ = browsers::forget(site_dir);
-                if browser == "firefox" {
-                    eprintln!("dl: {matched} {} cookie(s) imported but none could be read — the profile DB may be unreadable; re-import", site.label);
-                } else {
-                    eprintln!("dl: {matched} {} cookie(s) imported but none decrypted — Chromium needs the desktop keyring unlocked; a Firefox store is more reliable. Import discarded.", site.label);
-                }
-                false
-            }
-            None => {
-                println!("(couldn't verify readability — is yt-dlp installed? the {matched} imported cookie(s) will be tried on dl runs)");
-                wal_note();
-                true
-            }
-        }
-    }
-
-    /// Prompt for one of `stores` to import `site_label`'s cookies from (auto-selecting a lone
-    /// candidate).
-    fn _pick<'a>(stores: &'a [browsers::CookieStore], site_label: &str) -> Option<&'a browsers::CookieStore> {
-        if let [only] = stores {
-            println!("one cookie store found — importing {site_label} cookies from {}", only.label);
-            return Some(only);
-        }
-        println!("{}", _header(&format!("Import {site_label} cookies from:")));
-        for (i, store) in stores.iter().enumerate() {
-            println!("  {}) {}", i + 1, store.label);
-        }
-        print!("choice [1-{}]: ", stores.len());
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line).ok()?;
-        match line.trim().parse::<usize>().ok().filter(|n| (1..=stores.len()).contains(n)) {
-            Some(n) => Some(&stores[n - 1]),
-            None => {
-                eprintln!("dl: not a listed number");
-                None
-            }
-        }
     }
 
     /// Download a video with the bundled yt-dlp. A YouTube URL (`youtube.com`, `youtu.be`, …)
@@ -368,46 +228,30 @@ mod commands {
     /// the [`vidl`] crate; this stays the thin argument shell.
     #[name("dl")]
     pub fn dl(args: DlArgs) {
-        let DlArgs { mut vidl, no_cookies, cookie_import, compatibility_help } = args;
+        let DlArgs { mut vidl, compatibility_help } = args;
         if compatibility_help {
             print!("{}", _compatibility_help());
             return;
         }
-        if let Some(target) = &cookie_import {
-            let imported = _import_cookies(target);
-            // `--cookie-import <target>` (no URL) is a setup step: import and stop. With a URL,
-            // fall through and download, now able to use what was just imported.
-            if vidl.url.is_none() {
-                std::process::exit(i32::from(!imported));
-            }
-        }
-        if vidl.url.is_none() && !vidl.taglist {
-            eprintln!("dl: a URL is required (or -t, -c, or --cookie-import)");
+        if vidl.url.is_none() && !vidl.taglist && vidl.cookies_extract_for_domain.is_none() {
+            eprintln!("dl: a URL is required (or -t, -c, or --cookies-extract-for-domain)");
             std::process::exit(2);
         }
         // Hand vidl the copies bashrs bundles and version-pins. Without this it would find
         // whatever is on PATH — which is the right default for a standalone user, and exactly
-        // what the pinning exists to avoid here.
+        // what the pinning exists to avoid here. The python matters twice over: it runs the
+        // cookie filter's sqlite work, so an extract never depends on a system interpreter.
         vidl::tools::install(vidl::tools::Tools {
             ytdlp: _bundled("yt-dlp").map(PathBuf::into_os_string),
             python: _bundled("python3").map(PathBuf::into_os_string),
             ffmpeg_dir: _bundled("ffmpeg").and_then(|bin| bin.parent().map(Path::to_path_buf)),
             js_runtime: _bundled("deno"),
         });
-        // Auto-select the per-site store matching this URL's host — a prior `--cookie-import` for
-        // this site is the standing default; an explicit `--cookies` file wins, and `--no-cookies`
-        // opts out of stored cookies entirely (download anonymously). This is the one download
-        // option bashrs decides for itself; every other flag reaches vidl as the user typed it.
-        let site = browsers::resolve_target(vidl.url.as_deref().unwrap_or_default());
-        let site_dir = _cookie_store_dir().join(&site.key);
-        let asked_for_cookies = vidl.cookies.is_some() || vidl.cookies_from_browser.is_some();
-        let imported = (!no_cookies && !asked_for_cookies)
-            .then(|| browsers::imported_spec(&site_dir))
-            .flatten();
-        if imported.is_some() {
-            _warn_if_cookies_expired(&site_dir, &site);
-            vidl.cookies_from_browser = imported;
-        }
+        // Imported cookies live under bashrs's data dir, not vidl's per-user default — the one
+        // download option bashrs decides for itself. Set unconditionally, not just on an import: a
+        // store is READ on every run, and a root known only while importing would be found once
+        // and then lost.
+        vidl.cookie_root = Some(_cookie_store_dir());
         let code = vidl::run(vidl);
         if code != 0 {
             std::process::exit(code);
@@ -418,20 +262,6 @@ mod commands {
     pub struct DlArgs {
         #[command(flatten)]
         pub vidl: vidl::Args,
-        /// Ignore cookies stored by a prior `--cookie-import` for this site and download
-        /// anonymously — useful when a site bot-walls a signed-in session (e.g. TikTok) and
-        /// sending your real cookies risks getting that session flagged
-        #[arg(long, conflicts_with_all = ["cookies", "cookies_from_browser", "cookie_import"])]
-        pub no_cookies: bool,
-        /// Import a browser's cookies for one site, so later dl runs on it authenticate. TARGET
-        /// is a site keyword (youtube, tiktok, facebook, instagram, twitter, reddit, vimeo,
-        /// twitch, niconico, bilibili, patreon, nebula, bbc), a domain (example.com), or a URL.
-        /// Only that site's cookies are copied —
-        /// never your whole cookie DB. Scans installed browsers (native/Flatpak/Snap/Nix) and
-        /// copies from your pick, so a running browser can't lock it. Runs standalone, or before
-        /// a download when a URL is also given
-        #[arg(long, value_name = "TARGET", conflicts_with = "cookies")]
-        pub cookie_import: Option<String>,
         /// Print the kinds of sites yt-dlp tends to support (like --help, but for site coverage)
         #[arg(short = 'c', long)]
         pub compatibility_help: bool,

@@ -1,14 +1,12 @@
 //! The tool drivers — feature-facing logic that *commands* the bundled tools
 //! ([`crate::tools`] acquires, resolves, and exposes them; this layer drives them): the python
 //! environment management behind the `py_*` commands, the yt-dlp driving behind `dl` (now the `vidl` crate),
-//! the companion-repo ("stainless") sync, and the cookie-DB paring behind
-//! `dl --cookie-import` ([`cookie_store`], which runs python over a browser's sqlite). A driver may use any tool and everything below;
+//! and the companion-repo ("stainless") sync. A driver may use any tool and everything below;
 //! the command categories stay thin argument shells over drivers. Split from `tools` because
 //! the two change at different speeds — plumbing is stable, drivers grow with every feature.
 
 pub mod python;
 pub mod carstay;
-pub mod cookie_store;
 pub mod stainless;
 
 /// SIDE EFFECTS — COMPILE.sh's companion-provisioning step (the hidden `install-stainless`

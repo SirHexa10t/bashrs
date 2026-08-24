@@ -6,22 +6,21 @@
 //! ([`streamgrep`]), a
 //! recursive tree grep ([`treegrep`] — its `--delve` binary decoders are a private child), output
 //! capture and the stdout colour policy ([`shell`]), filename-stamp formatting ([`preferences`]),
-//! privilege escalation ([`superuser`]), the system package-manager registry
-//! ([`package_management`]), and browser cookie-store discovery ([`browsers`]).
+//! privilege escalation ([`superuser`]), and the system package-manager registry
+//! ([`package_management`]).
 
 pub mod ai_meta;
 pub mod args;
-pub mod browsers;
 pub mod comfy_repos;
 pub mod doc_render;
 pub mod doc_style;
 pub mod exec;
 pub mod input;
 pub mod net;
-pub mod package_management;
-pub mod prog_langs;
+// The software-world resource lists moved to their own extractable crate; re-exported here so
+// every `crate::support::…` call site keeps reading naturally.
+pub use software_inventory::{package_management, prog_langs};
 pub mod preferences;
-pub mod prompt;
 pub mod shell;
 pub mod streamgrep;
 pub mod superuser;

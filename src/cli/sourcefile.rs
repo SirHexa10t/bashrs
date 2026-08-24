@@ -7,7 +7,7 @@
 //! them into the one sourced file, plus the per-command flag lists TAB-completion asks for.
 
 use clap::Subcommand;
-use super::hide_pinned;
+use super::adjust_pinned;
 use crate::categories::autogen_lookup::{GgCommand, GrepCommand};
 use crate::categories::autogen_styles::StylizedEchoCommand;
 use crate::categories::bashrs::BashrsCommand;
@@ -95,7 +95,7 @@ fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 16] {
         ("comfy_repos", ComfyReposCommand::augment_subcommands(clap::Command::new("comfy_repos")),
             ComfyReposCommand::shell_functions().to_vec()),
     ];
-    categories.map(|(label, cmd, shell_fns)| (label, hide_pinned(cmd), shell_fns))
+    categories.map(|(label, cmd, shell_fns)| (label, adjust_pinned(cmd), shell_fns))
 }
 
 /// Space-separated `-short --long` names of `command`'s arguments (matched by clap name or visible

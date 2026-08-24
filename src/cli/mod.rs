@@ -150,9 +150,10 @@ impl Command {
     }
 }
 
-/// Flags a command forces on, hidden from its help and completion — still *accepted*, since
-/// passing one is a harmless no-op (it's already on). Keyed by clap name and arg ID (the field
-/// name). The `g<N>`/`gg<N>` variants aren't listed: they REMOVE their pinned `-C` outright by
+/// Arguments a command settles for itself, hidden from its help and completion. Mostly flags it
+/// forces on, where passing one is a harmless no-op (it's already on); `dl`'s `--cookie-dir` is
+/// the one that carries a value, and `dl` overwrites it, because where bashrs keeps its data is
+/// not the caller's to move. Keyed by clap name and arg ID (the field name). The `g<N>`/`gg<N>` variants aren't listed: they REMOVE their pinned `-C` outright by
 /// taking the `*Base` argument structs (see [`crate::support::args`]).
 const HIDDEN_PINNED: &[(&str, &[&str])] = &[
     ("GG", &["delve", "lean"]),
@@ -161,9 +162,22 @@ const HIDDEN_PINNED: &[(&str, &[&str])] = &[
     ("autokey_reformat", &["format"]),
 ];
 
-/// Hide each [`HIDDEN_PINNED`] flag on its command. Applied everywhere the command tree is built —
-/// parsing ([`parse`]) and generation (`sourcefile::category_commands`) — so help, wrappers, and
-/// completion all tell one truth.
+/// Arguments a command *narrows*: upstream takes more values than this shell exposes, because
+/// bashrs supplies the rest itself. Keyed by clap name, arg ID, the number of values to expose,
+/// and the value names to show for them.
+///
+/// One entry today. `vidl` spells it `--cookies-extract-for-domain <TARGET> <OUTPUT-DIR>`, which is
+/// right for a tool with no data directory of its own; bashrs has one, and where it keeps imported
+/// cookies is not the caller's to move. So `dl` takes the target alone and fills the directory in
+/// (see [`crate::categories::comfy_repos::dl`]) — narrowed rather than hidden, because the target
+/// half is still very much the caller's to give.
+const NARROWED_ARGS: &[(&str, &str, usize, &[&str])] =
+    &[("dl", "cookies_extract_for_domain", 1, &["TARGET"])];
+
+/// Apply both upstream-argument adjustments: hide each [`HIDDEN_PINNED`] flag on its command, and
+/// narrow each [`NARROWED_ARGS`] one to the values this shell exposes. Applied everywhere the
+/// command tree is built — parsing ([`parse`]) and generation (`sourcefile::category_commands`) —
+/// so help, wrappers, and completion all tell one truth.
 ///
 /// Walks the subcommands rather than reaching for each pinned name by hand: `mut_subcommand`
 /// removes its target and pushes it back on the end, so naming them dealt every pinned command to
@@ -171,20 +185,28 @@ const HIDDEN_PINNED: &[(&str, &[&str])] = &[
 /// (`backup_find_bitrot` stranded away from `backup_diff`). Mapping rewrites them where they
 /// stand, and a category that doesn't hold a given command simply never matches it — which is
 /// also what keeps `mut_arg` from conjuring a command into the wrong category.
-fn hide_pinned(cmd: clap::Command) -> clap::Command {
+fn adjust_pinned(cmd: clap::Command) -> clap::Command {
     cmd.mut_subcommands(|sub| {
-        let pinned = HIDDEN_PINNED.iter().find(|(name, _)| *name == sub.get_name()).map(|&(_, args)| args);
-        match pinned {
+        let name = sub.get_name().to_string();
+        let hidden =
+            HIDDEN_PINNED.iter().find(|(pinned, _)| *pinned == name).map(|&(_, args)| args);
+        let sub = match hidden {
             Some(args) => args.iter().fold(sub, |sub, arg| sub.mut_arg(*arg, |a| a.hide(true))),
             None => sub,
-        }
+        };
+        NARROWED_ARGS
+            .iter()
+            .filter(|(narrowed, ..)| *narrowed == name)
+            .fold(sub, |sub, &(_, arg, count, value_names)| {
+                sub.mut_arg(arg, |a| a.num_args(count).value_names(value_names))
+            })
     })
 }
 
-/// Parse argv against the adjusted command tree ([`hide_pinned`]) — the binary's normal entry,
+/// Parse argv against the adjusted command tree ([`adjust_pinned`]) — the binary's normal entry,
 /// called by [`crate::run`] once the re-exec handlers have passed on the invocation.
 pub fn parse() -> Cli {
-    let mut matches = hide_pinned(Cli::command()).get_matches();
+    let mut matches = adjust_pinned(Cli::command()).get_matches();
     Cli::from_arg_matches_mut(&mut matches).unwrap_or_else(|err| err.exit())
 }
 
@@ -215,14 +237,14 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
-        hide_pinned(Cli::command()).debug_assert(); // the adjusted tree the binary actually parses
+        adjust_pinned(Cli::command()).debug_assert(); // the adjusted tree the binary actually parses
     }
 
     #[test]
     fn hidden_pinned_flags_are_real_and_hidden() {
         // `mut_arg` silently CREATES a missing arg, so a drifted field name would ghost a fresh
         // hidden arg instead of hiding the real flag — the long/short assertion catches that.
-        let cmd = hide_pinned(Cli::command());
+        let cmd = adjust_pinned(Cli::command());
         for &(name, args) in HIDDEN_PINNED {
             let sub = cmd.find_subcommand(name).unwrap_or_else(|| panic!("`{name}` not found"));
             for id in args {
@@ -236,6 +258,41 @@ mod tests {
                     "`{name}`'s `{id}` looks like a ghost created by `mut_arg` — the arg ID drifted"
                 );
             }
+        }
+    }
+
+    /// A narrowed argument must really be narrower than upstream, or the entry is a no-op that
+    /// reads like a guarantee. `mut_arg` would also happily invent a missing arg, so the value
+    /// names are checked too — a drifted ID would otherwise ghost a fresh one and leave the real
+    /// flag at its upstream width.
+    #[test]
+    fn narrowed_args_take_fewer_values_here_than_upstream() {
+        let adjusted = adjust_pinned(Cli::command());
+        let upstream = Cli::command();
+        for &(name, id, count, value_names) in NARROWED_ARGS {
+            let sub = adjusted.find_subcommand(name).unwrap_or_else(|| panic!("`{name}` not found"));
+            let arg = sub
+                .get_arguments()
+                .find(|a| a.get_id().as_str() == id)
+                .unwrap_or_else(|| panic!("`{name}` has no arg `{id}`"));
+            assert!(arg.get_long().is_some(), "`{name}`'s `{id}` is a ghost — the arg ID drifted");
+            assert_eq!(
+                arg.get_num_args().map(|range| range.max_values()),
+                Some(count),
+                "`{name}`'s `{id}` should expose {count} value(s)"
+            );
+            assert_eq!(arg.get_value_names().map(<[_]>::len), Some(value_names.len()));
+
+            let before = upstream
+                .find_subcommand(name)
+                .and_then(|sub| sub.get_arguments().find(|a| a.get_id().as_str() == id))
+                .and_then(clap::Arg::get_num_args)
+                .map(|range| range.max_values())
+                .unwrap_or(0);
+            assert!(
+                before > count,
+                "`{name}`'s `{id}` already took {count} upstream — narrowing it promises nothing"
+            );
         }
     }
 
@@ -261,7 +318,7 @@ mod tests {
         };
         assert_eq!(
             names(Cli::command()),
-            names(hide_pinned(Cli::command())),
+            names(adjust_pinned(Cli::command())),
             "hiding pinned flags reordered the command list"
         );
     }
@@ -293,7 +350,7 @@ mod tests {
         );
 
         // After pinning: reformat offers one flag fewer, and nothing else moved.
-        let pinned = hide_pinned(Cli::command());
+        let pinned = adjust_pinned(Cli::command());
         let offered = ids(&sub(&pinned, "autokey_check"), true);
         let forced = ids(&sub(&pinned, "autokey_reformat"), true);
         assert!(forced.is_subset(&offered), "pinning may only withdraw flags, never add them");

@@ -182,8 +182,6 @@ pub struct EchoArgs {
 
 #[cfg(test)]
 mod tests {
-    use clap::Args as _;
-
     use super::*;
 
     /// The reason skips match components and not substrings: `target/bebuggers` starts with

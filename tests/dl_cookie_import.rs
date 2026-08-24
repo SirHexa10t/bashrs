@@ -139,11 +139,11 @@ impl Rig {
     }
 
     fn import(&self, mode: &str, target: &str) -> Output {
-        self.run(mode, &["dl", "--cookie-import", target], None)
+        self.run(mode, &["dl", "--cookies-extract-for-domain", target], None)
     }
 
     fn import_with_stdin(&self, mode: &str, target: &str, stdin: &str) -> Output {
-        self.run(mode, &["dl", "--cookie-import", target], Some(stdin))
+        self.run(mode, &["dl", "--cookies-extract-for-domain", target], Some(stdin))
     }
 
     /// The per-site store dir bashrs writes under this rig's HOME.
@@ -295,7 +295,7 @@ fn cookie_import_with_a_url_falls_through_to_a_download_using_the_fresh_store() 
     let into = rig.into.to_string_lossy().into_owned();
     let out = rig.run(
         "ok",
-        &["dl", "--cookie-import", "youtube", YT_VIDEO, "--into", &into],
+        &["dl", "--cookies-extract-for-domain", "youtube", YT_VIDEO, "--into", &into],
         None,
     );
     let all = text(&out);
@@ -376,7 +376,7 @@ con.commit()"#,
     let all = text(&out);
     assert!(out.status.success(), "the warning must not block the download: {all}");
     assert!(
-        all.contains("cookies have expired") && all.contains("--cookie-import youtube"),
+        all.contains("cookies have expired") && all.contains("--cookies-extract-for-domain youtube"),
         "the red heads-up names the fix: {all}"
     );
 
@@ -470,8 +470,13 @@ fn an_explicitly_named_cookie_source_beats_the_auto_selected_store() {
     };
 
     // A --cookies file: the store must not also be sent, or yt-dlp gets two conflicting sources.
-    let file = run("prec_file", &["--cookies", "/tmp/nonexistent-jar.txt"]);
-    assert!(file.contains("--cookies /tmp/nonexistent-jar.txt"), "the file is passed:\n{file}");
+    // The jar has to actually exist — vidl checks before downloading, so that a bad path is
+    // reported up front instead of as a Python codec error four lines into the first attempt.
+    let jar = std::env::temp_dir().join(format!("bashrs_dl_jar_{}.txt", std::process::id()));
+    std::fs::write(&jar, "# Netscape HTTP Cookie File\n").unwrap();
+    let jar_arg = jar.display().to_string();
+    let file = run("prec_file", &["--cookies-use", &jar_arg]);
+    assert!(file.contains(&format!("--cookies {jar_arg}")), "the file is passed:\n{file}");
     assert!(
         !file.contains("--cookies-from-browser"),
         "an explicit jar must suppress the auto-selected store:\n{file}"
@@ -479,7 +484,7 @@ fn an_explicitly_named_cookie_source_beats_the_auto_selected_store() {
 
     // An explicit --cookies-from-browser: passed through verbatim, NOT replaced by the store's
     // own spec (which would silently point at a different profile than the user asked for).
-    let spec = run("prec_spec", &["--cookies-from-browser", "chrome:/somewhere/else"]);
+    let spec = run("prec_spec", &["--cookies-use", "chrome:/somewhere/else"]);
     assert!(
         spec.contains("--cookies-from-browser chrome:/somewhere/else"),
         "the user's spec reaches yt-dlp unchanged:\n{spec}"
@@ -488,6 +493,7 @@ fn an_explicitly_named_cookie_source_beats_the_auto_selected_store() {
         !spec.contains("browser_cookies/youtube"),
         "the auto-selected store must not override an explicit spec:\n{spec}"
     );
+    let _ = std::fs::remove_file(&jar);
 }
 
 /// `--no-cookies` is refused alongside every way of asking FOR cookies, rather than silently
@@ -497,9 +503,9 @@ fn an_explicitly_named_cookie_source_beats_the_auto_selected_store() {
 fn no_cookies_conflicts_with_every_way_of_supplying_them() {
     let rig = Rig::new("conflicts", None);
     for other in [
-        vec!["--cookies", "/tmp/j.txt"],
-        vec!["--cookies-from-browser", "firefox"],
-        vec!["--cookie-import", "youtube"],
+        vec!["--cookies-use", "/tmp/j.txt"],
+        vec!["--cookies-use", "firefox"],
+        vec!["--cookies-extract-for-domain", "youtube"],
     ] {
         let mut args = vec!["dl", "https://www.youtube.com/watch?v=stubvid0000", "--no-cookies"];
         args.extend_from_slice(&other);
