@@ -25,17 +25,29 @@ struct Tool {
     bins: &'static [(&'static str, &'static str)],
     /// How the bundle is acquired and kept current.
     acquire: Acquire,
-    /// Which `always_bundle_*` configuration group governs it.
+    /// Which configuration group governs whether it's bundled ([`Group`]).
     group: Group,
+    /// A one-time action to run right after this tool is *freshly* fetched (install or update) —
+    /// `None` for the tools that need nothing beyond their binary. Fired only on a fetch (see
+    /// [`fetch::sync`]), so it does not repeat on later compiles: git-lfs registers Git's global
+    /// LFS filters here, the step its binary alone doesn't do.
+    post_install: Option<fn(&std::path::Path)>,
 }
 
-/// The configuration groups of [`Tool`]s — each with its own `[tools] always_bundle_*` flag.
-/// Languages default to bundled (bashrs commands and companion repos run on them — near
-/// non-negotiable); utilities default to bundle-only-what's-missing.
+/// The configuration groups of [`Tool`]s.
+///
+/// [`Language`](Group::Language) and [`Utility`](Group::Utility) are things bashrs's own commands
+/// depend on, each with an `[tools] always_bundle_*` flag: languages default to bundled (bashrs
+/// and its companion repos run on them — near non-negotiable), utilities to
+/// bundle-only-what's-missing. [`Extra`](Group::Extra) is neither — a useful tool nothing bashrs
+/// calls, off unless `[tools] install_extras` opts in, and then bundled only where the system
+/// lacks it. The distinction is the whole point of the group: an extra failing to install can
+/// never break a bashrs command, because no command relies on one.
 #[derive(Clone, Copy)]
 enum Group {
     Language,
     Utility,
+    Extra,
 }
 
 /// How a tool's bundle comes to exist (and updates). The URL functions take an optional
@@ -64,12 +76,14 @@ const TOOLS: &[Tool] = &[
         // BtbN's rolling `latest` URL can't name an exact build — the dated autobuild tag can.
         acquire: Acquire::Archive { url: fetch::ffmpeg_url, dated_tag: Some(fetch::ffmpeg_dated_tag) },
         group: Group::Utility,
+        post_install: None,
     },
     Tool {
         dir: "yt-dlp",
         bins: &[("yt-dlp", "bin/yt-dlp")],
         acquire: Acquire::Binary(fetch::ytdlp_url),
         group: Group::Utility,
+        post_install: None,
     },
     // uv's archive carries the binaries at its root (no bin/); it manages the python below —
     // which is why it belongs to the Language group despite being a utility in shape.
@@ -78,12 +92,14 @@ const TOOLS: &[Tool] = &[
         bins: &[("uv", "uv"), ("uvx", "uvx")],
         acquire: Acquire::Archive { url: fetch::uv_url, dated_tag: None },
         group: Group::Language,
+        post_install: None,
     },
     Tool {
         dir: "python",
         bins: &[("python3", "bin/python3")],
         acquire: Acquire::UvVenv { python: "3.14" },
         group: Group::Language,
+        post_install: None,
     },
     // deno exists here to serve yt-dlp: YouTube extraction needs a JS runtime (EJS) or formats
     // go missing. Listed after python on purpose — its release is a .zip, and the fetcher
@@ -93,6 +109,21 @@ const TOOLS: &[Tool] = &[
         bins: &[("deno", "deno")],
         acquire: Acquire::Archive { url: fetch::deno_url, dated_tag: None },
         group: Group::Utility,
+        post_install: None,
+    },
+    // --- Extras: useful, but nothing above depends on them (see `Group::Extra`). Off by default;
+    // `[tools] install_extras` opts in, and then only where the system lacks the tool.
+    // git-lfs is Git's large-file support: the bundled binary does the work, and `post_install`
+    // runs `git lfs install` once (on first fetch) to register Git's global LFS filters, without
+    // which LFS checkouts come down as pointer files. That one step edits ~/.gitconfig, which is
+    // why it's gated behind the same opt-in as the install itself. The tarball unpacks to
+    // `git-lfs-<ver>/` (root stripped on unpack, like uv), leaving the binary at the dir's root.
+    Tool {
+        dir: "git-lfs",
+        bins: &[("git-lfs", "git-lfs")],
+        acquire: Acquire::Archive { url: fetch::gitlfs_url, dated_tag: None },
+        group: Group::Extra,
+        post_install: Some(fetch::activate_git_lfs),
     },
 ];
 
@@ -222,6 +253,21 @@ mod tests {
         let uv = TOOLS.iter().position(|tool| tool.dir == "uv").expect("uv row");
         let python = TOOLS.iter().position(|tool| tool.dir == "python").expect("python row");
         assert!(uv < python, "sync bundles in table order; the python venv step runs uv");
+    }
+
+    /// A post-install action is the exception, not the rule: a dependency tool is done once its
+    /// binary is in place, and only git-lfs needs the extra `git lfs install` step. Pinning that
+    /// here keeps a stray hook (which runs a process on every fresh fetch) from being added by
+    /// habit, and documents that the extras group is where such a step belongs.
+    #[test]
+    fn only_git_lfs_carries_a_post_install_step() {
+        let with_hook: Vec<&str> =
+            TOOLS.iter().filter(|tool| tool.post_install.is_some()).map(|tool| tool.dir).collect();
+        assert_eq!(with_hook, ["git-lfs"], "only git-lfs activates anything after install");
+        // And it's an Extra — a post-install that could touch user config has no place on a
+        // dependency the user never opted into.
+        let git_lfs = TOOLS.iter().find(|tool| tool.dir == "git-lfs").expect("git-lfs row");
+        assert!(matches!(git_lfs.group, Group::Extra));
     }
 
     #[test]

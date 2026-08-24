@@ -27,7 +27,7 @@ use crate::categories::processes::ProcessesCommand;
 use crate::categories::project::ProjectCommand;
 use crate::categories::python::PythonCommand;
 use crate::categories::anti_ai::AntiAiCommand;
-use crate::categories::session::SessionCommand;
+use crate::categories::shell::ShellCommand;
 use crate::categories::styles::StyleCommand;
 use crate::conf::{config_file, environment, greeting, keybinds};
 use crate::conf::RELOAD_EXIT_CODE;
@@ -81,10 +81,10 @@ fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 16] {
             ProjectCommand::shell_functions().to_vec()),
         ("python", PythonCommand::augment_subcommands(clap::Command::new("python")),
             PythonCommand::shell_functions().to_vec()),
-        // `session_new`/`session_bare` are `#[shell_body]` (they `exec` the calling shell);
-        // `session_sudo` is an ordinary command with a generated wrapper.
-        ("session", SessionCommand::augment_subcommands(clap::Command::new("session")),
-            SessionCommand::shell_functions().to_vec()),
+        // `shell_new`/`shell_bare` are `#[shell_body]` (they `exec` the calling shell);
+        // `shell_sudo` and `print_args` are ordinary commands with generated wrappers.
+        ("shell", ShellCommand::augment_subcommands(clap::Command::new("shell")),
+            ShellCommand::shell_functions().to_vec()),
         // One `lookup` group. The generated `g`/`gg` families come first so the hand-written
         // commands can follow what they are built on: `GG` is `gg --delve` and `GGG` is `GG`
         // plus more, which only reads that way listed after `gg`. Within that last enum `hg`
@@ -273,7 +273,7 @@ pub(super) fn wrappers() -> String {
                 .filter(|a| !a.is_empty())
                 .map(|a| format!("  # {a}"))
                 .unwrap_or_default();
-            // Run the suffix (e.g. `session_new`) only when the command signals a
+            // Run the suffix (e.g. `shell_new`) only when the command signals a
             // reload by exiting RELOAD_EXIT_CODE. A real success does; clap's
             // `--help` (exit 0) and any failure (non-zero) do not.
             let suffix = wrapper_suffix(real)
@@ -400,11 +400,11 @@ pub(super) fn wrappers() -> String {
         // that don't maintain PS1's invariant (non-interactive zsh keeps a default PS1).
         // `return 0` explicitly, so the early-out doesn't parrot the caller's stale status.
         out += "\ncase $- in *i*) ;; *) return 0 ;; esac  # interactive shells only — non-interactive contexts must inherit nothing\n";
-        // The bashrs-free escape hatch: `session_bare` starts a shell with this flag exported,
+        // The bashrs-free escape hatch: `shell_bare` starts a shell with this flag exported,
         // and this guard CONSUMES it — unset, then return — so the shell comes up without the
         // surface and without the flag lingering in its environment. One-shot by design: any
         // later shell (or re-sourcing this file by hand) arms bashrs again.
-        out += "[ -n \"$_BASHRS_BARE\" ] && { unset _BASHRS_BARE ; return 0; }  # session_bare: skip bashrs for THIS shell, flag consumed (any new shell arms again)\n";
+        out += "[ -n \"$_BASHRS_BARE\" ] && { unset _BASHRS_BARE ; return 0; }  # shell_bare: skip bashrs for THIS shell, flag consumed (any new shell arms again)\n";
         // Bail early (before defining anything) if the binary isn't present. `return 0`, not a
         // bare `return`: bare would silently forward the failed test's status 1 to whatever
         // sourced this file, and a not-yet-installed bashrs is a quiet no-op, not an error.
@@ -512,7 +512,7 @@ mod tests {
         has("backup_find_bitrot() { \"$HOME/.bashrs/bashrs\" backup_find_bitrot \"$@\"; }"); // comfy: pinned variant
         // bashrs_compile starts a fresh session only when compile signals a reload (exit code)
         has(&format!(
-            "bashrs_compile() {{ \"$HOME/.bashrs/bashrs\" bashrs_compile \"$@\"; [ \"$?\" -eq {RELOAD_EXIT_CODE} ] && session_new; }}"
+            "bashrs_compile() {{ \"$HOME/.bashrs/bashrs\" bashrs_compile \"$@\"; [ \"$?\" -eq {RELOAD_EXIT_CODE} ] && shell_new; }}"
         ));
         has("bashrs_sourcefile() { \"$HOME/.bashrs/bashrs\" bashrs_sourcefile \"$@\"; }");
         has("bashrs_configure() { \"$HOME/.bashrs/bashrs\" bashrs_configure \"$@\"; }");
@@ -528,16 +528,16 @@ mod tests {
     #[test]
     fn wrappers_include_session_function_and_bash_guarded_keybind() {
         let script = wrappers();
-        assert!(script.contains("session_new() { exec bash; }"), "session_new missing");
-        assert!(script.contains("session_bare() { _BASHRS_BARE=1 exec bash; }"), "session_bare missing");
+        assert!(script.contains("shell_new() { exec bash; }"), "shell_new missing");
+        assert!(script.contains("shell_bare() { _BASHRS_BARE=1 exec bash; }"), "shell_bare missing");
         // The one-shot guard: consume the flag AND return, so a bare session starts with a clean
         // environment and the very next shell arms bashrs again.
         assert!(
             script.contains("[ -n \"$_BASHRS_BARE\" ] && { unset _BASHRS_BARE ; return 0; }"),
             "the flag-consuming bare guard must sit at the sourcefile's top"
         );
-        assert!(script.contains(r#"bind '"\en": "session_new\n"'"#), "ALT+N keybind missing");
-        assert!(script.contains(r#"bind '"\e\C-n": "session_bare\n"'"#), "CTRL+ALT+N keybind missing");
+        assert!(script.contains(r#"bind '"\en": "shell_new\n"'"#), "ALT+N keybind missing");
+        assert!(script.contains(r#"bind '"\e\C-n": "shell_bare\n"'"#), "CTRL+ALT+N keybind missing");
         // Every bind carries a comment naming the chord as a keyboard labels it, plus what it
         // runs — sourced from the bound command's own description, so it cannot drift.
         assert!(script.contains("# Alt+N: Start a fresh shell session"), "bind comment missing");

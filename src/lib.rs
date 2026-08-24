@@ -13,7 +13,7 @@
 //!
 //! Higher layers never leak downward. Instead, each subsystem *contributes* its shell surface as
 //! strings — categories their command wrappers, [`tools`] its PATH line and companion aliases,
-//! [`categories::session`] its raw-shell commands — and [`cli`] assembles them all into the
+//! [`categories::shell`] its raw-shell commands — and [`cli`] assembles them all into the
 //! sourcefile. `tests/layering.rs` enforces the arrow directions.
 
 pub mod categories;

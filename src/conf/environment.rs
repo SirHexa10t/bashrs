@@ -1,5 +1,5 @@
 //! Environment-variable and prompt settings emitted into `sourcefile.sh`. Like
-//! [`crate::categories::session`], this is raw shell (not a `#[category]`), but authored as a small
+//! [`crate::categories::shell`], this is raw shell (not a `#[category]`), but authored as a small
 //! table — variable, shell-quoted value, and comment — that [`settings`] renders into
 //! `export` lines. Options that aren't on by default are kept commented out *in this
 //! table*, as a reminder to whoever edits it that they're there to switch on.

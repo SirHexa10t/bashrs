@@ -5,7 +5,8 @@
 //! resolution ([`input`]), the network-probing engines ([`net`]), an in-process stream grep
 //! ([`streamgrep`]), a
 //! recursive tree grep ([`treegrep`] — its `--delve` binary decoders are a private child), output
-//! capture and the stdout colour policy ([`shell`]), filename-stamp formatting ([`preferences`]),
+//! capture and the stdout colour policy ([`shell`]), shell-word quoting shared by the
+//! string-displaying commands ([`shell_quote`]), filename-stamp formatting ([`preferences`]),
 //! privilege escalation ([`superuser`]), and the system package-manager registry
 //! ([`package_management`]).
 
@@ -22,6 +23,7 @@ pub mod net;
 pub use software_inventory::{package_management, prog_langs};
 pub mod preferences;
 pub mod shell;
+pub mod shell_quote;
 pub mod streamgrep;
 pub mod superuser;
 // Data, not a helper module: the `g`/`gg` search-family generation data plus the `BasicLook`

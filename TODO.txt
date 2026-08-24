@@ -32,8 +32,6 @@ Add Spotify to `dl`
 taking inventory of games-library
 
 
-Add in key-bind programming and auto-clicking tool `sequencer`
-
 USB-cable speed-tester 
     diagnosis for:
         full-functionality (no inner tears)
@@ -48,6 +46,10 @@ android de-bloating
 dl:
     add subtitle-scrubbing function? (or is it attached in a standard way and can be put in bashrs's `media`?)
     test if .mkv is truly more compact, verify if it's really less lossy (are we converting to it post-download?)
+    download from twitter
+        support downloading images
+        entire accounts' history, including txt files (post, reception(likes/retweets), community notes), videos/gifs, images
+    
 
 
 jukebox:
@@ -76,9 +78,6 @@ files:
     `gui` function (error message if running headless)
     mountpoints command + configuration file
 
-add process-killing command (looks-up string, offers matches, allows choosing which in `form`)
-
-y/n , Y/n , y/N functions
 
 
 
@@ -94,8 +93,6 @@ profile-apply (autoclick) in comfygurations (use form?)
 at some point, move out the document formatting code into Carl (non-Marks).
 
 alias cat command (show line numbers, maybe color text)
-
-use `form` on `bashrs_configure` (alt+w)
 
 Calendaric notifications could go into comfygurations
     maybe forms would need to include list-editing
@@ -120,11 +117,5 @@ Get a rusty htop, or implement own:
     probably in a project of its own
 ricing module
     `ricing_backup` would save aside the dot-files and files from /etc/
-
-
-add a `shell` category, and put in it `print_args` (or `shell_args`? `debug_args`? `args_pring`?) function, which enumerates and prints the args that you give it (quoted, so that spaces would be seen)
-    it might sound useless, but it can help read how your shell expands your args (demonstrated here: https://www.youtube.com/watch?v=w-PgWIZm5Qs )
-    also, check if anything in the project belongs in `shell` category
-
 
 

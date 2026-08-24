@@ -25,6 +25,7 @@ use std::path::PathBuf;
 /// signal a reload.
 pub const RELOAD_EXIT_CODE: i32 = 97;
 
+
 /// The user's home directory (empty path if somehow unset — callers join onto it). The one
 /// place bashrs reads `$HOME` in Rust.
 pub(crate) fn home() -> PathBuf {

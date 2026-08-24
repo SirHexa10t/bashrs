@@ -1,4 +1,6 @@
-# bashrs configuration — edit by hand (ALT+W), read when commands and compiles run.
+# bashrs configuration — ticked on and off by `bashrs_configure` (ALT+W), read when
+# commands and compiles run. `bashrs_configure -e` opens this file in your editor, for
+# adding your own keys or anything the form doesn't show.
 # When bashrs adds or renames settings, an outdated file is archived as configrs.toml.<time>.old
 # and a fresh one is written; merge your values back, then delete the .old file.
 
@@ -11,3 +13,8 @@ always_bundle_languages = true
 # Bundle the utility programs (ffmpeg, yt-dlp, deno) even when the system provides them.
 # false: bundle only what the system lacks.
 always_bundle_utilities = true
+# Install optional extras — tools bashrs never calls itself, but can set up for you instead of a
+# manual install. Off by default (opt-in); when on, each is bundled only if the system lacks it.
+# Currently: git-lfs (Git large-file support) — after it installs, run `git lfs install` once to
+# activate Git's LFS filters for your checkouts.
+install_extras = false

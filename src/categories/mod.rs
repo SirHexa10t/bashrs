@@ -1,7 +1,8 @@
 //! The command categories — each module groups related commands (via the
 //! `#[category]` macro). Assembled into the CLI and `sourcefile.sh` by [`crate::cli`].
-//! One exception in mechanism, not in nature: [`session`] holds commands that must run in the
-//! shell itself, contributed as raw shell functions rather than clap commands.
+//! One exception in mechanism, not in nature: [`shell`] holds, among ordinary commands, a few
+//! that must run in the shell itself, contributed as raw shell functions rather than clap
+//! commands.
 
 pub mod autogen_lookup;
 pub mod autogen_styles;
@@ -19,5 +20,5 @@ pub mod packages;
 pub mod processes;
 pub mod project;
 pub mod python;
-pub mod session;
+pub mod shell;
 pub mod styles;

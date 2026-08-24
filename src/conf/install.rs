@@ -76,7 +76,79 @@ pub fn install_shell(content: &str) {
         println!("Note: neither ~/.bashrc nor ~/.zshrc exists; nothing was wired up.");
     }
     println!();
-    println!("Done. Open a new shell, or run:  . \"{}\"", sourcefile.display());
+    // A `bashrs_compile` (the everyday recompile) reloads the shell for you the instant this
+    // returns, so telling the user to open one themselves is wrong — it already happens. Only a
+    // run with no reload coming (a first-time `./COMPILE.sh`, or the script run by hand) needs
+    // the manual instruction. Which one this is is read off the process tree, where the fact
+    // already lives — see [`reload_follows`].
+    println!("{}", activation_line(reload_follows(), &sourcefile));
+}
+
+/// The install's closing line. When a shell reload will follow (the `bashrs_compile` flow),
+/// say so — the prompt is about to reset under the user, and asking them to act would contradict
+/// what's happening. Otherwise (a first-time `./COMPILE.sh`), name the one step that activates it.
+///
+/// The backticks around the command are display only: this string leaves through `println!`, not
+/// through a shell, so nothing here is ever evaluated — unlike the sourcefile's stale-config nag,
+/// where a backtick once meant command substitution at every prompt.
+fn activation_line(reload_follows: bool, sourcefile: &Path) -> String {
+    if reload_follows {
+        "Done — reloading your shell.".to_string()
+    } else {
+        format!("Done. Open a new shell, or run:  `. \"{}\"`", sourcefile.display())
+    }
+}
+
+/// Whether the shell will reload on its own once this install returns — true exactly when a
+/// `bashrs_compile` invocation sits in this process's ancestry (its generated wrapper catches the
+/// reload exit code and runs `shell_new`). Read straight off `/proc`'s parent chain rather than
+/// signalled through an env var: the process tree already carries the fact, and a second channel
+/// for it could only drift or leak. The chain here is short — install-shell ← bash(COMPILE.sh) ←
+/// bashrs(bashrs_compile) ← the user's shell — but the walk is bounded anyway.
+fn reload_follows() -> bool {
+    ancestor_argvs().into_iter().any(|argv| is_bashrs_compile(&argv))
+}
+
+/// The argv of each ancestor process, nearest first, walked via `/proc/<pid>/stat`'s ppid field
+/// (parsed past the LAST `)` — the comm before it may itself contain parentheses) up to init.
+/// Bounded, and any unreadable link ends the walk — a truncated answer degrades to the manual
+/// closing line, never to a wrong claim of a reload.
+fn ancestor_argvs() -> Vec<Vec<String>> {
+    let mut argvs = Vec::new();
+    let mut pid = std::process::id();
+    for _ in 0..16 {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { break };
+        let Some(after_comm) = stat.rsplit(')').next() else { break };
+        let Some(ppid) = after_comm.split_whitespace().nth(1).and_then(|f| f.parse::<u32>().ok())
+        else {
+            break;
+        };
+        if ppid <= 1 {
+            break;
+        }
+        if let Ok(cmdline) = std::fs::read(format!("/proc/{ppid}/cmdline")) {
+            let argv: Vec<String> = cmdline
+                .split(|byte| *byte == 0)
+                .filter(|part| !part.is_empty())
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+                .collect();
+            argvs.push(argv);
+        }
+        pid = ppid;
+    }
+    argvs
+}
+
+/// Whether one process's argv is a `bashrs_compile` run — the bashrs binary (by file name, since
+/// the wrapper invokes it by absolute path) told to compile. Both halves matter: `bashrs_compile`
+/// alone would also match some unrelated program handed that word as data.
+fn is_bashrs_compile(argv: &[String]) -> bool {
+    let binary_is_bashrs = argv
+        .first()
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "bashrs");
+    binary_is_bashrs && argv.get(1).is_some_and(|arg| arg == "bashrs_compile")
 }
 
 /// Guard and create the install dir. `~/.bashrs` itself is preserved as-is — it may be a
@@ -159,6 +231,60 @@ mod tests {
     fn the_wired_path_is_left_unexpanded_for_the_shell_to_expand() {
         // A literal `$HOME`, not this machine's home: the rc line must stay portable.
         assert!(UNEXPANDED_SOURCEFILE_PATH.starts_with("$HOME/"));
+    }
+
+    /// The closing line must match what actually happens next. When `bashrs_compile` will reload
+    /// the shell, it must NOT tell the user to open one — that was the bug: the message asked for
+    /// an action the wrapper had already taken. Only a first-time `./COMPILE.sh` gets the manual
+    /// instruction, because only then is there no wrapper to reload.
+    #[test]
+    fn the_closing_line_tracks_whether_a_reload_will_follow() {
+        let sourcefile = Path::new("/home/u/.bashrs/sourcefile.sh");
+
+        let reloading = activation_line(true, sourcefile);
+        assert!(reloading.contains("reloading"), "the recompile path says a reload is happening");
+        assert!(
+            !reloading.contains("Open a new shell") && !reloading.contains("run:"),
+            "and does NOT ask the user to do what the wrapper already does: {reloading}"
+        );
+
+        let manual = activation_line(false, sourcefile);
+        assert!(manual.contains("Open a new shell"), "first-install names the manual step");
+        assert!(manual.contains(&sourcefile.display().to_string()), "with the sourcing command");
+        // The command is set off in backticks for readability. Safe here and ONLY here because
+        // this goes out via `println!` — the sourcefile's nag, which a shell evaluates, must not.
+        assert!(
+            manual.contains("`. \"/home/u/.bashrs/sourcefile.sh\"`"),
+            "the runnable command is quoted as code: {manual}"
+        );
+    }
+
+    /// The reload verdict comes off the process tree, so the recognizer decides everything: it
+    /// must accept the wrapper's absolute-path invocation and reject look-alikes — a program
+    /// merely *handed* the word (`echo bashrs_compile`) is not a compile.
+    #[test]
+    fn only_a_real_bashrs_compile_invocation_counts_as_a_pending_reload() {
+        let argv = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert!(
+            is_bashrs_compile(&argv(&["/home/u/.bashrs/bashrs", "bashrs_compile"])),
+            "the wrapper invokes the binary by absolute path"
+        );
+        assert!(is_bashrs_compile(&argv(&["bashrs", "bashrs_compile", "--use-stable-cargo"])));
+        // Not a compile: another bashrs command, another program, or the word as mere data.
+        assert!(!is_bashrs_compile(&argv(&["/home/u/.bashrs/bashrs", "bashrs_test"])));
+        assert!(!is_bashrs_compile(&argv(&["echo", "bashrs_compile"])));
+        assert!(!is_bashrs_compile(&argv(&["bashrs"])));
+        assert!(!is_bashrs_compile(&[]));
+    }
+
+    /// The walk must terminate and stay honest on a machine it can't read: a bounded chain that
+    /// ends at init, and no claim of a reload when the ancestry says nothing about one. (The test
+    /// binary is not run from `bashrs_compile`, so the answer here is false.)
+    #[test]
+    fn the_ancestry_walk_terminates_and_claims_no_reload_by_default() {
+        let ancestors = ancestor_argvs();
+        assert!(ancestors.len() <= 16, "the walk is bounded: {}", ancestors.len());
+        assert!(!reload_follows(), "a plain `cargo test` has no pending shell reload");
     }
 
     #[test]

@@ -32,6 +32,7 @@ const TAG_MARKER: &str = ".build_tag";
 pub fn sync(pins: &[(String, String)]) -> bool {
     let bundle_languages = config_file::always_bundle_languages();
     let bundle_utilities = config_file::always_bundle_utilities();
+    let install_extras = config_file::install_extras();
 
     // Plan first, on local information only: a config flag and a PATH probe decide whether this
     // machine bundles each tool at all, and Carstay names the version when pinned. Settling the
@@ -40,16 +41,27 @@ pub fn sync(pins: &[(String, String)]) -> bool {
     let plan: Vec<Option<Option<&str>>> = TOOLS
         .iter()
         .map(|tool| {
-            let (always, field) = match tool.group {
-                Group::Language => (bundle_languages, "always_bundle_languages"),
-                Group::Utility => (bundle_utilities, "always_bundle_utilities"),
-            };
             let probe = tool.bins[0].0;
-            if !always && exec::on_path(probe) {
-                eprintln!(
-                    "tools: {probe} is already on this system — not bundling (override: [tools] {field} in {})",
-                    config_file::CONFIG_FILE
-                );
+            let present = exec::on_path(probe);
+            // Dependencies (Language/Utility) are bundled unless the flag says "only what's
+            // missing" AND the system already has it. An Extra is the mirror: never bundled unless
+            // opted in, and even then only to fill a gap — the user asked for the tool, not
+            // necessarily for OUR copy over one they already have.
+            let (wanted, field) = match tool.group {
+                Group::Language => (bundle_languages || !present, "always_bundle_languages"),
+                Group::Utility => (bundle_utilities || !present, "always_bundle_utilities"),
+                Group::Extra => (install_extras && !present, "install_extras"),
+            };
+            if !wanted {
+                // "You already have it" is worth saying; a switched-off opt-in extra is not —
+                // that's the default state for everyone, and a line per compile would be noise.
+                let opted_out_extra = matches!(tool.group, Group::Extra) && !install_extras;
+                if present && !opted_out_extra {
+                    eprintln!(
+                        "tools: {probe} is already on this system — not bundling (override: [tools] {field} in {})",
+                        config_file::CONFIG_FILE
+                    );
+                }
                 return None;
             }
             let pin = pins.iter().find(|(name, _)| name == tool.dir).map(|(_, pin)| pin.as_str());
@@ -94,13 +106,21 @@ pub fn sync(pins: &[(String, String)]) -> bool {
     for ((tool, planned), url) in TOOLS.iter().zip(&plan).zip(&urls) {
         let Some(pin) = *planned else { continue };
         let dir = root().join(tool.dir);
-        fetched_any |= match &tool.acquire {
+        let fetched = match &tool.acquire {
             Acquire::Archive { dated_tag, .. } => {
                 sync_archive(tool, url.as_deref(), &dir, pin, *dated_tag)
             }
             Acquire::Binary(_) => sync_binary(tool, url.as_deref(), &dir, pin),
             Acquire::UvVenv { python } => sync_python_venv(python, &dir, pin),
         };
+        // A one-time post-install runs ONLY on a fresh fetch, so it never repeats on a steady
+        // compile — the tool is already current then, and `fetched` is false.
+        if fetched {
+            if let Some(activate) = tool.post_install {
+                activate(&dir);
+            }
+        }
+        fetched_any |= fetched;
     }
     // Whatever is bundled — fetched just now or on an earlier compile — gets a PATH shim, so the
     // tools also win when named as arguments (see `tools::shell_setup`).
@@ -133,7 +153,33 @@ fn release_url_if_stale(
         return None;
     };
     let recorded = std::fs::read_to_string(dir.join(SOURCE_MARKER)).unwrap_or_default();
-    (!installed || recorded.trim() != url).then(|| url.to_string())
+    (!installed || archive_is_stale(recorded.trim(), url, pin)).then(|| url.to_string())
+}
+
+/// Whether the bundle built from `recorded` should be replaced by `wanted` — by *build identity*,
+/// not URL spelling, wherever an identity can be read ([`asset_channel`]; today that's ffmpeg).
+///
+/// The URLs alone are treacherous for a rolling release: BtbN re-creates the `latest` release
+/// every day (deleting and re-uploading its assets), and a check that lands in that window gets a
+/// different answer from the API — the dated release's URLs instead of the rolling ones, or a
+/// partial asset list missing the newest channel. Comparing URL strings turned each such flip
+/// into a ~120 MB re-download of the SAME build generation, twice (once into the window's answer,
+/// once back out). Comparing channels makes both directions of that flip a no-op, and — unpinned —
+/// only a genuinely NEWER channel (n8.1 → n9.0) fetches: never a downgrade, which is what the
+/// missing-asset flavor of the window would otherwise cause.
+///
+/// Pins override in two grades: a dated pin (`n8.1 @ autobuild-…`) exists to restore an *exact*
+/// build, so it compares exactly; a channel-only pin restores that channel, newer or older.
+/// A URL with no readable channel (every other tool) keeps the plain string comparison.
+fn archive_is_stale(recorded: &str, wanted: &str, pin: Option<&str>) -> bool {
+    if pin.is_some_and(|pin| pin.contains(" @ ")) {
+        return recorded != wanted; // exact-build restore: the precise URL is the point
+    }
+    match (asset_channel(recorded), asset_channel(wanted)) {
+        (Some(have), Some(want)) if pin.is_some() => have != want, // pinned channel, either way
+        (Some(have), Some(want)) => want > have,                   // rolling: upgrades only
+        _ => recorded != wanted,
+    }
 }
 
 /// The archive mode: re-fetch when the wanted URL (latest published, or the `pin`ned release in
@@ -537,6 +583,62 @@ pub(super) fn deno_url(pin: Option<&str>) -> Option<String> {
     find_ytdlp_asset(&release_json("denoland/deno", pin)?, asset)
 }
 
+/// Register Git's global LFS filters after git-lfs is freshly bundled — the `git lfs install`
+/// step the binary alone doesn't perform, without which LFS repos check out as pointer files
+/// rather than real content (see the answer to "are the binaries any use after install": yes —
+/// these filters are what *call* the binary on every LFS checkout/commit).
+///
+/// `--skip-repo` keeps it to the user's *global* config (`~/.gitconfig`) and touches no
+/// repository — in particular not the bashrs checkout this happens to run inside. It shells out
+/// to Git (the filter lines are written via `git config`), so a machine with no `git` on PATH
+/// gets a clear note instead of a silent miss. Never fatal: the binary is installed regardless,
+/// and the message names the one command to run by hand. Reached only on a fresh fetch (see
+/// [`sync`]), so it does not re-run on later compiles.
+pub(super) fn activate_git_lfs(dir: &Path) {
+    let binary = dir.join("git-lfs");
+    match std::process::Command::new(&binary).args(["install", "--skip-repo"]).output() {
+        Ok(out) if out.status.success() => {
+            eprintln!("tools: git-lfs activated (git lfs install) — LFS repositories will now fetch file content");
+        }
+        Ok(out) => {
+            let why = String::from_utf8_lossy(&out.stderr);
+            eprintln!(
+                "tools: git-lfs is bundled, but `git lfs install` failed ({}) — is git on PATH? run it yourself to activate LFS filters",
+                why.trim()
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "tools: git-lfs is bundled, but `git lfs install` could not run ({err}) — run it yourself to activate LFS filters"
+            );
+        }
+    }
+}
+
+/// git-lfs's Linux tarball for this machine, discovered from the latest release — an optional
+/// extra (`[tools] install_extras`), Git's large-file support. Nothing bashrs runs touches it;
+/// it's here only to save a manual install.
+pub(super) fn gitlfs_url(pin: Option<&str>) -> Option<String> {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        _ => return None,
+    };
+    find_gitlfs_asset(&release_json("git-lfs/git-lfs", pin)?, arch)
+}
+
+/// git-lfs's `git-lfs-linux-<arch>-v<ver>.tar.gz` — matched by the `linux-<arch>-v` infix so the
+/// other OSes and the wrong architecture don't qualify, and by the `.tar.gz` suffix so the
+/// checksum file (`.tar.gz` + a `sha256sums` sibling) can't be mistaken for the archive.
+fn find_gitlfs_asset(json: &str, arch: &str) -> Option<String> {
+    let infix = format!("/git-lfs-linux-{arch}-v");
+    json.split('"')
+        .find(|token| {
+            token.starts_with("https://") && token.contains(&infix) && token.ends_with(".tar.gz")
+        })
+        .map(str::to_owned)
+}
+
 /// The release asset named exactly `asset` — a `/`-anchored suffix match on the download URL,
 /// which sibling assets (`yt-dlp` / `yt-dlp_linux` / `yt-dlp_linux_aarch64`) can't satisfy for
 /// one another.
@@ -651,6 +753,67 @@ mod tests {
             "the bare zipapp asset must not match its `yt-dlp_*` siblings"
         );
         assert!(find_ytdlp_asset(json, "yt-dlp_windows").is_none());
+    }
+
+    /// The two spellings of one ffmpeg build generation — the rolling URL and a dated autobuild
+    /// URL of the same channel — must read as CURRENT, in both directions: BtbN re-creates the
+    /// rolling release daily, and a freshness check landing in that window sees the other
+    /// spelling. Before this rule, each flip re-downloaded ~120 MB of the same generation.
+    #[test]
+    fn ffmpeg_freshness_is_by_channel_so_daily_republication_never_refetches() {
+        const ROLLING_81: &str = "https://x/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz";
+        // (real asset spellings, taken from BtbN's rolling and dated releases)
+        const ROLLING_90: &str = "https://x/download/latest/ffmpeg-n9.0-latest-linux64-gpl-9.0.tar.xz";
+        const DATED_90: &str = "https://x/download/autobuild-2026-08-24-13-10/ffmpeg-n9.0.1-6-g9d4ca21220-linux64-gpl-9.0.tar.xz";
+
+        // The window's two flips: rolling → dated (API served the autobuild release) and
+        // dated → rolling (back to normal). Same channel both ways → current, no fetch.
+        assert!(!archive_is_stale(ROLLING_90, DATED_90, None), "same generation, other spelling");
+        assert!(!archive_is_stale(DATED_90, ROLLING_90, None), "and the way back");
+        // The window's other flavor: the newest channel's asset momentarily missing, so the
+        // wanted URL falls back a channel. A downgrade is never fetched.
+        assert!(!archive_is_stale(ROLLING_90, ROLLING_81, None), "no downgrade on a partial list");
+        // A genuinely newer channel is exactly what SHOULD fetch.
+        assert!(archive_is_stale(ROLLING_81, ROLLING_90, None), "n8.1 → n9.0 is a real upgrade");
+
+        // Pins: a dated pin restores an exact build (URL-precise); a channel pin restores its
+        // channel in either direction — a downgrade is the user's explicit ask there.
+        assert!(archive_is_stale(ROLLING_90, DATED_90, Some("n9.0 @ autobuild-2026-08-24-13-10")),
+            "an exact-build pin compares exactly");
+        assert!(archive_is_stale(ROLLING_90, ROLLING_81, Some("n8.1")), "a pinned downgrade fetches");
+        assert!(!archive_is_stale(ROLLING_90, ROLLING_90, Some("n9.0")));
+
+        // No readable channel (every non-ffmpeg archive): the plain URL comparison stands.
+        assert!(archive_is_stale("https://x/uv-1.tar.gz", "https://x/uv-2.tar.gz", None));
+        assert!(!archive_is_stale("https://x/uv-2.tar.gz", "https://x/uv-2.tar.gz", None));
+    }
+
+    #[test]
+    fn gitlfs_asset_picks_this_arch_linux_tarball_over_every_sibling() {
+        // A real release carries every OS/arch plus a checksum file; the finder must land on
+        // exactly the Linux tarball for the asked arch — not another OS, not the other arch, and
+        // never the `.sha256` beside it (which also contains the tarball's name).
+        let json = r#"{"assets":[
+            {"browser_download_url":"https://github.com/git-lfs/git-lfs/releases/download/v3.5.1/git-lfs-darwin-amd64-v3.5.1.zip"},
+            {"browser_download_url":"https://github.com/git-lfs/git-lfs/releases/download/v3.5.1/git-lfs-linux-arm64-v3.5.1.tar.gz"},
+            {"browser_download_url":"https://github.com/git-lfs/git-lfs/releases/download/v3.5.1/git-lfs-linux-amd64-v3.5.1.tar.gz"},
+            {"browser_download_url":"https://github.com/git-lfs/git-lfs/releases/download/v3.5.1/git-lfs-linux-amd64-v3.5.1.tar.gz.sha256"}]}"#;
+        assert_eq!(
+            find_gitlfs_asset(json, "amd64").unwrap(),
+            "https://github.com/git-lfs/git-lfs/releases/download/v3.5.1/git-lfs-linux-amd64-v3.5.1.tar.gz",
+            "the amd64 Linux tarball, not the arm64 sibling, the mac build, or the .sha256"
+        );
+        assert_eq!(
+            find_gitlfs_asset(json, "arm64").unwrap(),
+            "https://github.com/git-lfs/git-lfs/releases/download/v3.5.1/git-lfs-linux-arm64-v3.5.1.tar.gz"
+        );
+        // The release tag still reads out of the chosen URL, so the version marker records it.
+        assert_eq!(
+            release_tag(&find_gitlfs_asset(json, "amd64").unwrap()).as_deref(),
+            Some("v3.5.1")
+        );
+        // A machine whose arch git-lfs doesn't publish gets nothing, not a wrong build.
+        assert!(find_gitlfs_asset(json, "riscv64").is_none());
     }
 
     #[test]

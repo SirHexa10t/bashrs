@@ -14,6 +14,7 @@ mod commands {
 
     use crate::support::doc_style::{self, _header};
     use crate::support::exec;
+    use crate::support::shell_quote;
     use clap::Args;
 
     /// Hop one directory up
@@ -354,37 +355,32 @@ mod commands {
         }
     }
 
-    /// Characters a name may hold and still be printed bare: bash reads every one of them back
-    /// literally. Anything else — a space, a glob, a quote, a redirection, a control character —
-    /// means the name has to be spelled out to be unambiguous.
-    const BARE_SAFE: &str =
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-+,:@%";
-
     /// `ls -F`'s type markers, appended after the name (and after its colour reset).
     const TYPE_MARKERS: &str = "*/=>@|";
 
-    /// How a name has to be spelled for bash to read back exactly the bytes on disk.
+    /// How a name has to be spelled for bash to read back exactly the bytes on disk. The
+    /// bare/`'…'`/`$'…'` decision is [`crate::support::shell_quote`]'s (shared with
+    /// `shell_args_print`); this variant differs only by forcing `$'…'` on a two-space run, which
+    /// the table's column divider ([`TABLE_SEPARATOR`]) would otherwise cut the name at.
     #[derive(PartialEq, Eq, Debug)]
     enum _Quoting {
-        /// Only [`BARE_SAFE`] characters — print it as it is.
+        /// Bare-safe — print it as it is.
         Bare,
         /// `'…'`: everything inside is literal, which covers spaces, globs, `$`, `"` and `\`.
         Single,
-        /// `$'…'`: the only form that can express a control character, so it also takes names
-        /// holding a `'` (which `'…'` cannot escape) and space runs (which the column divider
-        /// would otherwise cut the name at).
+        /// `$'…'`: a control character, a `'`, or a two-space run the column divider can't survive.
         Ansi,
     }
 
     /// Which spelling `plain` (already stripped of colour and of its type marker) needs.
     fn _quoting_for(plain: &str) -> _Quoting {
-        if plain.chars().any(char::is_control) || plain.contains('\'') || plain.contains("  ") {
+        if shell_quote::needs_ansi_c(plain) || plain.contains("  ") {
             return _Quoting::Ansi;
         }
-        if plain.is_empty() || plain.chars().any(|ch| !BARE_SAFE.contains(ch)) {
-            return _Quoting::Single;
+        if shell_quote::is_bare_safe(plain) {
+            return _Quoting::Bare;
         }
-        _Quoting::Bare
+        _Quoting::Single
     }
 
     /// Render `name` so that it is unambiguous, safe in a table cell, and still a valid bash word
@@ -413,17 +409,11 @@ mod commands {
             _Quoting::Bare => name.to_string(),
             _Quoting::Single => format!("'{body}'{marker}"),
             _Quoting::Ansi => {
-                let inner = _map_outside_ansi(body, |ch, out| match ch {
-                    '\n' => out.push_str("\\n"),
-                    '\t' => out.push_str("\\t"),
-                    '\r' => out.push_str("\\r"),
-                    '\\' => out.push_str("\\\\"),
-                    '\'' => out.push_str("\\'"),
-                    ' ' if escape_spaces => out.push_str("\\x20"),
-                    other if other.is_control() => {
-                        out.push_str(&format!("\\x{:02x}", other as u32));
-                    }
-                    other => out.push(other),
+                // Escape outside ls's colour spans (they're control bytes too, but escaping them
+                // would print the codes instead of colouring the name); the per-character rule is
+                // the shared one.
+                let inner = _map_outside_ansi(body, |ch, out| {
+                    shell_quote::push_ansi_c(ch, escape_spaces, out)
                 });
                 format!("$'{inner}'{marker}")
             }

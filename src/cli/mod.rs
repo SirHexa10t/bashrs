@@ -24,7 +24,7 @@ use crate::categories::packages::PackagesCommand;
 use crate::categories::processes::ProcessesCommand;
 use crate::categories::project::ProjectCommand;
 use crate::categories::python::PythonCommand;
-use crate::categories::session::SessionCommand;
+use crate::categories::shell::ShellCommand;
 use crate::categories::styles::StyleCommand;
 
 // The generator half of the crate root: everything `sourcefile.sh` and TAB-completion need,
@@ -76,7 +76,7 @@ pub enum Command {
     #[command(flatten)]
     Python(PythonCommand),
     #[command(flatten)]
-    Session(SessionCommand),
+    Shell(ShellCommand),
     // Three enums, one logical `lookup` category. The generated families lead so the
     // hand-written commands can follow what they build on (`GG` is `gg --delve`) — the same
     // order `sourcefile::category_commands` groups them in, so help and wrappers agree.
@@ -134,7 +134,7 @@ impl Command {
             Command::Processes(cmd) => cmd.run(),
             Command::Project(cmd) => cmd.run(),
             Command::Python(cmd) => cmd.run(),
-            Command::Session(cmd) => cmd.run(),
+            Command::Shell(cmd) => cmd.run(),
             Command::Lookup(cmd) => cmd.run(),
             Command::Grep(cmd) => cmd.run(),
             Command::Treegrep(cmd) => cmd.run(),
@@ -429,10 +429,10 @@ mod tests {
     }
 
     #[test]
-    fn session_commands_follow_naming_standard() {
+    fn shell_commands_follow_naming_standard() {
         // All three carry the prefix in an explicit `#[name]`, because the bare fn names
         // (`new`, `bare`, `sudo`) would be terrible commands on their own.
-        assert_prefixed(&command_names::<SessionCommand>(), "session_", &[]);
+        assert_prefixed(&command_names::<ShellCommand>(), "shell_", &[]);
     }
 
     #[test]
