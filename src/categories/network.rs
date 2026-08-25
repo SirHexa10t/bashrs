@@ -24,7 +24,7 @@ mod commands {
     use crate::support::doc_style::{self, _header, approved, notice, problematic};
     use crate::support::theme::{Basic, Weight};
     use crate::support::exec;
-    use crate::support::net::{self, dns, probe, rdap, whois, Target};
+    use crate::support::net::{self, bluetooth, dns, lan, netbios, oui, probe, rdap, whois, Target};
     use clap::Args;
     use std::net::IpAddr;
 
@@ -373,6 +373,590 @@ mod commands {
         match answered.get(answered.len() / 2) {
             Some(median) => format!("{} of {total} answered · median {median} ms", answered.len()),
             None => problematic(&format!("none of the {total} hosts answered — the problem is on this side")),
+        }
+    }
+
+    // --- local -------------------------------------------------------------
+
+    /// List the devices around this machine — IP and Bluetooth both. Finds even IP devices that
+    /// ignore every probe, by reading the kernel's ARP table after provoking it; no root, no raw
+    /// sockets. Bluetooth is discovered too, so a device advertising to pair shows up
+    /// (`--no-bluetooth` skips that wait)
+    #[trailing_newline]
+    pub fn local(args: LocalArgs) {
+        // `support` may not ask where `~/.bashrs` is; this layer may, so it says so once.
+        oui::install_cache_path(crate::conf::user_data_dir().join("oui.tsv"));
+        if args.refresh_vendors {
+            match oui::refresh() {
+                Ok(count) => println!("{}", approved(&format!("manufacturer registry: {count} entries"))),
+                Err(why) => eprintln!("{}", notice(&format!("net_local: {why}"))),
+            }
+        }
+        let networks = match &args.network {
+            Some(cidr) => match lan::parse_cidr(cidr) {
+                Ok(network) => vec![network],
+                Err(why) => return eprintln!("{}", problematic(&format!("net_local: {why}"))),
+            },
+            None => lan::local_networks(),
+        };
+        if networks.is_empty() {
+            return eprintln!(
+                "{}",
+                problematic("net_local: no on-link IPv4 network found — this machine reaches nothing directly")
+            );
+        }
+        // Settle which ports to sweep once, before any probing: a bad spec should be a message,
+        // not a discovery made after a minute of scanning.
+        let ports = match _wanted_ports(&args) {
+            Ok(ports) => ports,
+            Err(why) => return eprintln!("{}", problematic(&format!("net_local: {why}"))),
+        };
+        let timeout = std::time::Duration::from_millis(args.timeout.max(50));
+        let workers = args.workers.max(1);
+        for network in &networks {
+            _scan_network(network, timeout, workers, &ports);
+        }
+        // Bluetooth is a different transport, but "show me the devices around me" plainly means
+        // both — so they are LISTED here, not pointed at. A short discovery runs by default,
+        // because a device that is advertising (pairing mode, a new headset) is invisible until
+        // something scans for it; `--no-bluetooth` skips the wait when only IP matters.
+        if !args.no_bluetooth {
+            _bluetooth_section(args.bluetooth_scan);
+        }
+    }
+
+    /// The Bluetooth half of `net_local`: the same diagnostic ladder `net_bluetooth` uses, under
+    /// its own heading, so one command answers "what is around me" for both transports.
+    fn _bluetooth_section(seconds: u32) {
+        println!("{}", _header("── bluetooth ──"));
+        let scan = (seconds > 0).then_some(seconds);
+        if let Some(devices) = _bluetooth_devices(scan, "net_local") {
+            _report_bluetooth(devices);
+        }
+    }
+
+    #[derive(Args)]
+    pub struct LocalArgs {
+        /// Sweep every found device across ports 1-1024 plus the known high ones, instead of the
+        /// LAN shortlist — slower, and a more thorough probe of your neighbours
+        #[arg(long, conflicts_with = "ports")]
+        pub deep: bool,
+        /// Scan exactly these ports: numbers and ranges, e.g. `22`, `1-1024`, `22,2222,8000-8100`
+        #[arg(short = 'p', long, value_name = "SPEC")]
+        pub ports: Option<String>,
+        /// Scan this subnet (CIDR, e.g. `192.168.1.0/24`) instead of the ones this machine is on
+        /// — how to look at a slice of a network too wide to sweep whole
+        #[arg(short = 'n', long, value_name = "CIDR")]
+        pub network: Option<String>,
+        /// Fetch the current IEEE manufacturer registry (~4 MB, once), for prefixes newer than the
+        /// one built in. Skipped when your system already ships one
+        #[arg(long)]
+        pub refresh_vendors: bool,
+        /// Milliseconds to wait for each address. A LAN answers in single-digit milliseconds;
+        /// the wait is really for the ones that never will
+        #[arg(short = 't', long, default_value_t = 300)]
+        pub timeout: u64,
+        /// Addresses probed at once. High on purpose — each worker only waits on a socket
+        #[arg(short = 'j', long, default_value_t = SWEEP_WORKERS)]
+        pub workers: usize,
+        /// Seconds to spend discovering Bluetooth devices. A device that is advertising but not
+        /// yet known needs a scan to be seen at all; 0 lists only what BlueZ already knows
+        #[arg(long, value_name = "SECONDS", default_value_t = 5)]
+        pub bluetooth_scan: u32,
+        /// Skip Bluetooth entirely — no scan, no wait, just the IP networks
+        #[arg(long)]
+        pub no_bluetooth: bool,
+    }
+
+    /// Addresses probed at once during the sweep. Far above the core count deliberately: a worker
+    /// spends its whole life blocked on a connect that will time out, so the limit that matters is
+    /// the file-descriptor budget, not the CPU. At this width a /24 finishes in about a second.
+    const SWEEP_WORKERS: usize = 128;
+
+    /// Which ports the detail pass sweeps: an explicit `--ports` spec, the whole low range with
+    /// `--deep`, else the LAN shortlist.
+    fn _wanted_ports(args: &LocalArgs) -> Result<Vec<(u16, &'static str)>, String> {
+        match (&args.ports, args.deep) {
+            (Some(spec), _) => lan::parse_ports(spec),
+            (None, true) => Ok(lan::deep_ports()),
+            (None, false) => Ok(lan::lan_ports()),
+        }
+    }
+
+    /// Discover and report one network.
+    fn _scan_network(
+        network: &lan::Network,
+        timeout: std::time::Duration,
+        workers: usize,
+        ports: &[(u16, &'static str)],
+    ) {
+        let hosts = network.host_count();
+        println!(
+            "{}",
+            _header(&format!("── {}/{} on {} ──", network.base, network.prefix, network.device))
+        );
+        if hosts > lan::MAX_SWEEP_HOSTS {
+            // Refused rather than attempted: at this size the sweep stops being a quick look.
+            // The neighbour table still knows whoever this machine has actually talked to.
+            eprintln!(
+                "{}",
+                notice(&format!(
+                    "{hosts} addresses is past the {} this sweeps — showing only the kernel's known \
+                     neighbours. To sweep a slice: net_local --network {}/24",
+                    lan::MAX_SWEEP_HOSTS,
+                    network.base
+                ))
+            );
+            let known: Vec<lan::Device> = lan::neighbours()
+                .into_iter()
+                .filter(|(ip, _)| network.contains(*ip))
+                .map(|(ip, mac)| lan::Device {
+                    ip,
+                    mac: Some(mac),
+                    evidence: lan::Evidence::Arp,
+                    is_self: false,
+                    open_ports: Vec::new(),
+                    hostname: None,
+                    role: lan::Role::Unknown,
+                })
+                .collect();
+            return _report_devices(known, ports, timeout, lan::local_address(network));
+        }
+        let progress = _sweep_progress(hosts);
+        let found = lan::sweep(network, lan::KNOCK_PORT, timeout, workers, progress);
+        _clear_progress();
+        // Our own address ON THIS NETWORK — the multicast queries must leave by this interface,
+        // or they go out whichever one the kernel prefers globally and never reach these devices.
+        _report_devices(found, ports, timeout, lan::local_address(network));
+    }
+
+    /// How often the progress line is rewritten, in addresses — often enough to look alive,
+    /// rarely enough that the terminal isn't redrawn once per probe.
+    const PROGRESS_STEP: u32 = 16;
+
+    /// A counter that rewrites one line as the sweep advances — a sweep of a /24 is a second of
+    /// silence otherwise. Returns a closure to call per address tried.
+    ///
+    /// Silent when stderr isn't a terminal: the line is drawn by rewriting itself in place, which
+    /// only means anything on a screen. Redirected to a file or a pipe it would deposit a
+    /// carriage-return smear instead of a progress bar.
+    fn _sweep_progress(total: u32) -> impl Fn() + Sync {
+        use std::io::IsTerminal;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let done = AtomicU32::new(0);
+        let live = std::io::stderr().is_terminal();
+        move || {
+            if !live {
+                return;
+            }
+            let seen = done.fetch_add(1, Ordering::Relaxed) + 1;
+            // Only when it lands on a boundary, so the terminal isn't rewritten 254 times.
+            if seen.is_multiple_of(PROGRESS_STEP) || seen == total {
+                eprint!("\r\x1b[2K  probing {seen}/{total}…");
+                use std::io::Write;
+                let _ = std::io::stderr().flush();
+            }
+        }
+    }
+
+    /// Wipe the progress line, so the table starts on a clean row. A no-op where none was drawn.
+    fn _clear_progress() {
+        use std::io::IsTerminal;
+        if std::io::stderr().is_terminal() {
+            eprint!("\r\x1b[2K");
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
+        }
+    }
+
+    /// Fill in the per-device detail (ports, names) and print the table.
+    fn _report_devices(
+        mut devices: Vec<lan::Device>,
+        ports: &[(u16, &'static str)],
+        timeout: std::time::Duration,
+        source: Option<std::net::Ipv4Addr>,
+    ) {
+        if devices.is_empty() {
+            return println!("{}", notice("no devices answered"));
+        }
+        _detail(&mut devices, ports, timeout, source);
+        // Classified only now: the ports the detail pass just found are most of the evidence.
+        let gateways = lan::default_gateways();
+        for device in &mut devices {
+            device.role = lan::classify(device, &gateways);
+        }
+        let mut lines = vec![_header("Address\tWhat\tHardware\tVendor\tName\tSeen by\tServing")];
+        for device in &devices {
+            lines.push(format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                device.ip,
+                device.role.label(),
+                device.mac.clone().unwrap_or_else(|| "—".to_string()),
+                device.mac.as_deref().and_then(lan::vendor).unwrap_or("—"),
+                device.hostname.clone().unwrap_or_else(|| "—".to_string()),
+                device.evidence.label(),
+                _ports_cell(device),
+            ));
+        }
+        for line in table_formatter::format_table(&lines, &_sonar_table()).unwrap_or(lines) {
+            println!("{line}");
+        }
+        println!("{}", approved(&format!("{} device(s)", devices.len())));
+        // A blank Vendor means the embedded registry has no assignment for that prefix — either
+        // genuinely unassigned, or newer than the copy compiled in. `--refresh-vendors` fixes only
+        // the second, so the nudge is offered only when a fresher registry isn't already in use.
+        let unnamed = devices
+            .iter()
+            .any(|device| device.mac.as_deref().is_some_and(|mac| lan::vendor(mac).is_none()));
+        if unnamed && oui::source().is_none() {
+            println!(
+                "{}",
+                notice(
+                    "some prefixes aren't in the built-in registry — `net_local --refresh-vendors` fetches the current one (or install nmap / wireshark-common)"
+                )
+            );
+        }
+    }
+
+    /// The serving column: the ports that answered, or a dash.
+    fn _ports_cell(device: &lan::Device) -> String {
+        match device.open_ports.is_empty() {
+            true => "—".to_string(),
+            false => device
+                .open_ports
+                .iter()
+                .map(|(port, service)| match service.is_empty() {
+                    true => port.to_string(),
+                    false => format!("{port}/{service}"),
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+
+    /// What the detail pass learns about one device: the ports that answered, and its name.
+    type Detail = (Vec<(u16, &'static str)>, Option<String>);
+
+    /// How long to listen for mDNS announcements. Devices answer at their own pace and some jitter
+    /// deliberately to avoid a multicast storm, so this is a window rather than a round trip —
+    /// long enough for a Chromecast to speak up, short enough not to dominate a scan.
+    const BROWSE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1200);
+
+    /// Fill each found device's ports and reverse-DNS name, all devices at once.
+    ///
+    /// Only the devices that turned out to exist are swept, which is what keeps the port detail
+    /// affordable: the expensive pass runs over a handful of addresses rather than the subnet.
+    fn _detail(
+        devices: &mut [lan::Device],
+        ports: &[(u16, &'static str)],
+        timeout: std::time::Duration,
+        source: Option<std::net::Ipv4Addr>,
+    ) {
+        // One mDNS browse for the whole segment, before anything per-device: a multicast question
+        // is heard by every responder at once, so asking per address would send the same packets
+        // over and over for the same answers. This is what names the devices that never answer a
+        // reverse lookup — Chromecasts, printers, AV gear.
+        let announced = dns::mdns_browse(source, BROWSE_WINDOW);
+        let found: Vec<Detail> = std::thread::scope(|scope| {
+            let handles: Vec<_> = devices
+                .iter()
+                .map(|device| {
+                    let ip = std::net::IpAddr::V4(device.ip);
+                    let announced = &announced;
+                    scope.spawn(move || {
+                        // A name the device volunteered costs nothing to use and is the only one
+                        // most devices will ever give; the per-address protocols are the fallback.
+                        let name = announced
+                            .iter()
+                            .find(|(address, _)| *address == device.ip)
+                            .map(|(_, name)| name.clone())
+                            .or_else(|| _reverse_name(ip, source, timeout));
+                        (probe::open_ports(ip, ports), name)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|handle| handle.join().unwrap_or_default()).collect()
+        });
+        for (device, (ports, name)) in devices.iter_mut().zip(found) {
+            device.open_ports = ports;
+            device.hostname = name;
+            // A port that answered is stronger evidence than the ARP entry that found it.
+            if !device.open_ports.is_empty() {
+                device.evidence = device.evidence.max(lan::Evidence::Open);
+            }
+        }
+    }
+
+    /// What a LAN address calls itself, asked three ways — because no single protocol covers a
+    /// real network, and the three miss different halves of it.
+    ///
+    /// 1. **mDNS**, the protocol a home network actually speaks: the device answers for itself,
+    ///    so anything running Avahi or Bonjour — Apple hardware, printers, Chromecasts, most
+    ///    NASes — has a name whether or not any server ever recorded one.
+    /// 2. **NetBIOS**, which catches precisely what mDNS misses: a Windows machine, with no Avahi
+    ///    and often no DNS record, that will nonetheless say its name to anyone asking on port 137.
+    ///    These are also the machines most likely to be sharing files, so leaving them nameless
+    ///    was the worst of the three gaps.
+    /// 3. **Unicast DNS**, which knows a device only if the router registered a PTR for its DHCP
+    ///    lease. Plenty don't — relying on it alone is what left most of the column blank.
+    ///
+    /// Tried in that order and stopping at the first answer, so the common cases cost one query.
+    /// A miss is ordinary, not a fault: a device may simply have no name to give.
+    fn _reverse_name(
+        ip: IpAddr,
+        source: Option<std::net::Ipv4Addr>,
+        timeout: std::time::Duration,
+    ) -> Option<String> {
+        if let Some(name) = dns::mdns_reverse(ip, source, timeout) {
+            return Some(name);
+        }
+        if let IpAddr::V4(v4) = ip {
+            if let Some(name) = netbios::name(v4, timeout) {
+                return Some(name);
+            }
+        }
+        let response = dns::lookup(&dns::reverse_name(ip), dns::Kind::Ptr).ok()?;
+        let answer = response.answers.first()?;
+        Some(answer.record.render().trim_end_matches('.').to_string())
+    }
+
+    // --- vendor -------------------------------------------------------------
+
+    /// Name the manufacturer behind a MAC address — for putting a name to the mouse, keyboard or
+    /// nameless box that turned up in a scan. Takes any spelling, and only needs the first three
+    /// octets
+    #[trailing_newline]
+    pub fn vendor(args: VendorArgs) {
+        for mac in &args.macs {
+            println!("{mac}\t{}", _vendor_answer(mac));
+        }
+    }
+
+    /// What to say about one address. Built from the underlying facts rather than from
+    /// [`lan::vendor`], whose `(self-assigned)` is a table-cell stand-in — here there is room to
+    /// say what that actually means, and the three silences have three different causes.
+    fn _vendor_answer(mac: &str) -> String {
+        use software_inventory::mac_vendors as registry;
+        // A fresher registry (system copy, or one this project fetched) outranks the built-in one.
+        if let Some(name) = oui::vendor(mac).or_else(|| registry::vendor(mac)) {
+            return approved(name);
+        }
+        if registry::is_locally_administered(mac) {
+            return notice(
+                "self-assigned — the device picked this address itself, so no manufacturer owns it (phones randomise per network)",
+            );
+        }
+        // Distinguish "a real prefix nobody registered" from "that isn't an address".
+        match lan::vendor(mac).is_none() && registry::hint(mac) == registry::Hint::Any {
+            true if mac.chars().all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '-' | '.'))
+                && mac.chars().filter(char::is_ascii_hexdigit).count() >= 6 =>
+            {
+                notice("no manufacturer has registered this prefix")
+            }
+            _ => problematic("not a MAC address"),
+        }
+    }
+
+    #[derive(Args)]
+    pub struct VendorArgs {
+        /// One or more MAC addresses (or just their first three octets): `a4:83:e7:11:22:33`,
+        /// `A4-83-E7`, `a483e7` — separators and any extra octets are ignored
+        #[arg(required = true, value_name = "MAC")]
+        pub macs: Vec<String>,
+    }
+
+    // --- bluetooth ---------------------------------------------------------
+
+    /// List the Bluetooth devices this machine knows: what is paired, what is connected, and —
+    /// with `--scan` — whatever is advertising nearby right now. Says which part of the stack is
+    /// missing when nothing shows up
+    #[trailing_newline]
+    pub fn bluetooth(args: BluetoothArgs) {
+        // Every step here can fail for a different reason with a different fix, so each is checked
+        // and named separately. Reporting "no devices found" when the radio is switched off is the
+        // single most confusing thing this command could do to someone whose device is right there.
+        let Some(devices) = _bluetooth_devices(args.scan, "net_bluetooth") else { return };
+        _report_bluetooth(devices);
+    }
+
+    /// Walk the stack from hardware upward, returning the devices once every layer checks out —
+    /// or `None`, having explained which layer didn't.
+    fn _bluetooth_devices(scan: Option<u32>, who: &str) -> Option<Vec<bluetooth::BtDevice>> {
+        let adapters = bluetooth::adapters();
+        if adapters.is_empty() {
+            eprintln!(
+                "{}",
+                problematic(&format!("{who}: this machine has no Bluetooth adapter — nothing is registered under /sys/class/bluetooth"))
+            );
+            // A USB dongle that is plugged in but unbound looks exactly like this, so say what
+            // would prove otherwise rather than leaving it at "no".
+            eprintln!("{}", notice("if you expected one: check `lsusb` / `dmesg` for the controller, or that the driver loaded"));
+            return None;
+        }
+        for adapter in &adapters {
+            println!(
+                "{}",
+                _header(&format!(
+                    "── {} {} ──",
+                    adapter.name,
+                    adapter.address.as_deref().unwrap_or("(no address)")
+                ))
+            );
+        }
+        // The radio can be switched off while the adapter is still listed — the case that makes
+        // "no devices" a lie.
+        match bluetooth::radio() {
+            bluetooth::Radio::SoftBlocked => {
+                eprintln!("{}", problematic(&format!("{who}: the Bluetooth radio is switched OFF (soft block)")));
+                eprintln!("{}", notice("turn it on: `rfkill unblock bluetooth`, or the Bluetooth toggle in your desktop settings"));
+                return None;
+            }
+            bluetooth::Radio::HardBlocked => {
+                eprintln!("{}", problematic(&format!("{who}: the Bluetooth radio is switched off by a HARDWARE switch")));
+                eprintln!("{}", notice("no software can undo this — look for a physical wireless switch, an Fn-key toggle, or a BIOS setting"));
+                return None;
+            }
+            bluetooth::Radio::Live | bluetooth::Radio::Unknown => {}
+        }
+        if !bluetooth::tooling_present() {
+            eprintln!(
+                "{}",
+                problematic(&format!("{who}: the adapter is present, but `bluetoothctl` is not installed"))
+            );
+            eprintln!("{}", notice("it ships with BlueZ: `apt install bluez` / `pacman -S bluez-utils` / `dnf install bluez`"));
+            return None;
+        }
+        match bluetooth::controller_powered() {
+            None => {
+                eprintln!("{}", problematic(&format!("{who}: `bluetoothctl` could not be run")));
+                return None;
+            }
+            Some(None) => {
+                // BlueZ is installed but names no controller: the daemon isn't running, or it
+                // hasn't claimed the adapter.
+                eprintln!("{}", problematic(&format!("{who}: BlueZ is installed but reports no controller — its service is probably not running"))
+                );
+                eprintln!("{}", notice("start it: `systemctl start bluetooth` (and `systemctl enable bluetooth` to keep it on)"));
+                return None;
+            }
+            Some(Some(false)) => {
+                eprintln!("{}", problematic(&format!("{who}: the adapter is present but powered down")));
+                eprintln!("{}", notice("power it up: `bluetoothctl power on`"));
+                return None;
+            }
+            Some(Some(true)) => {}
+        }
+        let found = match scan {
+            Some(seconds) => {
+                let seconds = seconds.clamp(1, 60);
+                println!("{}", notice(&format!("scanning for {seconds}s…")));
+                bluetooth::scan(seconds)
+            }
+            None => bluetooth::known_devices(),
+        };
+        let Some(devices) = found else {
+            eprintln!("{}", problematic(&format!("{who}: could not read the device list from `bluetoothctl`")));
+            return None;
+        };
+        if devices.is_empty() {
+            // Everything works; there is simply nothing to show. Which of the two situations this
+            // is depends on whether they already scanned.
+            match scan.is_some() {
+                true => println!("{}", notice("no devices are advertising nearby — a device must be in PAIRING mode to be discoverable, not merely switched on")),
+                false => println!("{}", notice("nothing paired yet, and no recent sightings — run `net_bluetooth --scan` to look for nearby devices")),
+            }
+            return None;
+        }
+        Some(devices)
+    }
+
+    /// Fill in each device's detail and print the table.
+    fn _report_bluetooth(mut devices: Vec<bluetooth::BtDevice>) {
+        // The detail is one `bluetoothctl info` per device; a handful of devices, run together.
+        std::thread::scope(|scope| {
+            for device in &mut devices {
+                scope.spawn(|| bluetooth::describe(device));
+            }
+        });
+        devices.sort_by(|a, b| {
+            (!b.connected, !b.paired, &a.address).cmp(&(!a.connected, !a.paired, &b.address))
+        });
+        let mut lines = vec![_header("Address\tName\tWhat\tState\tSignal")];
+        for device in &devices {
+            lines.push(format!(
+                "{}\t{}\t{}\t{}\t{}",
+                device.address,
+                match device.name.is_empty() {
+                    true => "—",
+                    false => device.name.as_str(),
+                },
+                device.kind(),
+                _bt_state(device),
+                device.rssi.map_or_else(|| "—".to_string(), |dbm| format!("{dbm} dBm")),
+            ));
+        }
+        for line in table_formatter::format_table(&lines, &_sonar_table()).unwrap_or(lines) {
+            println!("{line}");
+        }
+        println!("{}", approved(&format!("{} device(s)", devices.len())));
+    }
+
+    #[derive(Args)]
+    pub struct BluetoothArgs {
+        /// Also run a live discovery for this many seconds, picking up devices that are nearby but
+        /// not paired (needs the adapter powered on)
+        #[arg(short = 's', long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "8")]
+        pub scan: Option<u32>,
+    }
+
+    /// The state column: connected outranks paired, which outranks merely having been seen.
+    fn _bt_state(device: &bluetooth::BtDevice) -> String {
+        match (device.connected, device.paired) {
+            (true, _) => approved("connected"),
+            (false, true) => "paired".to_string(),
+            (false, false) => "seen".to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    mod local_tests {
+        use super::*;
+
+        /// The four distinct things a lookup can find, each needing its own words: a name, an
+        /// address that belongs to nobody by design, a prefix nobody registered, and a string
+        /// that was never an address. Collapsing any pair of them loses the reason.
+        #[test]
+        fn a_vendor_lookup_separates_the_four_possible_answers() {
+            let plain = |mac: &str| console::strip_ansi_codes(&_vendor_answer(mac)).into_owned();
+            assert_eq!(plain("a4:83:e7:11:22:33"), "Apple", "a registered prefix names its owner");
+            assert_eq!(plain("30-75-12-88-CF-A5"), "Sony", "separators and extra octets are fine");
+            assert_eq!(plain("b827eb"), "Raspberry Pi Foundation", "the prefix alone is enough");
+            assert!(plain("a2:0e:0a:70:c6:6f").contains("self-assigned"), "belongs to nobody");
+            assert!(plain("00:f0:21:0f:f0:02").contains("no manufacturer has registered"));
+            assert!(plain("nonsense").contains("not a MAC address"));
+            // The two silences must not be worded the same — they have different causes.
+            assert_ne!(plain("a2:0e:0a:70:c6:6f"), plain("00:f0:21:0f:f0:02"));
+        }
+
+        /// `net_local` must LIST Bluetooth, not merely mention it: someone who typed "show me the
+        /// devices near me" means both transports. This pins that the section is reachable and
+        /// that skipping it is opt-in, not the default — the whole complaint was silence.
+        #[test]
+        fn bluetooth_is_listed_by_default_and_skipping_it_is_opt_in() {
+            use clap::Parser;
+            #[derive(Parser)]
+            struct Cli {
+                #[command(flatten)]
+                args: LocalArgs,
+            }
+            let parse = |extra: &[&str]| {
+                Cli::parse_from(std::iter::once("net_local").chain(extra.iter().copied())).args
+            };
+            let default = parse(&[]);
+            assert!(!default.no_bluetooth, "Bluetooth must be included unless asked otherwise");
+            assert!(default.bluetooth_scan > 0, "and discovered, or an advertising device is invisible");
+            assert!(parse(&["--no-bluetooth"]).no_bluetooth, "and skippable when only IP matters");
+            assert_eq!(parse(&["--bluetooth-scan", "0"]).bluetooth_scan, 0, "0 lists without scanning");
         }
     }
 

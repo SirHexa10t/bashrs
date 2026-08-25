@@ -30,4 +30,3 @@ termcolor = "1"       # colour selection (ColorChoice) for grep's Standard print
 console = "0.16"      # ANSI-escape stripping (strip_ansi_codes) for `lll`'s .lnk detection
 minimad = "0.16"      # line-based Markdown parser — `doc_render` emits its own ANSI from this
 lofty = "0.24"        # in-place audio metadata writes — `dl --audio`'s subtitle tags, no python needed
-

@@ -119,3 +119,5 @@ ricing module
     `ricing_backup` would save aside the dot-files and files from /etc/
 
 
+bluetooth in net_local
+

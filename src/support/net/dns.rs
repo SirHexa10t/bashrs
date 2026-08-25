@@ -230,6 +230,198 @@ pub(crate) fn uncacheable_label() -> String {
     format!("bashrs-probe-{:x}{:x}", std::process::id(), nanos)
 }
 
+/// Ask the LAN itself what an address calls itself — a one-shot **mDNS** reverse lookup.
+///
+/// This is the name protocol a home network actually speaks. Unicast DNS only knows a device if
+/// the router happened to register a PTR record for its DHCP lease, which most do not; mDNS is how
+/// Apple devices, printers, Chromecasts, NASes and anything running Avahi announce themselves, and
+/// it needs no server at all — the device answers for itself.
+///
+/// Deliberately reusing this module's packet code: mDNS is DNS on the wire, byte for byte. Only
+/// three things differ, and all three are why a plain [`lookup`] can't be pointed at it:
+/// - it goes to the multicast group `224.0.0.251:5353` rather than a configured resolver;
+/// - the question's class carries the **QU bit** (`0x8001`), asking the responder to reply
+///   directly to our ephemeral port instead of multicasting the answer to the whole segment.
+///   That also makes the answer trustworthy: an mDNS network is full of unsolicited
+///   announcements, but those go to port 5353, which this socket is deliberately NOT bound to —
+///   so the only packets it can receive are replies addressed to this query. The cost is that a
+///   responder which ignores the QU bit and multicasts anyway is missed, which is a lost name
+///   rather than a wrong one;
+/// - recursion-desired is not set, because there is nobody to recurse.
+pub(crate) fn mdns_reverse(ip: IpAddr, source: Option<Ipv4Addr>, timeout: Duration) -> Option<String> {
+    let mut query = build_query(0, &reverse_name(ip), Kind::Ptr).ok()?;
+    let length = query.len();
+    query[2..4].copy_from_slice(&0u16.to_be_bytes()); // no recursion-desired: nobody to recurse
+    query[length - 2..].copy_from_slice(&0x8001u16.to_be_bytes()); // class IN + the QU bit
+
+    let socket = multicast_socket(source).ok()?;
+    socket.set_read_timeout(Some(timeout)).ok()?;
+    socket.send_to(&query, (MDNS_GROUP, MDNS_PORT)).ok()?;
+
+    // Several devices may answer a multicast question; take the first reply that actually carries
+    // a PTR for what we asked, and stop. A machine with nothing to say simply never answers, so
+    // the timeout IS the negative result — it is kept short by the caller for that reason.
+    let deadline = Instant::now() + timeout;
+    let mut buffer = [0u8; 1500];
+    while Instant::now() < deadline {
+        let Ok((read, _)) = socket.recv_from(&mut buffer) else { return None };
+        if let Ok(answers) = parse_answers(&buffer[..read], Kind::Ptr) {
+            if let Some(Record::Name(name)) = answers.first().map(|answer| &answer.record) {
+                let name = name.trim_end_matches('.');
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Ask the whole segment to introduce itself, and keep every address→name pair that comes back.
+///
+/// [`mdns_reverse`] asks "who owns this address?", which only **Avahi** reliably answers. Embedded
+/// responders — Chromecasts, printers, AV receivers, most smart speakers — never implement reverse
+/// PTR at all. What they *do* answer is a service query, and by convention every mDNS reply
+/// carries the responder's own `A` record alongside, so that a client learns the address without a
+/// second round trip. Harvesting those `A` records is therefore how a name is actually obtained
+/// from such a device, and it is what `avahi-browse` and `dns-sd -B` are doing underneath.
+///
+/// One burst of queries for the whole network, not one per address: a multicast question is heard
+/// by everything, so asking per-device would be the same packets many times over.
+pub(crate) fn mdns_browse(source: Option<Ipv4Addr>, timeout: Duration) -> Vec<(Ipv4Addr, String)> {
+    let Ok(socket) = multicast_socket(source) else { return Vec::new() };
+    if socket.set_read_timeout(Some(READ_SLICE)).is_err() {
+        return Vec::new();
+    }
+    for service in BROWSE_SERVICES {
+        let Ok(mut query) = build_query(0, service, Kind::Ptr) else { continue };
+        let length = query.len();
+        query[2..4].copy_from_slice(&0u16.to_be_bytes());
+        query[length - 2..].copy_from_slice(&0x8001u16.to_be_bytes()); // QU: answer me directly
+        let _ = socket.send_to(&query, (MDNS_GROUP, MDNS_PORT));
+    }
+    // Collect until the budget runs out. Devices answer at their own pace (and some deliberately
+    // jitter to avoid a multicast storm), so this is a listening window rather than a round trip.
+    let deadline = Instant::now() + timeout;
+    let mut found: Vec<(Ipv4Addr, String)> = Vec::new();
+    let mut buffer = [0u8; 4096];
+    while Instant::now() < deadline {
+        let Ok((read, _)) = socket.recv_from(&mut buffer) else { continue };
+        harvest_addresses(&buffer[..read], &mut found);
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// How long a single `recv` waits before the loop re-checks its deadline. Short enough that the
+/// overall budget is honoured closely, long enough not to spin.
+const READ_SLICE: Duration = Duration::from_millis(120);
+
+/// The service types worth asking about — chosen for what actually sits on a home network and
+/// answers. The first is the DNS-SD meta-query ("what service types exist here?"), which many
+/// responders answer with their own address attached; the rest are the households names most
+/// likely to be present.
+const BROWSE_SERVICES: &[&str] = &[
+    "_services._dns-sd._udp.local",
+    "_googlecast._tcp.local",   // Chromecast, Google/Nest speakers and displays
+    "_airplay._tcp.local",      // Apple TV, AirPlay receivers
+    "_raop._tcp.local",         // AirPlay audio (also Sonos, many AV receivers)
+    "_spotify-connect._tcp.local",
+    "_ipp._tcp.local",          // printers
+    "_printer._tcp.local",
+    "_smb._tcp.local",          // file sharing
+    "_afpovertcp._tcp.local",
+    "_workstation._tcp.local",  // Avahi hosts announce themselves here
+    "_device-info._tcp.local",
+    "_hap._tcp.local",          // HomeKit accessories
+];
+
+/// Pull every `A` record out of a reply, whichever section it sits in.
+///
+/// Deliberately lenient: this reads unsolicited and third-party mDNS traffic, where a strict
+/// parser's job (rejecting malformed messages) is the wrong instinct — a record that reads cleanly
+/// is worth keeping even if something later in the datagram does not. Anything unparseable simply
+/// ends the walk.
+fn harvest_addresses(reply: &[u8], into: &mut Vec<(Ipv4Addr, String)>) {
+    if reply.len() < 12 {
+        return;
+    }
+    let count = |at: usize| u16::from_be_bytes([reply[at], reply[at + 1]]) as usize;
+    let (questions, records) = (count(4), count(6) + count(8) + count(10));
+    let mut pos = 12;
+    for _ in 0..questions {
+        let Ok(next) = skip_name(reply, pos) else { return };
+        pos = next + 4; // QTYPE + QCLASS
+    }
+    for _ in 0..records {
+        // The owner NAME is what we are after, so it is read rather than skipped.
+        let Ok((name, next)) = read_name(reply, pos) else { return };
+        let Ok((rtype, _ttl, rdlength, data_start)) = record_header(reply, next) else { return };
+        let end = data_start + rdlength;
+        if end > reply.len() {
+            return;
+        }
+        // Type 1 is `A`; four bytes of address.
+        if rtype == 1 && rdlength == 4 {
+            let address = Ipv4Addr::new(
+                reply[data_start],
+                reply[data_start + 1],
+                reply[data_start + 2],
+                reply[data_start + 3],
+            );
+            let name = name.trim_end_matches('.').to_string();
+            if !name.is_empty() {
+                into.push((address, name));
+            }
+        }
+        pos = end;
+    }
+}
+
+/// A UDP socket that will send multicast out a CHOSEN interface.
+///
+/// This matters more than it looks. A multicast datagram leaves by exactly one interface, and with
+/// nothing specified the kernel picks it from the route to `224.0.0.0/4` — one global choice, made
+/// without reference to the network being scanned. On a machine with several interfaces (a laptop
+/// with Docker bridges has six) the query can therefore go out a bridge and never touch the real
+/// LAN, while the host's own responder still answers because it listens everywhere. The result is
+/// a scan that names the local machine and nothing else, which looks like "the devices don't
+/// support mDNS" and is not.
+///
+/// `IP_MULTICAST_IF` is the only way to say which interface; the standard library does not expose
+/// it, so this is the one place the crate reaches for `setsockopt`. Binding the source address as
+/// well keeps replies coming back to the same interface.
+fn multicast_socket(source: Option<Ipv4Addr>) -> std::io::Result<UdpSocket> {
+    let Some(source) = source else {
+        // No known address on this network: fall back to the kernel's choice, which is at least
+        // as good as it was before, and still works on a single-homed machine.
+        return UdpSocket::bind(("0.0.0.0", 0));
+    };
+    let socket = UdpSocket::bind((source, 0))?;
+    // `s_addr` holds the address in NETWORK byte order, which is exactly the octet order
+    // `Ipv4Addr::octets` yields — so `from_ne_bytes` lays the right bytes in memory on either
+    // endianness.
+    let request = libc::in_addr { s_addr: u32::from_ne_bytes(source.octets()) };
+    let set = unsafe {
+        libc::setsockopt(
+            std::os::fd::AsRawFd::as_raw_fd(&socket),
+            libc::IPPROTO_IP,
+            libc::IP_MULTICAST_IF,
+            std::ptr::addr_of!(request).cast(),
+            std::mem::size_of::<libc::in_addr>() as libc::socklen_t,
+        )
+    };
+    match set == 0 {
+        true => Ok(socket),
+        false => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// The IPv4 multicast group every mDNS responder listens on, and its port.
+const MDNS_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
+const MDNS_PORT: u16 = 5353;
+
 /// The reverse-DNS name for an address (`1.2.3.4` → `4.3.2.1.in-addr.arpa`, and the nibble form
 /// for IPv6) — the name a PTR lookup asks about.
 pub(crate) fn reverse_name(ip: IpAddr) -> String {
@@ -548,6 +740,81 @@ fn skip_name(reply: &[u8], pos: usize) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
+    /// The record harvest is what names a device that never answers a reverse lookup. It must
+    /// read `A` records out of ANY section — a Chromecast puts its address in ADDITIONAL, beside
+    /// the service record that was actually asked for.
+    #[test]
+    fn addresses_are_harvested_from_every_section_of_a_reply() {
+        use super::*;
+        fn encode(name: &str) -> Vec<u8> {
+            let mut out = Vec::new();
+            for label in name.split('.') {
+                out.push(label.len() as u8);
+                out.extend_from_slice(label.as_bytes());
+            }
+            out.push(0);
+            out
+        }
+        // A reply shaped like a real one: one PTR answer, one A record in ADDITIONAL.
+        let mut reply = vec![0x00, 0x00, 0x84, 0x00];
+        reply.extend_from_slice(&0u16.to_be_bytes()); // questions
+        reply.extend_from_slice(&1u16.to_be_bytes()); // answers
+        reply.extend_from_slice(&0u16.to_be_bytes()); // authority
+        reply.extend_from_slice(&1u16.to_be_bytes()); // ADDITIONAL — where the address hides
+        let instance = encode("Front-Room._googlecast._tcp.local");
+        reply.extend_from_slice(&encode("_googlecast._tcp.local"));
+        reply.extend_from_slice(&12u16.to_be_bytes()); // PTR
+        reply.extend_from_slice(&1u16.to_be_bytes());
+        reply.extend_from_slice(&120u32.to_be_bytes());
+        reply.extend_from_slice(&(instance.len() as u16).to_be_bytes());
+        reply.extend_from_slice(&instance);
+        reply.extend_from_slice(&encode("Front-Room.local"));
+        reply.extend_from_slice(&1u16.to_be_bytes()); // A
+        reply.extend_from_slice(&1u16.to_be_bytes());
+        reply.extend_from_slice(&120u32.to_be_bytes());
+        reply.extend_from_slice(&4u16.to_be_bytes());
+        reply.extend_from_slice(&[10, 0, 0, 4]);
+
+        let mut found = Vec::new();
+        harvest_addresses(&reply, &mut found);
+        assert_eq!(found, [(Ipv4Addr::new(10, 0, 0, 4), "Front-Room.local".to_string())]);
+
+        // Unsolicited and damaged traffic arrives on the same socket; neither may panic, and a
+        // truncation must simply end the walk with whatever was already read cleanly.
+        harvest_addresses(&[], &mut Vec::new());
+        harvest_addresses(&[0; 12], &mut Vec::new());
+        for cut in 0..reply.len() {
+            let mut partial = Vec::new();
+            harvest_addresses(&reply[..cut], &mut partial);
+            assert!(partial.len() <= 1, "a truncated reply cannot invent records");
+        }
+    }
+
+    /// The three bytes that make a DNS query an mDNS query. Checked on the wire, because each one
+    /// is silently survivable: without the QU bit the answer is multicast and never reaches this
+    /// socket, and with recursion-desired set some responders ignore the packet outright.
+    #[test]
+    fn an_mdns_query_is_a_dns_query_with_three_changes() {
+        use super::*;
+        let ip: IpAddr = "192.168.1.42".parse().unwrap();
+        let name = reverse_name(ip);
+        assert_eq!(name, "42.1.168.192.in-addr.arpa", "the question is a reverse PTR");
+
+        // Rebuild exactly what `mdns_reverse` sends.
+        let mut query = build_query(0, &name, Kind::Ptr).expect("query");
+        let length = query.len();
+        query[2..4].copy_from_slice(&0u16.to_be_bytes());
+        query[length - 2..].copy_from_slice(&0x8001u16.to_be_bytes());
+
+        assert_eq!(&query[0..2], &[0, 0], "mDNS one-shot queries carry no transaction id");
+        assert_eq!(&query[2..4], &[0, 0], "recursion-desired must be clear — nobody to recurse");
+        assert_eq!(&query[4..6], &[0, 1], "exactly one question");
+        assert_eq!(&query[length - 4..length - 2], &[0, 12], "type PTR (12)");
+        assert_eq!(&query[length - 2..], &[0x80, 0x01], "class IN with the QU bit set");
+        // And the name really is encoded in it, label by label.
+        assert!(query.windows(7).any(|w| w == b"in-addr"), "the question name is present");
+    }
+
     use super::*;
 
     /// Assemble a DNS reply: 12-byte header (one question, `answers` answers), the question, then

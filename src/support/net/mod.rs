@@ -13,7 +13,11 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+pub(crate) mod bluetooth;
 pub(crate) mod dns;
+pub(crate) mod lan;
+pub(crate) mod netbios;
+pub(crate) mod oui;
 pub(crate) mod probe;
 pub(crate) mod rdap;
 pub(crate) mod whois;
