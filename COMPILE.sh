@@ -11,7 +11,11 @@
 # Flags — the "stay on known-good versions" pair (either, or both):
 #   --use-stable-cargo     skip `cargo update`; build --locked against the current Cargo.lock
 #                          (the committed lock is the stable record: `git checkout -- Cargo.lock`
-#                          first if a previous update already moved it)
+#                          first if a previous update already moved it). It saves the re-resolve
+#                          and its network round trips — nothing more: what cargo RECOMPILES is
+#                          its own fingerprints' business, which no flag here can reach (both
+#                          build invocations below are identical as far as cargo is concerned;
+#                          `--locked` only forbids writing the lock).
 #   --use-stable-carstay   provision the tool/repo versions RECORDED in Carstay.toml instead of
 #                          the latest releases (`git log Carstay.toml` names known-good sets)
 set -euo pipefail

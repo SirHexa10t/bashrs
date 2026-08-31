@@ -15,7 +15,7 @@ mod commands {
     /// documents them (currently --use-stable-cargo, --use-stable-carstay).
     #[derive(Args)]
     pub struct CompileArgs {
-        /// Flags for COMPILE.sh (e.g. --use-stable-cargo, --use-stable-carstay — see its header)
+        /// Flags for COMPILE.sh: --use-stable-cargo, --use-stable-carstay — see its header
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     }
@@ -206,6 +206,21 @@ mod commands {
             Err(err) => eprintln!("bashrs_sourcefile: cannot read {}: {err}", path.display()),
         }
     }
+
+    /// `cd` to the bashrs project's root directory (where it stood at the last compile)
+    ///
+    /// The path is compile-time truth, baked into the emitted function by the sourcefile
+    /// generator (`{PROJECT_ROOT}` — the generator runs inside the binary, which is where
+    /// compile-time knowledge lives, so no subprocess is needed at `cd` time). If the project
+    /// has moved since, the `cd` fails naming the stale path, and a recompile re-teaches it.
+    /// Pure shell because a child process can't move its parent.
+    #[shell_body("cd -- {PROJECT_ROOT}")]
+    pub fn cd() {}
+
+    /// `cd` to ~/.bashrs — the installation: binary, sourcefile, config, tools, user-data
+    #[name("dotbashrs_cd")]
+    #[shell_body(r#"cd -- "$HOME/.bashrs""#)]
+    pub fn dot_cd() {}
 
     /// Resolve `script` inside the project directory, or explain why it can't be found.
     fn _locate_script(project: &Path, script: &str) -> Result<PathBuf, String> {

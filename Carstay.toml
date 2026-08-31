@@ -10,10 +10,10 @@
 [tools]
 ffmpeg = "n9.0 @ autobuild-2026-08-24-13-10"
 yt-dlp = "2026.08.19"
-uv = "0.12.5"
+uv = "0.12.7"
 python = "3.14.6"
-deno = "v2.9.5"
+deno = "v2.9.6"
 git-lfs = "v3.7.1"
 
 [stainless_comfy]
-contAInerized = "8c3b6d067910de33da26308f369767a3441e260c"
+contAInerized = "1036648d5bdd993b782cb585193352accfe9112d"

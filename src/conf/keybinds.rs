@@ -14,6 +14,12 @@ pub fn bindings() -> &'static [(&'static str, &'static str)] {
         (r"\eh", "bashrs_sourcefile"), // ALT+H → run bashrs_sourcefile
         (r"\ew", "bashrs_configure"),  // ALT+W → the settings form
         (r"\eq", "bashrs_compile"),    // ALT+Q → run bashrs_compile
+        // Picking new chords, learned the hard way (each confirmed through a pty / `bind -p`):
+        // CTRL+SHIFT+<key> is byte-identical to CTRL+<key> — a terminal cannot encode Shift
+        // beside a control character — and CTRL+Q (0x11) is XON, eaten by the tty's flow
+        // control before readline ever sees it. ALT+SHIFT+<key> arrives intact but collides
+        // with the ALT+SHIFT keyboard-layout switch common on desktops. ALT+F/B/D/N/L are
+        // readline's own (word motion and friends); ALT+Z/W/H/Q/V were free.
     ]
 }
 

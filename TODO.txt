@@ -88,8 +88,6 @@ list of unusual characters, such as '—'
         scrubbing the technique mentioned here: https://www.youtube.com/watch?v=3FhxdhVMJoU
             the method for creating the "watermarks" is in accordance with the algorithm at github: google-deepmind/synthid-text
 
-profile-apply (autoclick) in comfygurations (use form?) 
-
 at some point, move out the document formatting code into Carl (non-Marks).
 
 alias cat command (show line numbers, maybe color text)
@@ -97,18 +95,11 @@ alias cat command (show line numbers, maybe color text)
 Calendaric notifications could go into comfygurations
     maybe forms would need to include list-editing
 
-Is the compilation of all dependencies necessary when just updating one file in code? All of this:
-   Compiling toml_writer v1.1.2+spec-1.1.0
-   Compiling grep v0.4.1
-   Compiling synoptic v2.2.9
-   Compiling table_formatter v5.1.0 (https://github.com/SirHexa10t/table_formatter.git?branch=main#9a1936b3)
-   Compiling toml v1.1.4+spec-1.1.0
-   Compiling sequencer-cli v0.5.0 (https://github.com/SirHexa10t/sequencer.git?branch=main#579c7106)
-Maybe there's a flag that could shorten it (won't be the default, just COMPILE.sh with an extra flag, triggered via `ctrl+shift+q`)
 
 Get a rusty htop, or implement own:
     CPU graph, MEM graph, top-CPU processes, top-MEM processes (all at once).
         Network graph?
+        GPU graph?
         Do we need a view by parent process? (are sub-processes displayed at the top, or do their parents appear?)
             Might need to dsiplay with indentations, to show the tree structure you'd be taking down
         Make sure that crucial details are visible, for distinguishing between similar processes (time started, full command-line (args), PID, parent PID (...?))

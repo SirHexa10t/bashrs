@@ -11,6 +11,7 @@ use super::adjust_pinned;
 use crate::categories::autogen_lookup::{GgCommand, GrepCommand};
 use crate::categories::autogen_styles::StylizedEchoCommand;
 use crate::categories::bashrs::BashrsCommand;
+use crate::categories::builtins::BuiltinsCommand;
 use crate::categories::comfy_repos::ComfyReposCommand;
 use crate::categories::download::DownloadCommand;
 use crate::categories::exposed_helpers::ExposedHelpersCommand;
@@ -55,12 +56,14 @@ macro_rules! category_group {
 
 /// The command categories: the label grouping them in the generated `sourcefile.sh`, the clap
 /// graph, and the category's pure-shell commands. One row per category — never per command.
-fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 16] {
+fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 17] {
     let categories = [
         ("anti_ai", AntiAiCommand::augment_subcommands(clap::Command::new("anti_ai")),
             AntiAiCommand::shell_functions().to_vec()),
         ("bashrs", BashrsCommand::augment_subcommands(clap::Command::new("bashrs")),
             BashrsCommand::shell_functions().to_vec()),
+        ("builtin overrides", BuiltinsCommand::augment_subcommands(clap::Command::new("builtin overrides")),
+            BuiltinsCommand::shell_functions().to_vec()),
         ("filesystem", FilesystemCommand::augment_subcommands(clap::Command::new("filesystem")),
             FilesystemCommand::shell_functions().to_vec()),
         ("git", GitCommand::augment_subcommands(clap::Command::new("git")),
@@ -138,6 +141,7 @@ pub(super) fn complete_flags(name: &str) -> String {
 type WrapperLookup = fn(&str) -> Option<&'static str>;
 const WRAPPER_HOOKS: &[(WrapperLookup, WrapperLookup)] = &[
     (BashrsCommand::wrapper_suffix, BashrsCommand::wrapper_prefix),
+    (BuiltinsCommand::wrapper_suffix, BuiltinsCommand::wrapper_prefix),
     (FilesystemCommand::wrapper_suffix, FilesystemCommand::wrapper_prefix),
     (GitCommand::wrapper_suffix, GitCommand::wrapper_prefix),
     (MediaTranscodeCommand::wrapper_suffix, MediaTranscodeCommand::wrapper_prefix),
@@ -148,6 +152,7 @@ const WRAPPER_HOOKS: &[(WrapperLookup, WrapperLookup)] = &[
     (PackagesCommand::wrapper_suffix, PackagesCommand::wrapper_prefix),
     (ProjectCommand::wrapper_suffix, ProjectCommand::wrapper_prefix),
     (PythonCommand::wrapper_suffix, PythonCommand::wrapper_prefix),
+    (ShellCommand::wrapper_suffix, ShellCommand::wrapper_prefix),
     (LookupCommand::wrapper_suffix, LookupCommand::wrapper_prefix),
     (GrepCommand::wrapper_suffix, GrepCommand::wrapper_prefix),
     (GgCommand::wrapper_suffix, GgCommand::wrapper_prefix),
@@ -305,6 +310,13 @@ pub(super) fn wrappers() -> String {
             if !comment.is_empty() {
                 abouts.insert(name.to_string(), comment.to_string());
             }
+            // The one generation-time substitution a body may use: `{PROJECT_ROOT}` becomes the
+            // project directory this binary was compiled from, already shell-quoted. The
+            // attribute only takes a string literal, but the generator runs inside the binary —
+            // which is exactly where compile-time knowledge lives — so the path is baked into
+            // the emitted text instead of fetched through a subprocess at every call.
+            let fn_body = fn_body
+                .replace("{PROJECT_ROOT}", &crate::support::shell_quote::quote(env!("CARGO_MANIFEST_DIR")));
             let about = if comment.is_empty() { String::new() } else { format!("  # {comment}") };
             lines.push(format!("{name}() {{ {fn_body}; }}{about}"));
         }
@@ -555,6 +567,106 @@ mod tests {
         assert!(script.contains(r#"bind '"\eq": "bashrs_compile\n"'"#), "ALT+Q keybind missing");
         assert!(script.contains("if pgrep -x cinnamon >/dev/null; then bind"), "ALT+L desktop-restart missing");
         assert!(script.contains("if [ -n \"$BASH_VERSION\" ]; then"), "keybinds should be bash-guarded");
+    }
+
+    /// A keybind pointing at a command that does not exist fails *silently*: readline binds the
+    /// text happily, the description lookup misses and degrades to echoing the command back, and
+    /// nothing complains until someone presses the key and gets `command not found`. Renaming a
+    /// bound function without updating `keybinds::bindings` is exactly how that happens, so the
+    /// two are tied together here rather than left to be discovered by hand.
+    #[test]
+    fn every_keybind_targets_a_function_the_sourcefile_defines() {
+        let script = wrappers();
+        for (key, bound) in keybinds::bindings() {
+            // A bind may carry arguments; only the command itself has to resolve.
+            let command = bound.split_once(' ').map_or(*bound, |(name, _)| name);
+            let definition = format!("{command}() {{");
+            assert!(
+                script.lines().any(|line| line.starts_with(&definition)),
+                "{key} binds `{command}`, which this sourcefile never defines — \
+                 that key would fail only at the moment someone pressed it"
+            );
+            // The other half of the same failure: the description lookup is keyed by command
+            // name, and on a miss it degrades to printing the command back. That reads as a
+            // comment, so it survives review — assert the lookup actually resolved.
+            let bind_line = script
+                .lines()
+                .find(|line| line.contains(&format!("\"{key}\":")))
+                .unwrap_or_else(|| panic!("{key} is in bindings() but emitted no bind line"));
+            let (_, description) = bind_line.rsplit_once(": ").expect("every bind line is commented");
+            assert_ne!(
+                description.trim(),
+                command,
+                "{key}'s comment is just `{command}` echoed back — the description lookup missed"
+            );
+        }
+    }
+
+    /// The `cd` commands and `shell_def` are pure shell — a child process can't move its
+    /// parent, and only the calling shell knows its own aliases/functions/variables — so what
+    /// the sourcefile defines IS the implementation, pinned here. `dotbashrs_cd`'s off-prefix
+    /// name is deliberate: the dot names the directory (~/.bashrs), and the clap-side naming
+    /// test can't see shell-body commands, so this is where the spelling is held.
+    #[test]
+    fn the_cd_and_define_commands_are_inline_shell() {
+        let script = wrappers();
+        // The project root is baked at generation time, shell-quoted — no subprocess at `cd`
+        // time. Asserted through the same quote + env the generator uses, so this test is
+        // location-independent.
+        let baked = format!(
+            "bashrs_cd() {{ cd -- {}; }}",
+            crate::support::shell_quote::quote(env!("CARGO_MANIFEST_DIR"))
+        );
+        assert!(script.contains(&baked), "bashrs_cd must cd to the baked project root: {baked}");
+        assert!(
+            !script.contains("{PROJECT_ROOT}"),
+            "the placeholder must never survive into the emitted script"
+        );
+        assert!(
+            script.contains(r#"dotbashrs_cd() { cd -- "$HOME/.bashrs"; }"#),
+            "dotbashrs_cd must cd to the installation directory"
+        );
+        // The `cd` builtin override: the real builtin (every native behavior kept), and on
+        // success the landing directory's contents — with GNU ls's own shell-escape quoting,
+        // so a problematic name pastes back like lll's do. Its section header proves the
+        // category registered end-to-end.
+        assert!(script.contains("\n# builtin overrides\n"), "the builtin-overrides section is missing");
+        assert!(
+            script.contains(r#"cd() { builtin cd "$@" && ls -AF --color=always --group-directories-first --quoting-style=shell-escape; }"#),
+            "the cd override must run the builtin, then list escaped on success"
+        );
+        // shell_def's wrapper pipes the four shell-only probes into the binary (NUL-delimited),
+        // where the ranking/labeling logic lives in tested Rust — the shell half is only what a
+        // child process cannot see. Every probe silenced and `--`-terminated.
+        let def = script
+            .lines()
+            .find(|line| line.trim_start().starts_with("shell_def()"))
+            .expect("shell_def must be emitted");
+        for needed in [
+            r#"alias -- "$__n" 2>/dev/null"#,
+            r#"declare -f -- "$__n" 2>/dev/null"#,
+            r#"declare -p -- "$__n" 2>/dev/null"#,
+            r#"type -at -- "$__n" 2>/dev/null"#,
+            r"printf '\0'",
+            r#"| "$HOME/.bashrs/bashrs" shell_def "$@""#,
+        ] {
+            assert!(def.contains(needed), "shell_def's wrapper is missing `{needed}`: {def}");
+        }
+    }
+
+    /// The `autokey_*` commands take real paths and complete like any other command — flags
+    /// from the binary, filenames from the PWD. The store's contents are deliberately NOT
+    /// completion candidates: they live outside the PWD (the full-path listing is
+    /// `autokey_list_bashrs_profiles`'s job, and a bare `autokey_apply` already reaches the
+    /// whole store), so offering them would only pollute the completion space.
+    #[test]
+    fn profile_commands_get_no_special_completion() {
+        let script = wrappers();
+        assert!(!script.contains("_bashrs_autokey_complete"), "the store completer was removed");
+        assert!(
+            !script.contains("user-data/sequencer/\"*.toml"),
+            "nothing in the sourcefile should glob the profile store"
+        );
     }
 
     #[test]

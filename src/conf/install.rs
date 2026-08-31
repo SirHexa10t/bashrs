@@ -41,6 +41,9 @@ pub fn install_shell(content: &str) {
     if let Err(msg) = ensure_home(&home) {
         die(msg);
     }
+    if let Err(msg) = ensure_profile_store(&home) {
+        die(msg);
+    }
     match install_binary(&home) {
         Ok(Some(bin)) => println!("Installed {}", bin.display()),
         Ok(None) => {} // already running as the installed copy — nothing to move
@@ -162,6 +165,18 @@ fn ensure_home(home: &Path) -> Result<(), String> {
         ));
     }
     std::fs::create_dir_all(home).map_err(|err| format!("could not create {}: {err}", home.display()))
+}
+
+/// Create the binds-profile store, `<home>/user-data/sequencer` (the `<home>` form of
+/// [`super::user_data_dir`], kept parameterised like everything here so tests install into a
+/// temp home). Nothing else creates it — profiles are hand-written — and it must exist before
+/// the first one does: it's what makes the store discoverable, and what a bare `autokey_apply`
+/// passes. The other user-data dirs are NOT made here; their owners build them on first write
+/// (`dl`'s cookie store, the oui cache).
+fn ensure_profile_store(home: &Path) -> Result<(), String> {
+    let store = home.join("user-data").join("sequencer");
+    std::fs::create_dir_all(&store)
+        .map_err(|err| format!("could not create {}: {err}", store.display()))
 }
 
 /// Install the running executable as `<home>/bashrs` — the self-copy that IS the installation
@@ -304,6 +319,18 @@ mod tests {
         std::os::unix::fs::symlink(&live_target, &live).unwrap();
         assert_eq!(ensure_home(&live), Ok(()), "a symlink into a live dir is written through");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The binds-profile store exists from the first install on — empty is fine, missing is
+    /// not: it's what makes the store discoverable, and what a bare `autokey_apply` passes.
+    #[test]
+    fn installing_creates_the_profile_store() {
+        let home = scratch("profilestore");
+        assert_eq!(ensure_profile_store(&home), Ok(()));
+        assert!(home.join("user-data/sequencer").is_dir());
+        // Idempotent, like the rest of the install: a second run changes nothing.
+        assert_eq!(ensure_profile_store(&home), Ok(()));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

@@ -5,6 +5,10 @@ edition = "2021"
 
 [workspace]
 members = ["macros"]
+# The companion checkouts are their own workspaces; without this, a path dependency into one
+# (the unpushed-iteration wiring) would be adopted as a member here and cut off from the
+# `workspace.package` fields it inherits from its real root.
+exclude = ["bashrs_dependencies"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

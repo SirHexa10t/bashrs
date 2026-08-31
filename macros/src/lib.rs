@@ -44,7 +44,11 @@ use syn::{
 ///   binary call: for work that must run in the *calling* shell (`cd`, environment changes),
 ///   which a child process can't do. The function takes no arguments and never enters the clap
 ///   graph (there is nothing for the binary to run); its name and doc comment surface in the
-///   sourcefile as usual, via the generated `shell_functions()`.
+///   sourcefile as usual, via the generated `shell_functions()`. The attribute only takes a
+///   string literal, so compile-time values can't be spliced here — but the body may embed
+///   `{PROJECT_ROOT}`, which the sourcefile generator (running inside the binary) replaces
+///   with the shell-quoted project directory. Keep bodies to one line: anything with real
+///   logic belongs in Rust, with `#[piped("…")]` feeding it whatever only the shell knows.
 ///
 /// ```ignore
 /// #[category(command = MediaCommand, prefix = "media_")]

@@ -11,6 +11,7 @@
 
 #[bashrs_macros::category(command = ComfyReposCommand, prefix = "comfy_")]
 mod commands {
+    use crate::support::args::NoArgs;
     use crate::support::comfy_repos::table_fancy_options;
     use crate::support::doc_render;
     use clap::Args;
@@ -120,6 +121,17 @@ mod commands {
         _sequencer(sequencer::Command::Doctor(args));
     }
 
+    /// `~/.bashrs/user-data/sequencer` — the profile store: where this shell keeps binds
+    /// profiles. Deliberately nothing more than a well-known directory — sequencer takes real
+    /// paths only, no command resolves bare names against this behind the user's back, and TAB
+    /// completion doesn't offer its contents (they aren't in the PWD; the full-path listing is
+    /// `autokey_list_bashrs_profiles`'s job). It is what a bare `autokey_apply` passes and what
+    /// that listing walks; the same division as [`_cookie_store_dir`] — where bashrs keeps its
+    /// data is bashrs's own business. `install-shell` creates it.
+    fn _profile_store_dir() -> PathBuf {
+        crate::conf::user_data_dir().join("sequencer")
+    }
+
     /// Check binds files for problems without applying them: nothing is activated, no profile
     /// state is touched, and the files are left exactly as they are. `autokey_reformat` is the
     /// same check with tidying turned on (sequencer profile-check)
@@ -141,10 +153,76 @@ mod commands {
 
     /// Apply binds profiles: remap keys and run sequences until stopped. Each FILE is linked into
     /// the active set (naming a directory takes every `.toml` directly inside it, in name order);
-    /// the first invocation becomes the manager and later ones add to it (sequencer profile-apply)
+    /// naming nothing applies the profile store, ~/.bashrs/user-data/sequencer. The first
+    /// invocation becomes the manager and later ones add to it (sequencer profile-apply)
     #[unprefixed]
-    pub fn autokey_apply(args: sequencer::ProfileApplyArgs) {
+    pub fn autokey_apply(mut args: sequencer::ProfileApplyArgs) {
+        // Upstream requires at least one FILE; this shell relaxes that (`cli::OPTIONAL_ARGS`)
+        // and answers the bare invocation itself: the whole store, as an ordinary directory
+        // argument through upstream's own expansion — which also supplies the error when the
+        // store is empty. Explicit arguments pass through untouched, real paths like anywhere.
+        if args.files.is_empty() {
+            args.files = vec![_profile_store_dir()];
+        }
         _sequencer(sequencer::Command::ProfileApply(args));
+    }
+
+    /// List the profile store (~/.bashrs/user-data/sequencer): every binds profile in it,
+    /// RECURSIVELY, and every directory — `autokey_apply` expands a directory non-recursively
+    /// on purpose, so each directory is its own applyable unit and earns its own line (a
+    /// trailing `/`). Full paths, made to be copied straight onto an `autokey_apply` line:
+    /// the apply commands take real paths only, so the listing hands out exactly those.
+    /// Applied entries are marked, plus anything applied from outside the store, with the
+    /// path it came from. `_bashrs_` because the store is this shell's: sequencer applies
+    /// whatever files it is given and has no drawer of its own
+    #[unprefixed]
+    pub fn autokey_list_bashrs_profiles(_args: NoArgs) {
+        let store = _profile_store_dir();
+        // Applied links resolve to CANONICAL targets (sequencer's scan), so stored files are
+        // matched by canonical path — two same-named profiles in different folders can't
+        // vouch for each other the way name-matching would let them.
+        let applied = sequencer::applied_profiles();
+        let is_applied = |path: &Path| {
+            std::fs::canonicalize(path)
+                .is_ok_and(|canonical| applied.iter().any(|(_, target)| *target == canonical))
+        };
+        let mut lines: Vec<String> = Vec::new();
+        let mut matched: Vec<PathBuf> = Vec::new(); // store files found applied, canonical
+        let mut pending = vec![store.clone()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                let shown = path.display().to_string();
+                if path.is_dir() {
+                    lines.push(format!("{shown}/"));
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("toml")) {
+                    match is_applied(&path) {
+                        true => {
+                            lines.push(format!("{shown}  [applied]"));
+                            matched.extend(std::fs::canonicalize(&path));
+                        }
+                        false => lines.push(shown),
+                    }
+                }
+            }
+        }
+        if lines.is_empty() {
+            println!(
+                "no profiles in {} — drop binds .toml files there (see `autokey_check`)",
+                store.display()
+            );
+        }
+        lines.sort(); // paths sort a directory's line right above its contents
+        for line in &lines {
+            println!("{line}");
+        }
+        // Applied out of somewhere else entirely — still part of "what is live right now".
+        for (name, target) in &applied {
+            if !matched.contains(target) {
+                println!("{name}  [applied from {}]", target.display());
+            }
+        }
     }
 
     /// Remove profiles from the active set by name (`gaming` or `gaming.toml`); naming none opens
@@ -278,6 +356,19 @@ mod commands {
     /// `table_fancy`-style to fit the terminal.
     fn _compatibility_help() -> String {
         doc_render::render_doc(COMPATIBILITY)
+    }
+
+    #[cfg(test)]
+    mod autokey_tests {
+        use super::*;
+
+        /// The Rust half of the store-location pin; the shell half (the completer's
+        /// `$HOME/.bashrs/user-data/sequencer` glob) is pinned in `cli::sourcefile`'s tests.
+        /// Either moving without the other turns exactly one of the two red.
+        #[test]
+        fn the_profile_store_sits_in_user_data() {
+            assert_eq!(_profile_store_dir(), crate::conf::user_data_dir().join("sequencer"));
+        }
     }
 
     #[cfg(test)]

@@ -34,6 +34,12 @@ struct Comfy {
     /// Sibling runnable scripts in the same clone, each exposed as flag-variant aliases — run by
     /// absolute path with no `cd`, exactly like the main alias.
     scripts: &'static [Script],
+    /// Fixed-purpose aliases of the MAIN executable, as `(alias, pinned args)` — the pinned args
+    /// are the WHOLE invocation, not a prefix to the caller's. For flags that are a complete
+    /// action in themselves (`--stop`), where any further argument is noise at best: `-h`/`--help`
+    /// is the one pass-through (forwarded as the tool's own `--help`), anything else is refused.
+    /// Contrast [`Script`] variants, which pin flags and still append `"$@"`.
+    locked: &'static [(&'static str, &'static str)],
 }
 
 /// A secondary alias for a [`Comfy`]'s clone: the same tool, a different entry point. Run by the
@@ -73,6 +79,8 @@ const STAINLESS: &[Comfy] = &[Comfy {
         exe: "dockerized_claude_code/quick_question.py",
         variants: &[("q", ""), ("q2", "--explain"), ("q3", "--research")],
     }],
+    // `ai --stop` as its own verb: stopping is a complete action, so no other argument passes.
+    locked: &[("ai_stop", "--stop")],
 }];
 
 /// Clone root as the *generated shell* spells it — the sanctioned `$HOME`-relative literal, kept
@@ -394,6 +402,12 @@ pub(crate) fn aliases() -> (String, Vec<(String, String)>) {
         let about = help.as_deref().and_then(extract_about);
         lines.push_str(&alias_line(comfy, about.as_deref()));
         complete(comfy.alias, &help.as_deref().map(extract_flags).unwrap_or_default(), "");
+        for (alias, pinned) in comfy.locked {
+            lines.push_str(&locked_line(comfy, alias, pinned, about.as_deref()));
+            // Static, not probed: refusing everything but help IS the alias's contract, so the
+            // completion needs no live clone to be right.
+            complete(alias, &["-h".to_string(), "--help".to_string()], "");
+        }
         for aux in comfy.aux {
             let help = exists.then(|| fetch_help_aux(comfy, aux)).flatten();
             let about = help.as_deref().and_then(extract_about);
@@ -417,6 +431,25 @@ pub(crate) fn aliases() -> (String, Vec<(String, String)>) {
 fn alias_line(comfy: &Comfy, about: Option<&str>) -> String {
     let comment = about.map(|about| format!("  # {about}")).unwrap_or_default();
     format!("{}() {{ {} \"{}\" \"$@\"; }}{comment}\n", comfy.alias, comfy.run, exe_shell(comfy))
+}
+
+/// Pure: one locked-alias line — the pinned args are the whole invocation. Bare runs the tool
+/// with exactly the pinned args; `-h`/`--help` forwards as the tool's own `--help`; anything
+/// else is refused with a usage error (exit 2), because the alias's entire meaning is its pinned
+/// flag and a further argument would silently change it. The probed `about` rides along like a
+/// script variant's, suffixed with the pinned args and the no-arguments contract.
+fn locked_line(comfy: &Comfy, alias: &str, pinned: &str, about: Option<&str>) -> String {
+    let comment = about
+        .map(|about| format!("  # {about} ({pinned}; takes no further arguments)"))
+        .unwrap_or_default();
+    let exe = exe_shell(comfy);
+    format!(
+        "{alias}() {{ if [ $# -eq 0 ]; then {run} \"{exe}\" {pinned}; \
+         elif [ \"$1\" = -h ] || [ \"$1\" = --help ]; then {run} \"{exe}\" --help; \
+         else echo \"{alias}: takes no arguments beyond -h/--help - it is exactly '{main} {pinned}'\" >&2; return 2; fi; }}{comment}\n",
+        run = comfy.run,
+        main = comfy.alias,
+    )
 }
 
 /// Pure: one auxiliary alias line (`about` becomes an inline `#` comment when present) — `cd` to
@@ -465,6 +498,7 @@ mod tests {
             exe: "dockerized_claude_code/quick_question.py",
             variants: &[("q", ""), ("q2", "--explain")],
         }],
+        locked: &[("ai_stop", "--stop")],
     };
 
     #[test]
@@ -502,6 +536,27 @@ mod tests {
         );
     }
 
+    /// A locked alias is a complete action: bare runs exactly the pinned invocation, `-h`/
+    /// `--help` reaches the tool's own help, and any other argument is refused — pinned args are
+    /// the meaning, so extras must not ride along the way a [`Script`] variant's `"$@"` would.
+    #[test]
+    fn locked_line_pins_the_whole_invocation_and_refuses_extras() {
+        let line = locked_line(SAMPLE, "ai_stop", "--stop", Some("Launch an agent"));
+        assert_eq!(
+            line,
+            "ai_stop() { if [ $# -eq 0 ]; then python3 \
+             \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/run.py\" --stop; \
+             elif [ \"$1\" = -h ] || [ \"$1\" = --help ]; then python3 \
+             \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/run.py\" --help; \
+             else echo \"ai_stop: takes no arguments beyond -h/--help - it is exactly 'ai --stop'\" >&2; return 2; fi; }\
+             \x20 # Launch an agent (--stop; takes no further arguments)\n"
+        );
+        // The whole point, stated negatively: nothing forwards the caller's arguments.
+        assert!(!line.contains("\"$@\""), "a locked alias must never pass caller arguments through");
+        // No probe (clone absent) → no comment, same as every other alias kind.
+        assert!(locked_line(SAMPLE, "ai_stop", "--stop", None).ends_with("fi; }\n"));
+    }
+
     #[test]
     fn script_lines_run_by_absolute_path_with_fixed_flags_and_no_cd() {
         // Each variant is a bare alias like the main one (no `cd`): the script by absolute path,
@@ -533,6 +588,7 @@ mod tests {
             python_deps: &[],
             aux: &[],
             scripts: &[],
+            locked: &[],
         };
         assert_eq!(exe_dir_shell(FLAT), "$HOME/.bashrs/stainless_comfy/tool");
     }

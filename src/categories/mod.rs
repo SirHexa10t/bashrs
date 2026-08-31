@@ -8,6 +8,7 @@ pub mod autogen_lookup;
 pub mod autogen_styles;
 pub mod anti_ai;
 pub mod bashrs;
+pub mod builtins;
 pub mod comfy_repos;
 pub mod download;
 pub mod exposed_helpers;

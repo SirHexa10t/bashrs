@@ -9,6 +9,7 @@ use crate::categories::anti_ai::AntiAiCommand;
 use crate::categories::autogen_lookup::{GgCommand, GrepCommand};
 use crate::categories::autogen_styles::StylizedEchoCommand;
 use crate::categories::bashrs::BashrsCommand;
+use crate::categories::builtins::BuiltinsCommand;
 use crate::categories::comfy_repos::ComfyReposCommand;
 use crate::categories::download::DownloadCommand;
 use crate::categories::exposed_helpers::ExposedHelpersCommand;
@@ -46,6 +47,8 @@ pub enum Command {
     AntiAi(AntiAiCommand),
     #[command(flatten)]
     Bashrs(BashrsCommand),
+    #[command(flatten)]
+    Builtins(BuiltinsCommand),
     #[command(flatten)]
     Filesystem(FilesystemCommand),
     #[command(flatten)]
@@ -120,6 +123,7 @@ impl Command {
         match self {
             Command::AntiAi(cmd) => cmd.run(),
             Command::Bashrs(cmd) => cmd.run(),
+            Command::Builtins(cmd) => cmd.run(),
             Command::Filesystem(cmd) => cmd.run(),
             Command::Git(cmd) => cmd.run(),
             Command::Download(cmd) => cmd.run(),
@@ -174,8 +178,15 @@ const HIDDEN_PINNED: &[(&str, &[&str])] = &[
 const NARROWED_ARGS: &[(&str, &str, usize, &[&str])] =
     &[("dl", "cookies_extract_for_domain", 1, &["TARGET"])];
 
-/// Apply both upstream-argument adjustments: hide each [`HIDDEN_PINNED`] flag on its command, and
-/// narrow each [`NARROWED_ARGS`] one to the values this shell exposes. Applied everywhere the
+/// Upstream-required arguments this shell relaxes, as `(command, argument)`. The wrapper
+/// supplies a default when nothing is passed — `autokey_apply` with no FILE applies the whole
+/// profile store — so keeping upstream's `required` would reject exactly the invocation the
+/// wrapper exists to serve, before its code ever ran.
+const OPTIONAL_ARGS: &[(&str, &str)] = &[("autokey_apply", "files")];
+
+/// Apply the upstream-argument adjustments: hide each [`HIDDEN_PINNED`] flag on its command,
+/// narrow each [`NARROWED_ARGS`] one to the values this shell exposes, and relax each
+/// [`OPTIONAL_ARGS`] requirement the wrapper answers itself. Applied everywhere the
 /// command tree is built — parsing ([`parse`]) and generation (`sourcefile::category_commands`) —
 /// so help, wrappers, and completion all tell one truth.
 ///
@@ -194,12 +205,16 @@ fn adjust_pinned(cmd: clap::Command) -> clap::Command {
             Some(args) => args.iter().fold(sub, |sub, arg| sub.mut_arg(*arg, |a| a.hide(true))),
             None => sub,
         };
-        NARROWED_ARGS
+        let sub = NARROWED_ARGS
             .iter()
             .filter(|(narrowed, ..)| *narrowed == name)
             .fold(sub, |sub, &(_, arg, count, value_names)| {
                 sub.mut_arg(arg, |a| a.num_args(count).value_names(value_names))
-            })
+            });
+        OPTIONAL_ARGS
+            .iter()
+            .filter(|(relaxed, _)| *relaxed == name)
+            .fold(sub, |sub, &(_, arg)| sub.mut_arg(arg, |a| a.required(false)))
     })
 }
 
@@ -358,6 +373,44 @@ mod tests {
         assert_eq!(withheld.len(), 1, "expected exactly one pinned flag, found {withheld:?}");
     }
 
+    /// `autokey_apply` with nothing at all must parse — the wrapper answers the bare
+    /// invocation with the whole profile store, and it can only do that if clap lets the
+    /// invocation through ([`OPTIONAL_ARGS`]). The relaxation must not leak: `autokey_check`
+    /// wraps the same upstream FILE argument and still requires it.
+    #[test]
+    fn a_bare_autokey_apply_parses_and_only_apply_is_relaxed() {
+        let try_parse = |argv: &[&str]| adjust_pinned(Cli::command()).try_get_matches_from(argv.to_vec());
+        assert!(try_parse(&["bashrs", "autokey_apply"]).is_ok(), "the bare invocation must parse");
+        assert!(try_parse(&["bashrs", "autokey_apply", "gaming"]).is_ok(), "naming files still works");
+        assert!(
+            try_parse(&["bashrs", "autokey_check"]).is_err(),
+            "check has no bare-invocation meaning; upstream's required FILE must survive for it"
+        );
+    }
+
+    /// Only the clap-backed commands appear here — `#[shell_body]` ones (`bashrs_cd`,
+    /// `dotbashrs_cd`) never enter the clap graph, and `dotbashrs_cd`'s deliberate off-prefix
+    /// name (the dot names the DIRECTORY, ~/.bashrs) is asserted where the shell functions
+    /// are emitted, in `sourcefile`'s tests.
+    #[test]
+    fn bashrs_commands_follow_naming_standard() {
+        assert_prefixed(&command_names::<BashrsCommand>(), "bashrs_", &[]);
+    }
+
+    /// Builtin overrides carry the builtin's exact name by definition, and each is a
+    /// `#[shell_body]` function — invisible to clap, its spelling asserted where the shell
+    /// functions are emitted (`sourcefile`'s tests). What this guards is the category gaining
+    /// clap-backed strays: anything the binary can run isn't an override and belongs elsewhere.
+    #[test]
+    fn builtins_commands_follow_naming_standard() {
+        assert_eq!(
+            command_names::<BuiltinsCommand>(),
+            Vec::<String>::new(),
+            "builtin overrides are shell functions only — a clap command in this category \
+             would be reachable as `bashrs <name>`, which an override of a builtin is not"
+        );
+    }
+
     #[test]
     fn filesystem_commands_follow_naming_standard() {
         // `lll` is a bare `ls`-like verb (à la `ll`), intentionally unprefixed — the same
@@ -423,7 +476,7 @@ mod tests {
                 "backup_diff", "backup_sync", "backup_find_bitrot",
                 "dl",
                 "clicker", "clicker_benchmark",
-                "autokey_doctor", "autokey_check", "autokey_reformat", "autokey_apply", "autokey_unapply", "autokey_detect",
+                "autokey_doctor", "autokey_check", "autokey_reformat", "autokey_apply", "autokey_unapply", "autokey_detect", "autokey_list_bashrs_profiles",
             ],
         );
     }
