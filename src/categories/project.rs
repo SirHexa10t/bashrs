@@ -45,7 +45,9 @@
 
 #[bashrs_macros::category(command = ProjectCommand, prefix = "pro_")]
 mod commands {
-    use crate::support::exec;
+    use crate::support::args::SkipArgs;
+    use crate::support::doc_style::_header;
+    use crate::support::{exec, treegrep};
     use clap::Args;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -385,6 +387,100 @@ mod commands {
         }
     }
 
+    /// Print the project's TODOs, both kinds: every TODO file in DIR's root (the name in any
+    /// letter case, with any extension or none) in full — then every `todo` mention in the
+    /// tree, found with the `gg` engine and always `--lean` (machine-written dirs skipped;
+    /// `_arg_lean_spec` lists them), so vendored and build-output TODOs stay out. A mention
+    /// counts only with no ASCII letter touching it (`TODO:`, `# todo`, `todo!(…)` — not
+    /// `todos`, `MyTODO`); `--match-any-todo` drops that and takes the substring anywhere
+    pub fn todo(args: TodoArgs) {
+        let dir = Path::new(&args.dir);
+        if !dir.is_dir() {
+            eprintln!("pro_todo: no such directory: {}", dir.display());
+            std::process::exit(1);
+        }
+        // The project's TODO files first, whole: they ARE the todo list, whether or not their
+        // lines contain the word — which is exactly why a grep alone would not do.
+        for path in _todo_files(dir) {
+            match fs::read_to_string(&path) {
+                Ok(text) => {
+                    println!("{}", _header(&path.display().to_string()));
+                    print!("{text}");
+                    if !text.ends_with('\n') {
+                        println!();
+                    }
+                }
+                Err(err) => eprintln!("pro_todo: cannot read {}: {err}", path.display()),
+            }
+        }
+        // Then every mention in the tree — the `gg` engine, so nested TODO files surface in
+        // its filenames pass and the comments in its contents pass, both highlighted. The
+        // matcher it builds is case-insensitive, so the pattern spells no `(?i)`.
+        let opts = treegrep::Options {
+            line_number: true,
+            context: 0,
+            delve: false,
+            regex: true,
+            save: None,
+            skips: SkipArgs { skip_pattern: Vec::new(), lean: true }.skips(),
+        };
+        let expressions = vec![_todo_pattern(args.match_any_todo).to_string()];
+        let denied = treegrep::search(&expressions, &[dir.to_path_buf()], &opts);
+        if !denied.is_empty() {
+            // Named, not silently dropped — and pointed at the tool that owns the remedy
+            // (GG's root re-scan offer), rather than growing a second sudo flow here.
+            eprintln!(
+                "pro_todo: {} path(s) unreadable for permissions — `GG todo` offers a root re-scan",
+                denied.len()
+            );
+        }
+    }
+
+    /// The mention pattern. Bounded (the default): a `todo` that no ASCII letter touches, so
+    /// punctuation, digits, whitespace and line edges all count as boundaries (`TODO:`,
+    /// `-todo`, `#todo`, `todo2`) while `todos`, `todotodo` and `MyTODO` stay out. The
+    /// boundary consumes one neighbour character, which is fine for line matching (one hit
+    /// marks the line) and spares a lookaround engine the `grep` crate doesn't have.
+    fn _todo_pattern(match_any: bool) -> &'static str {
+        match match_any {
+            true => "todo",
+            false => r"(^|[^A-Za-z])todo($|[^A-Za-z])",
+        }
+    }
+
+    /// Root-level TODO files: the stem `todo` in any letter case, any extension or none —
+    /// `TODO`, `todo.txt`, `ToDo.md` alike (`TODOS.txt` is a different stem and stays out).
+    /// Sorted, so several print in a stable order.
+    fn _todo_files(dir: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = fs::read_dir(dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .filter(|path| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem.eq_ignore_ascii_case("todo"))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// What `pro_todo` takes: the directory, and the one looseness switch.
+    #[derive(Args)]
+    pub struct TodoArgs {
+        /// Project directory to search
+        #[arg(default_value = ".")]
+        dir: String,
+        /// Match `todo` anywhere, letters around it included (`todos`, `MyTODO`, `todoooo`);
+        /// the default requires no ASCII letter on either side
+        #[arg(long)]
+        match_any_todo: bool,
+    }
+
     /// The directory to act in (default: current directory).
     #[derive(Args)]
     pub struct DirArgs {
@@ -638,6 +734,66 @@ mod commands {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The bounded pattern, judged by the REAL matcher (`streamgrep::build_matcher`, the
+        /// same builder the search runs — case-insensitive, so the pattern spells no `(?i)`):
+        /// anything non-alphabetic is a boundary, letters on either side disqualify.
+        #[test]
+        fn the_bounded_todo_pattern_needs_letter_free_edges() {
+            use grep::matcher::Matcher as _;
+            let bounded = crate::support::streamgrep::build_matcher(
+                &[_todo_pattern(false).to_string()],
+                true,
+            )
+            .expect("a fixed pattern compiles");
+            for hit in [
+                "TODO: fix this",
+                "# todo",
+                "-todo-",
+                "todo!(\"later\")",
+                "todo",
+                "2todo3", // digits are not letters: the spec bounds on ALPHABETIC neighbours
+                "\u{2014}ToDo\u{2014}",
+            ] {
+                assert!(bounded.is_match(hit.as_bytes()).unwrap(), "{hit:?} should match");
+            }
+            for miss in ["todos", "todotodo", "todoooo", "MyTODO", "todoA", "mastodon"] {
+                assert!(!bounded.is_match(miss.as_bytes()).unwrap(), "{miss:?} must not match");
+            }
+
+            // `--match-any-todo`: the substring anywhere, same case-insensitivity.
+            let any = crate::support::streamgrep::build_matcher(
+                &[_todo_pattern(true).to_string()],
+                true,
+            )
+            .expect("compiles");
+            for hit in ["todos", "todotodo", "MyTODO", "todoA", "mastodon-todo"] {
+                assert!(any.is_match(hit.as_bytes()).unwrap(), "{hit:?} should match loosely");
+            }
+            assert!(!any.is_match(b"nothing here").unwrap());
+        }
+
+        /// TODO files are found by stem, any letter case, any extension or none — and only at
+        /// the project root: nested ones belong to the grep's filenames pass instead.
+        #[test]
+        fn todo_files_are_matched_by_stem_at_the_root_only() {
+            let dir = std::env::temp_dir().join(format!("bashrs_protodo_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("nested")).unwrap();
+            for name in ["TODO", "todo.txt", "ToDo.md", "TODOS.txt", "README.md", "todo.tar.gz"] {
+                std::fs::write(dir.join(name), "x").unwrap();
+            }
+            std::fs::write(dir.join("nested/TODO"), "x").unwrap();
+
+            let found: Vec<String> = _todo_files(&dir)
+                .into_iter()
+                .filter_map(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect();
+            // Sorted, stem-exact: `TODOS` is a different stem, `todo.tar.gz`'s stem is
+            // `todo.tar`, and nested/TODO is out of scope here.
+            assert_eq!(found, ["TODO", "ToDo.md", "todo.txt"]);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
 
         fn detect(present: &[&str]) -> Option<&'static str> {
             _detect_with(|m| present.contains(&m)).map(|tc| tc.name)
