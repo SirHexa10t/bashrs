@@ -1,6 +1,5 @@
-//! Finding AI provenance markers in file *metadata* — the engine behind
-//! `anti_ai_metadata_watermark_detect`, the way [`crate::support::net`] sits behind
-//! `net_excavate`.
+//! Finding AI provenance markers in file *metadata* — half of this crate's engine, beside
+//! [`crate::hidden`]'s character scan.
 //!
 //! Two halves, deliberately separable:
 //!

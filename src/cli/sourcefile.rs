@@ -10,6 +10,7 @@ use clap::Subcommand;
 use super::adjust_pinned;
 use crate::categories::autogen_lookup::{GgCommand, GrepCommand};
 use crate::categories::autogen_styles::StylizedEchoCommand;
+use crate::categories::ai_fingerprint::AiFingerprintCommand;
 use crate::categories::bashrs::BashrsCommand;
 use crate::categories::builtins::BuiltinsCommand;
 use crate::categories::comfy_repos::ComfyReposCommand;
@@ -27,7 +28,6 @@ use crate::categories::packages::PackagesCommand;
 use crate::categories::processes::ProcessesCommand;
 use crate::categories::project::ProjectCommand;
 use crate::categories::python::PythonCommand;
-use crate::categories::anti_ai::AntiAiCommand;
 use crate::categories::shell::ShellCommand;
 use crate::categories::styles::StyleCommand;
 use crate::conf::{config_file, environment, greeting, keybinds};
@@ -56,10 +56,8 @@ macro_rules! category_group {
 
 /// The command categories: the label grouping them in the generated `sourcefile.sh`, the clap
 /// graph, and the category's pure-shell commands. One row per category — never per command.
-fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 17] {
+fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 16] {
     let categories = [
-        ("anti_ai", AntiAiCommand::augment_subcommands(clap::Command::new("anti_ai")),
-            AntiAiCommand::shell_functions().to_vec()),
         ("bashrs", BashrsCommand::augment_subcommands(clap::Command::new("bashrs")),
             BashrsCommand::shell_functions().to_vec()),
         ("builtin overrides", BuiltinsCommand::augment_subcommands(clap::Command::new("builtin overrides")),
@@ -95,8 +93,10 @@ fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 17] {
         category_group!("lookup", GrepCommand, GgCommand, LookupCommand),
         // One `style` group spanning both style enums: hand-written + generated.
         category_group!("style", StyleCommand, StylizedEchoCommand),
-        ("comfy_repos", ComfyReposCommand::augment_subcommands(clap::Command::new("comfy_repos")),
-            ComfyReposCommand::shell_functions().to_vec()),
+        // One `comfy_repos` group: the Rust companions this shell wraps, plus the AI-fingerprint
+        // command over the `ai_detection` crate — an adaptation of a dependency like every other
+        // entry here, so it belongs beside them rather than in a category of its own.
+        category_group!("comfy_repos", ComfyReposCommand, AiFingerprintCommand),
     ];
     categories.map(|(label, cmd, shell_fns)| (label, adjust_pinned(cmd), shell_fns))
 }
@@ -161,14 +161,18 @@ const WRAPPER_HOOKS: &[(WrapperLookup, WrapperLookup)] = &[
     (ComfyReposCommand::wrapper_suffix, ComfyReposCommand::wrapper_prefix),
 ];
 
-/// The completion lines for the comfy/external aliases — `(alias, space-joined flags)` rows
-/// contributed by [`stainless::aliases`], whose flag lists were probed from each tool's own
-/// `--help` at generate time (the binary can't answer for them: they aren't clap commands, so
-/// `complete-flags` knows nothing about them). Rendered as a sibling of `_bashrs_complete`
-/// inside the same bash-only block, with the same contract: flags only once `-` is typed,
-/// filenames otherwise (`-o default`). Empty input renders nothing — a sourcefile generated
-/// before the first repo sync simply has no comfy completion.
-fn comfy_complete_block(entries: &[(String, String)]) -> String {
+/// Flag completion for the STAINLESS aliases, and only for them — hence the name: every
+/// Rust-side command is answered live by the binary (`_bashrs_complete` → `complete-flags`),
+/// which is always in sync with the real CLI. The non-Rust companions aren't clap commands, so
+/// the binary can't answer for them; instead [`stainless::aliases`] probes each tool's own
+/// `--help` at generate time and hands back `(alias, space-joined flags)` rows, which this bakes
+/// into a `case`. Still derived, never hand-written — just derived a generation earlier, from
+/// the tool itself rather than from a table someone has to remember to update.
+///
+/// Rendered as a sibling of `_bashrs_complete` inside the same bash-only block, with the same
+/// contract: flags only once `-` is typed, filenames otherwise (`-o default`). Empty input
+/// renders nothing — a sourcefile generated before the first repo sync simply has no rows.
+fn stainless_flags_block(entries: &[(String, String)]) -> String {
     if entries.is_empty() {
         return String::new();
     }
@@ -178,7 +182,7 @@ fn comfy_complete_block(entries: &[(String, String)]) -> String {
         .collect();
     let names: Vec<&str> = entries.iter().map(|(alias, _)| alias.as_str()).collect();
     format!(
-        "\x20   _bashrs_comfy_complete() {{\n\
+        "\x20   _bashrs_stainless_flags() {{\n\
          \x20       local cur=${{COMP_WORDS[COMP_CWORD]}}\n\
          \x20       [[ $cur == -* ]] || return 0\n\
          \x20       local flags=\"\"\n\
@@ -187,7 +191,7 @@ fn comfy_complete_block(entries: &[(String, String)]) -> String {
          \x20       esac\n\
          \x20       COMPREPLY=($(compgen -W \"$flags\" -- \"$cur\"))\n\
          \x20   }}\n\
-         \x20   complete -F _bashrs_comfy_complete -o default {}\n",
+         \x20   complete -F _bashrs_stainless_flags -o default {}\n",
         names.join(" ")
     )
 }
@@ -337,9 +341,9 @@ pub(super) fn wrappers() -> String {
     }
 
     // Non-Rust companion repos (cloned by the hidden `install-stainless` command), aliased to their launchers.
-    let (comfy, comfy_completions) = stainless::aliases();
+    let (comfy, stainless_flags) = stainless::aliases();
     if !comfy.is_empty() {
-        body += &format!("\n# comfy / external tools\n{comfy}");
+        body += &format!("\n# stainless comfy repos\n{comfy}");
     }
 
     // Bundled tools (fetched and kept current by the same bin): their shim dir wins by PATH.
@@ -386,7 +390,7 @@ pub(super) fn wrappers() -> String {
          \x20   complete -F _bashrs_complete -o default {}\n\
          {}fi\n",
         completion_names.join(" "),
-        comfy_complete_block(&comfy_completions)
+        stainless_flags_block(&stainless_flags)
     );
 
     // A load greeting — after the `gecho`/`boecho` wrappers it calls are defined.
@@ -490,15 +494,15 @@ mod tests {
         // (stainless), so this renders rows verbatim. No rows → no block at all.
         let rows = [("q".to_string(), "--explain --research -h --help".to_string()),
                     ("ai".to_string(), "--dry-run".to_string())];
-        let block = comfy_complete_block(&rows);
+        let block = stainless_flags_block(&rows);
         assert!(block.contains("q) flags=\"--explain --research -h --help\" ;;"), "{block}");
         assert!(block.contains("ai) flags=\"--dry-run\" ;;"), "{block}");
         assert!(block.contains("[[ $cur == -* ]] || return 0"), "flags only after `-`: {block}");
         assert!(
-            block.contains("complete -F _bashrs_comfy_complete -o default q ai"),
+            block.contains("complete -F _bashrs_stainless_flags -o default q ai"),
             "both aliases registered: {block}"
         );
-        assert_eq!(comfy_complete_block(&[]), "", "no rows, no block");
+        assert_eq!(stainless_flags_block(&[]), "", "no rows, no block");
     }
 
     #[test]

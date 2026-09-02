@@ -6,7 +6,7 @@
 
 pub mod autogen_lookup;
 pub mod autogen_styles;
-pub mod anti_ai;
+pub mod ai_fingerprint;
 pub mod bashrs;
 pub mod builtins;
 pub mod comfy_repos;

@@ -5,9 +5,9 @@
 //! lives in the [`sourcefile`] child.
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
-use crate::categories::anti_ai::AntiAiCommand;
 use crate::categories::autogen_lookup::{GgCommand, GrepCommand};
 use crate::categories::autogen_styles::StylizedEchoCommand;
+use crate::categories::ai_fingerprint::AiFingerprintCommand;
 use crate::categories::bashrs::BashrsCommand;
 use crate::categories::builtins::BuiltinsCommand;
 use crate::categories::comfy_repos::ComfyReposCommand;
@@ -44,8 +44,6 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     #[command(flatten)]
-    AntiAi(AntiAiCommand),
-    #[command(flatten)]
     Bashrs(BashrsCommand),
     #[command(flatten)]
     Builtins(BuiltinsCommand),
@@ -68,6 +66,8 @@ pub enum Command {
     MediaImages(MediaImagesCommand),
     #[command(flatten)]
     ComfyRepos(ComfyReposCommand),
+    #[command(flatten)]
+    AiFingerprint(AiFingerprintCommand),
     #[command(flatten)]
     Network(NetworkCommand),
     #[command(flatten)]
@@ -121,7 +121,6 @@ pub enum Command {
 impl Command {
     pub fn run(self) {
         match self {
-            Command::AntiAi(cmd) => cmd.run(),
             Command::Bashrs(cmd) => cmd.run(),
             Command::Builtins(cmd) => cmd.run(),
             Command::Filesystem(cmd) => cmd.run(),
@@ -133,6 +132,7 @@ impl Command {
             Command::MediaAudioFx(cmd) => cmd.run(),
             Command::MediaImages(cmd) => cmd.run(),
             Command::ComfyRepos(cmd) => cmd.run(),
+            Command::AiFingerprint(cmd) => cmd.run(),
             Command::Network(cmd) => cmd.run(),
             Command::Packages(cmd) => cmd.run(),
             Command::Processes(cmd) => cmd.run(),
@@ -489,8 +489,11 @@ mod tests {
     }
 
     #[test]
-    fn anti_ai_commands_follow_naming_standard() {
-        assert_prefixed(&command_names::<AntiAiCommand>(), "anti_ai_", &[]);
+    fn ai_fingerprint_commands_follow_naming_standard() {
+        // Grouped under `comfy_repos` in the sourcefile (it wraps the `ai_detection` crate, the
+        // way `autokey_*` wraps sequencer) but prefixed for what it DOES, not for the repo it
+        // came from — the same choice `backup_*` and `autokey_*` make.
+        assert_prefixed(&command_names::<AiFingerprintCommand>(), "detect_ai_", &[]);
     }
 
     #[test]

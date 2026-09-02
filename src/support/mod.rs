@@ -10,7 +10,6 @@
 //! privilege escalation ([`superuser`]), and the system package-manager registry
 //! ([`package_management`]).
 
-pub mod ai_meta;
 pub mod args;
 pub mod comfy_repos;
 pub mod doc_render;

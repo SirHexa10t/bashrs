@@ -1,98 +1,236 @@
 //! Commands for dealing with AI-generated content on your own machine (`anti_ai_*`).
 //!
-//! `anti_ai_textual_watermark_detect` is the first: it finds *hidden characters* — the invisible
-//! codepoints that carry edit-based text watermarks, and the same ones that get pasted in by
-//! accident and then break diffs, greps and search.
+//! One command, `detect_ai_textual_fingerprint`, asking one question — does this file show
+//! signs of AI? — of three kinds of evidence in a single walk:
+//!
+//! 1. **Hidden characters** in text: the invisible codepoints that carry edit-based watermarks,
+//!    and the same ones pasted in by accident that then break diffs, greps and search.
+//! 2. **Provenance labels** in file metadata: frontmatter and `<meta>` generator fields, XMP
+//!    CreatorTool, C2PA containers, vendor names.
+//! 3. **Writing tells**: excess vocabulary, stock phrases, sentence shapes, formatting habits.
+//!
+//! The three are graded, not pooled. The first two are *verifiable* — a codepoint is there or it
+//! is not — and they alone set the exit code, so `… && publish` still refuses to chain past one.
+//! The third is style: reported with an evidence tier and a caveat on every finding, and never
+//! able to fail a build. `--skip-tells` drops it entirely.
+//!
+//! Each engine also sees a different thing, and that is the point of keeping them apart: the
+//! character and prose scans read the file's *text*, while the metadata scan reads its raw bytes
+//! and opens only the metadata containers. So a bare "AI" is a marker in a `Generator` field and
+//! unremarkable in a sentence — the word is suspicious in a label, not in prose.
+//!
+//! **The detection itself is not here.** All three engines live in the [`ai_detection`] crate,
+//! which knows nothing of this shell — no walking, no skipping, no colour — so anything can use
+//! them. What stays in this module is the half that is bashrs's: the clap surface, the tree walk
+//! under this shell's shared `--skip`/`--lean` conventions ([`crate::support::args`]), reading a
+//! file safely (binary sniff, size cap, and [`delve`](crate::support::treegrep::delve) for
+//! containers with a text section), telling the crate whether a surface renders Markdown, and
+//! rendering the report in this shell's palette.
 //!
 //! Deliberately **detect only**. Reporting where something is is a different act from altering
 //! a file, and only the first is safe to run over a whole tree by default. What the output is
 //! good for is deciding — the codepoints are printed by name so a reader can judge whether a
 //! given one is a carrier, an emoji joiner, or ordinary orthography.
 //!
-//! Scope, which the `txt_` in the name is there to state: this is the *edit-based text* class
-//! only, the one that is verifiable by looking. Statistical (token-sampling) watermarks live in word choice with
-//! nothing to scan for, and provenance metadata lives in container headers rather than text —
-//! neither is visible to a character scan, and neither is claimed here.
+//! What is *not* claimed: statistical (token-sampling) watermarks live in word choice with
+//! nothing to scan for, and no vendor is ever named from prose. See
+//! [`ai_detection::tells::pending::GAPS`] for the detectors the reference document describes and
+//! this does not yet implement.
 
-#[bashrs_macros::category(command = AntiAiCommand, prefix = "anti_ai_")]
+#[bashrs_macros::category(command = AiFingerprintCommand, prefix = "detect_ai_")]
 mod commands {
-    use crate::support::ai_meta;
+    use ai_detection::{hidden, metadata, tells};
     use crate::support::doc_style::{approved, notice, problematic};
     use clap::Args;
     use ignore::WalkBuilder;
     use std::io::{self, BufWriter, Write};
     use std::path::{Path, PathBuf};
 
-    /// Find verifiable AI marks in a file, or in every file under a directory: hidden
-    /// characters in text (zero-width joiners, bidi controls, tag chars, variation selectors —
-    /// with the line and codepoint of each), and AI provenance in metadata (frontmatter and
-    /// `<meta>` generator fields, XMP CreatorTool, C2PA containers, vendor names) for
-    /// md/html/svg/png/jpeg. Media data itself is never decoded; changes nothing
-    pub fn textual_watermark_detect(args: WatermarkDetectArgs) {
+    /// Find AI marks in a file, or in every file under a directory: hidden characters in text
+    /// (zero-width joiners, bidi controls, tag chars — with the line and codepoint of each), AI
+    /// provenance in metadata (frontmatter, `<meta>` generator, XMP CreatorTool, C2PA, vendor
+    /// names) for md/html/svg/png/jpeg, and writing tells in prose (excess vocabulary, stock
+    /// phrases, sentence shapes, formatting habits — each with its evidence tier and its reason
+    /// for doubt). Only the first two are verifiable and only they set the exit code;
+    /// `--skip-tells` drops the third. Media data is never decoded; changes nothing
+    pub fn textual_fingerprint(args: FingerprintArgs) {
         _detect(args);
     }
 
-    /// Both scans, one walk.
-    fn _detect(args: WatermarkDetectArgs) {
-        let WatermarkDetectArgs { target, skip, skip_spaces, emoji, skip_metadata, max_file_size } =
-            args;
+    /// All three scans, one walk.
+    ///
+    /// The engines are fed different things on purpose, and it matters: [`hidden`] and [`tells`]
+    /// see the file's *text*, while [`metadata`] sees its raw bytes and reads only the metadata
+    /// containers. That separation is why a bare "AI" counts as a marker in a `Generator` field
+    /// but not in a sentence — the word is suspicious in a label and unremarkable in prose, and
+    /// neither engine's vocabulary leaks into the other's.
+    fn _detect(args: FingerprintArgs) {
+        let FingerprintArgs {
+            target,
+            skip,
+            skip_spaces,
+            emoji,
+            skip_metadata,
+            skip_tells,
+            max_file_size,
+        } = args;
         let skips = skip.skips();
         if !target.exists() {
-            eprintln!("anti_ai_textual_watermark_detect: no such path: {}", target.display());
+            eprintln!("detect_ai_textual_fingerprint: no such path: {}", target.display());
             std::process::exit(1);
         }
         // One locked, buffered writer for the whole report: a per-line `println!` would take
         // the stdout lock and syscall for every hit, and a tree scan can produce thousands.
         let mut out = BufWriter::new(io::stdout().lock());
-        let mut files_with_hits = 0_usize;
+        let mut files_with_marks = 0_usize;
+        let mut files_with_tells = 0_usize;
         let mut total_hidden = 0_usize;
         let mut total_meta = 0_usize;
+        let mut fired: Vec<tells::Family> = Vec::new();
 
         for path in _files(&target, &skips) {
-            let hits = _read_text(&path, max_file_size)
-                .map(|text| _scan(&text, !skip_spaces, emoji))
+            // Read once, scan twice: both text engines want the same decoded string.
+            let text = _read_text(&path, max_file_size);
+            let hits = text
+                .as_deref()
+                .map(|text| hidden::scan(text, !skip_spaces, emoji))
                 .unwrap_or_default();
             // Metadata is a second look at the same file, gated by whether the engine has an
             // extractor at all — no point reading a .rs file's bytes twice to learn nothing.
-            let findings = if !skip_metadata && ai_meta::handles(&path) {
+            let findings = if !skip_metadata && metadata::handles(&path) {
                 _read_capped(&path, max_file_size)
-                    .and_then(|bytes| ai_meta::extract(&path, &bytes, true))
+                    .and_then(|bytes| metadata::extract(&path, &bytes, true))
                     .unwrap_or_default()
             } else {
                 Vec::new()
             };
-            if hits.is_empty() && findings.is_empty() {
+            let prose = match (skip_tells, text.as_deref()) {
+                (false, Some(text)) => Some(tells::scan_with(text, _surface_of(&path))),
+                _ => None,
+            };
+            let prose_tells = prose.as_ref().map_or(0, |report| report.tells.len());
+            if hits.is_empty() && findings.is_empty() && prose_tells == 0 {
                 continue;
             }
-            files_with_hits += 1;
-            total_hidden += hits.iter().map(|line| line.chars.len()).sum::<usize>();
+
+            let verifiable = !hits.is_empty() || !findings.is_empty();
+            files_with_marks += usize::from(verifiable);
+            files_with_tells += usize::from(prose_tells > 0);
+            total_hidden += hits.iter().map(|line| line.hits.len()).sum::<usize>();
             total_meta += findings.len();
             let _ = writeln!(out, "\n{}", notice(&path.display().to_string()));
             let _ = _report_file(&mut out, &hits);
             let _ = _report_metadata(&mut out, &findings);
+            if let Some(report) = &prose {
+                fired.extend(report.tells.iter().map(|tell| tell.family));
+                let _ = _report_tells(&mut out, report);
+            }
         }
 
         // Named on both paths: "nothing found" means something different when the walk was
         // allowed to skip files, and the reader cannot tell from the output otherwise.
         let scope = _scope_note(&skip);
-        let _ = if files_with_hits == 0 {
-            writeln!(out, "{}{scope}", approved("no hidden characters or AI metadata found"))
+        let _ = if files_with_marks == 0 && files_with_tells == 0 {
+            writeln!(out, "{}{scope}", approved("no AI marks, metadata or writing tells found"))
         } else {
             writeln!(
                 out,
                 "\n{}",
                 problematic(&format!(
                     "{total_hidden} hidden character(s), {total_meta} metadata finding(s) \
-                     across {files_with_hits} file(s){scope}"
+                     across {files_with_marks} file(s); writing tells in \
+                     {files_with_tells} file(s){scope}"
                 ))
             )
         };
+        if !skip_tells {
+            _tells_epilogue(&mut out, files_with_tells, &mut fired);
+        }
         let _ = out.flush();
-        if files_with_hits > 0 {
-            // Non-zero so `anti_ai_textual_watermark_detect && publish` refuses to chain past
-            // a find of either kind.
+        if files_with_marks > 0 {
+            // Non-zero on the VERIFIABLE half only, so `detect_ai_textual_fingerprint &&
+            // publish` still refuses to chain past a hidden character or an AI metadata label —
+            // artifacts, worth cleaning. Writing tells never set it: they are style, they prove
+            // nothing, and an exit code would invite gating a pipeline on prose, which is the
+            // harm the source document records (essays flagged, writers self-censoring
+            // punctuation they had used for decades).
             std::process::exit(1);
         }
+    }
+
+    /// What only this side knows about a file: whether its surface renders Markdown, which
+    /// decides if a visible `**` is residue or just markup. The extension is bashrs's to read —
+    /// the same division as the walk itself.
+    fn _surface_of(path: &Path) -> tells::Options {
+        let markdown = path.extension().is_some_and(|kind| {
+            kind.eq_ignore_ascii_case("md") || kind.eq_ignore_ascii_case("markdown")
+        });
+        tells::Options { surface_is_plain: !markdown }
+    }
+
+    /// One file's writing tells: the evidence mark, the family, where, and why it matched.
+    fn _report_tells(out: &mut impl Write, report: &tells::Report) -> io::Result<()> {
+        for tell in &report.tells {
+            let place = tell.line.map_or_else(String::new, |line| format!("line {line}: "));
+            writeln!(
+                out,
+                "  {} {} — {place}{}",
+                tell.family.evidence().mark(),
+                tell.family.title(),
+                tell.detail
+            )?;
+            if !tell.excerpt.is_empty() {
+                writeln!(out, "       {}", tell.excerpt)?;
+            }
+        }
+        writeln!(
+            out,
+            "  {}",
+            notice(&format!(
+                "{} of {} tell families, in {} words",
+                report.families().len(),
+                tells::Family::ALL.len(),
+                report.words
+            ))
+        )
+    }
+
+    /// The part of the report that must never be omitted: which families fired, the reason to
+    /// doubt each one, and the standing warning that none of this identifies a document.
+    fn _tells_epilogue(out: &mut impl Write, files: usize, fired: &mut Vec<tells::Family>) {
+        if files == 0 {
+            let _ = writeln!(out, "{}", approved("no writing tells found"));
+            let _ = writeln!(
+                out,
+                "  {}",
+                notice("absence means nothing either — these markers are trivially removable")
+            );
+            return;
+        }
+        fired.sort_unstable();
+        fired.dedup();
+        let _ = writeln!(out, "\n{}", problematic(&format!("tells in {files} file(s)")));
+        let _ = writeln!(out, "\nwhy each family might be innocent:");
+        for family in fired.iter() {
+            let _ = writeln!(
+                out,
+                "  {} {} (§{}) — {}",
+                family.evidence().mark(),
+                family.title(),
+                family.section(),
+                family.caveat()
+            );
+        }
+        let _ = writeln!(
+            out,
+            "\n{}",
+            problematic(
+                "None of this is proof of AI authorship. Every marker has a legitimate human \
+                 use, the strongest are corpus-level statistics being read against single \
+                 documents, and a text ABOUT these markers looks exactly like one exhibiting \
+                 them. Weigh clusters of independent families, never a single hit."
+            )
+        );
     }
 
     /// A file's raw bytes, size-capped the same way the textual scan is. No text sniff here:
@@ -101,7 +239,7 @@ mod commands {
         let size = std::fs::metadata(path).ok()?.len();
         if size > max_bytes {
             eprintln!(
-                "anti_ai_textual_watermark_detect: skipping {} ({} bytes > --max-file-size {})",
+                "detect_ai_textual_fingerprint: skipping {} ({} bytes > --max-file-size {})",
                 path.display(),
                 size,
                 max_bytes
@@ -113,14 +251,14 @@ mod commands {
 
     /// One file's metadata findings: the field, the (display-truncated) value, and why it
     /// made the report.
-    fn _report_metadata(out: &mut impl Write, findings: &[ai_meta::Finding]) -> io::Result<()> {
+    fn _report_metadata(out: &mut impl Write, findings: &[metadata::Finding]) -> io::Result<()> {
         for finding in findings {
             // Matches and provenance fields are tagged; the rest of the inventory is plain —
             // an untagged line means exactly "metadata, listed by default, nothing matched".
             let why = match &finding.why {
-                ai_meta::Why::Marker(marker) => format!("  {}", problematic(&format!("[marker: {marker}]"))),
-                ai_meta::Why::ProvenanceField => format!("  {}", notice("[provenance field]")),
-                ai_meta::Why::Everything => String::new(),
+                metadata::Why::Marker(marker) => format!("  {}", problematic(&format!("[marker: {marker}]"))),
+                metadata::Why::ProvenanceField => format!("  {}", notice("[provenance field]")),
+                metadata::Why::Everything => String::new(),
             };
             writeln!(out, "  {}: {}{why}", finding.field, _display_value(&finding.value))?;
         }
@@ -140,7 +278,7 @@ mod commands {
     }
 
     #[derive(Args)]
-    pub struct WatermarkDetectArgs {
+    pub struct FingerprintArgs {
         /// File or directory to scan; a directory is walked recursively
         #[arg(default_value = ".")]
         pub target: PathBuf,
@@ -155,6 +293,11 @@ mod commands {
         /// metadata string found is reported, tagged with why it's there
         #[arg(long)]
         pub skip_metadata: bool,
+        /// Don't report writing tells — the verifiable marks only. Tells are prose habits
+        /// (vocabulary, stock phrases, sentence shapes, formatting); they prove nothing on
+        /// their own and never affect the exit code, so this silences the noisiest half
+        #[arg(long)]
+        pub skip_tells: bool,
         /// Also report characters that build emoji — variation selectors, flag tag characters,
         /// and joiners after a non-ASCII character. Off by default: `⚠️` and `👨‍👩‍👧` are
         /// spelled with them, so reporting them buries real carriers in noise
@@ -225,7 +368,7 @@ mod commands {
             // Text, but too big to hold. Skipping is the honest outcome — and it is announced,
             // because a file silently missed is exactly the failure this command must not have.
             eprintln!(
-                "anti_ai_textual_watermark_detect: skipping {} ({} bytes > --max-file-size {})",
+                "detect_ai_textual_fingerprint: skipping {} ({} bytes > --max-file-size {})",
                 path.display(),
                 size,
                 max_bytes
@@ -270,223 +413,31 @@ mod commands {
             .ok_or_else(|| format!("`{raw}` is larger than this machine can address"))
     }
 
-    /// Every hidden character on one line, with the column it sits at.
-    struct LineHits {
-        number: usize,
-        text: String,
-        chars: Vec<(usize, char, &'static str)>, // (column, char, kind)
-    }
-
-    /// Scan `text` line by line.
-    fn _scan(text: &str, spaces: bool, emoji: bool) -> Vec<LineHits> {
-        let mut found = Vec::new();
-        for (index, line) in text.lines().enumerate() {
-            let mut previous: Option<char> = None;
-            let mut chars: Vec<(usize, char, &'static str)> = Vec::new();
-            for (column, ch) in line.chars().enumerate() {
-                let Some(kind) = _kind(ch) else {
-                    previous = Some(ch);
-                    continue;
-                };
-                let reportable = match kind {
-                    SPACE => spaces,
-                    _ if !emoji && _is_emoji_use(ch, previous) => false,
-                    _ => true,
-                };
-                if reportable {
-                    chars.push((column + 1, ch, kind));
-                }
-                previous = Some(ch);
-            }
-            if !chars.is_empty() {
-                found.push(LineHits { number: index + 1, text: line.to_string(), chars });
-            }
-        }
-        found
-    }
-
-    const SPACE: &str = "space";
-
-    /// Whether this character is here to build an emoji rather than to hide a payload.
-    ///
-    /// Variation selectors and tag characters are emoji machinery almost everywhere they
-    /// appear — `⚠️` is U+26A0 plus VS16, a flag is a base plus tag chars. A joiner counts as
-    /// emoji use only when it *follows a non-ASCII character*, which covers 👨‍👩‍👧 and Persian
-    /// `می‌روم` alike, while `a<ZWJ>b` between plain letters stays a carrier.
-    ///
-    /// A heuristic, deliberately: the alternative is shipping Unicode's emoji tables. It errs
-    /// toward silence, which is why it is what `--emoji` turns OFF rather than what it turns on.
-    fn _is_emoji_use(ch: char, previous: Option<char>) -> bool {
-        match ch as u32 {
-            0xFE00..=0xFE0F | 0xE0100..=0xE01EF | 0xE0000..=0xE007F => true,
-            0x200C | 0x200D => previous.is_some_and(|prev| !prev.is_ascii()),
-            _ => false,
-        }
-    }
-
-    /// What class of hidden character this is, or `None` if it is ordinary text.
-    ///
-    /// An explicit table rather than a Unicode general-category lookup, which the standard
-    /// library does not expose and which would cost a dependency to get. The ranges below are
-    /// the format/invisible blocks actually used as carriers — everything here renders as
-    /// nothing (or as a plain space) while still occupying a codepoint.
-    fn _kind(ch: char) -> Option<&'static str> {
-        match ch as u32 {
-            0x200B | 0x200C | 0x200D | 0x2060 | 0xFEFF => Some("zero-width"),
-            0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069 | 0x061C => Some("bidi"),
-            0xE0000..=0xE007F => Some("tag-char"),
-            0xFE00..=0xFE0F | 0xE0100..=0xE01EF => Some("variation-selector"),
-            0x00AD | 0x034F | 0x180B..=0x180E | 0x2061..=0x2064 | 0x206A..=0x206F => {
-                Some("format-control")
-            }
-            0xFFF9..=0xFFFB => Some("annotation"),
-            // Zl/Zp, not Zs — and never silenceable, not even by `--skip-spaces`. `str::lines()` splits
-            // on \n only, so one of these sits *inside* what this scan calls a line while many
-            // editors and JS engines break there: the file displays with lines the report never
-            // mentions. Nothing in ordinary prose needs them, so there is no legitimate use to
-            // weigh against saying so.
-            0x2028 | 0x2029 => Some("line-separator"),
-            // The whole Zs category except U+0020 itself, which is the character the rest would
-            // be normalised *to* — flagging it would report every space in every file.
-            0x00A0 | 0x1680 | 0x2000..=0x200A | 0x202F | 0x205F | 0x3000 => Some(SPACE),
-            _ => None,
-        }
-    }
-
-    /// Print one file's hits: the path, then each offending line rendered with its hidden
-    /// characters made visible in place, then the codepoints by name.
-    fn _report_file(out: &mut impl Write, hits: &[LineHits]) -> io::Result<()> {
-        for line in hits {
+    /// Print one file's hits: each offending line's codepoints by name, then the line itself
+    /// rendered with those characters made visible in place. The rendering is the engine's
+    /// ([`hidden::render_line`], so markers can never disagree with the list above them); the
+    /// colour it wraps them in is ours.
+    fn _report_file(out: &mut impl Write, lines: &[hidden::LineHits]) -> io::Result<()> {
+        for line in lines {
             let names: Vec<String> = line
-                .chars
+                .hits
                 .iter()
-                .map(|(column, ch, kind)| format!("col {column}: U+{:04X} [{kind}]", *ch as u32))
+                .map(|hit| format!("col {}: U+{:04X} [{}]", hit.column, hit.ch as u32, hit.kind))
                 .collect();
             writeln!(out, "  {}: {}", line.number, names.join(", "))?;
-            writeln!(out, "     {}", _visible(&line.text, &line.chars))?;
+            writeln!(out, "     {}", hidden::render_line(line, problematic))?;
         }
         Ok(())
-    }
-
-    /// The line with every *reported* hidden character replaced by its codepoint in angle
-    /// brackets, so the reader can see where it sits relative to the visible text. Rendering
-    /// the raw line would show exactly nothing, which is the whole problem being reported.
-    ///
-    /// Driven by the hit list rather than by re-testing each character, so the markers and the
-    /// list above them can never disagree: with spaces silenced, an exotic space is neither
-    /// listed nor marked, instead of being silently marked as something the report never
-    /// mentioned.
-    fn _visible(line: &str, hits: &[(usize, char, &'static str)]) -> String {
-        line.chars()
-            .enumerate()
-            .map(|(index, ch)| {
-                if hits.iter().any(|(column, _, _)| *column == index + 1) {
-                    problematic(&format!("<U+{:04X}>", ch as u32))
-                } else {
-                    ch.to_string()
-                }
-            })
-            .collect()
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
 
-        #[test]
-        fn the_invisible_carriers_are_recognised_and_ordinary_text_is_not() {
-            for (ch, expected) in [
-                ('\u{200B}', "zero-width"),
-                ('\u{200D}', "zero-width"),
-                ('\u{202E}', "bidi"),
-                ('\u{E0041}', "tag-char"),
-                ('\u{FE0F}', "variation-selector"),
-                ('\u{00AD}', "format-control"),
-            ] {
-                assert_eq!(_kind(ch), Some(expected), "U+{:04X}", ch as u32);
-            }
-            for ordinary in ['a', 'Z', ' ', '\t', 'é', '中', '🙂'] {
-                assert_eq!(_kind(ordinary), None, "{ordinary:?} is ordinary text");
-            }
-        }
-
-        /// Exotic spaces report by default (they are a real carrier class) and
-        /// `--skip-spaces` silences them for prose that uses them as typography.
-        #[test]
-        fn exotic_spaces_can_be_silenced_but_default_on() {
-            let text = "a\u{00A0}b";
-            assert!(_scan(text, false, true).is_empty(), "silenced when the flag says so");
-            let hits = _scan(text, true, true);
-            assert_eq!(hits.len(), 1);
-            assert_eq!(hits[0].chars[0].2, SPACE);
-        }
-
-        /// The space class means the whole Zs category, not a handful of it. Enumerated rather than
-        /// sampled, because the gap that prompted this test (U+1680) was a member nobody
-        /// thought of — a range plus a few literals reads complete without being complete.
-        #[test]
-        fn every_unicode_space_separator_is_covered_except_the_ordinary_one() {
-            let zs = [
-                0x00A0_u32, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006,
-                0x2007, 0x2008, 0x2009, 0x200A, 0x202F, 0x205F, 0x3000,
-            ];
-            for cp in zs {
-                let ch = char::from_u32(cp).expect("a real codepoint");
-                assert_eq!(_kind(ch), Some(SPACE), "U+{cp:04X} is a space separator");
-            }
-            assert_eq!(_kind(' '), None, "U+0020 is what the others normalise TO, not a carrier");
-        }
-
-        /// Line and paragraph separators are reported even under `--skip-spaces`: `str::lines()` does
-        /// not split on them, so they hide *inside* a reported line while an editor shows a
-        /// break there — and unlike an em space, no ordinary prose needs one.
-        #[test]
-        fn line_separators_are_always_reported_and_do_not_split_our_lines() {
-            for cp in ['\u{2028}', '\u{2029}'] {
-                assert_eq!(_kind(cp), Some("line-separator"), "{:04X}", cp as u32);
-            }
-            let text = "before\u{2028}after";
-            assert_eq!(text.lines().count(), 1, "our line splitting does not see the break");
-            let hits = _scan(text, false, true);
-            assert_eq!(hits.len(), 1, "yet it is reported, with spaces silenced");
-            assert_eq!(hits[0].chars[0].2, "line-separator");
-        }
-
-        #[test]
-        fn a_hit_carries_its_line_number_and_column() {
-            let text = "clean line\nhas a \u{200B}carrier\nalso clean";
-            let hits = _scan(text, false, true);
-            assert_eq!(hits.len(), 1, "only the middle line");
-            assert_eq!(hits[0].number, 2, "line numbers count from one");
-            assert_eq!(hits[0].chars[0].0, 7, "and so do columns");
-            assert_eq!(hits[0].chars[0].1, '\u{200B}');
-        }
-
-        /// The reason the report renders lines at all: printing the raw line would show
-        /// nothing where the carrier is, which is exactly what makes it hard to find.
-        #[test]
-        fn rendering_makes_the_invisible_visible_in_place() {
-            let line = "hi\u{200B}there";
-            let hits = _scan(line, false, true);
-            let shown = _visible(line, &hits[0].chars);
-            assert!(shown.contains("<U+200B>"), "{shown}");
-            assert!(shown.contains("hi") && shown.contains("there"), "{shown}");
-        }
-
-        /// The markers and the listed hits are one decision, not two: a character the report
-        /// chose not to list must not appear marked in the line beneath it.
-        #[test]
-        fn rendering_marks_exactly_what_was_reported() {
-            let line = "a\u{00A0}b\u{200B}c";
-            let quiet = _scan(line, false, true);
-            let shown = _visible(line, &quiet[0].chars);
-            assert!(shown.contains("<U+200B>"), "the carrier is marked: {shown}");
-            assert!(!shown.contains("<U+00A0>"), "the unlisted space is not: {shown}");
-
-            let loud = _scan(line, true, true);
-            let shown = _visible(line, &loud[0].chars);
-            assert!(shown.contains("<U+00A0>"), "with spaces on it is both listed and marked");
-        }
+        // What the detection engine decides — which codepoints are carriers, when a joiner is
+        // emoji glue, how a marked line renders — is tested in `ai_detection`, where it now
+        // lives. What remains here is this command's own half: which files the walk visits,
+        // what it will and won't read, and how it says what it skipped.
 
         /// The lesson from the `--tidy` bug: a scan of a tree must never report *fewer*
         /// files than a scan of something inside it. The old gitignore-based filtering broke
@@ -571,27 +522,6 @@ mod commands {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// Emoji are spelled with the same codepoints carriers use, and there are far more
-        /// emoji in a normal repo than carriers — so reporting them by default buries the
-        /// signal. On this project they were the majority of all hits.
-        #[test]
-        fn emoji_machinery_is_quiet_unless_asked_for() {
-            for text in ["warn \u{26A0}\u{FE0F} here", "fam \u{1F468}\u{200D}\u{1F469}", "\u{1F3F4}\u{E0067}\u{E0062}"] {
-                assert!(_scan(text, false, false).is_empty(), "quiet by default: {text:?}");
-                assert!(!_scan(text, false, true).is_empty(), "--emoji reports it: {text:?}");
-            }
-        }
-
-        /// The other half: the same joiner between plain ASCII is a carrier, not emoji glue,
-        /// and stays reported without `--emoji`. Persian `می‌روم` is the case the rule protects.
-        #[test]
-        fn a_joiner_between_ascii_is_still_a_carrier() {
-            assert_eq!(_scan("a\u{200D}b", false, false).len(), 1, "ASCII neighbours: a carrier");
-            assert!(_scan("\u{0645}\u{200C}\u{0631}", false, false).is_empty(), "Persian ZWNJ is not");
-            // And the carriers that are never emoji stay on by default.
-            assert_eq!(_scan("a\u{200B}b", false, false).len(), 1, "ZWSP is always reported");
-        }
-
         /// The scan that ran the machine out of memory: `std::fs::read` loaded every file in
         /// full — including a 300 MB `.rlib` — before the UTF-8 check could reject it. Deciding
         /// from a prefix is what bounds the cost.
@@ -670,7 +600,7 @@ mod commands {
 
             let text = _read_text(&torrent, 16 << 20).expect("the text section is decoded");
             assert!(text.contains('\u{200B}'), "the carrier in the name is reachable: {text:?}");
-            assert!(!_scan(&text, false, true).is_empty(), "and it is reported");
+            assert!(!hidden::scan(&text, false, true).is_empty(), "and it is reported");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
