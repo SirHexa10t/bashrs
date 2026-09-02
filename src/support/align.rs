@@ -17,7 +17,15 @@
 /// the line) is left alone, so the function is idempotent.
 pub(crate) fn align_columns(lines: Vec<String>, columns: &[&str]) -> Vec<String> {
     let padded: Vec<String> = lines.into_iter().map(|line| _pad(line, columns)).collect();
-    let options = table_formatter::FormatOptions { trim_trailing: true, ..Default::default() };
+    // `reasonable_spacing`: one monstrous row (shell_def's probe loop, at four times anyone
+    // else's width) must not drag every neighbour's columns out to meet it — the outlier keeps
+    // its head aligned and goes minimal from the offending column, and the rest of the block
+    // snaps back to its own natural width.
+    let options = table_formatter::FormatOptions {
+        trim_trailing: true,
+        reasonable_spacing: true,
+        ..Default::default()
+    };
     table_formatter::format_table(&padded, &options).unwrap_or(padded)
 }
 

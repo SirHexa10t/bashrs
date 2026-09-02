@@ -726,6 +726,40 @@ mod tests {
         assert!(sections_checked >= 15, "sections actually checked: {sections_checked}");
     }
 
+    /// The reason `align_columns` runs with `reasonable_spacing`: `shell_def`'s probe loop is
+    /// four times as wide as any neighbour, and without it the whole shell section's comment
+    /// column was dragged out to meet it. With it, the outlier keeps its head aligned (the
+    /// brace column — asserted for every section elsewhere), goes minimal from its body on,
+    /// and the ordinary rows' comments snap back to their own width.
+    #[test]
+    fn the_shell_def_monster_does_not_stretch_its_category() {
+        let script = wrappers();
+        let shell: Vec<&str> = script
+            .lines()
+            .skip_while(|line| *line != "# shell")
+            .skip(1)
+            .take_while(|line| !line.starts_with("# ") && !line.is_empty())
+            .filter(|line| line.contains("() "))
+            .collect();
+        let (monster, ordinary): (Vec<&str>, Vec<&str>) =
+            shell.iter().partition(|line| line.starts_with("shell_def()"));
+        assert_eq!(monster.len(), 1, "shell_def is emitted once: {shell:?}");
+
+        // The ordinary rows share a comment column of their own natural width…
+        let comment_columns: std::collections::BTreeSet<usize> =
+            ordinary.iter().filter_map(|line| line.find("  # ")).collect();
+        assert_eq!(comment_columns.len(), 1, "ordinary rows align among themselves: {ordinary:?}");
+        let column = *comment_columns.iter().next().expect("one column");
+        assert!(column < 80, "…no longer stretched by shell_def (was ~230): {column}");
+
+        // …while the monster's tail is minimal: exactly the two-space join before its comment.
+        assert!(
+            monster[0].contains(r#""$@"; }  # "#) && !monster[0].contains(r#""$@"; }   "#),
+            "shell_def's own comment sits at minimal spacing: {}",
+            monster[0]
+        );
+    }
+
     /// The `autokey_*` commands take real paths and complete like any other command — flags
     /// from the binary, filenames from the PWD. The store's contents are deliberately NOT
     /// completion candidates: they live outside the PWD (the full-path listing is

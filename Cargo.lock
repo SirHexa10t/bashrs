@@ -20,6 +20,7 @@ dependencies = [
 [[package]]
 name = "ai_detection"
 version = "0.1.0"
+source = "git+https://github.com/SirHexa10t/ai_detection.git?branch=main#a5252956b48ddaa185d524d52ed3801f1904d557"
 dependencies = [
  "regex",
 ]
@@ -994,7 +995,7 @@ dependencies = [
 [[package]]
 name = "table_formatter"
 version = "5.1.0"
-source = "git+https://github.com/SirHexa10t/table_formatter.git?branch=main#9a1936b3a91b9c797cf455c157d2f90e06606716"
+source = "git+https://github.com/SirHexa10t/table_formatter.git?branch=main#aa8cb0ca0f526df7939bbc443f359091a6539fac"
 dependencies = [
  "clap",
  "console",
