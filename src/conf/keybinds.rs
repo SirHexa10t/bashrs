@@ -53,13 +53,22 @@ const DESKTOPS: &[(&str, &str, &str)] = &[
 /// when generating the file, so detection is deferred to the shell that sources it. Lines
 /// are indented to sit inside the generator's `if [ -n "$BASH_VERSION" ]` block.
 pub fn desktop_restart() -> String {
+    let lines: Vec<String> = DESKTOPS
+        .iter()
+        .enumerate()
+        .map(|(i, (process, command, guard))| {
+            let keyword = if i == 0 { "if" } else { "elif" };
+            let guard = if guard.is_empty() { String::new() } else { format!(" && {guard}") };
+            format!("{keyword} pgrep -x {process} >/dev/null{guard}; then bind '\"\\el\": \"{command}\\n\"'")
+        })
+        .collect();
     let mut out = String::from(
         "    # ALT+L : restart / reload the running desktop environment (resets visuals, keeps your session)\n",
     );
-    for (i, (process, command, guard)) in DESKTOPS.iter().enumerate() {
-        let keyword = if i == 0 { "if" } else { "elif" };
-        let guard = if guard.is_empty() { String::new() } else { format!(" && {guard}") };
-        out += &format!("    {keyword} pgrep -x {process} >/dev/null{guard}; then bind '\"\\el\": \"{command}\\n\"'\n");
+    // The `then`s aligned into a column (the shared aligner), so the eye can walk the chain of
+    // detection conditions without re-finding where each one ends.
+    for line in crate::support::align::align_columns(lines, &["then "]) {
+        out += &format!("    {line}\n");
     }
     out += "    fi\n";
     out
@@ -73,15 +82,26 @@ mod tests {
     fn desktop_restart_is_a_first_match_alt_l_chain() {
         let s = desktop_restart();
         assert!(s.contains("\\el"), "should bind ALT+L (\\el): {s}");
-        assert!(s.contains("if pgrep -x cinnamon >/dev/null; then bind"));
+        // The conditions and their binds, spacing-agnostic: the gap before `then` belongs to
+        // the aligner, asserted separately below.
+        assert!(s.contains("if pgrep -x cinnamon >/dev/null;"));
         assert!(s.contains("cinnamon --replace & disown"));
         // GNOME's --replace is gated to X11 — on Wayland it would kill the session
-        assert!(s.contains(r#"pgrep -x gnome-shell >/dev/null && [ "$XDG_SESSION_TYPE" = x11 ]; then bind"#));
+        assert!(s.contains(r#"pgrep -x gnome-shell >/dev/null && [ "$XDG_SESSION_TYPE" = x11 ];"#));
         // a tiling WM with its own (non-`--replace`) restart is carried through verbatim
-        assert!(s.contains("elif pgrep -x i3 >/dev/null; then bind") && s.contains("i3-msg restart"));
+        assert!(s.contains("elif pgrep -x i3 >/dev/null;") && s.contains("i3-msg restart"));
         // a Wayland compositor reload keeps clients
-        assert!(s.contains("elif pgrep -x Hyprland >/dev/null; then bind") && s.contains("hyprctl reload"));
+        assert!(s.contains("elif pgrep -x Hyprland >/dev/null;") && s.contains("hyprctl reload"));
         assert!(s.trim_end().ends_with("fi"));
         assert_eq!(s.matches("    if ").count(), 1, "single `if`, the rest `elif`");
+        // Every detection line's `then` sits in ONE column — the detection chain reads as a
+        // table, condition left, action right. Equality across all rows means the shared
+        // aligner really ran here.
+        let then_columns: std::collections::BTreeSet<usize> = s
+            .lines()
+            .filter(|line| line.contains("pgrep -x"))
+            .map(|line| line.find("then bind").expect("every detection line binds"))
+            .collect();
+        assert_eq!(then_columns.len(), 1, "the `then`s are not aligned: {s}");
     }
 }

@@ -483,9 +483,11 @@ mod tests {
 
     #[test]
     fn shell_commands_follow_naming_standard() {
-        // All three carry the prefix in an explicit `#[name]`, because the bare fn names
-        // (`new`, `bare`, `sudo`) would be terrible commands on their own.
-        assert_prefixed(&command_names::<ShellCommand>(), "shell_", &[]);
+        // The session commands carry the prefix in an explicit `#[name]`, because the bare fn
+        // names (`new`, `bare`, `sudo`) would be terrible commands on their own. `sudo_bashrs`
+        // is the deliberate exception: named for what it grants — sudo, but a BASHRS shell,
+        // sourcefile re-armed — rather than for the category it sits in.
+        assert_prefixed(&command_names::<ShellCommand>(), "shell_", &["sudo_bashrs"]);
     }
 
     #[test]

@@ -31,6 +31,7 @@ use crate::categories::python::PythonCommand;
 use crate::categories::shell::ShellCommand;
 use crate::categories::styles::StyleCommand;
 use crate::conf::{config_file, environment, greeting, keybinds};
+use crate::support::align::align_columns;
 use crate::conf::RELOAD_EXIT_CODE;
 use crate::drivers::stainless;
 use crate::tools;
@@ -83,7 +84,7 @@ fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 16] {
         ("python", PythonCommand::augment_subcommands(clap::Command::new("python")),
             PythonCommand::shell_functions().to_vec()),
         // `shell_new`/`shell_bare` are `#[shell_body]` (they `exec` the calling shell);
-        // `shell_sudo` and `print_args` are ordinary commands with generated wrappers.
+        // `sudo_bashrs` and `print_args` are ordinary commands with generated wrappers.
         ("shell", ShellCommand::augment_subcommands(clap::Command::new("shell")),
             ShellCommand::shell_functions().to_vec()),
         // One `lookup` group. The generated `g`/`gg` families come first so the hand-written
@@ -176,10 +177,13 @@ fn stainless_flags_block(entries: &[(String, String)]) -> String {
     if entries.is_empty() {
         return String::new();
     }
-    let arms: String = entries
-        .iter()
-        .map(|(alias, flags)| format!("            {alias}) flags=\"{flags}\" ;;\n"))
-        .collect();
+    let arms: String = align_columns(
+        entries.iter().map(|(alias, flags)| format!("{alias}) flags=\"{flags}\" ;;")).collect(),
+        &["flags="],
+    )
+    .into_iter()
+    .map(|arm| format!("            {arm}\n"))
+    .collect();
     let names: Vec<&str> = entries.iter().map(|(alias, _)| alias.as_str()).collect();
     format!(
         "\x20   _bashrs_stainless_flags() {{\n\
@@ -280,7 +284,7 @@ pub(super) fn wrappers() -> String {
                 .map(|a| a.to_string())
                 .and_then(|a| a.lines().next().map(str::to_string))
                 .filter(|a| !a.is_empty())
-                .map(|a| format!("  # {a}"))
+                .map(|a| format!(" # {a}"))
                 .unwrap_or_default();
             // Run the suffix (e.g. `shell_new`) only when the command signals a
             // reload by exiting RELOAD_EXIT_CODE. A real success does; clap's
@@ -291,7 +295,7 @@ pub(super) fn wrappers() -> String {
             // A command that consumes a builtin's output (e.g. `hg` ← `history`) has it piped
             // in ahead of the binary; the shell must produce it, since we can't.
             let prefix = wrapper_prefix(real).map(|cmd| format!("{cmd} | ")).unwrap_or_default();
-            if let Some(first_line) = about.strip_prefix("  # ") {
+            if let Some(first_line) = about.strip_prefix(" # ") {
                 abouts.insert(real.to_string(), first_line.to_string());
             }
             for shell_name in std::iter::once(real).chain(sub.get_visible_aliases()) {
@@ -321,7 +325,7 @@ pub(super) fn wrappers() -> String {
             // the emitted text instead of fetched through a subprocess at every call.
             let fn_body = fn_body
                 .replace("{PROJECT_ROOT}", &crate::support::shell_quote::quote(env!("CARGO_MANIFEST_DIR")));
-            let about = if comment.is_empty() { String::new() } else { format!("  # {comment}") };
+            let about = if comment.is_empty() { String::new() } else { format!(" # {comment}") };
             lines.push(format!("{name}() {{ {fn_body}; }}{about}"));
         }
         if !lines.is_empty() {
@@ -330,10 +334,9 @@ pub(super) fn wrappers() -> String {
             // adds to comment-less rows. The fallback is unreachable: only `sort` can error,
             // and it's off.
             body += &format!("\n# {label}\n");
-            // Default delimiters (2-space split/join); `trim_trailing` drops the padding added to
-            // comment-less rows. Fallback unreachable: sort is off and the defaults are valid.
-            let opts = table_formatter::FormatOptions { trim_trailing: true, ..Default::default() };
-            for line in table_formatter::format_table(&lines, &opts).unwrap_or(lines) {
+            // Every category is a table: name, `{`-opened body, `#` comment — each in its own
+            // column, so a section reads down as easily as across.
+            for line in align_columns(lines, &["{", "# "]) {
                 body.push_str(&line);
                 body.push('\n');
             }
@@ -359,15 +362,11 @@ pub(super) fn wrappers() -> String {
         .iter()
         .map(|(key, func)| {
             let what = abouts.get(*func).map_or_else(|| (*func).to_string(), Clone::clone);
-            format!("bind '\"{key}\": \"{func}\\n\"'  # {}: {what}", hotkey_label(key))
+            format!("bind '\"{key}\": \"{func}\\n\"' # {}: {what}", hotkey_label(key))
         })
         .collect();
-    let opts = table_formatter::FormatOptions { trim_trailing: true, ..Default::default() };
-    let binds: String = table_formatter::format_table(&bind_lines, &opts)
-        .unwrap_or(bind_lines)
-        .into_iter()
-        .map(|line| format!("    {line}\n"))
-        .collect();
+    let binds: String =
+        align_columns(bind_lines, &["# "]).into_iter().map(|line| format!("    {line}\n")).collect();
     let desktop = keybinds::desktop_restart();
     if !binds.is_empty() || !desktop.is_empty() {
         // `bind` is a bash readline builtin; zsh (which also sources this) has none.
@@ -433,6 +432,24 @@ pub(super) fn wrappers() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `text` with every run of two-plus spaces collapsed to one — for asserting a line's
+    /// CONTENT while staying agnostic about the aligner's gaps, which have their own
+    /// column-equality tests. Newlines are untouched, so line-based checks still work.
+    fn flat(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut spaces = 0_usize;
+        for ch in text.chars() {
+            if ch == ' ' {
+                spaces += 1;
+                continue;
+            }
+            out.push_str(&" ".repeat(spaces.min(1)));
+            spaces = 0;
+            out.push(ch);
+        }
+        out
+    }
     use crate::cli::Cli;
     use clap::CommandFactory;
 
@@ -495,8 +512,16 @@ mod tests {
         let rows = [("q".to_string(), "--explain --research -h --help".to_string()),
                     ("ai".to_string(), "--dry-run".to_string())];
         let block = stainless_flags_block(&rows);
-        assert!(block.contains("q) flags=\"--explain --research -h --help\" ;;"), "{block}");
-        assert!(block.contains("ai) flags=\"--dry-run\" ;;"), "{block}");
+        // Arms hold their rows (spacing-agnostic — the gap is the aligner's), and `flags=`
+        // sits in one column across them, so the case reads alias left, flag list right.
+        assert!(block.contains("q)") && block.contains("flags=\"--explain --research -h --help\" ;;"), "{block}");
+        assert!(block.contains("ai)") && block.contains("flags=\"--dry-run\" ;;"), "{block}");
+        let flag_columns: std::collections::BTreeSet<usize> = block
+            .lines()
+            .filter(|line| line.contains(") "))
+            .filter_map(|line| line.find("flags=\""))
+            .collect();
+        assert_eq!(flag_columns.len(), 1, "the case arms are not aligned: {block}");
         assert!(block.contains("[[ $cur == -* ]] || return 0"), "flags only after `-`: {block}");
         assert!(
             block.contains("complete -F _bashrs_stainless_flags -o default q ai"),
@@ -507,7 +532,9 @@ mod tests {
 
     #[test]
     fn wrappers_cover_every_command_and_alias() {
-        let script = wrappers();
+        // Collapsed before comparing: the aligner's gaps are asserted by the column tests,
+        // and every line here states CONTENT only.
+        let script = flat(&wrappers());
         let has = |line: &str| assert!(script.contains(line), "missing wrapper line: {line}");
         has("fs_usage() { \"$HOME/.bashrs/bashrs\" fs_usage \"$@\"; }");
         has("dl_page_links() { \"$HOME/.bashrs/bashrs\" dl_page_links \"$@\"; }");
@@ -544,8 +571,9 @@ mod tests {
     #[test]
     fn wrappers_include_session_function_and_bash_guarded_keybind() {
         let script = wrappers();
-        assert!(script.contains("shell_new() { exec bash; }"), "shell_new missing");
-        assert!(script.contains("shell_bare() { _BASHRS_BARE=1 exec bash; }"), "shell_bare missing");
+        let content = flat(&script);
+        assert!(content.contains("shell_new() { exec bash; }"), "shell_new missing");
+        assert!(content.contains("shell_bare() { _BASHRS_BARE=1 exec bash; }"), "shell_bare missing");
         // The one-shot guard: consume the flag AND return, so a bare session starts with a clean
         // environment and the very next shell arms bashrs again.
         assert!(
@@ -569,7 +597,9 @@ mod tests {
         assert!(script.contains(r#"bind '"\eh": "bashrs_sourcefile\n"'"#), "ALT+H keybind missing");
         assert!(script.contains(r#"bind '"\ew": "bashrs_configure\n"'"#), "ALT+W keybind missing");
         assert!(script.contains(r#"bind '"\eq": "bashrs_compile\n"'"#), "ALT+Q keybind missing");
-        assert!(script.contains("if pgrep -x cinnamon >/dev/null; then bind"), "ALT+L desktop-restart missing");
+        // Spacing-agnostic: the gap before `then` belongs to the aligner (keybinds' own test
+        // asserts the column), this one only cares that the ALT+L chain is present.
+        assert!(script.contains("if pgrep -x cinnamon >/dev/null;"), "ALT+L desktop-restart missing");
         assert!(script.contains("if [ -n \"$BASH_VERSION\" ]; then"), "keybinds should be bash-guarded");
     }
 
@@ -586,7 +616,7 @@ mod tests {
             let command = bound.split_once(' ').map_or(*bound, |(name, _)| name);
             let definition = format!("{command}() {{");
             assert!(
-                script.lines().any(|line| line.starts_with(&definition)),
+                script.lines().any(|line| flat(line).starts_with(&definition)),
                 "{key} binds `{command}`, which this sourcefile never defines — \
                  that key would fail only at the moment someone pressed it"
             );
@@ -614,6 +644,7 @@ mod tests {
     #[test]
     fn the_cd_and_define_commands_are_inline_shell() {
         let script = wrappers();
+        let content = flat(&script);
         // The project root is baked at generation time, shell-quoted — no subprocess at `cd`
         // time. Asserted through the same quote + env the generator uses, so this test is
         // location-independent.
@@ -621,13 +652,13 @@ mod tests {
             "bashrs_cd() {{ cd -- {}; }}",
             crate::support::shell_quote::quote(env!("CARGO_MANIFEST_DIR"))
         );
-        assert!(script.contains(&baked), "bashrs_cd must cd to the baked project root: {baked}");
+        assert!(content.contains(&baked), "bashrs_cd must cd to the baked project root: {baked}");
         assert!(
             !script.contains("{PROJECT_ROOT}"),
             "the placeholder must never survive into the emitted script"
         );
         assert!(
-            script.contains(r#"dotbashrs_cd() { cd -- "$HOME/.bashrs"; }"#),
+            content.contains(r#"dotbashrs_cd() { cd -- "$HOME/.bashrs"; }"#),
             "dotbashrs_cd must cd to the installation directory"
         );
         // The `cd` builtin override: the real builtin (every native behavior kept), and on
@@ -636,7 +667,7 @@ mod tests {
         // category registered end-to-end.
         assert!(script.contains("\n# builtin overrides\n"), "the builtin-overrides section is missing");
         assert!(
-            script.contains(r#"cd() { builtin cd "$@" && ls -AF --color=always --group-directories-first --quoting-style=shell-escape; }"#),
+            content.contains(r#"cd() { builtin cd "$@" && ls -AF --color=always --group-directories-first --quoting-style=shell-escape; }"#),
             "the cd override must run the builtin, then list escaped on success"
         );
         // shell_def's wrapper pipes the four shell-only probes into the binary (NUL-delimited),
@@ -647,15 +678,52 @@ mod tests {
             .find(|line| line.trim_start().starts_with("shell_def()"))
             .expect("shell_def must be emitted");
         for needed in [
-            r#"alias -- "$__n" 2>/dev/null"#,
-            r#"declare -f -- "$__n" 2>/dev/null"#,
-            r#"declare -p -- "$__n" 2>/dev/null"#,
-            r#"type -at -- "$__n" 2>/dev/null"#,
-            r"printf '\0'",
-            r#"| "$HOME/.bashrs/bashrs" shell_def "$@""#,
+            r#""$(alias -- "$__n")""#,
+            r#""$(declare -f -- "$__n")""#,
+            r#""$(declare -p -- "$__n")""#,
+            r#""$(type -at -- "$__n")""#,
+            // One printf frames all four fields; substitutions never short-circuit.
+            r"printf '%s\0%s\0%s\0%s\0'",
+            // ONE stderr discard for the whole probe loop, sitting inside the pipeline
+            // segment — the binary's own stderr (the not-found reports) stays audible.
+            r#"done 2>/dev/null | "$HOME/.bashrs/bashrs" shell_def "$@""#,
         ] {
             assert!(def.contains(needed), "shell_def's wrapper is missing `{needed}`: {def}");
         }
+    }
+
+    /// Every category block is a table — name, `{`-opened body, `#` comment — so within each
+    /// section the `{` openers share one column. Checked per section against the real labels
+    /// (each category aligns independently; a global column would stretch every short section
+    /// to the longest name in the file).
+    #[test]
+    fn every_category_aligns_its_openers_into_a_column() {
+        let script = wrappers();
+        let mut sections_checked = 0_usize;
+        // The category sections, plus the stainless block — not a category, but the same
+        // three-column table and the same alignment promise.
+        let labels: Vec<String> = category_commands()
+            .iter()
+            .map(|(label, _, _)| (*label).to_string())
+            .chain(std::iter::once("stainless comfy repos".to_string()))
+            .collect();
+        for label in labels {
+            let header = format!("# {label}");
+            let braces: std::collections::BTreeSet<usize> = script
+                .lines()
+                .skip_while(|line| *line != header)
+                .skip(1)
+                .take_while(|line| !line.starts_with("# ") && !line.is_empty())
+                .filter(|line| line.contains("() "))
+                .filter_map(|line| line.find('{'))
+                .collect();
+            if braces.is_empty() {
+                continue; // a category can be momentarily wrapper-less (builtin overrides once was)
+            }
+            assert_eq!(braces.len(), 1, "`{{` openers in `# {label}` are not one column");
+            sections_checked += 1;
+        }
+        assert!(sections_checked >= 15, "sections actually checked: {sections_checked}");
     }
 
     /// The `autokey_*` commands take real paths and complete like any other command — flags
@@ -710,9 +778,10 @@ mod tests {
         // `..` must run in the calling shell (a child can't `cd` its parent), so its wrapper
         // carries the body itself — no binary call — grouped under its category like any command.
         let script = wrappers();
-        assert!(script.contains("..() { cd .. \"$@\"; }"), "`..` shell function missing:\n{script}");
+        let content = flat(&script);
+        assert!(content.contains("..() { cd .. \"$@\"; }"), "`..` shell function missing:\n{script}");
         let filesystem = script.split("\n# ").find(|s| s.starts_with("filesystem")).expect("filesystem section");
-        assert!(filesystem.contains("..() {") && filesystem.contains("# Hop one directory up"),
+        assert!(filesystem.contains("..()") && filesystem.contains("# Hop one directory up"),
             "the shell function belongs to its category, doc comment included: {filesystem}");
         assert!(!script.contains("..() { \"$HOME/.bashrs/bashrs\""),
             "a shell-body command must not call the binary");
@@ -742,20 +811,22 @@ mod tests {
     #[test]
     fn wrappers_include_the_stainless_aliases() {
         // The alias is emitted whether or not the repo has been cloned yet; only the trailing
-        // `--help` comment varies with the environment, so assert just the alias line's stable head.
-        assert!(wrappers().contains("ai() { python3 \"$HOME/.bashrs/stainless_comfy/"), "stainless `ai` alias missing");
+        // `--help` comment varies with the environment, so assert just the alias line's stable
+        // head — collapsed, since the block's `{` gaps belong to the aligner.
+        let content = flat(&wrappers());
+        assert!(content.contains("ai() { python3 \"$HOME/.bashrs/stainless_comfy/"), "stainless `ai` alias missing");
         // …and the same clone's auxiliary entry point: `ai_audit_self`, a `-m` module run from the tool's dir.
         assert!(
-            wrappers().contains("ai_audit_self() { (cd \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code\" >/dev/null && python3 -m launch.audit \"$@\"); }"),
+            content.contains("ai_audit_self() { (cd \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code\" >/dev/null && python3 -m launch.audit \"$@\"); }"),
             "stainless `ai_audit_self` aux alias missing"
         );
         // …and the same clone's `quick_question.py` script family: `q` bare, `q3` with a pinned flag.
         assert!(
-            wrappers().contains("q() { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" \"$@\"; }"),
+            content.contains("q() { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" \"$@\"; }"),
             "stainless `q` script alias missing"
         );
         assert!(
-            wrappers().contains("q3() { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" --research \"$@\"; }"),
+            content.contains("q3() { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" --research \"$@\"; }"),
             "stainless `q3` script alias missing"
         );
     }
@@ -792,7 +863,7 @@ mod tests {
         // aligned into a column, so the wrapper and its comment are no longer adjacent —
         // assert each is present rather than expecting them side by side.
         let script = wrappers();
-        assert!(script.contains("media_metadata() { \"$HOME/.bashrs/bashrs\" media_metadata \"$@\"; }"));
+        assert!(flat(&script).contains("media_metadata() { \"$HOME/.bashrs/bashrs\" media_metadata \"$@\"; }"));
         assert!(script.contains("# Get metadata of an audio/video/image file"));
     }
 

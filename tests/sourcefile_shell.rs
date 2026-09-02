@@ -133,8 +133,10 @@ fn the_dotdot_function_climbs_one_directory() {
     // in script contexts like this one, where an alias would be dead on arrival.
     let dir = std::env::temp_dir().join(format!("bashrs_dotdot_{}", std::process::id()));
     std::fs::create_dir_all(dir.join("inner")).unwrap();
+    // Located by name, not by `..() {` verbatim: the gap between `()` and `{` belongs to the
+    // category-table aligner and may be any width.
     let script =
-        format!("{}\ncd '{}'\n..\npwd", section("..() {", 1), dir.join("inner").display());
+        format!("{}\ncd '{}'\n..\npwd", section("..()", 1), dir.join("inner").display());
     let out = bash(&script);
     assert_eq!(out.trim(), dir.to_str().unwrap(), "`..` must land one directory up");
     let _ = std::fs::remove_dir_all(&dir);

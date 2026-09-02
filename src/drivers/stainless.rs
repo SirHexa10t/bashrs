@@ -424,6 +424,18 @@ pub(crate) fn aliases() -> (String, Vec<(String, String)>) {
             }
         }
     }
+    // The block is a table like every category's: name, `{`-opened body, `#` comment, each in
+    // its own column. Aligned here, where the lines are born (the same division as
+    // `keybinds::desktop_restart`); the pure line builders below stay gap-free and their tests
+    // stay exact.
+    let aligned = crate::support::align::align_columns(
+        lines.lines().map(str::to_string).collect(),
+        &["{", "# "],
+    );
+    let mut lines: String = aligned.join("\n");
+    if !lines.is_empty() {
+        lines.push('\n');
+    }
     (lines, completions)
 }
 
@@ -514,6 +526,21 @@ mod tests {
             aux_line(SAMPLE, &SAMPLE.aux[0], None).ends_with("\"$@\"); }\n"),
             "no about → no trailing comment"
         );
+    }
+
+    /// The assembled block is a table: every alias's `{` opener in one column. Offline-safe —
+    /// with no clone the probes are skipped and comments are absent, but the wrapper lines are
+    /// emitted regardless, which is exactly what the aligner works on.
+    #[test]
+    fn aliases_align_their_openers_into_a_column() {
+        let (lines, _) = aliases();
+        let braces: std::collections::BTreeSet<usize> = lines
+            .lines()
+            .filter(|line| line.contains("() "))
+            .filter_map(|line| line.find('{'))
+            .collect();
+        assert!(!lines.is_empty(), "the table always emits its aliases");
+        assert_eq!(braces.len(), 1, "stainless `{{` openers are not one column:\n{lines}");
     }
 
     #[test]

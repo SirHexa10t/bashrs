@@ -5,14 +5,16 @@
 //!   shell produced after it expanded, split, and unquoted your line.
 //! - [`shell_def`](commands::def) shows what a name *is* to the current shell — alias, function,
 //!   builtin, binaries, variable — in every meaning it holds at once.
-//! - `shell_new` / `shell_bare` / `shell_sudo` start or move between shells.
+//! - `shell_new` / `shell_bare` / `sudo_bashrs` start or move between shells.
 //!
 //! Two of the three session commands must run in the *calling* shell — `exec bash` replaces the
 //! shell that invoked it, and a child process cannot replace its parent — so they are
 //! `#[shell_body]` commands, declared here and emitted into `sourcefile.sh` as inline shell.
-//! `shell_sudo` is different in kind: it *spawns* a nested shell and returns when that shell
+//! `sudo_bashrs` is different in kind: it *spawns* a nested shell and returns when that shell
 //! exits, which a binary does perfectly well, so its logic is Rust and its wrapper is the ordinary
-//! generated one-liner.
+//! generated one-liner. Its name breaks the `shell_` prefix deliberately — it reads as "sudo,
+//! but a BASHRS shell": what you get is not a bare root prompt but a root session with the
+//! sourcefile re-armed, and the name should say so before you are root to find out.
 //!
 //! `shell_new` is referenced by the ALT+N keybind (see [`crate::conf::keybinds`]) and by
 //! `bashrs_compile` (via `#[after]`); `shell_bare` by CTRL+ALT+N. Both resolve at call time, so
@@ -77,14 +79,19 @@ mod commands {
     /// functions, unexported variables, and builtin set, so the wrapper's `#[piped]` prefix
     /// probes those four (`--`-terminated, so a name starting with `-` can't read as flags)
     /// and pipes them in NUL-delimited — a shell string can't contain NUL, so no probe output
-    /// can fake a boundary. Everything decidable out-of-shell IS out of the shell: ranking,
+    /// can fake a boundary. One `printf` per name frames all four: command substitutions run
+    /// independently (a failing probe yields an empty field, never blocks the next), and the
+    /// trailing newline `$()` strips is one [`_def_report`] trims anyway. The probes' stderr is
+    /// discarded once, on the loop's `done` (a missing meaning is data here, not an error) —
+    /// and only there: the redirect sits inside the pipeline segment, so the BINARY's stderr,
+    /// which carries the not-found reports, still reaches the terminal. Everything decidable out-of-shell IS out of the shell: ranking,
     /// labels, the PATH walk (this process inherits the caller's PATH), and exit codes are
     /// Rust — [`_def_report`] — where they are unit-tested instead of being an if/case forest
     /// in a string of bash. Under zsh the `type -at` probe fails silently (empty field) and
     /// the report derives the ranking from which probes answered, claiming nothing about
     /// builtins it cannot see.
     #[name("shell_def")]
-    #[piped(r#"local __n; for __n in "$@"; do alias -- "$__n" 2>/dev/null; printf '\0'; declare -f -- "$__n" 2>/dev/null; printf '\0'; declare -p -- "$__n" 2>/dev/null; printf '\0'; type -at -- "$__n" 2>/dev/null; printf '\0'; done"#)]
+    #[piped(r#"local __n; for __n in "$@"; do printf '%s\0%s\0%s\0%s\0' "$(alias -- "$__n")" "$(declare -f -- "$__n")" "$(declare -p -- "$__n")" "$(type -at -- "$__n")"; done 2>/dev/null"#)]
     pub fn def(args: DefArgs) {
         let mut piped = Vec::new();
         use std::io::Read as _;
@@ -324,10 +331,10 @@ mod commands {
 
     /// Move into a root shell with bashrs sourced — for running several elevated commands
     /// without a password each time. `exit` returns here. Files written inside are root-owned
-    #[name("shell_sudo")]
+    #[name("sudo_bashrs")]
     pub fn sudo(_args: NoArgs) {
         if superuser::is_root() {
-            eprintln!("shell_sudo: this is already a root shell");
+            eprintln!("sudo_bashrs: this is already a root shell");
             return;
         }
         // Probed before sudo can mint one, so only an elevation this command earned is
@@ -338,7 +345,7 @@ mod commands {
         match status {
             Ok(status) => std::process::exit(status.code().unwrap_or(1)),
             Err(err) => {
-                eprintln!("shell_sudo: could not start the root shell: {err}");
+                eprintln!("sudo_bashrs: could not start the root shell: {err}");
                 std::process::exit(1);
             }
         }
