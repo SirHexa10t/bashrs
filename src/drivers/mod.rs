@@ -7,6 +7,7 @@
 
 pub mod python;
 pub mod carstay;
+pub mod comfy_graph;
 pub mod stainless;
 
 /// SIDE EFFECTS — COMPILE.sh's companion-provisioning step (the hidden `install-stainless`

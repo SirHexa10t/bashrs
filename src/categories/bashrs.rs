@@ -137,10 +137,13 @@ mod commands {
             for line in &setting.docs {
                 form = form.comment(line.clone());
             }
+            // Each group holds one option, so a per-option sub-title would say what the
+            // comments above it already do; and every setting here is the user's to change.
+            let mut option = terminal_choice::Choice::named(key);
+            option.checked = setting.enabled;
             form.items.push(terminal_choice::Item::Checkboxes {
                 label: String::new(),
-                options: vec![key.to_string()],
-                checked: vec![setting.enabled],
+                options: vec![option],
             });
         }
         form
@@ -151,7 +154,7 @@ mod commands {
     /// answer with the key it came from.
     fn _save(path: &Path, text: &str, settings: &[config_file::Setting], form: &terminal_choice::Form) {
         let ticked = form.items.iter().filter_map(|item| match item {
-            terminal_choice::Item::Checkboxes { checked, .. } => checked.first().copied(),
+            terminal_choice::Item::Checkboxes { options, .. } => options.first().map(|o| o.checked),
             _ => None,
         });
         let values: Vec<(String, bool)> =
@@ -186,6 +189,13 @@ mod commands {
             _ => {
                 exec::run_reporting("xdg-open", [path]);
             }
+        }
+    }
+
+    /// Draw how my own crates depend on each other, and which of them are shared
+    pub fn map_comfy(_args: NoArgs) {
+        for line in crate::drivers::comfy_graph::map() {
+            println!("{line}");
         }
     }
 
@@ -292,8 +302,8 @@ mod commands {
                 .items
                 .iter()
                 .filter_map(|item| match item {
-                    Item::Checkboxes { options, checked, .. } => {
-                        Some((options[0].as_str(), checked[0]))
+                    Item::Checkboxes { options, .. } => {
+                        Some((options[0].name.as_str(), options[0].checked))
                     }
                     _ => None,
                 })
@@ -335,14 +345,14 @@ mod commands {
             let mut form = _settings_form(&settings, Path::new("/tmp/configrs.toml"));
             // Untick the first box, as a user would.
             for item in &mut form.items {
-                if let Item::Checkboxes { options, checked, .. } = item {
-                    if options[0] == "always_bundle_languages" {
-                        checked[0] = false;
+                if let Item::Checkboxes { options, .. } = item {
+                    if options[0].name == "always_bundle_languages" {
+                        options[0].checked = false;
                     }
                 }
             }
             let ticked = form.items.iter().filter_map(|item| match item {
-                Item::Checkboxes { checked, .. } => checked.first().copied(),
+                Item::Checkboxes { options, .. } => options.first().map(|o| o.checked),
                 _ => None,
             });
             let values: Vec<(String, bool)> =

@@ -33,6 +33,81 @@ pub(crate) fn _wrap(styles: &[&dyn Style]) -> String {
     escape(&sgr)
 }
 
+/// The hues a name can land on: twelve, evenly spaced around the wheel.
+///
+/// QUANTIZED on purpose. Hashing onto a continuous circle clusters — twelve real crate names put
+/// two of them 2 degrees apart, which is the worst possible outcome: colours that look identical
+/// while claiming to differ. Landing on a step means a clash is an honest clash, two names in
+/// plainly the same colour, and everything else is plainly apart.
+const HUE_STEPS: u16 = 12;
+
+/// The two vividness tiers a name can land on, doubling the distinguishable looks without
+/// touching lightness — which is what readability actually rides on.
+const HUE_SATURATIONS: [f64; 2] = [0.78, 0.42];
+
+/// How light every hued name comes out, whichever hue and tier it took.
+///
+/// One value for all of them, as a deliberate compromise between backgrounds a terminal will not
+/// name: light enough that a blue is not a hole on black, dark enough that a yellow is not a
+/// smear on white.
+const HUE_LIGHTNESS: f64 = 0.58;
+
+/// A hue for `text`, in degrees around the colour wheel — one of [`HUE_STEPS`] evenly spaced
+/// steps, the same one every time, on every machine, for as long as the name is spelled the same.
+///
+/// FNV-1a rather than the standard library's hasher: `DefaultHasher`'s output is explicitly not
+/// promised to hold across Rust releases, and a colour that quietly changed under a toolchain
+/// upgrade would undo the only thing this is for. A name is worth colouring because you learn
+/// its colour.
+pub(crate) fn hue(text: &str) -> u16 {
+    let step = u16::try_from(_hash(text) % u64::from(HUE_STEPS)).unwrap_or(0);
+    step * (360 / HUE_STEPS)
+}
+
+/// `text`, coloured by its own spelling — so one name is one colour wherever it appears, and the
+/// eye can follow it through a list without reading it.
+///
+/// Nothing here can promise two names differ: a context-free colour is a hash, and hashes
+/// collide. What it promises is that they either match exactly or are far apart, and that the
+/// answer never changes.
+pub(crate) fn hued(text: &str) -> String {
+    // A separate slice of the same hash, so the tier does not track the hue.
+    let tier = _hash(text) / u64::from(HUE_STEPS) % HUE_SATURATIONS.len() as u64;
+    let (red, green, blue) = _hue_rgb(hue(text), HUE_SATURATIONS[tier as usize]);
+    _scoped(&escape(&format!("38;2;{red};{green};{blue}")), text)
+}
+
+/// FNV-1a over the bytes. Small, fully specified, and unchanging — the three things that matter
+/// for a value someone is going to recognise on sight.
+fn _hash(text: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    text.bytes().fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
+}
+
+/// One hue as truecolor RGB, at `saturation` and the fixed lightness. The standard HSL
+/// conversion: `chroma` is the span between the channel extremes, `second` the middle channel's
+/// share of it, and `base` lifts the lot to the wanted lightness.
+fn _hue_rgb(hue: u16, saturation: f64) -> (u8, u8, u8) {
+    let degrees = hue % 360;
+    let chroma = (1.0 - HUE_LIGHTNESS.mul_add(2.0, -1.0).abs()) * saturation;
+    let position = f64::from(degrees) / 60.0;
+    let second = chroma * (1.0 - (position % 2.0 - 1.0).abs());
+    // The sector comes from the INTEGER degrees, so it can never disagree with `position`
+    // through the same number being rounded twice.
+    let (red, green, blue) = match degrees / 60 {
+        0 => (chroma, second, 0.0),
+        1 => (second, chroma, 0.0),
+        2 => (0.0, chroma, second),
+        3 => (0.0, second, chroma),
+        4 => (second, 0.0, chroma),
+        _ => (chroma, 0.0, second),
+    };
+    let base = chroma.mul_add(-0.5, HUE_LIGHTNESS);
+    let byte = |channel: f64| ((channel + base) * 255.0).round().clamp(0.0, 255.0) as u8;
+    (byte(red), byte(green), byte(blue))
+}
+
 /// Style `text` in the shared bold-blue "header" style — `lll`'s column row and `gg`'s section
 /// titles both use it, so the style is defined once and composed from theme styles like the rest.
 pub(crate) fn _header(text: &str) -> String {
@@ -91,6 +166,66 @@ pub(crate) fn _scoped(codes: &str, text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every hue is one of the steps, and the value never drifts: these numbers are pinned
+    /// because the whole point is that a name looks the same tomorrow. Change the hash and this
+    /// fails, which is the warning it exists to give.
+    #[test]
+    fn a_name_always_lands_on_the_same_step() {
+        for name in ["bashrs", "vidl", "", "a", "software_inventory", "🙂"] {
+            let degrees = hue(name);
+            assert!(degrees < 360, "{name:?} left the wheel: {degrees}");
+            assert_eq!(degrees % (360 / HUE_STEPS), 0, "{name:?} landed off-step: {degrees}");
+            assert_eq!(hue(name), degrees, "twice running must agree");
+        }
+        assert_eq!(hue("bashrs"), 0);
+        assert_eq!(hue("vidl"), 0, "a clash is allowed — and is an honest one, not a near-miss");
+        assert_eq!(hue("terminal_choice"), 30);
+        assert_eq!(hue("software_inventory"), 210);
+    }
+
+    /// A clash in hue is survivable when the tier differs, which is what the second axis buys.
+    /// The real crate names of this build must come out wholly distinguishable — that is the
+    /// claim the feature makes, so it is the claim under test.
+    #[test]
+    fn this_build_s_own_crate_names_are_all_tellable_apart() {
+        let names = [
+            "bashrs", "ai_detection", "bashrs-macros", "filesync", "sequencer-cli",
+            "sequencer-core", "sequencer-input", "software_inventory", "table_formatter",
+            "terminal_choice", "vidl", "os_ricing",
+        ];
+        let looks: std::collections::BTreeSet<String> =
+            names.iter().map(|name| hued(name)).collect();
+        assert_eq!(looks.len(), names.len(), "two of these look alike");
+
+        // `bashrs` and `vidl` share a hue; the tier is what keeps them apart.
+        assert_eq!(hue("bashrs"), hue("vidl"));
+        assert_ne!(hued("bashrs"), hued("vidl"), "same hue, and still distinguishable");
+    }
+
+    /// The colouring is a truecolor foreground, scoped like every other style here so it nests
+    /// safely, and readable at every step rather than going dark at the blues.
+    #[test]
+    fn a_hued_name_is_scoped_truecolor_and_never_too_dark() {
+        let painted = hued("bashrs");
+        assert!(painted.contains("bashrs"), "the text survives: {painted:?}");
+        assert!(painted.contains("\x1b[38;2;"), "truecolor foreground: {painted:?}");
+        assert!(painted.ends_with(RESET), "closes like every other span: {painted:?}");
+        let empty = hued("");
+        assert!(empty.contains("\x1b[38;2;"), "empty text still resolves to a colour: {empty:?}");
+        assert_eq!(empty, hued(""), "and to the same one twice");
+
+        // Every step, at both tiers, keeps its channels off the floor — a hue that came out near
+        // black would be a name you cannot read on a dark terminal.
+        for step in 0..HUE_STEPS {
+            for saturation in HUE_SATURATIONS {
+                let (red, green, blue) = _hue_rgb(step * (360 / HUE_STEPS), saturation);
+                let brightest = red.max(green).max(blue);
+                assert!(brightest > 120, "step {step} at {saturation} is too dark: {red},{green},{blue}");
+            }
+        }
+    }
+
     use crate::support::theme::Underline; // only the multi-style `_wrap` case needs it
 
     // ANSI shorthands for readable expectations.

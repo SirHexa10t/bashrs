@@ -112,3 +112,31 @@ ricing module
 
 bluetooth in net_local
 
+
+media:
+    compare: webp, avif, jxl
+        use the right one in different cases?
+        avif is great for lossy, but bad at lossless.
+        lossy: jpgxl is considered better than avif, but not always (seen a case where avif is better at similarity score of 0.01)
+    
+phone debloating
+
+os_ricing
+    use forms to choose what ricing to apply
+        list features (and detect if they're present or relevant for your system)
+        for each feature, create a (toml?) mapping of feature-name to script (e.g. in "packages" there'd be a key "zed", and for value, its installation script: `curl -f https://zed.dev/install.sh | sh`)
+            obviously, this mapping would be the basis of the form
+
+        Make sure forms have a way to display warnings (red?) at the bottom (e.g. when choosing "packages", there should be a warning when you choose to install more than one type of VPN; it's weird enough to be considered unintentional, but still allowed). Of-course, the forms should provide a way to specify what warnings appear, under which type of checkbox (check/uncheck) combinations.
+    
+
+cheatsheets
+    include search
+    include aliasing for each sheet
+
+add function that uses scrcpy?
+
+add program that uses joycon as a mouse
+
+project Carl (marks your text)
+

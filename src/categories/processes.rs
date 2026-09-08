@@ -144,12 +144,11 @@ mod commands {
                     .items
                     .iter()
                     .filter_map(|item| match item {
-                        terminal_choice::Item::Checkboxes { options, checked, .. } => Some(
+                        terminal_choice::Item::Checkboxes { options, .. } => Some(
                             options
                                 .iter()
-                                .zip(checked)
-                                .filter(|(_, on)| **on)
-                                .filter_map(|(option, _)| _picked_pid(option)),
+                                .filter(|option| option.checked)
+                                .filter_map(|option| _picked_pid(&option.name)),
                         ),
                         _ => None,
                     })
@@ -1243,12 +1242,11 @@ mod commands {
                         .items
                         .iter()
                         .filter_map(|item| match item {
-                            terminal_choice::Item::Checkboxes { options, checked, .. } => Some(
+                            terminal_choice::Item::Checkboxes { options, .. } => Some(
                                 options
                                     .iter()
-                                    .zip(checked)
-                                    .filter(|(_, on)| **on)
-                                    .filter_map(|(option, _)| _picked_pid(option)),
+                                    .filter(|option| option.checked)
+                                    .filter_map(|option| _picked_pid(&option.name)),
                             ),
                             _ => None,
                         })
@@ -1873,7 +1871,7 @@ mod commands {
                     terminal_choice::Item::Comment(_) => comment_rows += 1,
                     terminal_choice::Item::Checkboxes { label, options, .. } => {
                         assert!(label.is_empty(), "tree groups are anonymous — no heading line");
-                        option_pids.extend(options.iter().filter_map(|o| _picked_pid(o)));
+                        option_pids.extend(options.iter().filter_map(|o| _picked_pid(&o.name)));
                     }
                     other => panic!("nothing else belongs in this form: {other:?}"),
                 }

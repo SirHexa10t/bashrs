@@ -18,7 +18,8 @@ mod commands {
     use std::io::{self, BufWriter, Write};
     use std::path::{Path, PathBuf};
 
-    /// Align whitespace-delimited columns into a neat table (table_formatter)
+    /// Align whitespace-delimited columns into a neat table — or paste an HTML <table>
+    /// (a saved wiki/docs page) and it's translated into one (table_formatter)
     #[unprefixed]
     pub fn table(args: table_formatter::Args) {
         if let Err(err) = table_formatter::run_with(args) {
