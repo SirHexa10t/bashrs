@@ -45,7 +45,11 @@ pub fn ensure_current() -> std::io::Result<PathBuf> {
     if needs_migration(&std::fs::read_to_string(&path)?) {
         let archived =
             path.with_file_name(format!("{CONFIG_FILE}.{}.old", preferences::datehour_stamp()));
-        std::fs::rename(&path, &archived)?;
+        // Archived by COPY, not rename: renaming a symlinked config would move the LINK to the
+        // archive name and leave a regular file behind, parting it from the user's dotfile. A copy
+        // keeps the old content here beside it — where the shell's merge reminder looks — and
+        // the write below goes through the link, as `fs::write` does.
+        std::fs::copy(&path, &archived)?;
         std::fs::write(&path, TEMPLATE)?;
         eprintln!(
             "bashrs: {CONFIG_FILE} was outdated — archived to {} and rewritten; merge your settings back (`brs_configure -e`)",

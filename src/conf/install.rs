@@ -45,7 +45,11 @@ pub fn install_shell(content: &str) {
         die(msg);
     }
     match install_binary(&home) {
-        Ok(Some(bin)) => println!("Installed {}", bin.display()),
+        // Through a symlink, both ends are named: the file written is not where the user looks.
+        Ok(Some(bin)) => match home.join("bashrs") {
+            link if link == bin => println!("Installed {}", bin.display()),
+            link => println!("Installed {} → {}", link.display(), bin.display()),
+        },
         Ok(None) => {} // already running as the installed copy — nothing to move
         Err(msg) => die(msg),
     }
@@ -185,9 +189,13 @@ fn ensure_profile_store(home: &Path) -> Result<(), String> {
 /// with ETXTBSY (the `brs_compile` flow keeps the old binary alive while this runs), while
 /// unlinking leaves that process its inode and frees the name. `None` when already running AS
 /// the installed copy — copying a file onto itself would truncate it.
+///
+/// A symlinked `<home>/bashrs` is replaced at the file it points to, and the link survives — see
+/// [`super::replacement_target`]. Unlink-first is exactly the kind of replacement that would
+/// otherwise cut the link.
 fn install_binary(home: &Path) -> Result<Option<PathBuf>, String> {
     let source = std::env::current_exe().map_err(|err| format!("could not locate the running binary: {err}"))?;
-    let dest = home.join("bashrs");
+    let dest = super::replacement_target(&home.join("bashrs"));
     if dest.exists()
         && matches!((source.canonicalize(), dest.canonicalize()), (Ok(a), Ok(b)) if a == b)
     {
@@ -348,6 +356,42 @@ mod tests {
         std::fs::write(&installed, b"stale").unwrap();
         install_binary(&dir).expect("reinstall works").expect("replaced");
         assert_eq!(std::fs::metadata(&installed).unwrap().len(), source_len, "stale copy replaced");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symlinked install is replaced where it points and the link survives — the case that
+    /// used to lose the link, unlinking it and leaving a regular file in its place. A dangling
+    /// link has nowhere to be written through, so it is replaced as before; and a link straight
+    /// at the running binary is recognised as installed rather than unlinked from under itself.
+    #[test]
+    fn a_symlinked_binary_is_replaced_where_it_points_and_the_link_survives() {
+        use std::os::unix::fs::symlink;
+        let dir = scratch("symlinked");
+        let (home, elsewhere) = (dir.join("home"), dir.join("elsewhere"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let real = elsewhere.join("bashrs");
+        std::fs::write(&real, b"stale").unwrap();
+        symlink(&real, home.join("bashrs")).unwrap();
+
+        let source_len = std::fs::metadata(std::env::current_exe().unwrap()).unwrap().len();
+        let installed = install_binary(&home).expect("install works").expect("a copy was made");
+        assert_eq!(installed, real.canonicalize().unwrap(), "written where the link points");
+        assert!(home.join("bashrs").is_symlink(), "and the link itself survives");
+        assert_eq!(std::fs::metadata(&real).unwrap().len(), source_len, "a full copy, through it");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o755, 0o755);
+
+        std::fs::remove_file(home.join("bashrs")).unwrap();
+        symlink(dir.join("no/such/bashrs"), home.join("bashrs")).unwrap();
+        install_binary(&home).expect("install works").expect("a copy was made");
+        assert!(!home.join("bashrs").is_symlink(), "a dangling link is replaced, as before");
+        assert_eq!(std::fs::metadata(home.join("bashrs")).unwrap().len(), source_len);
+
+        std::fs::remove_file(home.join("bashrs")).unwrap();
+        symlink(std::env::current_exe().unwrap(), home.join("bashrs")).unwrap();
+        assert_eq!(install_binary(&home), Ok(None), "linked at the running binary: installed");
+        assert!(home.join("bashrs").is_symlink());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

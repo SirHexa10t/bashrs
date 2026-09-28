@@ -70,6 +70,37 @@ fn brs_configure_creates_the_config_from_the_template_and_opens_it() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A config the user symlinked (a dotfiles repo, say) survives the outdated-shape migration: the
+/// fresh template goes into the file the link points at, the link is still a link, and the old
+/// settings are archived beside it in `~/.bashrs` — where the shell's merge reminder looks.
+/// Renaming used to move the link itself to the archive name, leaving a regular file behind.
+#[test]
+fn a_symlinked_config_is_migrated_through_the_link() {
+    let home = std::env::temp_dir().join(format!("bashrs_cfg_link_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(".bashrs")).unwrap();
+    std::fs::create_dir_all(home.join("dotfiles")).unwrap();
+    let dotfile = home.join("dotfiles/configrs.toml");
+    std::fs::write(&dotfile, "[tools]\nalways_bundle = true\n").unwrap();
+    let link = home.join(".bashrs/configrs.toml");
+    std::os::unix::fs::symlink(&dotfile, &link).unwrap();
+
+    let out = bashrs(&["brs_configure"], &[("HOME", home.to_str().unwrap()), ("EDITOR", "cat")]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("archived"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(link.is_symlink(), "the link must survive the migration");
+    assert!(std::fs::read_to_string(&dotfile).unwrap().contains("always_bundle_languages"),
+        "the fresh template goes where the link points");
+    let olds: Vec<_> = std::fs::read_dir(home.join(".bashrs")).unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".old"))
+        .collect();
+    assert_eq!(olds.len(), 1, "archived once, in ~/.bashrs");
+    assert!(!olds[0].path().is_symlink(), "the archive is a copy, not the moved link");
+    assert!(std::fs::read_to_string(olds[0].path()).unwrap().contains("always_bundle = true"),
+        "and it holds the old settings");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn fs_usage_count_prints_a_bare_number_and_fails_on_missing_paths() {
     let dir = std::env::temp_dir().join(format!("bashrs_usage_e2e_{}", std::process::id()));

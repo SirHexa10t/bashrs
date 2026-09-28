@@ -369,6 +369,10 @@ fn ensure_shims(tool: &Tool) {
         }
         let link = bin_dir().join(name);
         let _ = std::fs::create_dir_all(bin_dir());
+        // Replaced as a LINK, deliberately not through `conf::replacement_target`: this is
+        // bashrs's own shim, and resolving it would delete the tool it points at and write the
+        // new shim over it. User symlinks are preserved elsewhere in `~/.bashrs`; `tools/` is
+        // bashrs's managed tree, rebuilt by every sync.
         let _ = std::fs::remove_file(&link);
         // A venv's binaries must NOT be shimmed by symlink: python discovers its venv by looking
         // for pyvenv.cfg beside the path it was *invoked as* (symlinks deliberately unresolved —
