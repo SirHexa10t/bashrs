@@ -2,7 +2,7 @@
 //! under `~/.bashrs/` (whose root path this module owns: [`bashrs_home`]): the sourcefile's
 //! shell settings (environment/prompt exports, keybinds, the load greeting), assembled by
 //! [`crate::cli`], and the user's hand-edited configuration file ([`config_file`] —
-//! `configrs.toml`, opened by `bashrs_configure`/ALT+W and read wherever behavior is tunable).
+//! `configrs.toml`, opened by `brs_configure`/ALT+W and read wherever behavior is tunable).
 //!
 //! Sits below [`crate::tools`] in the crate layering (see [`crate`]'s diagram): tools reads the
 //! config, so nothing here may import upward. Subsystem-derived shell lines (command wrappers,
@@ -47,7 +47,7 @@ pub(crate) fn user_data_dir() -> PathBuf {
 }
 
 /// `~/.bashrs/sourcefile.sh` — the generated shell file. Derived here so its writer
-/// ([`install::install_shell`]) and its reader (`bashrs_sourcefile`) can't drift apart; the
+/// ([`install::install_shell`]) and its reader (`brs_sourcefile`) can't drift apart; the
 /// unexpanded `$HOME/…` form the rc files are wired with is [`install`]'s own concern.
 pub(crate) fn sourcefile() -> PathBuf {
     bashrs_home().join("sourcefile.sh")

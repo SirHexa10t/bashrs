@@ -177,7 +177,7 @@ pub(crate) fn resolve_uv() -> OsString {
 }
 
 /// The command to run for `program`: its bundled copy when present — the project-pinned version,
-/// kept current by `bashrs_compile` — else the bare name, so the system installation (or its
+/// kept current by `brs_compile` — else the bare name, so the system installation (or its
 /// normal "command not found" error) takes over. A program not in the table passes through.
 pub(crate) fn resolve(program: &str) -> OsString {
     for tool in TOOLS {

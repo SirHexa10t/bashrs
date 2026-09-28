@@ -79,7 +79,7 @@ pub fn install_shell(content: &str) {
         println!("Note: neither ~/.bashrc nor ~/.zshrc exists; nothing was wired up.");
     }
     println!();
-    // A `bashrs_compile` (the everyday recompile) reloads the shell for you the instant this
+    // A `brs_compile` (the everyday recompile) reloads the shell for you the instant this
     // returns, so telling the user to open one themselves is wrong — it already happens. Only a
     // run with no reload coming (a first-time `./COMPILE.sh`, or the script run by hand) needs
     // the manual instruction. Which one this is is read off the process tree, where the fact
@@ -87,7 +87,7 @@ pub fn install_shell(content: &str) {
     println!("{}", activation_line(reload_follows(), &sourcefile));
 }
 
-/// The install's closing line. When a shell reload will follow (the `bashrs_compile` flow),
+/// The install's closing line. When a shell reload will follow (the `brs_compile` flow),
 /// say so — the prompt is about to reset under the user, and asking them to act would contradict
 /// what's happening. Otherwise (a first-time `./COMPILE.sh`), name the one step that activates it.
 ///
@@ -103,13 +103,13 @@ fn activation_line(reload_follows: bool, sourcefile: &Path) -> String {
 }
 
 /// Whether the shell will reload on its own once this install returns — true exactly when a
-/// `bashrs_compile` invocation sits in this process's ancestry (its generated wrapper catches the
+/// `brs_compile` invocation sits in this process's ancestry (its generated wrapper catches the
 /// reload exit code and runs `shell_new`). Read straight off `/proc`'s parent chain rather than
 /// signalled through an env var: the process tree already carries the fact, and a second channel
 /// for it could only drift or leak. The chain here is short — install-shell ← bash(COMPILE.sh) ←
-/// bashrs(bashrs_compile) ← the user's shell — but the walk is bounded anyway.
+/// bashrs(brs_compile) ← the user's shell — but the walk is bounded anyway.
 fn reload_follows() -> bool {
-    ancestor_argvs().into_iter().any(|argv| is_bashrs_compile(&argv))
+    ancestor_argvs().into_iter().any(|argv| is_brs_compile(&argv))
 }
 
 /// The argv of each ancestor process, nearest first, walked via `/proc/<pid>/stat`'s ppid field
@@ -142,16 +142,16 @@ fn ancestor_argvs() -> Vec<Vec<String>> {
     argvs
 }
 
-/// Whether one process's argv is a `bashrs_compile` run — the bashrs binary (by file name, since
-/// the wrapper invokes it by absolute path) told to compile. Both halves matter: `bashrs_compile`
+/// Whether one process's argv is a `brs_compile` run — the bashrs binary (by file name, since
+/// the wrapper invokes it by absolute path) told to compile. Both halves matter: `brs_compile`
 /// alone would also match some unrelated program handed that word as data.
-fn is_bashrs_compile(argv: &[String]) -> bool {
+fn is_brs_compile(argv: &[String]) -> bool {
     let binary_is_bashrs = argv
         .first()
         .map(Path::new)
         .and_then(Path::file_name)
         .is_some_and(|name| name == "bashrs");
-    binary_is_bashrs && argv.get(1).is_some_and(|arg| arg == "bashrs_compile")
+    binary_is_bashrs && argv.get(1).is_some_and(|arg| arg == "brs_compile")
 }
 
 /// Guard and create the install dir. `~/.bashrs` itself is preserved as-is — it may be a
@@ -182,7 +182,7 @@ fn ensure_profile_store(home: &Path) -> Result<(), String> {
 /// Install the running executable as `<home>/bashrs` — the self-copy that IS the installation
 /// (COMPILE.sh runs this command from the freshly built `target/release/bashrs`). The old copy
 /// is unlinked first, like `install(1)` did: overwriting a *running* executable in place fails
-/// with ETXTBSY (the `bashrs_compile` flow keeps the old binary alive while this runs), while
+/// with ETXTBSY (the `brs_compile` flow keeps the old binary alive while this runs), while
 /// unlinking leaves that process its inode and frees the name. `None` when already running AS
 /// the installed copy — copying a file onto itself would truncate it.
 fn install_binary(home: &Path) -> Result<Option<PathBuf>, String> {
@@ -248,7 +248,7 @@ mod tests {
         assert!(UNEXPANDED_SOURCEFILE_PATH.starts_with("$HOME/"));
     }
 
-    /// The closing line must match what actually happens next. When `bashrs_compile` will reload
+    /// The closing line must match what actually happens next. When `brs_compile` will reload
     /// the shell, it must NOT tell the user to open one — that was the bug: the message asked for
     /// an action the wrapper had already taken. Only a first-time `./COMPILE.sh` gets the manual
     /// instruction, because only then is there no wrapper to reload.
@@ -276,25 +276,25 @@ mod tests {
 
     /// The reload verdict comes off the process tree, so the recognizer decides everything: it
     /// must accept the wrapper's absolute-path invocation and reject look-alikes — a program
-    /// merely *handed* the word (`echo bashrs_compile`) is not a compile.
+    /// merely *handed* the word (`echo brs_compile`) is not a compile.
     #[test]
-    fn only_a_real_bashrs_compile_invocation_counts_as_a_pending_reload() {
+    fn only_a_real_brs_compile_invocation_counts_as_a_pending_reload() {
         let argv = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
         assert!(
-            is_bashrs_compile(&argv(&["/home/u/.bashrs/bashrs", "bashrs_compile"])),
+            is_brs_compile(&argv(&["/home/u/.bashrs/bashrs", "brs_compile"])),
             "the wrapper invokes the binary by absolute path"
         );
-        assert!(is_bashrs_compile(&argv(&["bashrs", "bashrs_compile", "--use-stable-cargo"])));
+        assert!(is_brs_compile(&argv(&["bashrs", "brs_compile", "--use-stable-cargo"])));
         // Not a compile: another bashrs command, another program, or the word as mere data.
-        assert!(!is_bashrs_compile(&argv(&["/home/u/.bashrs/bashrs", "bashrs_test"])));
-        assert!(!is_bashrs_compile(&argv(&["echo", "bashrs_compile"])));
-        assert!(!is_bashrs_compile(&argv(&["bashrs"])));
-        assert!(!is_bashrs_compile(&[]));
+        assert!(!is_brs_compile(&argv(&["/home/u/.bashrs/bashrs", "brs_test"])));
+        assert!(!is_brs_compile(&argv(&["echo", "brs_compile"])));
+        assert!(!is_brs_compile(&argv(&["bashrs"])));
+        assert!(!is_brs_compile(&[]));
     }
 
     /// The walk must terminate and stay honest on a machine it can't read: a bounded chain that
     /// ends at init, and no claim of a reload when the ancestry says nothing about one. (The test
-    /// binary is not run from `bashrs_compile`, so the answer here is false.)
+    /// binary is not run from `brs_compile`, so the answer here is false.)
     #[test]
     fn the_ancestry_walk_terminates_and_claims_no_reload_by_default() {
         let ancestors = ancestor_argvs();

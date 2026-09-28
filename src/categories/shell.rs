@@ -17,7 +17,7 @@
 //! sourcefile re-armed, and the name should say so before you are root to find out.
 //!
 //! `shell_new` is referenced by the ALT+N keybind (see [`crate::conf::keybinds`]) and by
-//! `bashrs_compile` (via `#[after]`); `shell_bare` by CTRL+ALT+N. Both resolve at call time, so
+//! `brs_compile` (via `#[after]`); `shell_bare` by CTRL+ALT+N. Both resolve at call time, so
 //! nothing depends on where in the sourcefile these land.
 //!
 //! The pair around `_BASHRS_BARE` (underscore: machinery-internal, not a user knob): `shell_bare`

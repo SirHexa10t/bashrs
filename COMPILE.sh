@@ -148,7 +148,7 @@ else
     if [ "$(cksum Cargo.lock 2>/dev/null || true)" != "$LOCK_BEFORE" ]; then
         printf '\033[1;34m%s\n%s\033[0m\n' \
             "New crate versions were locked. If this build misbehaves, revert to the last stable set:" \
-            "    git checkout -- Cargo.lock && ./COMPILE.sh --use-stable-cargo   (or: bashrs_compile --use-stable-cargo)"
+            "    git checkout -- Cargo.lock && ./COMPILE.sh --use-stable-cargo   (or: brs_compile --use-stable-cargo)"
     fi
     cargo build --release
 fi

@@ -1,6 +1,6 @@
 //! Turn one media file into another: transcode with per-container quality/compact profiles
-//! (`media_convert*`), or cut the front off (`media_trim_start`). Both write a new file through
-//! the shared `_run_writing` tail.
+//! (`media_convert*`), or keep one stretch of the timeline (`media_trim`). Both write a new file
+//! through the shared `_run_writing` tail.
 
 #[bashrs_macros::category(command = MediaTranscodeCommand, prefix = "media_")]
 mod commands {
@@ -309,27 +309,40 @@ mod commands {
         path.extension().map(|ext| ext.to_string_lossy().to_lowercase())
     }
 
-    // --- media_trim_start -------------------------------------------------------
+    // --- media_trim -------------------------------------------------------------
 
-    /// Cut the first part off a video/audio file — frame-accurate (re-encoding on the output
-    /// container's defaults), or instant and lossless with `--copy` at keyframe precision
-    pub fn trim_start(args: TrimStartArgs) {
-        let TrimStartArgs { input, duration, output, overwrite, copy } = args;
+    /// Keep one stretch of a video/audio file: from a start, up to an end, or between the two —
+    /// frame-accurate (re-encoding on the output container's defaults), or instant and lossless
+    /// with `--copy` at keyframe precision
+    pub fn trim(args: TrimArgs) {
+        let TrimArgs { input, points, start, end, output, overwrite, copy } = args;
+        let cut = match _resolve_cut(&points, start.as_deref(), end.as_deref()) {
+            Ok(cut) => cut,
+            Err(why) => {
+                eprintln!("media_trim: {why}");
+                // A usage error, and 2 is what clap exits with for one of its own.
+                std::process::exit(2);
+            }
+        };
         let output = output.unwrap_or_else(|| _trimmed_output(&input));
-        _run_writing(
-            "media_trim_start",
-            &input,
-            &output,
-            _trim_argv(&input, &output, &duration, overwrite, copy),
-        );
+        let argv = _trim_argv(&input, &output, &cut, overwrite, copy);
+        _run_writing("media_trim", &input, &output, argv);
     }
 
     #[derive(Args)]
-    pub struct TrimStartArgs {
+    pub struct TrimArgs {
         /// Input video/audio file
         pub input: PathBuf,
-        /// How much to cut off the front — seconds (`1.2`) or a timestamp (`0:05.5`)
-        pub duration: String,
+        /// Where to cut — seconds (`90`, `1.5`) or a timestamp (`1:30`, `0:01:30.5`). One point
+        /// is the start; two are the start and the end. An end on its own needs `--end`
+        #[arg(value_name = "DURATION", num_args = 0..=2)]
+        pub points: Vec<String>,
+        /// The start point, named — the same as giving it first
+        #[arg(long, value_name = "DURATION")]
+        pub start: Option<String>,
+        /// The end point, named — the only way to give an end without a start
+        #[arg(long, value_name = "DURATION")]
+        pub end: Option<String>,
         /// Output file (defaults to `<input>_trimmed.<ext>`, beside the input)
         #[arg(long)]
         pub output: Option<PathBuf>,
@@ -342,13 +355,119 @@ mod commands {
         pub copy: bool,
     }
 
+    /// The stretch to keep, as ffmpeg will be told it: where to seek to (`-ss`, the start as
+    /// typed) and how much to keep from there (`-t`).
+    ///
+    /// `-t` rather than `-to`, and the difference matters. With `-ss` before `-i` ffmpeg restarts
+    /// the output's clock at the seek point, so `-to` there counts from the START — `-ss 0:05 -to
+    /// 0:30` keeps thirty seconds, not twenty-five. `-t` with the difference says what was meant
+    /// on every ffmpeg version; with no start there is no seek, and the end as typed IS the
+    /// length.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Cut {
+        seek: Option<String>,
+        keep: Option<String>,
+    }
+
+    /// Which point is which. Named flags claim their role outright; positionals fill whatever is
+    /// left, start before end — so one bare point is a start (as `media_trim_start` was), two are
+    /// start and end, and a lone end has to be said with `--end`. A point that would land on a
+    /// role a flag already took is an error rather than a guess.
+    fn _resolve_cut(
+        points: &[String],
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<Cut, String> {
+        let mut unclaimed: Vec<&str> = Vec::new();
+        if start.is_none() {
+            unclaimed.push("start");
+        }
+        if end.is_none() {
+            unclaimed.push("end");
+        }
+        if points.len() > unclaimed.len() {
+            return Err(match unclaimed.as_slice() {
+                [] => "both `--start` and `--end` are given, so there is no point left to place"
+                    .to_string(),
+                [role] => {
+                    format!("only the {role} is left to give, but {} points were", points.len())
+                }
+                _ => format!("at most two points — a start and an end — not {}", points.len()),
+            });
+        }
+        let mut points = points.iter().map(String::as_str);
+        let start = start.or_else(|| unclaimed.contains(&"start").then(|| points.next()).flatten());
+        let end = end.or_else(|| points.next());
+        if start.is_none() && end.is_none() {
+            return Err("nothing to cut: give a start, an end (`--end`), or both".to_string());
+        }
+        // Parsed for two reasons: to refuse nonsense here with a sentence rather than let ffmpeg
+        // fail on it later, and because a start AND an end need arithmetic (see `Cut`).
+        let parsed = |text: Option<&str>| -> Result<Option<f64>, String> {
+            text.map(|text| {
+                _seconds(text).ok_or_else(|| {
+                    format!(
+                        "`{text}` is not a duration — seconds (`90`, `1.5`) or a timestamp \
+                         (`1:30`, `0:01:30.5`)"
+                    )
+                })
+            })
+            .transpose()
+        };
+        let (start_at, end_at) = (parsed(start)?, parsed(end)?);
+        let keep = match (start_at, end_at) {
+            (Some(from), Some(to)) if to <= from => {
+                return Err(format!(
+                    "the end ({}) is not after the start ({})",
+                    end.unwrap_or_default(),
+                    start.unwrap_or_default()
+                ));
+            }
+            (Some(from), Some(to)) => Some(_ffmpeg_seconds(to - from)),
+            (None, Some(_)) => end.map(str::to_string),
+            (_, None) => None,
+        };
+        Ok(Cut { seek: start.map(str::to_string), keep })
+    }
+
+    /// A duration in ffmpeg's own syntax, as seconds: `[[HH:]MM:]SS[.frac]`, or a bare number of
+    /// seconds with an optional `s`/`ms`/`us` unit. `None` for anything else — negatives
+    /// included, which cut nothing.
+    fn _seconds(text: &str) -> Option<f64> {
+        let text = text.trim();
+        if let Some((unit, scale)) = [("ms", 1e-3), ("us", 1e-6), ("s", 1.0)]
+            .into_iter()
+            .find(|(unit, _)| text.ends_with(unit) && !text.contains(':'))
+        {
+            return _positive(text.strip_suffix(unit)?).map(|value| value * scale);
+        }
+        let parts: Vec<&str> = text.split(':').collect();
+        if parts.len() > 3 || parts.iter().any(|part| part.is_empty()) {
+            return None;
+        }
+        parts.iter().try_fold(0.0, |total, part| Some(total * 60.0 + _positive(part)?))
+    }
+
+    /// A non-negative decimal number, or nothing.
+    fn _positive(text: &str) -> Option<f64> {
+        text.parse::<f64>().ok().filter(|value| value.is_finite() && *value >= 0.0)
+    }
+
+    /// Seconds for an ffmpeg argument: millisecond precision, no trailing zeros — `25`, `24.5`,
+    /// `0.9` rather than the `0.9000000000000001` that subtracting two floats leaves behind.
+    fn _ffmpeg_seconds(seconds: f64) -> String {
+        let text = format!("{seconds:.3}");
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+
     /// ffmpeg argv for the trim. `-ss` sits *before* `-i`: ffmpeg then seeks instead of decoding
     /// through the skipped part — and when re-encoding it is still frame-accurate, decoding
-    /// forward from the preceding keyframe and discarding up to the requested point.
+    /// forward from the preceding keyframe and discarding up to the requested point. `-t` is an
+    /// output option and sits after the input, like `-c copy`.
     fn _trim_argv(
         input: &Path,
         output: &Path,
-        duration: &str,
+        cut: &Cut,
         overwrite: bool,
         copy: bool,
     ) -> Vec<OsString> {
@@ -356,11 +475,16 @@ mod commands {
         if overwrite {
             argv.push("-y".into());
         }
-        argv.extend(["-ss", duration].map(OsString::from));
+        if let Some(seek) = &cut.seek {
+            argv.extend(["-ss", seek].map(OsString::from));
+        }
         argv.push("-i".into());
         argv.push(input.as_os_str().to_owned());
         if copy {
             argv.extend(["-c", "copy"].map(OsString::from));
+        }
+        if let Some(keep) = &cut.keep {
+            argv.extend(["-t", keep].map(OsString::from));
         }
         argv.push(output.as_os_str().to_owned());
         argv
@@ -475,13 +599,108 @@ mod commands {
             assert!(_profile_flags(Path::new("noext"), Profile::Compact, false).is_empty());
         }
 
+        fn cut(seek: Option<&str>, keep: Option<&str>) -> Cut {
+            Cut { seek: seek.map(str::to_string), keep: keep.map(str::to_string) }
+        }
+
+        fn resolve(points: &[&str], start: Option<&str>, end: Option<&str>) -> Result<Cut, String> {
+            let points: Vec<String> = points.iter().map(|p| (*p).to_string()).collect();
+            _resolve_cut(&points, start, end)
+        }
+
+        /// One bare point is the start — exactly what `media_trim_start` did — and two are the
+        /// start and the end, in that order.
         #[test]
-        fn trim_argv_seeks_before_the_input() {
-            // `-ss` after `-i` would decode through the skipped part instead of seeking past it.
-            let argv = strs(&_trim_argv(Path::new("in.mp4"), Path::new("out.mp4"), "1.2", false, false));
-            assert_eq!(argv, ["-ss", "1.2", "-i", "in.mp4", "out.mp4"]);
-            let copy = strs(&_trim_argv(Path::new("in.mp4"), Path::new("out.mp4"), "0:05", true, true));
-            assert_eq!(copy, ["-y", "-ss", "0:05", "-i", "in.mp4", "-c", "copy", "out.mp4"]);
+        fn bare_points_are_start_then_end() {
+            assert_eq!(resolve(&["1.2"], None, None), Ok(cut(Some("1.2"), None)));
+            assert_eq!(resolve(&["0:05", "0:30"], None, None), Ok(cut(Some("0:05"), Some("25"))));
+        }
+
+        /// Named flags claim their role; a bare point then fills whatever role is left. An end on
+        /// its own is only sayable as `--end`.
+        #[test]
+        fn named_points_claim_their_role_and_bare_ones_fill_what_is_left() {
+            assert_eq!(resolve(&[], None, Some("0:30")), Ok(cut(None, Some("0:30"))), "end alone");
+            assert_eq!(resolve(&[], Some("0:05"), None), Ok(cut(Some("0:05"), None)), "start alone, named");
+            assert_eq!(resolve(&[], Some("0:05"), Some("0:30")), Ok(cut(Some("0:05"), Some("25"))));
+            assert_eq!(resolve(&["0:05"], None, Some("0:30")), Ok(cut(Some("0:05"), Some("25"))), "the bare one is the start");
+            assert_eq!(resolve(&["0:30"], Some("0:05"), None), Ok(cut(Some("0:05"), Some("25"))), "the bare one is the end");
+        }
+
+        /// Every way of asking for nothing, too much, or nonsense is refused with a sentence,
+        /// before ffmpeg is anywhere near it.
+        #[test]
+        fn a_cut_that_cannot_be_meant_is_refused_with_a_reason() {
+            assert!(resolve(&[], None, None).unwrap_err().starts_with("nothing to cut"));
+            assert!(resolve(&["1", "2", "3"], None, None).unwrap_err().starts_with("at most two points"));
+            assert!(resolve(&["1"], Some("0"), Some("2")).unwrap_err().contains("no point left"));
+            assert!(resolve(&["1", "2"], Some("0"), None).unwrap_err().starts_with("only the end is left"));
+            assert!(resolve(&["soon"], None, None).unwrap_err().contains("`soon` is not a duration"));
+            assert_eq!(
+                resolve(&["0:30", "0:05"], None, None).unwrap_err(),
+                "the end (0:05) is not after the start (0:30)"
+            );
+            assert!(resolve(&["5", "5"], None, None).is_err(), "an empty stretch is nothing to keep");
+        }
+
+        /// ffmpeg's own time syntax, both shapes, and the things that are not a time.
+        #[test]
+        fn durations_read_as_ffmpeg_reads_them() {
+            assert_eq!(_seconds("90"), Some(90.0));
+            assert_eq!(_seconds("1.5"), Some(1.5));
+            assert_eq!(_seconds("1:30"), Some(90.0));
+            assert_eq!(_seconds("0:01:30.5"), Some(90.5));
+            assert_eq!(_seconds("3s"), Some(3.0));
+            assert_eq!(_seconds("250ms"), Some(0.25));
+            assert_eq!(_seconds("500us"), Some(0.0005));
+            for not_a_time in ["-1", "abc", "1:2:3:4", "1::2", "", "inf", "1.5x"] {
+                assert_eq!(_seconds(not_a_time), None, "{not_a_time:?}");
+            }
+        }
+
+        /// The length ffmpeg is handed is the difference, written without float residue.
+        #[test]
+        fn the_kept_length_is_the_difference_written_plainly() {
+            assert_eq!(_ffmpeg_seconds(25.0), "25");
+            assert_eq!(_ffmpeg_seconds(24.5), "24.5");
+            assert_eq!(_ffmpeg_seconds(1.1 - 0.2), "0.9", "not 0.9000000000000001");
+            assert_eq!(resolve(&["0:00:05.5", "1:00"], None, None), Ok(cut(Some("0:00:05.5"), Some("54.5"))));
+        }
+
+        /// `-ss` seeks before the input; `-t` limits the output after it. With `-ss` before `-i`,
+        /// `-to` would count from the seek point, which is why `-t` carries the difference.
+        #[test]
+        fn trim_argv_seeks_before_the_input_and_limits_after_it() {
+            let argv = |cut, overwrite, copy| strs(&_trim_argv(Path::new("in.mp4"), Path::new("out.mp4"), &cut, overwrite, copy));
+            assert_eq!(argv(cut(Some("1.2"), None), false, false), ["-ss", "1.2", "-i", "in.mp4", "out.mp4"]);
+            assert_eq!(argv(cut(None, Some("0:30")), false, false), ["-i", "in.mp4", "-t", "0:30", "out.mp4"]);
+            assert_eq!(
+                argv(cut(Some("0:05"), Some("25")), true, true),
+                ["-y", "-ss", "0:05", "-i", "in.mp4", "-c", "copy", "-t", "25", "out.mp4"]
+            );
+        }
+
+        /// The command line as clap sees it: up to two bare points, the two named ones, and the
+        /// flags `media_trim_start` had — pinned because this is the first optional positional in
+        /// the tree, and `num_args` is where such a thing goes quietly wrong.
+        #[test]
+        fn trim_takes_up_to_two_points_and_the_named_ones() {
+            #[derive(clap::Parser)]
+            struct Cli {
+                #[command(flatten)]
+                trim: TrimArgs,
+            }
+            use clap::Parser;
+            let parse = |argv: &[&str]| Cli::try_parse_from(std::iter::once("media_trim").chain(argv.iter().copied()));
+
+            let two = parse(&["in.mp4", "0:05", "0:30", "-y", "--copy"]).expect("two points").trim;
+            assert_eq!(two.points, ["0:05", "0:30"]);
+            assert!(two.overwrite && two.copy && two.start.is_none() && two.end.is_none());
+            let named = parse(&["in.mp4", "--end", "0:30", "--output", "cut.mp4"]).expect("named end").trim;
+            assert!(named.points.is_empty() && named.end.as_deref() == Some("0:30"));
+            assert_eq!(named.output, Some(PathBuf::from("cut.mp4")));
+            assert!(parse(&["in.mp4"]).is_ok(), "no points parse; resolving them is what refuses");
+            assert!(parse(&["in.mp4", "1", "2", "3"]).is_err(), "a third bare point is a usage error");
         }
 
         #[test]

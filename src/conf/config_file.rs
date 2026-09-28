@@ -1,5 +1,5 @@
 //! The user's bashrs configuration — `~/.bashrs/configrs.toml`, edited through
-//! `bashrs_configure`'s form (ALT+W; `-e` opens the file itself) and read wherever behavior is
+//! `brs_configure`'s form (ALT+W; `-e` opens the file itself) and read wherever behavior is
 //! user-tunable. [`settings`] and [`with_values`] are what that form reads and writes: both work
 //! on the file's LINES, because the comments beside each key are the only documentation it has
 //! and a round-trip through `toml` would drop every one of them. Every reader falls back to the
@@ -48,7 +48,7 @@ pub fn ensure_current() -> std::io::Result<PathBuf> {
         std::fs::rename(&path, &archived)?;
         std::fs::write(&path, TEMPLATE)?;
         eprintln!(
-            "bashrs: {CONFIG_FILE} was outdated — archived to {} and rewritten; merge your settings back (`bashrs_configure -e`)",
+            "bashrs: {CONFIG_FILE} was outdated — archived to {} and rewritten; merge your settings back (`brs_configure -e`)",
             archived.display()
         );
     }
@@ -186,13 +186,13 @@ pub(crate) fn stale_config_notice() -> String {
     let stem = CONFIG_FILE.split('.').next().unwrap_or(CONFIG_FILE);
     // The command name is set off with single quotes, NOT backticks: this whole string is a
     // double-quoted argument to `errcho`, and a backtick there is command substitution — bash
-    // would RUN `bashrs_configure -e` (opening an editor) on every interactive shell start while
+    // would RUN `brs_configure -e` (opening an editor) on every interactive shell start while
     // an archive lingered, which is the opposite of an unobtrusive nag. Single quotes are literal
     // inside double quotes, so they display and do nothing.
     format!(
         "[ -n \"$(find -H \"$HOME/.bashrs\" -maxdepth 1 -name '{stem}*.old' -print -quit 2>/dev/null)\" ] && \
          errcho \"bashrs: an archived config (~/.bashrs/{stem}*.old) awaits merging into {CONFIG_FILE} \
-         (run 'bashrs_configure -e' to merge, then delete the .old file)\" \
+         (run 'brs_configure -e' to merge, then delete the .old file)\" \
          || true\n"
     )
 }
@@ -395,7 +395,7 @@ mod tests {
 
     /// The nag is a message, and a message must not DO anything. A backtick would make bash run
     /// whatever it wrapped (this string is a double-quoted `errcho` argument) on every interactive
-    /// shell start — which is exactly how naming the fix as `` `bashrs_configure -e` `` once opened
+    /// shell start — which is exactly how naming the fix as `` `brs_configure -e` `` once opened
     /// an editor in the user's face each session. It still has to name the command, so that stays.
     #[test]
     fn the_stale_notice_names_the_fix_without_executing_anything() {
@@ -407,6 +407,6 @@ mod tests {
         // No `$(` either, for the same reason — the only command substitution allowed is the
         // deliberate `$(find …)` guard, so any OTHER must be absent. (There's exactly one `$(`.)
         assert_eq!(notice.matches("$(").count(), 1, "only the find-guard may substitute: {notice}");
-        assert!(notice.contains("bashrs_configure -e"), "it must still name the fix: {notice}");
+        assert!(notice.contains("brs_configure -e"), "it must still name the fix: {notice}");
     }
 }

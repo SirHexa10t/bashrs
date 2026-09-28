@@ -388,13 +388,13 @@ mod tests {
         );
     }
 
-    /// Only the clap-backed commands appear here — `#[shell_body]` ones (`bashrs_cd`,
+    /// Only the clap-backed commands appear here — `#[shell_body]` ones (`brs_cd`,
     /// `dotbashrs_cd`) never enter the clap graph, and `dotbashrs_cd`'s deliberate off-prefix
     /// name (the dot names the DIRECTORY, ~/.bashrs) is asserted where the shell functions
     /// are emitted, in `sourcefile`'s tests.
     #[test]
     fn bashrs_commands_follow_naming_standard() {
-        assert_prefixed(&command_names::<BashrsCommand>(), "bashrs_", &[]);
+        assert_prefixed(&command_names::<BashrsCommand>(), "brs_", &[]);
     }
 
     /// Builtin overrides carry the builtin's exact name by definition, and each is a

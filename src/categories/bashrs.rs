@@ -1,6 +1,9 @@
 //! Commands for managing bashrs itself.
 
-#[bashrs_macros::category(command = BashrsCommand, prefix = "bashrs_")]
+// `brs_` and not `rs_`, which was tried: `rs` also begins common system commands (`rsync` among
+// them), so `rs<TAB>` offered those alongside this category and every completion needed the `_`
+// typed out by hand.
+#[bashrs_macros::category(command = BashrsCommand, prefix = "brs_")]
 mod commands {
     use crate::conf::config_file;
     use crate::support::args::NoArgs;
@@ -33,7 +36,7 @@ mod commands {
         let script = match _locate_script(project, "COMPILE.sh") {
             Ok(script) => script,
             Err(msg) => {
-                eprintln!("bashrs_compile: {msg}");
+                eprintln!("brs_compile: {msg}");
                 std::process::exit(1);
             }
         };
@@ -44,11 +47,11 @@ mod commands {
             // Signal the wrapper to start a fresh session — only on a real success.
             Ok(status) if status.success() => std::process::exit(crate::conf::RELOAD_EXIT_CODE),
             Ok(status) => {
-                eprintln!("bashrs_compile: COMPILE.sh exited with status: {status}");
+                eprintln!("brs_compile: COMPILE.sh exited with status: {status}");
                 std::process::exit(1);
             }
             Err(err) => {
-                eprintln!("bashrs_compile: could not launch COMPILE.sh: {err}");
+                eprintln!("brs_compile: could not launch COMPILE.sh: {err}");
                 std::process::exit(1);
             }
         }
@@ -61,7 +64,7 @@ mod commands {
         let script = match _locate_script(project, "TEST.sh") {
             Ok(script) => script,
             Err(msg) => {
-                eprintln!("bashrs_test: {msg}");
+                eprintln!("brs_test: {msg}");
                 std::process::exit(1);
             }
         };
@@ -70,7 +73,7 @@ mod commands {
             // TEST.sh's own summary already named what failed — just propagate the verdict.
             Ok(status) => std::process::exit(status.code().unwrap_or(1)),
             Err(err) => {
-                eprintln!("bashrs_test: could not launch TEST.sh: {err}");
+                eprintln!("brs_test: could not launch TEST.sh: {err}");
                 std::process::exit(1);
             }
         }
@@ -89,30 +92,30 @@ mod commands {
     pub fn configure(args: ConfigureArgs) {
         let path = match config_file::ensure_current() {
             Ok(path) => path,
-            Err(err) => return eprintln!("bashrs_configure: cannot create the config file: {err}"),
+            Err(err) => return eprintln!("brs_configure: cannot create the config file: {err}"),
         };
         if args.editor {
             return _open_in_editor(&path);
         }
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
-            Err(err) => return eprintln!("bashrs_configure: cannot read {}: {err}", path.display()),
+            Err(err) => return eprintln!("brs_configure: cannot read {}: {err}", path.display()),
         };
         let settings = config_file::settings(&text);
         if settings.is_empty() {
             // Nothing tickable — a hand-emptied file, or one whose settings stopped being flags.
             // The editor is the honest fallback rather than an empty form.
-            eprintln!("bashrs_configure: no true/false settings in {} — opening it instead", path.display());
+            eprintln!("brs_configure: no true/false settings in {} — opening it instead", path.display());
             return _open_in_editor(&path);
         }
         let mut form = _settings_form(&settings, &path);
         match terminal_choice::run(&mut form) {
             Ok(terminal_choice::Outcome::Submitted) => _save(&path, &text, &settings, &form),
-            Ok(terminal_choice::Outcome::Cancelled) => println!("bashrs_configure: unchanged"),
+            Ok(terminal_choice::Outcome::Cancelled) => println!("brs_configure: unchanged"),
             Err(err) => {
                 // Not a terminal (piped, or a dumb one): say so and fall back to the editor,
                 // which is what the command did before the form existed.
-                eprintln!("bashrs_configure: {err}");
+                eprintln!("brs_configure: {err}");
                 _open_in_editor(&path);
             }
         }
@@ -161,7 +164,7 @@ mod commands {
             settings.iter().map(|s| s.path.clone()).zip(ticked).collect();
         let updated = config_file::with_values(text, &values);
         if updated == text {
-            return println!("bashrs_configure: unchanged");
+            return println!("brs_configure: unchanged");
         }
         match std::fs::write(path, &updated) {
             Ok(()) => {
@@ -171,9 +174,9 @@ mod commands {
                 for (path, on) in changed {
                     println!("{path} = {on}");
                 }
-                println!("bashrs_configure: saved to {}", path.display());
+                println!("brs_configure: saved to {}", path.display());
             }
-            Err(err) => eprintln!("bashrs_configure: cannot write {}: {err}", path.display()),
+            Err(err) => eprintln!("brs_configure: cannot write {}: {err}", path.display()),
         }
     }
 
@@ -213,7 +216,7 @@ mod commands {
                 println!(); // blank line to set the location note off from the file body
                 println!("# source file: {}", path.display());
             }
-            Err(err) => eprintln!("bashrs_sourcefile: cannot read {}: {err}", path.display()),
+            Err(err) => eprintln!("brs_sourcefile: cannot read {}: {err}", path.display()),
         }
     }
 

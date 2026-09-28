@@ -1,5 +1,5 @@
 # Non-Cargo dependencies as provisioned on this machine — rewritten by `bashrs install-stainless`
-# (COMPILE.sh / bashrs_compile) after every sync, all sections in one move. Commit it
+# (COMPILE.sh / brs_compile) after every sync, all sections in one move. Commit it
 # alongside code: when an upstream release breaks something, `git log Carstay.toml`
 # names the last-known-good versions — and `./COMPILE.sh --use-stable-carstay` provisions THESE
 # recorded versions instead of the latest releases (the file becomes the input then,
@@ -10,10 +10,10 @@
 [tools]
 ffmpeg = "n9.0 @ autobuild-2026-08-24-13-10"
 yt-dlp = "2026.08.19"
-uv = "0.12.10"
+uv = "0.12.19"
 python = "3.14.6"
-deno = "v2.9.6"
+deno = "v2.9.7"
 git-lfs = "v3.7.1"
 
 [stainless_comfy]
-contAInerized = "11072707533bdc9fbeabfe5bf8466fb492d62dc0"
+contAInerized = "1897cf5d366f15143c10bd114f964ac3a0b442ed"

@@ -57,7 +57,7 @@ pub fn stability_revert_notice() {
     let advice = format!(
         "New tool/repo versions were fetched. If they misbehave, revert to the last stable set:\n\
          reset {FILENAME} to the repo's committed version (git checkout -- {FILENAME}), then re-run\n\
-         ./COMPILE.sh --use-stable-carstay   (or: bashrs_compile --use-stable-carstay)"
+         ./COMPILE.sh --use-stable-carstay   (or: brs_compile --use-stable-carstay)"
     );
     println!("{}", crate::support::doc_style::notice(&advice));
 }
@@ -83,7 +83,7 @@ pub fn record() {
 fn render(tools: &[(&str, Option<String>)], repos: &[(&str, Option<String>)]) -> String {
     let mut out = String::from(
         "# Non-Cargo dependencies as provisioned on this machine — rewritten by `bashrs install-stainless`\n\
-         # (COMPILE.sh / bashrs_compile) after every sync, all sections in one move. Commit it\n\
+         # (COMPILE.sh / brs_compile) after every sync, all sections in one move. Commit it\n\
          # alongside code: when an upstream release breaks something, `git log Carstay.toml`\n\
          # names the last-known-good versions — and `./COMPILE.sh --use-stable-carstay` provisions THESE\n\
          # recorded versions instead of the latest releases (the file becomes the input then,\n\

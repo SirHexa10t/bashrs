@@ -140,3 +140,16 @@ add program that uses joycon as a mouse
 
 project Carl (marks your text)
 
+game inventory (steam, epic, maybe GOG)
+
+browser bookmarks browser
+    browser browser?
+
+set $HOME for inner programs within ~/.bashrs/inner_repos_home/  ?
+
+terminart
+
+
+ascii art of touhou character (different each time) that says something
+    a spin on the classic cow + quote
+

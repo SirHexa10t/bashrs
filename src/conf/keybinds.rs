@@ -11,9 +11,9 @@ pub fn bindings() -> &'static [(&'static str, &'static str)] {
     &[
         (r"\en", "shell_new"),         // ALT+N → start a fresh shell session
         (r"\e\C-n", "shell_bare"),     // CTRL+ALT+N → fresh session WITHOUT bashrs (one-shot; any new shell arms again)
-        (r"\eh", "bashrs_sourcefile"), // ALT+H → run bashrs_sourcefile
-        (r"\ew", "bashrs_configure"),  // ALT+W → the settings form
-        (r"\eq", "bashrs_compile"),    // ALT+Q → run bashrs_compile
+        (r"\eh", "brs_sourcefile"), // ALT+H → run brs_sourcefile
+        (r"\ew", "brs_configure"),  // ALT+W → the settings form
+        (r"\eq", "brs_compile"),    // ALT+Q → run brs_compile
         // Picking new chords, learned the hard way (each confirmed through a pty / `bind -p`):
         // CTRL+SHIFT+<key> is byte-identical to CTRL+<key> — a terminal cannot encode Shift
         // beside a control character — and CTRL+Q (0x11) is XON, eaten by the tty's flow

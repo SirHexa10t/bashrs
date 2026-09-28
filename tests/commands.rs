@@ -14,14 +14,14 @@ fn bashrs(args: &[&str], envs: &[(&str, &str)]) -> Output {
 }
 
 #[test]
-fn bashrs_configure_creates_the_config_from_the_template_and_opens_it() {
+fn brs_configure_creates_the_config_from_the_template_and_opens_it() {
     // A private HOME, so the test can never touch the user's real ~/.bashrs.
     let home = std::env::temp_dir().join(format!("bashrs_cfg_home_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
 
     // First use: the file is created from the template, then opened via $EDITOR (cat prints it).
-    let out = bashrs(&["bashrs_configure"], &[("HOME", home.to_str().unwrap()), ("EDITOR", "cat")]);
+    let out = bashrs(&["brs_configure"], &[("HOME", home.to_str().unwrap()), ("EDITOR", "cat")]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let shown = String::from_utf8_lossy(&out.stdout);
     // Fields must be present with SOME boolean value; the defaults themselves are the
@@ -47,13 +47,13 @@ fn bashrs_configure_creates_the_config_from_the_template_and_opens_it() {
     };
     let edited = format!("# my edited config\n{flipped}");
     std::fs::write(&file, &edited).unwrap();
-    let again = bashrs(&["bashrs_configure"], &[("HOME", home.to_str().unwrap()), ("EDITOR", "cat")]);
+    let again = bashrs(&["brs_configure"], &[("HOME", home.to_str().unwrap()), ("EDITOR", "cat")]);
     assert!(String::from_utf8_lossy(&again.stdout).contains("# my edited config"),
         "a current-shaped config must never be overwritten");
 
     // A file with an OUTDATED shape (missing template keys) is archived as `.old` + rewritten.
     std::fs::write(&file, "[tools]\nalways_bundle = true\n").unwrap();
-    let migrated = bashrs(&["bashrs_configure"], &[("HOME", home.to_str().unwrap()), ("EDITOR", "cat")]);
+    let migrated = bashrs(&["brs_configure"], &[("HOME", home.to_str().unwrap()), ("EDITOR", "cat")]);
     assert!(String::from_utf8_lossy(&migrated.stderr).contains("archived"), "{}", String::from_utf8_lossy(&migrated.stderr));
     assert!(String::from_utf8_lossy(&migrated.stdout).contains("always_bundle_languages"), "fresh template opened");
     let olds: Vec<_> = std::fs::read_dir(home.join(".bashrs")).unwrap()

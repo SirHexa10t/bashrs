@@ -542,7 +542,7 @@ mod tests {
         has("media_convert() { \"$HOME/.bashrs/bashrs\" media_convert \"$@\"; }");
         has("media_convert_quality() { \"$HOME/.bashrs/bashrs\" media_convert_quality \"$@\"; }");
         has("media_convert_compact() { \"$HOME/.bashrs/bashrs\" media_convert_compact \"$@\"; }");
-        has("media_trim_start() { \"$HOME/.bashrs/bashrs\" media_trim_start \"$@\"; }");
+        has("media_trim() { \"$HOME/.bashrs/bashrs\" media_trim \"$@\"; }");
         has("media_metadata() { \"$HOME/.bashrs/bashrs\" media_metadata \"$@\"; }");
         has("media_hmerge_imgs() { \"$HOME/.bashrs/bashrs\" media_hmerge_imgs \"$@\"; }");
         has("media_vmerge_imgs() { \"$HOME/.bashrs/bashrs\" media_vmerge_imgs \"$@\"; }");
@@ -553,12 +553,12 @@ mod tests {
         has("UPUP() { \"$HOME/.bashrs/bashrs\" UPUP \"$@\"; }"); // custom-named: update everything
         has("backup_diff() { \"$HOME/.bashrs/bashrs\" backup_diff \"$@\"; }"); // comfy: flattened filesync subcommand
         has("backup_find_bitrot() { \"$HOME/.bashrs/bashrs\" backup_find_bitrot \"$@\"; }"); // comfy: pinned variant
-        // bashrs_compile starts a fresh session only when compile signals a reload (exit code)
+        // brs_compile starts a fresh session only when compile signals a reload (exit code)
         has(&format!(
-            "bashrs_compile() {{ \"$HOME/.bashrs/bashrs\" bashrs_compile \"$@\"; [ \"$?\" -eq {RELOAD_EXIT_CODE} ] && shell_new; }}"
+            "brs_compile() {{ \"$HOME/.bashrs/bashrs\" brs_compile \"$@\"; [ \"$?\" -eq {RELOAD_EXIT_CODE} ] && shell_new; }}"
         ));
-        has("bashrs_sourcefile() { \"$HOME/.bashrs/bashrs\" bashrs_sourcefile \"$@\"; }");
-        has("bashrs_configure() { \"$HOME/.bashrs/bashrs\" bashrs_configure \"$@\"; }");
+        has("brs_sourcefile() { \"$HOME/.bashrs/bashrs\" brs_sourcefile \"$@\"; }");
+        has("brs_configure() { \"$HOME/.bashrs/bashrs\" brs_configure \"$@\"; }");
         has("recho() { \"$HOME/.bashrs/bashrs\" recho \"$@\"; }"); // style: bare, unprefixed
         has("py_install() { \"$HOME/.bashrs/bashrs\" py_install \"$@\"; }"); // python: bundled-env packages
         has("hg() { history | \"$HOME/.bashrs/bashrs\" hg \"$@\"; }"); // #[piped]: history fed in
@@ -594,9 +594,9 @@ mod tests {
             .filter_map(|line| line.find("  # "))
             .collect();
         assert_eq!(comment_columns.len(), 1, "bind comments are not aligned: {comment_columns:?}");
-        assert!(script.contains(r#"bind '"\eh": "bashrs_sourcefile\n"'"#), "ALT+H keybind missing");
-        assert!(script.contains(r#"bind '"\ew": "bashrs_configure\n"'"#), "ALT+W keybind missing");
-        assert!(script.contains(r#"bind '"\eq": "bashrs_compile\n"'"#), "ALT+Q keybind missing");
+        assert!(script.contains(r#"bind '"\eh": "brs_sourcefile\n"'"#), "ALT+H keybind missing");
+        assert!(script.contains(r#"bind '"\ew": "brs_configure\n"'"#), "ALT+W keybind missing");
+        assert!(script.contains(r#"bind '"\eq": "brs_compile\n"'"#), "ALT+Q keybind missing");
         // Spacing-agnostic: the gap before `then` belongs to the aligner (keybinds' own test
         // asserts the column), this one only cares that the ALT+L chain is present.
         assert!(script.contains("if pgrep -x cinnamon >/dev/null;"), "ALT+L desktop-restart missing");
@@ -649,10 +649,10 @@ mod tests {
         // time. Asserted through the same quote + env the generator uses, so this test is
         // location-independent.
         let baked = format!(
-            "bashrs_cd() {{ cd -- {}; }}",
+            "brs_cd() {{ cd -- {}; }}",
             crate::support::shell_quote::quote(env!("CARGO_MANIFEST_DIR"))
         );
-        assert!(content.contains(&baked), "bashrs_cd must cd to the baked project root: {baked}");
+        assert!(content.contains(&baked), "brs_cd must cd to the baked project root: {baked}");
         assert!(
             !script.contains("{PROJECT_ROOT}"),
             "the placeholder must never survive into the emitted script"
