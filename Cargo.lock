@@ -1056,7 +1056,7 @@ dependencies = [
 [[package]]
 name = "terminal_choice"
 version = "0.1.0"
-source = "git+https://github.com/SirHexa10t/terminal_choice.git?branch=main#bec8fd7206383619cd753214010dfebe8f13e869"
+source = "git+https://github.com/SirHexa10t/terminal_choice.git?branch=main#17599e27817026cc6c4171d689592815c4cb735c"
 dependencies = [
  "console",
  "libc",

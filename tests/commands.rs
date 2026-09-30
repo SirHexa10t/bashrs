@@ -1,7 +1,8 @@
 //! End-to-end tests of assorted non-search commands, driving the real binary.
 
+use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 /// Run the real `bashrs` with `args` and extra environment overrides.
 fn bashrs(args: &[&str], envs: &[(&str, &str)]) -> Output {
@@ -298,6 +299,72 @@ fn pro_test_survives_a_relative_dir_across_its_two_steps() {
     assert!(!all.contains("cannot enter"), "the second step must re-enter the SAME dir: {all}");
     assert!(all.contains("100% tests passed"), "ctest actually ran: {all}");
     let _ = std::fs::remove_dir_all(&parent);
+}
+
+#[test]
+fn diff_prints_gits_own_diff_of_two_files_and_exits_as_git_does() {
+    let dir = std::env::temp_dir().join(format!("bashrs_diff_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (old, new) = (dir.join("old.txt"), dir.join("new.txt"));
+    std::fs::write(&old, "same\nlet x = 1;\n").unwrap();
+    std::fs::write(&new, "same\nlet x = 2;\n").unwrap();
+    let path = |file: &Path| file.to_str().unwrap().to_owned();
+
+    // Coloured even into a pipe — and under the colour, byte for byte what git prints, with
+    // git's exit code: 1, "they differ".
+    let out = bashrs(&["diff", &path(&old), &path(&new)], &[]);
+    let git = Command::new("git")
+        .args(["diff", "--no-index", "--no-ext-diff", "--color=never", "--"])
+        .args([&old, &new])
+        .output()
+        .expect("run git");
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(shown.contains("\x1b["), "colour is on, terminal or not: {shown}");
+    let plain = console::strip_ansi_codes(&shown);
+    assert!(plain.contains("\n-let x = 1;\n+let x = 2;\n"), "a real diff: {plain}");
+    assert_eq!(plain.as_bytes(), git.stdout);
+
+    // `-n` puts each line's number in both files before it: `same` is line 1 of both, the removed
+    // line is 2 of the old file only, its replacement 2 of the new file only.
+    let numbered = bashrs(&["diff", "-n", &path(&old), &path(&new)], &[]);
+    let numbered = console::strip_ansi_codes(&String::from_utf8_lossy(&numbered.stdout)).into_owned();
+    assert!(numbered.contains("\n1 1 │ same\n2   │-let x = 1;\n  2 │+let x = 2;\n"), "{numbered}");
+
+    let same = bashrs(&["diff", &path(&old), &path(&old)], &[]);
+    assert_eq!((same.status.code(), same.stdout.as_slice()), (Some(0), &b""[..]), "a match is silent");
+
+    // A side that does not exist is git's to report — and never a match.
+    let missing = bashrs(&["diff", &path(&old), &path(&dir.join("absent"))], &[]);
+    let complaint = String::from_utf8_lossy(&missing.stderr);
+    assert_ne!(missing.status.code(), Some(0), "{complaint}");
+    assert!(complaint.contains("absent"), "git names the missing side: {complaint}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn diff_reads_a_dash_side_from_stdin() {
+    let dir = std::env::temp_dir().join(format!("bashrs_diff_stdin_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let new = dir.join("new.txt");
+    std::fs::write(&new, "same\nlet x = 2;\n").unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+        .args(["diff", "-", new.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run bashrs");
+    // Written, then dropped: the pipe closes and git reads to its end.
+    child.stdin.take().unwrap().write_all(b"same\nlet x = 1;\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let shown = console::strip_ansi_codes(&String::from_utf8_lossy(&out.stdout)).into_owned();
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(shown.contains("\n-let x = 1;\n+let x = 2;\n"), "stdin reached git as the old side: {shown}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Compile-time guard that the fixture path stays valid if this file grows path-dependent tests.

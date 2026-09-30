@@ -92,8 +92,14 @@ at some point, move out the document formatting code into Carl (non-Marks).
 
 alias cat command (show line numbers, maybe color text)
 
-Calendaric notifications could go into comfygurations
+Calendaric notifications and notes could go into comfygurations
     maybe forms would need to include list-editing
+    birthdays
+    expirations
+    subscriptions
+    bills
+    recipes
+
 
 
 Get a rusty htop, or implement own:
@@ -152,4 +158,39 @@ terminart
 
 ascii art of touhou character (different each time) that says something
     a spin on the classic cow + quote
+
+
+
+finish Backup-Sync dedupllication work
+
+finish initial terminart/arterminal version
+
+check if new terminal_choice broke projects
+
+finish or at-least continue os_ricing
+
+continue catalogames (free games, add queryable sources, epic games inventory, hashing/compressing lines individually)
+
+debloat the projects
+
+rename projects;
+    utility projects start with "util"
+    arterminal -> terminart?
+
+add-in util_carl 
+
+rewrite contAInerized: "ai_harness_harness" (Rust)
+    much like "browser_browser"
+
+
+
+shorten description in sourcefile for  `shell_args_print`, and probably `detect_ai_textual_fingerprint`, and a few others
+
+move `diff` to `builtins.rs` module
+
+
+check if the shell-function can run the printed output of the Rust command, rather than run the decorator's code
+i.e. so it'd look like: `shell_def() { $("$HOME/.bashrs/bashrs" shell_def "$@"); }
+Maybe through a new decorator? ("eval_printed_output"?)
+
 

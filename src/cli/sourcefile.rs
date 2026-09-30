@@ -40,66 +40,87 @@ use crate::tools;
 /// plain function, since its work (e.g. `cd`) must run in the calling shell, not the binary.
 type ShellFn = (&'static str, &'static str, &'static str);
 
-/// One label's clap group, from a flat list of the category enums that make it up: fold each
-/// enum's subcommands into one `clap::Command`, and concatenate their shell functions. Written as
-/// a macro because each enum is a distinct *type* — a runtime list would need them erased to fn
-/// pointers twice over, once per half. Replaces the right-drifting nest of `augment_subcommands`
-/// calls a multi-enum group would otherwise be.
-macro_rules! category_group {
-    ($label:literal, $($enum:ty),+ $(,)?) => {
-        ($label,
-         [$(<$enum>::augment_subcommands as fn(clap::Command) -> clap::Command),+]
-             .iter()
-             .fold(clap::Command::new($label), |cmd, augment| augment(cmd)),
-         [$(<$enum>::shell_functions()),+].concat())
+/// A category's by-name lookup of one wrapper hook, as `#[category]` generates it.
+type WrapperLookup = fn(&str) -> Option<&'static str>;
+
+/// What one category enum contributes to the sourcefile — the four things `#[category]`
+/// generates for every enum, held as fn pointers so that one list can hold enums of distinct
+/// types.
+struct Surface {
+    /// Adds the enum's subcommands to a clap group (clap's `augment_subcommands`).
+    commands: fn(clap::Command) -> clap::Command,
+    /// The enum's pure-shell commands (`#[shell_body]`).
+    shell_functions: fn() -> &'static [ShellFn],
+    /// The shell appended (after `&&`) to a command's wrapper, by command name (`#[after("…")]`).
+    wrapper_suffix: WrapperLookup,
+    /// The command piped into a command's wrapper, by command name (`#[piped("…")]`).
+    wrapper_prefix: WrapperLookup,
+}
+
+/// A category enum's [`Surface`]. A macro because each enum is a distinct *type*; the four fn
+/// pointers are the erasure that lets [`CATEGORIES`] list them all.
+macro_rules! surface {
+    ($enum:ty) => {
+        Surface {
+            commands: <$enum>::augment_subcommands,
+            shell_functions: <$enum>::shell_functions,
+            wrapper_suffix: <$enum>::wrapper_suffix,
+            wrapper_prefix: <$enum>::wrapper_prefix,
+        }
     };
 }
 
-/// The command categories: the label grouping them in the generated `sourcefile.sh`, the clap
-/// graph, and the category's pure-shell commands. One row per category — never per command.
-fn category_commands() -> [(&'static str, clap::Command, Vec<ShellFn>); 16] {
-    let categories = [
-        ("bashrs", BashrsCommand::augment_subcommands(clap::Command::new("bashrs")),
-            BashrsCommand::shell_functions().to_vec()),
-        ("builtin overrides", BuiltinsCommand::augment_subcommands(clap::Command::new("builtin overrides")),
-            BuiltinsCommand::shell_functions().to_vec()),
-        ("filesystem", FilesystemCommand::augment_subcommands(clap::Command::new("filesystem")),
-            FilesystemCommand::shell_functions().to_vec()),
-        ("git", GitCommand::augment_subcommands(clap::Command::new("git")),
-            GitCommand::shell_functions().to_vec()),
-        ("download", DownloadCommand::augment_subcommands(clap::Command::new("download")),
-            DownloadCommand::shell_functions().to_vec()),
-        ("exposed_helpers", ExposedHelpersCommand::augment_subcommands(clap::Command::new("exposed_helpers")),
-            ExposedHelpersCommand::shell_functions().to_vec()),
-        category_group!("media", MediaTranscodeCommand, MediaMetadataCommand,
-                                 MediaAudioFxCommand, MediaImagesCommand),
-        ("network", NetworkCommand::augment_subcommands(clap::Command::new("network")),
-            NetworkCommand::shell_functions().to_vec()),
-        ("packages", PackagesCommand::augment_subcommands(clap::Command::new("packages")),
-            PackagesCommand::shell_functions().to_vec()),
-        ("processes", ProcessesCommand::augment_subcommands(clap::Command::new("processes")),
-            ProcessesCommand::shell_functions().to_vec()),
-        ("project", ProjectCommand::augment_subcommands(clap::Command::new("project")),
-            ProjectCommand::shell_functions().to_vec()),
-        ("python", PythonCommand::augment_subcommands(clap::Command::new("python")),
-            PythonCommand::shell_functions().to_vec()),
-        // `shell_new`/`shell_bare` are `#[shell_body]` (they `exec` the calling shell);
-        // `sudo_bashrs` and `print_args` are ordinary commands with generated wrappers.
-        ("shell", ShellCommand::augment_subcommands(clap::Command::new("shell")),
-            ShellCommand::shell_functions().to_vec()),
-        // One `lookup` group. The generated `g`/`gg` families come first so the hand-written
-        // commands can follow what they are built on: `GG` is `gg --delve` and `GGG` is `GG`
-        // plus more, which only reads that way listed after `gg`. Within that last enum `hg`
-        // is declared after them, so the history search closes the section.
-        category_group!("lookup", GrepCommand, GgCommand, LookupCommand),
-        // One `style` group spanning both style enums: hand-written + generated.
-        category_group!("style", StyleCommand, StylizedEchoCommand),
-        // One `comfy_repos` group: the Rust companions this shell wraps, plus the AI-fingerprint
-        // command over the `ai_detection` crate — an adaptation of a dependency like every other
-        // entry here, so it belongs beside them rather than in a category of its own.
-        category_group!("comfy_repos", ComfyReposCommand, AiFingerprintCommand),
-    ];
-    categories.map(|(label, cmd, shell_fns)| (label, adjust_pinned(cmd), shell_fns))
+/// The command categories — and the ONE place a category is registered with the sourcefile: the
+/// label heading its section, and the enum(s) whose commands it groups. The clap graph, the
+/// shell functions and the wrapper hooks are all derived from this list, so a category cannot be
+/// in one and missing from another. One row per category — never per command.
+const CATEGORIES: &[(&str, &[Surface])] = &[
+    ("bashrs", &[surface!(BashrsCommand)]),
+    ("overrides", &[surface!(BuiltinsCommand)]),
+    ("filesystem", &[surface!(FilesystemCommand)]),
+    ("git", &[surface!(GitCommand)]),
+    ("download", &[surface!(DownloadCommand)]),
+    ("exposed_helpers", &[surface!(ExposedHelpersCommand)]),
+    ("media", &[surface!(MediaTranscodeCommand), surface!(MediaMetadataCommand),
+                surface!(MediaAudioFxCommand), surface!(MediaImagesCommand)]),
+    ("network", &[surface!(NetworkCommand)]),
+    ("packages", &[surface!(PackagesCommand)]),
+    ("processes", &[surface!(ProcessesCommand)]),
+    ("project", &[surface!(ProjectCommand)]),
+    ("python", &[surface!(PythonCommand)]),
+    // `shell_new`/`shell_bare` are `#[shell_body]` (they `exec` the calling shell);
+    // `sudo_bashrs` and `print_args` are ordinary commands with generated wrappers.
+    ("shell", &[surface!(ShellCommand)]),
+    // One `lookup` group. The generated `g`/`gg` families come first so the hand-written
+    // commands can follow what they are built on: `GG` is `gg --delve` and `GGG` is `GG`
+    // plus more, which only reads that way listed after `gg`. Within that last enum `hg`
+    // is declared after them, so the history search closes the section.
+    ("lookup", &[surface!(GrepCommand), surface!(GgCommand), surface!(LookupCommand)]),
+    // One `style` group spanning both style enums: hand-written + generated.
+    ("style", &[surface!(StyleCommand), surface!(StylizedEchoCommand)]),
+    // One `comfy_repos` group: the Rust companions this shell wraps, plus the AI-fingerprint
+    // command over the `ai_detection` crate — an adaptation of a dependency like every other
+    // entry here, so it belongs beside them rather than in a category of its own.
+    ("comfy_repos", &[surface!(ComfyReposCommand), surface!(AiFingerprintCommand)]),
+];
+
+/// Every category enum's [`Surface`], in section order.
+fn surfaces() -> impl Iterator<Item = &'static Surface> {
+    CATEGORIES.iter().flat_map(|(_, surfaces)| surfaces.iter())
+}
+
+/// The categories as the generator reads them: each label with one `clap::Command` holding all
+/// its enums' subcommands (the pinned flags hidden — [`adjust_pinned`]) and its pure-shell
+/// commands.
+fn category_commands() -> Vec<(&'static str, clap::Command, Vec<ShellFn>)> {
+    CATEGORIES
+        .iter()
+        .map(|(label, surfaces)| {
+            let group = surfaces.iter().fold(clap::Command::new(*label), |cmd, surface| (surface.commands)(cmd));
+            let shell_fns = surfaces.iter().flat_map(|surface| (surface.shell_functions)()).copied().collect();
+            (*label, adjust_pinned(group), shell_fns)
+        })
+        .collect()
 }
 
 /// Space-separated `-short --long` names of `command`'s arguments (matched by clap name or visible
@@ -135,32 +156,6 @@ pub(super) fn complete_flags(name: &str) -> String {
     }
     String::new()
 }
-
-/// Every category's `(wrapper_suffix, wrapper_prefix)` lookups — one row per category, so adding
-/// a category is one line here instead of an edit to each lookup. Command names are unique across
-/// categories (clap flattening requires it), so the first match wins.
-type WrapperLookup = fn(&str) -> Option<&'static str>;
-const WRAPPER_HOOKS: &[(WrapperLookup, WrapperLookup)] = &[
-    (BashrsCommand::wrapper_suffix, BashrsCommand::wrapper_prefix),
-    (BuiltinsCommand::wrapper_suffix, BuiltinsCommand::wrapper_prefix),
-    (FilesystemCommand::wrapper_suffix, FilesystemCommand::wrapper_prefix),
-    (GitCommand::wrapper_suffix, GitCommand::wrapper_prefix),
-    (MediaTranscodeCommand::wrapper_suffix, MediaTranscodeCommand::wrapper_prefix),
-    (MediaMetadataCommand::wrapper_suffix, MediaMetadataCommand::wrapper_prefix),
-    (MediaAudioFxCommand::wrapper_suffix, MediaAudioFxCommand::wrapper_prefix),
-    (MediaImagesCommand::wrapper_suffix, MediaImagesCommand::wrapper_prefix),
-    (NetworkCommand::wrapper_suffix, NetworkCommand::wrapper_prefix),
-    (PackagesCommand::wrapper_suffix, PackagesCommand::wrapper_prefix),
-    (ProjectCommand::wrapper_suffix, ProjectCommand::wrapper_prefix),
-    (PythonCommand::wrapper_suffix, PythonCommand::wrapper_prefix),
-    (ShellCommand::wrapper_suffix, ShellCommand::wrapper_prefix),
-    (LookupCommand::wrapper_suffix, LookupCommand::wrapper_prefix),
-    (GrepCommand::wrapper_suffix, GrepCommand::wrapper_prefix),
-    (GgCommand::wrapper_suffix, GgCommand::wrapper_prefix),
-    (StyleCommand::wrapper_suffix, StyleCommand::wrapper_prefix),
-    (StylizedEchoCommand::wrapper_suffix, StylizedEchoCommand::wrapper_prefix),
-    (ComfyReposCommand::wrapper_suffix, ComfyReposCommand::wrapper_prefix),
-];
 
 /// Flag completion for the STAINLESS aliases, and only for them — hence the name: every
 /// Rust-side command is answered live by the binary (`_bashrs_complete` → `complete-flags`),
@@ -203,7 +198,8 @@ fn stainless_flags_block(entries: &[(String, String)]) -> String {
 /// The shell appended (after `&&`) to a command's wrapper — e.g. to restart the
 /// shell after a command that changes the environment.
 fn wrapper_suffix(name: &str) -> Option<&'static str> {
-    WRAPPER_HOOKS.iter().find_map(|(suffix, _)| suffix(name))
+    // Command names are unique across categories (clap flattening requires it): first match wins.
+    surfaces().find_map(|surface| (surface.wrapper_suffix)(name))
 }
 
 /// A readline escape sequence as the hotkey a keyboard labels it: `\en` → `Alt+N`,
@@ -251,7 +247,7 @@ fn hotkey_label(sequence: &str) -> String {
 /// shell history, which only the shell itself can produce, so its wrapper runs `history` and
 /// pipes it in.
 fn wrapper_prefix(name: &str) -> Option<&'static str> {
-    WRAPPER_HOOKS.iter().find_map(|(_, prefix)| prefix(name))
+    surfaces().find_map(|surface| (surface.wrapper_prefix)(name))
 }
 
 /// Build the shell function definitions sourced from `~/.bashrs/sourcefile.sh`.
@@ -553,6 +549,7 @@ mod tests {
         has("UPUP() { \"$HOME/.bashrs/bashrs\" UPUP \"$@\"; }"); // custom-named: update everything
         has("backup_diff() { \"$HOME/.bashrs/bashrs\" backup_diff \"$@\"; }"); // comfy: flattened filesync subcommand
         has("backup_find_bitrot() { \"$HOME/.bashrs/bashrs\" backup_find_bitrot \"$@\"; }"); // comfy: pinned variant
+        has("diff() { \"$HOME/.bashrs/bashrs\" diff \"$@\"; }"); // overrides: a system command shadowed under its own name
         // brs_compile starts a fresh session only when compile signals a reload (exit code)
         has(&format!(
             "brs_compile() {{ \"$HOME/.bashrs/bashrs\" brs_compile \"$@\"; [ \"$?\" -eq {RELOAD_EXIT_CODE} ] && shell_new; }}"
@@ -665,7 +662,7 @@ mod tests {
         // success the landing directory's contents — with GNU ls's own shell-escape quoting,
         // so a problematic name pastes back like lll's do. Its section header proves the
         // category registered end-to-end.
-        assert!(script.contains("\n# builtin overrides\n"), "the builtin-overrides section is missing");
+        assert!(script.contains("\n# overrides\n"), "the overrides section is missing");
         assert!(
             content.contains(r#"cd() { builtin cd "$@" && ls -AF --color=always --group-directories-first --quoting-style=shell-escape; }"#),
             "the cd override must run the builtin, then list escaped on success"
@@ -718,7 +715,7 @@ mod tests {
                 .filter_map(|line| line.find('{'))
                 .collect();
             if braces.is_empty() {
-                continue; // a category can be momentarily wrapper-less (builtin overrides once was)
+                continue; // a category can be momentarily wrapper-less (overrides once was)
             }
             assert_eq!(braces.len(), 1, "`{{` openers in `# {label}` are not one column");
             sections_checked += 1;

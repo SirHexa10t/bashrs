@@ -351,10 +351,10 @@ impl<'a> GgSink<'a> {
     /// over-long line becomes [`TOO_LONG`]; a match line has its match spans highlighted.
     fn write_line(&mut self, raw: &[u8], line_number: Option<u64>, is_match: bool) -> io::Result<()> {
         let sep = if is_match { &b":"[..] } else { &b"-"[..] };
-        field(self.buffer, &self.path_color, &self.path)?;
+        shell::paint(self.buffer, &self.path_color, &self.path)?;
         self.buffer.write_all(sep)?;
         if let Some(n) = line_number {
-            field(self.buffer, &self.line_color, n.to_string().as_bytes())?;
+            shell::paint(self.buffer, &self.line_color, n.to_string().as_bytes())?;
             self.buffer.write_all(sep)?;
         }
         let content = trim_eol(raw);
@@ -406,13 +406,6 @@ fn match_spec() -> ColorSpec {
     spec(Color::Black, Some(Color::Red))
 }
 
-/// Write `bytes` in `color`, then reset. Colour codes are emitted only if `out` is in colour mode.
-fn field(out: &mut impl WriteColor, color: &ColorSpec, bytes: &[u8]) -> io::Result<()> {
-    out.set_color(color)?;
-    out.write_all(bytes)?;
-    out.reset()
-}
-
 /// Every match span of `matcher` in `bytes`, as `(start, end)` byte offsets — the shared span
 /// collector behind the highlighter and the `--re` replacer.
 fn match_spans(matcher: &RegexMatcher, bytes: &[u8]) -> Vec<(usize, usize)> {
@@ -430,7 +423,7 @@ fn write_spans(out: &mut impl WriteColor, matcher: &RegexMatcher, bytes: &[u8], 
     let mut last = 0;
     for (start, end) in match_spans(matcher, bytes) {
         out.write_all(&bytes[last..start])?;
-        field(out, spec, &bytes[start..end])?;
+        shell::paint(out, spec, &bytes[start..end])?;
         last = end;
     }
     out.write_all(&bytes[last..])

@@ -178,52 +178,87 @@ mod commands {
     /// whatever files it is given and has no drawer of its own
     #[unprefixed]
     pub fn autokey_list_bashrs_profiles(_args: NoArgs) {
-        let store = _profile_store_dir();
+        for line in _profile_listing(&_profile_store_dir(), &sequencer::applied_profiles()) {
+            println!("{line}");
+        }
+    }
+
+    /// The listing's lines exactly as printed: every profile and directory in `store`, then
+    /// whatever `applied` holds from outside it, the remarks lined up in one column. Reads
+    /// `store` and nothing else, so a test can pose both halves.
+    fn _profile_listing(store: &Path, applied: &[(String, PathBuf)]) -> Vec<String> {
         // Applied links resolve to CANONICAL targets (sequencer's scan), so stored files are
         // matched by canonical path — two same-named profiles in different folders can't
         // vouch for each other the way name-matching would let them.
-        let applied = sequencer::applied_profiles();
         let is_applied = |path: &Path| {
             std::fs::canonicalize(path)
                 .is_ok_and(|canonical| applied.iter().any(|(_, target)| *target == canonical))
         };
-        let mut lines: Vec<String> = Vec::new();
+        let mut rows: Vec<(String, Option<String>)> = Vec::new();
         let mut matched: Vec<PathBuf> = Vec::new(); // store files found applied, canonical
-        let mut pending = vec![store.clone()];
+        let mut pending = vec![store.to_path_buf()];
         while let Some(dir) = pending.pop() {
             for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
                 let path = entry.path();
                 let shown = path.display().to_string();
                 if path.is_dir() {
-                    lines.push(format!("{shown}/"));
+                    rows.push((format!("{shown}/"), None));
                     pending.push(path);
                 } else if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("toml")) {
                     match is_applied(&path) {
                         true => {
-                            lines.push(format!("{shown}  [applied]"));
+                            rows.push((shown, Some("[applied]".to_string())));
                             matched.extend(std::fs::canonicalize(&path));
                         }
-                        false => lines.push(shown),
+                        false => rows.push((shown, None)),
                     }
                 }
             }
         }
-        if lines.is_empty() {
-            println!(
+        let mut listing = Vec::new();
+        if rows.is_empty() {
+            listing.push(format!(
                 "no profiles in {} — drop binds .toml files there (see `autokey_check`)",
                 store.display()
-            );
+            ));
         }
-        lines.sort(); // paths sort a directory's line right above its contents
-        for line in &lines {
-            println!("{line}");
-        }
+        rows.sort(); // paths sort a directory's line right above its contents
         // Applied out of somewhere else entirely — still part of "what is live right now".
-        for (name, target) in &applied {
+        for (name, target) in applied {
             if !matched.contains(target) {
-                println!("{name}  [applied from {}]", target.display());
+                rows.push((name.clone(), Some(format!("[applied from {}]", target.display()))));
             }
         }
+        listing.extend(_aligned(&rows));
+        listing
+    }
+
+    /// `rows` as one table: the paths in the first column, the remarks lined up in the second,
+    /// and a row with no remark ending at its path — no padding after it, no filler.
+    ///
+    /// Divided by NUL, the one character a path can never hold. table_formatter reads its input
+    /// by splitting lines, and a whitespace divider — the default included — splits on any run
+    /// of two spaces or a tab, so a profile under `gaming  old/` would print re-spaced. These
+    /// paths are there to be copied onto an `autokey_apply` line; printing one wrong is the one
+    /// thing this listing cannot do.
+    fn _aligned(rows: &[(String, Option<String>)]) -> Vec<String> {
+        const DIVIDER: &str = " \0 ";
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|(path, remark)| match remark {
+                Some(remark) => format!("{path}{DIVIDER}{remark}"),
+                None => path.clone(),
+            })
+            .collect();
+        let opts = table_formatter::FormatOptions {
+            divide_by: DIVIDER.to_string(),
+            trim_trailing: true,
+            ..Default::default()
+        };
+        // Cannot fail with these options (a test pins it); if it ever did, this is the old
+        // two-space shape rather than NULs on the terminal.
+        table_formatter::format_table(&lines, &opts)
+            .unwrap_or_else(|_| lines.iter().map(|line| line.replace(DIVIDER, "  ")).collect())
     }
 
     /// Remove profiles from the active set by name (`gaming` or `gaming.toml`); naming none opens
@@ -369,6 +404,97 @@ mod commands {
         #[test]
         fn the_profile_store_sits_in_user_data() {
             assert_eq!(_profile_store_dir(), crate::conf::user_data_dir().join("sequencer"));
+        }
+        /// A scratch store for one test, gone afterwards.
+        fn scratch(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("bashrs_profiles_{tag}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// One line split into its path and its remark, padding dropped — the CONTENT of the
+        /// listing, so the layout can be asserted on its own.
+        fn content(line: &str) -> (String, Option<String>) {
+            match line.find("[applied") {
+                Some(at) => (line[..at].trim_end().to_string(), Some(line[at..].to_string())),
+                None => (line.to_string(), None),
+            }
+        }
+
+        /// Every profile and directory, recursively and in path order; applied ones marked,
+        /// matched by canonical path; anything applied from elsewhere listed last with where it
+        /// came from; a non-profile file left out.
+        #[test]
+        fn the_listing_names_every_profile_and_marks_the_applied_ones() {
+            let store = scratch("content");
+            std::fs::create_dir_all(store.join("sub/deep")).unwrap();
+            for file in ["a.toml", "b.toml", "notes.txt", "sub/c.toml"] {
+                std::fs::write(store.join(file), "").unwrap();
+            }
+            let canonical = |file: &str| store.join(file).canonicalize().unwrap();
+            let applied = vec![
+                ("a.toml".to_string(), canonical("a.toml")),
+                ("c.toml".to_string(), canonical("sub/c.toml")),
+                ("stray.toml".to_string(), PathBuf::from("/elsewhere/stray.toml")),
+            ];
+            let at = |rest: &str| format!("{}/{rest}", store.display());
+            let marked = |text: &str| Some(text.to_string());
+            let listing: Vec<(String, Option<String>)> =
+                _profile_listing(&store, &applied).iter().map(|line| content(line)).collect();
+            assert_eq!(
+                listing,
+                [
+                    (at("a.toml"), marked("[applied]")),
+                    (at("b.toml"), None),
+                    (at("sub/"), None),
+                    (at("sub/c.toml"), marked("[applied]")),
+                    (at("sub/deep/"), None),
+                    ("stray.toml".to_string(), marked("[applied from /elsewhere/stray.toml]")),
+                ]
+            );
+            let _ = std::fs::remove_dir_all(&store);
+        }
+
+        /// The layout: every remark starts in the same column, a line without one ends at its path,
+        /// and a path holding a double space and a tab prints exactly as it is — the case the NUL
+        /// divider exists for, since a whitespace divider would split it.
+        #[test]
+        fn the_remarks_line_up_and_every_path_prints_exactly() {
+            let store = scratch("layout");
+            std::fs::create_dir_all(store.join("gaming  old")).unwrap();
+            for file in ["a.toml", "a-much-longer-profile-name.toml", "gaming  old/x\ty.toml"] {
+                std::fs::write(store.join(file), "").unwrap();
+            }
+            let canonical = |file: &str| store.join(file).canonicalize().unwrap();
+            let applied = vec![
+                ("a.toml".to_string(), canonical("a.toml")),
+                ("x\ty.toml".to_string(), canonical("gaming  old/x\ty.toml")),
+                ("stray.toml".to_string(), PathBuf::from("/elsewhere/stray.toml")),
+            ];
+            let listing = _profile_listing(&store, &applied);
+            let columns: Vec<usize> =
+                listing.iter().filter_map(|line| line.find("[applied")).collect();
+            assert_eq!(columns.len(), 3, "three remarks: {listing:#?}");
+            assert!(columns.windows(2).all(|pair| pair[0] == pair[1]), "one column: {listing:#?}");
+            let odd = format!("{}/gaming  old/x\ty.toml", store.display());
+            assert!(listing.iter().any(|line| line.starts_with(&format!("{odd}  "))), "{listing:#?}");
+            let bare = format!("{}/a-much-longer-profile-name.toml", store.display());
+            assert!(listing.contains(&bare), "no remark, nothing after the path: {listing:#?}");
+            assert!(listing.iter().all(|line| !line.contains('\0')), "the divider never shows");
+            let _ = std::fs::remove_dir_all(&store);
+        }
+
+        /// An empty or missing store says so — and still lists what is applied from elsewhere.
+        #[test]
+        fn an_empty_store_says_so_and_still_lists_what_is_applied_elsewhere() {
+            let store = scratch("empty").join("never-made");
+            let none = _profile_listing(&store, &[]);
+            assert_eq!(none.len(), 1);
+            assert!(none[0].starts_with(&format!("no profiles in {}", store.display())), "{none:?}");
+            let stray = vec![("stray.toml".to_string(), PathBuf::from("/elsewhere/stray.toml"))];
+            let with = _profile_listing(&store, &stray);
+            assert_eq!(with[1], "stray.toml  [applied from /elsewhere/stray.toml]", "{with:?}");
         }
     }
 

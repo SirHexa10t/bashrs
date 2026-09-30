@@ -397,17 +397,18 @@ mod tests {
         assert_prefixed(&command_names::<BashrsCommand>(), "brs_", &[]);
     }
 
-    /// Builtin overrides carry the builtin's exact name by definition, and each is a
-    /// `#[shell_body]` function — invisible to clap, its spelling asserted where the shell
-    /// functions are emitted (`sourcefile`'s tests). What this guards is the category gaining
-    /// clap-backed strays: anything the binary can run isn't an override and belongs elsewhere.
+    /// Every override wears the exact name of what it overrides, so none carries the category
+    /// prefix — `overwritten_` exists only because `#[category]` wants one. The builtins'
+    /// overrides are `#[shell_body]` functions, invisible to clap and asserted where the shell
+    /// functions are emitted (`sourcefile`'s tests); what clap does see is the binary-backed
+    /// overrides of system commands, and this list is their register: shadowing a name the
+    /// system already has is a decision taken one name at a time.
     #[test]
     fn builtins_commands_follow_naming_standard() {
         assert_eq!(
             command_names::<BuiltinsCommand>(),
-            Vec::<String>::new(),
-            "builtin overrides are shell functions only — a clap command in this category \
-             would be reachable as `bashrs <name>`, which an override of a builtin is not"
+            ["diff"],
+            "a new override of a system command is registered here, under the tool's exact name"
         );
     }
 

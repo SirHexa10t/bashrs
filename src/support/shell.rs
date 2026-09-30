@@ -2,11 +2,11 @@
 //! string rather than letting it reach the terminal — the analogue of command substitution (`$(…)`),
 //! for commands that feed one command's output into another (unit tests also use it to assert on
 //! printed output). [`stdout_color`] is the `--color=auto` policy: the one place that decides when
-//! stdout gets colour.
+//! stdout gets colour, and `paint` the one way a stretch of output gets one.
 
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal};
 
-use termcolor::{Buffer, ColorChoice};
+use termcolor::{Buffer, ColorChoice, ColorSpec, WriteColor};
 
 /// Stdout's colour mode under the `--color=auto` rule: coloured when stdout is a terminal, plain
 /// when piped. Shared by every printer that colours matches (`g`'s, `gg`'s).
@@ -16,6 +16,14 @@ pub(crate) fn stdout_color() -> ColorChoice {
     } else {
         ColorChoice::Never
     }
+}
+
+/// Write `bytes` in `color`, then reset — the primitive every colouring printer (`gg`'s, `diff`'s)
+/// paints with. Colour codes are emitted only if `out` is in colour mode.
+pub(crate) fn paint(out: &mut impl WriteColor, color: &ColorSpec, bytes: &[u8]) -> io::Result<()> {
+    out.set_color(color)?;
+    out.write_all(bytes)?;
+    out.reset()
 }
 
 /// Run `write` against an in-memory colour sink and return everything it printed, as text. Colour is

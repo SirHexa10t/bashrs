@@ -1,8 +1,8 @@
 //! Running external programs with consistent output and status handling.
 //!
 //! Shared by the categories that shell out (e.g. [`crate::categories::media`],
-//! [`crate::categories::packages`], [`crate::categories::git`]) so the run / report /
-//! capture logic lives in one place.
+//! [`crate::categories::packages`], [`crate::categories::git`], [`crate::categories::builtins`])
+//! so the run / report / capture logic lives in one place.
 
 use std::ffi::OsStr;
 use std::process::{Command, Stdio};
@@ -98,6 +98,35 @@ where
     let program = program.as_ref();
     match Command::new(program).args(args).stdin(std::process::Stdio::null()).output() {
         Ok(out) => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Err(err) => {
+            eprintln!("could not run {}: {err}", program.to_string_lossy());
+            None
+        }
+    }
+}
+
+/// Run `program` with `args`, capturing stdout as raw bytes and returning it with the exit code,
+/// whatever that code is — for tools whose non-zero exit is an answer rather than a failure: `git
+/// diff --no-index` exits 1 exactly when its inputs differ. Stdin and stderr are inherited, so
+/// the tool can read piped input (`-`) and its diagnostics reach the user as it prints them.
+/// Bytes rather than text because the output is re-printed and must survive unchanged: a Latin-1
+/// file's diff is not UTF-8. A signal death, which carries no code, is reported and yields 1 (as
+/// in [`run_reporting_code`]); `None` only on a spawn failure (reported).
+pub(crate) fn capture_with_code<P, I, S>(program: P, args: I) -> Option<(i32, Vec<u8>)>
+where
+    P: AsRef<OsStr>,
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let program = program.as_ref();
+    match Command::new(program).args(args).stdin(Stdio::inherit()).stderr(Stdio::inherit()).output() {
+        Ok(out) => {
+            let code = out.status.code().unwrap_or_else(|| {
+                eprintln!("{} failed with status: {}", program.to_string_lossy(), out.status);
+                1
+            });
+            Some((code, out.stdout))
+        }
         Err(err) => {
             eprintln!("could not run {}: {err}", program.to_string_lossy());
             None
@@ -222,6 +251,16 @@ mod tests {
         assert_eq!(capture_stdout("bashrs_no_such_program_xyz", &[] as &[&str]), None);
     }
 
+    #[test]
+    fn capture_with_code_returns_the_raw_output_with_any_exit_code() {
+        // A non-zero exit is an answer, not a failure — and the bytes come back untouched, even
+        // ones that are not UTF-8 (`\377` is a lone 0xFF).
+        assert_eq!(capture_with_code("sh", ["-c", r"printf 'a\377'; exit 3"]), Some((3, b"a\xff".to_vec())));
+        assert_eq!(capture_with_code("sh", ["-c", "exit 0"]), Some((0, Vec::new())));
+        // A signal death carries no code of its own.
+        assert_eq!(capture_with_code("sh", ["-c", "kill -9 $$"]).map(|(code, _)| code), Some(1));
+        assert_eq!(capture_with_code("bashrs_no_such_program_xyz", &[] as &[&str]), None);
+    }
 
     #[test]
     fn run_ignores_exit_status_without_panicking() {
