@@ -367,6 +367,42 @@ fn diff_reads_a_dash_side_from_stdin() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn diff_compares_two_directories_one_level_deep_unless_recursive() {
+    let dir = std::env::temp_dir().join(format!("bashrs_diff_dirs_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (old, new) = (dir.join("a"), dir.join("b"));
+    for (file, text) in [
+        (old.join("f.txt"), "let x = 1;\n"), (new.join("f.txt"), "let x = 2;\n"),
+        (old.join("sub/deep.txt"), "old\n"), (new.join("sub/deep.txt"), "new\n"),
+        (new.join("only.txt"), "new\n"),
+    ] {
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+    }
+    let path = |side: &Path| side.to_str().unwrap().to_owned();
+    let shown = |out: &Output| console::strip_ansi_codes(&String::from_utf8_lossy(&out.stdout)).into_owned();
+
+    // One level, GNU's way: git's diff for the pair of files, GNU's lines for the rest.
+    let shallow = bashrs(&["diff", &path(&old), &path(&new)], &[]);
+    let text = shown(&shallow);
+    assert_eq!(shallow.status.code(), Some(1), "{}", String::from_utf8_lossy(&shallow.stderr));
+    assert!(text.contains("\n-let x = 1;\n+let x = 2;\n"), "{text}");
+    assert!(text.contains(&format!("Only in {}: only.txt\n", path(&new))), "{text}");
+    assert!(text.contains(&format!("Common subdirectories: {}/sub and {}/sub\n", path(&old), path(&new))), "{text}");
+    assert!(!text.contains("deep.txt"), "not walked without -r: {text}");
+
+    // `-r`: the subdirectory is compared where it was listed.
+    let deep = bashrs(&["diff", "-r", &path(&old), &path(&new)], &[]);
+    let text = shown(&deep);
+    assert_eq!(deep.status.code(), Some(1), "{}", String::from_utf8_lossy(&deep.stderr));
+    assert!(text.contains("\n-old\n+new\n") && !text.contains("Common subdirectories"), "{text}");
+
+    let same = bashrs(&["diff", "-r", &path(&old), &path(&old)], &[]);
+    assert_eq!((same.status.code(), same.stdout.as_slice()), (Some(0), &b""[..]), "a match is silent");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Compile-time guard that the fixture path stays valid if this file grows path-dependent tests.
 #[allow(dead_code)]
 fn _manifest_dir() -> &'static Path {

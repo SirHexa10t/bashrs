@@ -1,7 +1,8 @@
 //! Rust support shared across the command categories — clap argument structs ([`args`]), a syntax
 //! highlighter ([`theme_code`]), the one shared colour theme ([`theme`]), a Markdown-doc
 //! renderer ([`doc_render`]), the styling engine ([`doc_style`]), the in-line highlighter for
-//! unified diffs ([`diff_highlight`]), an external-process runner
+//! unified diffs ([`diff_highlight`]) and the GNU-style comparison of two directories
+//! ([`dir_diff`]), an external-process runner
 //! ([`exec`]), shared support for the wrapped-repo commands ([`comfy_repos`]), text-input
 //! resolution ([`input`]), the network-probing engines ([`net`]), an in-process stream grep
 //! ([`streamgrep`]), a
@@ -15,6 +16,7 @@ pub mod align;
 pub mod args;
 pub mod comfy_repos;
 pub mod diff_highlight;
+pub mod dir_diff;
 pub mod doc_render;
 pub mod doc_style;
 pub mod exec;

@@ -19,12 +19,13 @@
 #[bashrs_macros::category(command = BuiltinsCommand, prefix = "overwritten_")]
 mod commands {
     use std::ffi::OsStr;
-    use std::io::Write;
-    use std::path::PathBuf;
+    use std::io::{self, Write};
+    use std::path::{Path, PathBuf};
 
     use clap::Args;
-    use termcolor::{BufferedStandardStream, ColorChoice};
+    use termcolor::{BufferedStandardStream, ColorChoice, WriteColor};
 
+    use crate::support::dir_diff::{self, Finding};
     use crate::support::{diff_highlight, exec};
 
     /// `cd`, then print what you landed in: `ls -AF`, directories first, colours on
@@ -43,9 +44,11 @@ mod commands {
     /// `git diff` between any two files or directories — no repository needed — with what changed
     /// inside each changed line highlighted
     ///
-    /// `-` for either side reads stdin. Exits as git does — 0 when the two match, 1 when they
-    /// differ or a path cannot be read — and 2 when git itself cannot run, `diff`'s own code for
-    /// trouble.
+    /// `-` for either side reads stdin. Two directories are compared as GNU diff compares them:
+    /// one level deep unless `-r`, what one side lacks named in a line of its own (`Only in b:
+    /// x`), and git's diff for each pair of files that differ. Exits 0 when the two match and 1
+    /// when they differ; 2 is trouble — something that cannot be read, or no git to run. (A
+    /// missing file is git's to report, and git reports it with 1.)
     ///
     /// **Always in colour**, piped or not, so `| less -R` keeps it. For a plain patch, use
     /// `git diff --no-index` itself.
@@ -54,22 +57,65 @@ mod commands {
     /// `command diff` reaches it from a prompt too.
     #[unprefixed]
     pub fn diff(args: DiffArgs) {
+        // Coloured whether or not stdout is a terminal: the colour is the point of this command,
+        // and the one pipe its output goes into is a pager.
+        let mut out = BufferedStandardStream::stdout(ColorChoice::Always);
+        let compared = if args.old.is_dir() && args.new.is_dir() {
+            _diff_directories(&args, &mut out)
+        } else {
+            _git_diff(&args.old, &args.new, args.line_number, &mut out).map(|code| code.unwrap_or(2))
+        };
+        match compared.and_then(|code| out.flush().map(|()| code)) {
+            Ok(code) => std::process::exit(code),
+            Err(err) => {
+                eprintln!("diff: could not write the diff: {err}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    /// Two directories compared GNU's way ([`dir_diff`]), each finding painted into `out` as the
+    /// walk reaches it: git's diff for a pair that differs, and GNU's line for the rest — which
+    /// the highlighter paints as it paints git's headers, both being news about files rather than
+    /// lines. GNU's exit code: 0 when nothing was found, 1 when something was, and 2 for trouble,
+    /// which outranks both.
+    fn _diff_directories(args: &DiffArgs, out: &mut impl WriteColor) -> io::Result<i32> {
+        let mut code = 0;
+        for finding in dir_diff::compare(&args.old, &args.new, args.recursive) {
+            let found = match finding {
+                Finding::Differ(old, new) => match _git_diff(&old, &new, args.line_number, out)? {
+                    Some(code) => code.min(2),
+                    // No git for this pair is no git for any: nothing after it could be shown.
+                    None => return Ok(2),
+                },
+                Finding::Line(line) => {
+                    diff_highlight::render(&line, args.line_number, out)?;
+                    1
+                }
+                Finding::Unreadable(path, err) => {
+                    eprintln!("diff: {}: {err}", path.display());
+                    2
+                }
+            };
+            code = code.max(found);
+        }
+        Ok(code)
+    }
+
+    /// One `git diff --no-index` of two paths, painted into `out`: git's exit code, or `None` when
+    /// git could not run (already reported).
+    fn _git_diff(old: &Path, new: &Path, numbered: bool, out: &mut impl WriteColor) -> io::Result<Option<i32>> {
         // `--no-index` compares the two paths as plain files, needing no repository and consulting
         // none; `--no-ext-diff` keeps a configured external diff tool from replacing the unified
         // format the highlighter reads; `--color=never` because the colour is ours to add; and
         // `--` keeps a path that starts with `-` a path.
         let flags = ["diff", "--no-index", "--no-ext-diff", "--color=never", "--"].map(OsStr::new);
-        let git_args = flags.into_iter().chain([args.old.as_os_str(), args.new.as_os_str()]);
+        let git_args = flags.into_iter().chain([old.as_os_str(), new.as_os_str()]);
         let Some((code, output)) = exec::capture_with_code("git", git_args) else {
-            std::process::exit(2);
+            return Ok(None);
         };
-        // Coloured whether or not stdout is a terminal: the colour is the point of this command,
-        // and the one pipe its output goes into is a pager.
-        let mut out = BufferedStandardStream::stdout(ColorChoice::Always);
-        if let Err(err) = diff_highlight::render(&output, args.line_number, &mut out).and_then(|()| out.flush()) {
-            eprintln!("diff: could not write the diff: {err}");
-        }
-        std::process::exit(code);
+        diff_highlight::render(&output, numbered, out)?;
+        Ok(Some(code))
     }
 
     /// The two sides of a `diff`.
@@ -83,5 +129,9 @@ mod commands {
         /// before it (a removed line has only the old, an added line only the new)
         #[arg(short = 'n', long)]
         pub(crate) line_number: bool,
+        /// Compare subdirectories too, all the way down, as `diff -r` does. Without it two
+        /// directories are compared one level deep, and a subdirectory both have is only named
+        #[arg(short, long)]
+        pub(crate) recursive: bool,
     }
 }

@@ -7,7 +7,7 @@ Add a print at the end of sourcefile, notifying the user if his personal-data (i
     birthdays
     deadlines
     appointments
-    
+
 
 youtube/ffmpeg:
     scraping historic snapshots of channels to find if any of their videos have been de-listed/disappeared
@@ -32,7 +32,7 @@ Add Spotify to `dl`
 taking inventory of games-library
 
 
-USB-cable speed-tester 
+USB-cable speed-tester
     diagnosis for:
         full-functionality (no inner tears)
         transfer-speed (and concluded USB version)
@@ -49,7 +49,7 @@ dl:
     download from twitter
         support downloading images
         entire accounts' history, including txt files (post, reception(likes/retweets), community notes), videos/gifs, images
-    
+
 
 
 jukebox:
@@ -82,7 +82,7 @@ files:
 
 
 anti-ai:
-list of unusual characters, such as '—'
+list of unusual characters, such as '—' and '│'
     go look for a list of ai-affiliated words (like "delve"))
     replace words with synonyms, at a high "temperature" (consideration of lower-likeness words) setting
         scrubbing the technique mentioned here: https://www.youtube.com/watch?v=3FhxdhVMJoU
@@ -124,7 +124,7 @@ media:
         use the right one in different cases?
         avif is great for lossy, but bad at lossless.
         lossy: jpgxl is considered better than avif, but not always (seen a case where avif is better at similarity score of 0.01)
-    
+
 phone debloating
 
 os_ricing
@@ -134,7 +134,7 @@ os_ricing
             obviously, this mapping would be the basis of the form
 
         Make sure forms have a way to display warnings (red?) at the bottom (e.g. when choosing "packages", there should be a warning when you choose to install more than one type of VPN; it's weird enough to be considered unintentional, but still allowed). Of-course, the forms should provide a way to specify what warnings appear, under which type of checkbox (check/uncheck) combinations.
-    
+
 
 cheatsheets
     include search
@@ -174,10 +174,10 @@ continue catalogames (free games, add queryable sources, epic games inventory, h
 debloat the projects
 
 rename projects;
-    utility projects start with "util"
+    utility projects start with "util", or rather: "progutil"?
     arterminal -> terminart?
 
-add-in util_carl 
+add-in util_carl
 
 rewrite contAInerized: "ai_harness_harness" (Rust)
     much like "browser_browser"
@@ -186,11 +186,44 @@ rewrite contAInerized: "ai_harness_harness" (Rust)
 
 shorten description in sourcefile for  `shell_args_print`, and probably `detect_ai_textual_fingerprint`, and a few others
 
-move `diff` to `builtins.rs` module
-
 
 check if the shell-function can run the printed output of the Rust command, rather than run the decorator's code
 i.e. so it'd look like: `shell_def() { $("$HOME/.bashrs/bashrs" shell_def "$@"); }
 Maybe through a new decorator? ("eval_printed_output"?)
 
 
+debloat inner projects
+
+create joymouse (joycon as mouse)
+    Create 3D joycon model. Low poly.
+    Make it aim-able, wire buttons to mouse-buttons
+    Wire a button for orientation reset, or vertical/horizontal (pointing, not sideways) toggle
+
+autokey should present the optional scripts as a checklist (`terminal_choice`) that the user selects from
+
+Add a media function that scrubs the subtitles from a video (example would be given).
+    Maybe add in metadata a line about the modification (when scrubbing youtube auto-subs, explain that specifically)
+
+    Check that files without subs and/or modified metadata are detectable as different in `filesync`
+
+
+if there are no .toml "scripts" ready for `sequencer` (`autokey`) to find, instruct the user where to add them.
+    Also, refer the user to the github project's pages `https://github.com/SirHexa10t/sequencer/blob/main/example_profile.toml` , `https://github.com/SirHexa10t/sequencer/tree/main/practical_profile_examples`
+
+similarly, set-up a save-location for the `catalogames` files, and if it's empty, the user should be redirected to the program's wizard that creates / instructs-on-creating those.
+    Maybe it'd just be a "save them here, instructions on what to save in: <run the project accordingly>" kind of thing
+
+Add `midi` category module. Maybe should be its own thing like the arterminal project.
+
+Separate filesync's dedup into a "filededup" project (was this the name I thought of?) which would use filesync as a dependency
+
+Add `terminal` category, and add functionality for changing transparency if it's supported on the terminal (prints error if the terminal doesn't support it)
+
+Make sure that things work with Wayland too
+    autokey surely broke
+
+Add user-actions/ alongside user-data/ in .bashrs ; move-in the autokey scripts, and add the mounting scripts
+
+Make project autogenerate a .fish file too (pointers for the autogeneration are in the chat with the other AI) and source it in the ~/.config/<something>.fish file
+
+lll / LLL requires the table flag that doesn't force very long lines on all entries if 1st and 2nd place have a huge difference in size
