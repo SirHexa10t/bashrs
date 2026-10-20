@@ -27,8 +27,9 @@ use crate::categories::project::ProjectCommand;
 use crate::categories::python::PythonCommand;
 use crate::categories::shell::ShellCommand;
 use crate::categories::styles::StyleCommand;
+use crate::support::shell_dialect::Shell;
 
-// The generator half of the crate root: everything `sourcefile.sh` and TAB-completion need,
+// The generator half of the crate root: everything the sourcefiles and TAB-completion need,
 // assembled from the categories' contributed shell surfaces.
 mod sourcefile;
 
@@ -95,11 +96,16 @@ pub enum Command {
     Style(StyleCommand),
     #[command(flatten)]
     StylizedEcho(StylizedEchoCommand),
-    /// Emit shell function wrappers for every command (used by COMPILE.sh).
+    /// Emit shell function wrappers for every command — the sourcefile `install-shell` writes,
+    /// for one shell.
     #[command(hide = true)]
-    Generate,
-    /// Install the running binary under ~/.bashrs, write the sourcefile, and wire the shell rc
-    /// files (COMPILE.sh's last step).
+    Generate {
+        /// The shell to write it for.
+        #[arg(long, value_enum, default_value = "bash")]
+        shell: Shell,
+    },
+    /// Install the running binary under ~/.bashrs, write the sourcefiles (bash's and fish's), and
+    /// wire the shells to them: the bash and zsh rc files, fish's conf.d (COMPILE.sh's last step).
     #[command(hide = true)]
     InstallShell,
     /// Provision the non-Rust companions — bundled tools, repos, the Carstay.toml record
@@ -115,6 +121,9 @@ pub enum Command {
     CompleteFlags {
         /// The shell function name being completed (a command's clap name or visible alias).
         command: String,
+        /// The shell whose completer is asking — fish's takes each flag with its description.
+        #[arg(long, value_enum, default_value = "bash")]
+        shell: Shell,
     },
 }
 
@@ -144,12 +153,15 @@ impl Command {
             Command::Treegrep(cmd) => cmd.run(),
             Command::Style(cmd) => cmd.run(),
             Command::StylizedEcho(cmd) => cmd.run(),
-            Command::Generate => print!("{}", sourcefile::wrappers()),
-            Command::InstallShell => crate::conf::install::install_shell(&sourcefile::wrappers()),
+            Command::Generate { shell } => print!("{}", sourcefile::wrappers(shell)),
+            Command::InstallShell => {
+                let (fish, fish_completed) = sourcefile::generated(Shell::Fish);
+                crate::conf::install::install_shell(&sourcefile::wrappers(Shell::Bash), &fish, &fish_completed)
+            }
             Command::InstallStainless { use_stable_carstay } => {
                 crate::drivers::install_stainless(use_stable_carstay)
             }
-            Command::CompleteFlags { command } => println!("{}", sourcefile::complete_flags(&command)),
+            Command::CompleteFlags { command, shell } => println!("{}", sourcefile::complete_flags(&command, shell)),
         }
     }
 }

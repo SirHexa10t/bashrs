@@ -44,9 +44,16 @@ Two flags exist for staying on proven-good versions:
 ### What it touches
 
 Only your home directory. The binary copies itself to `~/.bashrs/`, writes
-`~/.bashrs/sourcefile.sh` beside it, puts the bundled tools under `~/.bashrs/tools/`, and adds one
-marked block to whichever of `~/.bashrc` and `~/.zshrc` you already have — marked so that
-re-running finds that block and replaces it instead of stacking copies.
+`~/.bashrs/sourcefile.sh` and `~/.bashrs/sourcefile.fish` beside it, puts the bundled tools under
+`~/.bashrs/tools/`, and adds one marked block to whichever of `~/.bashrc` and `~/.zshrc` you
+already have — marked so that re-running finds that block and leaves it alone instead of stacking
+copies.
+
+For fish, once fish has been run (so `~/.config/fish` exists), it adds a one-line
+`~/.config/fish/conf.d/bashrs.fish` instead, and never edits `config.fish`. Where fish already has
+completions for one of bashrs's command names (`diff`, Mercurial's `hg`), it also writes a small
+file per name to `~/.bashrs/fish_completions/`, so that bashrs's completions replace fish's rather
+than mixing with them.
 
 If the next shell greets you with a syntax error rather than a prompt, consult the **Troubleshooting** section. It is likely the expected bump when moving from an rc that already defines some of the same names.
 

@@ -16,6 +16,8 @@ pub use fetch::sync;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use crate::support::shell_dialect::{fish_function, Shell};
+
 /// A bundled tool: where it lives, what it provides, and how its bundle comes to exist.
 struct Tool {
     /// Directory under `~/.bashrs/tools/` holding the bundle.
@@ -201,19 +203,51 @@ pub(crate) fn bin_dir() -> PathBuf {
     root().join("bin")
 }
 
-/// The setup emitted into `sourcefile.sh` — the interactive side of the bundled tools, in two
-/// layers. The PATH prepend (idempotent; harmless when nothing is bundled) makes the shims win in
-/// *argument* position — `which`, `env`, shebangs. The `python3` function covers what PATH can't:
-/// sourced last in the rc chain, it replaces any same-named function the user's own rc defined
-/// earlier (the `unalias` clears an alias shadow likewise). An activated venv still wins either
-/// way, and a machine with no bundle falls through to its PATH python.
 /// The tools root as the *generated shell* spells it — `$HOME` expanded at use time (so a
 /// symlinked `~/.bashrs` keeps working). The one shell-side spelling of the directory
 /// [`root`] owns on the Rust side, shared by the PATH/shim setup below and the shim scripts
 /// [`fetch`] writes.
 const TOOLS_ROOT_SHELL: &str = "$HOME/.bashrs/tools";
 
-pub(crate) fn shell_setup() -> String {
+/// The setup emitted into `sourcefile.sh` — the interactive side of the bundled tools, in two
+/// layers. The PATH prepend (idempotent; harmless when nothing is bundled) makes the shims win in
+/// *argument* position — `which`, `env`, shebangs. The `python3` function covers what PATH can't:
+/// sourced last in the rc chain, it replaces any same-named function the user's own rc defined
+/// earlier (the `unalias` clears an alias shadow likewise). An activated venv still wins either
+/// way, and a machine with no bundle falls through to its PATH python.
+///
+/// Fish gets the same two layers in its own terms. The prepend is a session-only `set -gx`, not
+/// fish's usual `fish_add_path`, which stores the directory in a universal variable that would
+/// outlive bashrs. The function needs no `unalias`, since a fish alias is itself a function that
+/// the definition replaces; one defined in `config.fish` still wins, as fish reads `conf.d` first.
+pub(crate) fn shell_setup(shell: Shell) -> String {
+    match shell {
+        Shell::Bash => bash_shell_setup(),
+        Shell::Fish => fish_shell_setup(),
+    }
+}
+
+fn fish_shell_setup() -> String {
+    let root = TOOLS_ROOT_SHELL;
+    let python3 = fish_function(
+        "python3",
+        Some("The bundled python3, unless a venv is active"),
+        &[
+            format!("if test -z \"$VIRTUAL_ENV\"; and test -x \"{root}/bin/python3\""),
+            format!("\"{root}/bin/python3\" $argv"),
+            "else".to_string(),
+            "command python3 $argv".to_string(),
+            "end".to_string(),
+        ],
+    );
+    format!(
+        "contains -- \"{root}/bin\" $PATH; or set -gx PATH \"{root}/bin\" $PATH  \
+         # bundled tools (python3, ffmpeg, …) win by PATH — as arguments and in shebangs — for this session only\n\
+         {python3}  # a venv (or a missing bundle) falls through to PATH\n"
+    )
+}
+
+fn bash_shell_setup() -> String {
     let root = TOOLS_ROOT_SHELL;
     format!(
         "case \":$PATH:\" in *\":{root}/bin:\"*) ;; *) export PATH=\"{root}/bin:$PATH\";; esac  \
@@ -286,7 +320,7 @@ mod tests {
 
     #[test]
     fn the_shell_setup_prepends_the_shim_dir_idempotently_and_arms_the_function() {
-        let setup = shell_setup();
+        let setup = shell_setup(Shell::Bash);
         assert!(setup.contains("PATH=\"$HOME/.bashrs/tools/bin:$PATH\""), "{setup}");
         assert!(setup.starts_with("case \":$PATH:\" in"), "re-sourcing must not stack duplicates: {setup}");
         // The function layer: beats older same-named rc functions/aliases, respects venvs,
@@ -296,5 +330,20 @@ mod tests {
         assert!(setup.contains("VIRTUAL_ENV"), "{setup}");
         assert!(setup.contains("$HOME/.bashrs/tools/bin/python3"), "{setup}");
         assert!(setup.contains("command python3"), "fall-throughs bypass the function itself: {setup}");
+    }
+
+    /// The same two layers in fish, minus what fish does differently: the prepend stays in the
+    /// session (no universal variable), and no `unalias` is needed before the definition.
+    #[test]
+    fn the_fish_setup_prepends_for_the_session_only_and_arms_the_same_function() {
+        let setup = shell_setup(Shell::Fish);
+        assert!(
+            setup.contains("contains -- \"$HOME/.bashrs/tools/bin\" $PATH; or set -gx PATH \"$HOME/.bashrs/tools/bin\" $PATH"),
+            "{setup}"
+        );
+        assert!(!setup.contains("fish_add_path") && !setup.contains("set -U"), "nothing universal: {setup}");
+        assert!(!setup.contains("unalias"), "{setup}");
+        assert!(setup.contains("function python3 -d "), "{setup}");
+        assert!(setup.contains("test -z \"$VIRTUAL_ENV\"") && setup.contains("command python3 $argv"), "{setup}");
     }
 }

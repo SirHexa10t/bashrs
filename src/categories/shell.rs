@@ -7,9 +7,9 @@
 //!   builtin, binaries, variable — in every meaning it holds at once.
 //! - `shell_new` / `shell_bare` / `sudo_bashrs` start or move between shells.
 //!
-//! Two of the three session commands must run in the *calling* shell — `exec bash` replaces the
-//! shell that invoked it, and a child process cannot replace its parent — so they are
-//! `#[shell_body]` commands, declared here and emitted into `sourcefile.sh` as inline shell.
+//! Two of the three session commands must run in the *calling* shell — `exec bash` (`exec fish`
+//! in fish) replaces the shell that invoked it, and a child process cannot replace its parent — so they are
+//! `#[shell_body]` commands, declared here and emitted into the sourcefiles as inline shell, one body per shell.
 //! `sudo_bashrs` is different in kind: it *spawns* a nested shell and returns when that shell
 //! exits, which a binary does perfectly well, so its logic is Rust and its wrapper is the ordinary
 //! generated one-liner. Its name breaks the `shell_` prefix deliberately — it reads as "sudo,
@@ -30,6 +30,7 @@
 #[bashrs_macros::category(command = ShellCommand, prefix = "shell_")]
 mod commands {
     use crate::support::args::NoArgs;
+    use crate::support::shell_dialect::Shell;
     use crate::support::shell_quote;
     use crate::support::superuser;
     use clap::Args;
@@ -43,15 +44,26 @@ mod commands {
     ///
     /// Every value is quoted, so an empty argument still shows (`''`) and a run of spaces inside
     /// one is visible where the shell put it — the whole point being to see the boundaries the
-    /// shell chose, not the ones you meant.
+    /// shell chose, not the ones you meant. Quoted in the syntax of the shell it was run from, so
+    /// a value pastes back there as the same word.
     pub fn args_print(args: ArgsPrintArgs) {
-        let count = args.args.len();
-        println!("{count} arg{}:", if count == 1 { "" } else { "s" });
-        for (index, arg) in args.args.iter().enumerate() {
+        print!("{}", _args_report(&args.args, Shell::caller()));
+    }
+
+    /// The report [`args_print`] prints: the count, then each argument quoted for `shell`.
+    fn _args_report(args: &[String], shell: Shell) -> String {
+        let count = args.len();
+        let mut out = format!("{count} arg{}:\n", if count == 1 { "" } else { "s" });
+        for (index, arg) in args.iter().enumerate() {
             // 1-based, to read alongside the shell's own `$1 $2 …`. The quoting — always-on, so an
             // empty arg shows as `''` and every boundary is explicit — is the shared one.
-            println!("  arg{}: {}", index + 1, shell_quote::quote(arg));
+            let quoted = match shell {
+                Shell::Bash => shell_quote::quote(arg),
+                Shell::Fish => shell_quote::quote_fish(arg),
+            };
+            out += &format!("  arg{}: {quoted}\n", index + 1);
         }
+        out
     }
 
     /// Every token after the command, verbatim — hyphen-led ones (`-x`, `--foo`) included, since a
@@ -90,8 +102,19 @@ mod commands {
     /// in a string of bash. Under zsh the `type -at` probe fails silently (empty field) and
     /// the report derives the ranking from which probes answered, claiming nothing about
     /// builtins it cannot see.
+    ///
+    /// Fish probes in its own terms. It has no aliases — `alias` there defines a function, which
+    /// the function probe shows — so that field is always empty; the function is `functions`,
+    /// the variable `set --show` (every scope, universal included), the kinds `type -a -t`, which
+    /// names them as bash's `type -at` does. Each probe is `string collect -a`'d into exactly one
+    /// argument: without `-a`, an empty answer becomes no argument at all, and every later field
+    /// shifts left. And each carries its own `2>/dev/null`, since a redirect on fish's loop does
+    /// not reach the substitutions inside it.
     #[name("shell_def")]
-    #[piped(r#"local __n; for __n in "$@"; do printf '%s\0%s\0%s\0%s\0' "$(alias -- "$__n")" "$(declare -f -- "$__n")" "$(declare -p -- "$__n")" "$(type -at -- "$__n")"; done 2>/dev/null"#)]
+    #[piped(
+        bash = r#"local __n; for __n in "$@"; do printf '%s\0%s\0%s\0%s\0' "$(alias -- "$__n")" "$(declare -f -- "$__n")" "$(declare -p -- "$__n")" "$(type -at -- "$__n")"; done 2>/dev/null"#,
+        fish = r#"for __n in $argv; printf '%s\0%s\0%s\0%s\0' '' (functions -- $__n 2>/dev/null | string collect -a) (set --show -- $__n 2>/dev/null | string collect -a) (type -a -t -- $__n 2>/dev/null | string collect -a); end"#
+    )]
     pub fn def(args: DefArgs) {
         let mut piped = Vec::new();
         use std::io::Read as _;
@@ -320,13 +343,16 @@ mod commands {
     }
 
     /// Start a fresh shell session
+    ///
+    /// Bash's file is zsh's too, so its body starts whichever of the two is running it: zsh sets
+    /// `ZSH_NAME` (to the name it was started as), and bash leaves it unset.
     #[name("shell_new")]
-    #[shell_body("exec bash")]
+    #[shell_body(bash = r#"exec "${ZSH_NAME:-bash}""#, fish = "exec fish")]
     pub fn new() {}
 
     /// Fresh shell WITHOUT bashrs (one-shot: any later shell, or re-sourcing, arms it again)
     #[name("shell_bare")]
-    #[shell_body("_BASHRS_BARE=1 exec bash")]
+    #[shell_body(bash = r#"_BASHRS_BARE=1 exec "${ZSH_NAME:-bash}""#, fish = "_BASHRS_BARE=1 exec fish")]
     pub fn bare() {}
 
     /// Move into a root shell with bashrs sourced — for running several elevated commands
@@ -568,6 +594,24 @@ mod commands {
             assert_eq!(&text[2..4], ["bash", "--rcfile"]);
             assert!(text[4].ends_with("sourcefile.sh"), "{text:?}");
             assert_eq!(text[5], "-i", "an rcfile is only read by an interactive shell");
+        }
+
+        /// The report counts the words and quotes each in the dialect it is shown for — the quote
+        /// that is hostile to one shell's syntax and not the other's makes the difference visible.
+        #[test]
+        fn the_argument_report_quotes_for_the_shell_it_was_run_from() {
+            let args: Vec<String> = ["plain", "", "it's", "a  b"].map(str::to_string).to_vec();
+            assert_eq!(
+                _args_report(&args, Shell::Bash),
+                "4 args:\n  arg1: 'plain'\n  arg2: ''\n  arg3: $'it\\'s'\n  arg4: 'a  b'\n"
+            );
+            assert_eq!(
+                _args_report(&args, Shell::Fish),
+                "4 args:\n  arg1: 'plain'\n  arg2: ''\n  arg3: 'it\\'s'\n  arg4: 'a  b'\n",
+                "fish has no `$'…'`; its quotes take `\\'`"
+            );
+            assert_eq!(_args_report(&args[..1], Shell::Bash), "1 arg:\n  arg1: 'plain'\n", "one is singular");
+            assert_eq!(_args_report(&[], Shell::Fish), "0 args:\n");
         }
 
         #[test]

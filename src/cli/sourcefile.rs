@@ -1,10 +1,21 @@
-//! The `sourcefile.sh` generator and its completion data — the crate root's *assembly* half
+//! The sourcefile generator and its completion data — the crate root's *assembly* half
 //! (parsing/dispatch is [`super`], which serves this module's output through the hidden
 //! `generate`, `install-shell` and `complete-flags` commands). Nothing here leaks downward:
 //! each subsystem *contributes* its shell surface — categories their command wrappers and
 //! `#[shell_body]` functions, [`crate::tools`] its PATH line, [`crate::drivers::stainless`]
 //! its aliases, [`crate::conf`] the environment/keybinds/greeting — and this module gathers
 //! them into the one sourced file, plus the per-command flag lists TAB-completion asks for.
+//!
+//! One file per [`Shell`]: `sourcefile.sh` (bash, and zsh) and `sourcefile.fish`. Both come out
+//! of the one sequence in [`wrappers`] — the same sections, in the same order, from the same
+//! data — and each section that must be written differently `match`es on the shell, so neither a
+//! new section nor a new shell compiles until every one of them says how it is written. What each
+//! shell's syntax needs lives in its own child, [`bash`] and [`fish`].
+
+mod bash;
+mod fish;
+
+use std::collections::BTreeMap;
 
 use clap::Subcommand;
 use super::adjust_pinned;
@@ -30,18 +41,14 @@ use crate::categories::project::ProjectCommand;
 use crate::categories::python::PythonCommand;
 use crate::categories::shell::ShellCommand;
 use crate::categories::styles::StyleCommand;
-use crate::conf::{config_file, environment, greeting, keybinds};
-use crate::support::align::align_columns;
-use crate::conf::RELOAD_EXIT_CODE;
+use crate::conf::{config_file, environment, greeting};
 use crate::drivers::stainless;
+use crate::support::shell_dialect::{fish_original, Shell, ShellText};
 use crate::tools;
 
-/// A category's pure-shell command (`#[shell_body]`): `(name, body, comment)` — emitted as a
+/// A category's pure-shell command (`#[shell_body]`): `(name, bodies, comment)` — emitted as a
 /// plain function, since its work (e.g. `cd`) must run in the calling shell, not the binary.
-type ShellFn = (&'static str, &'static str, &'static str);
-
-/// A category's by-name lookup of one wrapper hook, as `#[category]` generates it.
-type WrapperLookup = fn(&str) -> Option<&'static str>;
+type ShellFn = (&'static str, ShellText, &'static str);
 
 /// What one category enum contributes to the sourcefile — the four things `#[category]`
 /// generates for every enum, held as fn pointers so that one list can hold enums of distinct
@@ -51,10 +58,10 @@ struct Surface {
     commands: fn(clap::Command) -> clap::Command,
     /// The enum's pure-shell commands (`#[shell_body]`).
     shell_functions: fn() -> &'static [ShellFn],
-    /// The shell appended (after `&&`) to a command's wrapper, by command name (`#[after("…")]`).
-    wrapper_suffix: WrapperLookup,
-    /// The command piped into a command's wrapper, by command name (`#[piped("…")]`).
-    wrapper_prefix: WrapperLookup,
+    /// The function a command's wrapper runs on a reload, by command name (`#[after("…")]`).
+    wrapper_suffix: fn(&str) -> Option<&'static str>,
+    /// The probe piped into a command's wrapper, by command name (`#[piped(…)]`).
+    wrapper_prefix: fn(&str) -> Option<ShellText>,
 }
 
 /// A category enum's [`Surface`]. A macro because each enum is a distinct *type*; the four fn
@@ -123,306 +130,227 @@ fn category_commands() -> Vec<(&'static str, clap::Command, Vec<ShellFn>)> {
         .collect()
 }
 
-/// Space-separated `-short --long` names of `command`'s arguments (matched by clap name or visible
-/// alias, so `upup` completes like `packages_upup`). Positionals and hidden flags (the pinned ones
-/// — [`HIDDEN_PINNED`]) are omitted; an unknown name yields nothing, so the completer simply offers
-/// no flags. Backs the hidden `complete-flags` command the generated completer calls at TAB-time.
-pub(super) fn complete_flags(name: &str) -> String {
-    for (_, category, _) in category_commands() {
-        for sub in category.get_subcommands() {
-            if sub.get_name() != name && !sub.get_visible_aliases().any(|alias| alias == name) {
-                continue;
+/// One category as both shells write it: its label, its binary-backed commands, and its
+/// pure-shell ones.
+struct Section {
+    label: &'static str,
+    wrappers: Vec<Wrapper>,
+    bodies: Vec<ShellFn>,
+}
+
+/// A binary-backed command as both shells' wrappers need it.
+struct Wrapper {
+    /// The clap name every wrapper calls — an alias is purely a shell-side convenience and never
+    /// has to resolve as a clap alias.
+    real: String,
+    /// Every name the command answers to: the real one, then its visible aliases.
+    names: Vec<String>,
+    /// The first line of its clap `about`.
+    about: Option<String>,
+    /// The function to run when the command asks for a reload (`#[after]`).
+    after: Option<&'static str>,
+    /// What the shell pipes into it (`#[piped]`).
+    piped: Option<ShellText>,
+}
+
+/// [`category_commands`] as [`Section`]s, every hidden command left out.
+fn sections() -> Vec<Section> {
+    category_commands()
+        .into_iter()
+        .map(|(label, category, bodies)| {
+            let wrappers = category
+                .get_subcommands()
+                .filter(|sub| !sub.is_hide_set()) // skip any command marked internal
+                .map(|sub| Wrapper {
+                    real: sub.get_name().to_string(),
+                    names: std::iter::once(sub.get_name()).chain(sub.get_visible_aliases()).map(str::to_string).collect(),
+                    about: first_line(sub.get_about()),
+                    after: wrapper_suffix(sub.get_name()),
+                    piped: wrapper_prefix(sub.get_name()),
+                })
+                .collect();
+            Section { label, wrappers, bodies }
+        })
+        .collect()
+}
+
+/// A clap help text's first line, as the comments and descriptions carry it — first line only, so
+/// a comment can't run over.
+fn first_line(text: Option<&clap::builder::StyledStr>) -> Option<String> {
+    text.map(ToString::to_string)
+        .and_then(|text| text.lines().next().map(str::to_string))
+        .filter(|line| !line.is_empty())
+}
+
+/// Command name → one-line description, for the keybind comments, which look their bound
+/// function up here.
+fn abouts(sections: &[Section]) -> BTreeMap<String, String> {
+    let mut abouts = BTreeMap::new();
+    for section in sections {
+        for wrapper in &section.wrappers {
+            if let Some(about) = &wrapper.about {
+                abouts.insert(wrapper.real.clone(), about.clone());
             }
-            let mut flags: Vec<String> = Vec::new();
-            for arg in sub.get_arguments() {
-                if arg.is_positional() || arg.is_hide_set() {
-                    continue;
-                }
-                if let Some(short) = arg.get_short() {
-                    flags.push(format!("-{short}"));
-                }
-                if let Some(long) = arg.get_long() {
-                    flags.push(format!("--{long}"));
-                }
+        }
+        for (name, _, comment) in &section.bodies {
+            if !comment.is_empty() {
+                abouts.insert((*name).to_string(), (*comment).to_string());
             }
-            // The auto help flag only materializes when clap *builds* a command, which these
-            // introspection copies aren't — add it by hand (no command disables it).
-            if !flags.iter().any(|flag| flag == "--help") {
-                flags.push("-h".into());
-                flags.push("--help".into());
-            }
-            return flags.join(" ");
         }
     }
-    String::new()
+    abouts
 }
 
-/// Flag completion for the STAINLESS aliases, and only for them — hence the name: every
-/// Rust-side command is answered live by the binary (`_bashrs_complete` → `complete-flags`),
-/// which is always in sync with the real CLI. The non-Rust companions aren't clap commands, so
-/// the binary can't answer for them; instead [`stainless::aliases`] probes each tool's own
-/// `--help` at generate time and hands back `(alias, space-joined flags)` rows, which this bakes
-/// into a `case`. Still derived, never hand-written — just derived a generation earlier, from
-/// the tool itself rather than from a table someone has to remember to update.
-///
-/// Rendered as a sibling of `_bashrs_complete` inside the same bash-only block, with the same
-/// contract: flags only once `-` is typed, filenames otherwise (`-o default`). Empty input
-/// renders nothing — a sourcefile generated before the first repo sync simply has no rows.
-fn stainless_flags_block(entries: &[(String, String)]) -> String {
-    if entries.is_empty() {
-        return String::new();
-    }
-    let arms: String = align_columns(
-        entries.iter().map(|(alias, flags)| format!("{alias}) flags=\"{flags}\" ;;")).collect(),
-        &["flags="],
-    )
-    .into_iter()
-    .map(|arm| format!("            {arm}\n"))
-    .collect();
-    let names: Vec<&str> = entries.iter().map(|(alias, _)| alias.as_str()).collect();
-    format!(
-        "\x20   _bashrs_stainless_flags() {{\n\
-         \x20       local cur=${{COMP_WORDS[COMP_CWORD]}}\n\
-         \x20       [[ $cur == -* ]] || return 0\n\
-         \x20       local flags=\"\"\n\
-         \x20       case \"${{COMP_WORDS[0]}}\" in\n\
-         {arms}\
-         \x20       esac\n\
-         \x20       COMPREPLY=($(compgen -W \"$flags\" -- \"$cur\"))\n\
-         \x20   }}\n\
-         \x20   complete -F _bashrs_stainless_flags -o default {}\n",
-        names.join(" ")
-    )
-}
-
-/// The shell appended (after `&&`) to a command's wrapper — e.g. to restart the
-/// shell after a command that changes the environment.
+/// The function a command's wrapper runs when it asks for a reload (e.g. `shell_new`).
 fn wrapper_suffix(name: &str) -> Option<&'static str> {
     // Command names are unique across categories (clap flattening requires it): first match wins.
     surfaces().find_map(|surface| (surface.wrapper_suffix)(name))
 }
 
-/// A readline escape sequence as the hotkey a keyboard labels it: `\en` → `Alt+N`,
-/// `\e\C-n` → `Ctrl+Alt+N`. Modifiers in Ctrl, Alt, Shift order; an uppercase key letter in
-/// the sequence means Shift was part of the chord.
-fn hotkey_label(sequence: &str) -> String {
-    let (mut ctrl, mut alt) = (false, false);
-    let mut rest = sequence;
-    loop {
-        if let Some(after) = rest.strip_prefix(r"\e") {
-            alt = true;
-            rest = after;
-        } else if let Some(after) = rest.strip_prefix(r"\C-") {
-            ctrl = true;
-            rest = after;
-        } else {
-            break;
-        }
-    }
-    let mut shift = false;
-    let key = rest
-        .chars()
-        .next()
-        .map(|ch| {
-            shift = ch.is_ascii_uppercase();
-            ch.to_ascii_uppercase()
-        })
-        .unwrap_or('?');
-    let mut parts: Vec<&str> = Vec::new();
-    if ctrl {
-        parts.push("Ctrl");
-    }
-    if alt {
-        parts.push("Alt");
-    }
-    if shift {
-        parts.push("Shift");
-    }
-    parts.push("");
-    let modifiers = parts.join("+");
-    format!("{modifiers}{key}")
-}
-
-/// The shell piped into a command's wrapper (ahead of the binary) — e.g. `hg` searches the
-/// shell history, which only the shell itself can produce, so its wrapper runs `history` and
-/// pipes it in.
-fn wrapper_prefix(name: &str) -> Option<&'static str> {
+/// The probe piped into a command's wrapper (ahead of the binary) — e.g. `hg` searches the shell
+/// history, which only the shell itself can produce, so its wrapper runs `history` and pipes it in.
+fn wrapper_prefix(name: &str) -> Option<ShellText> {
     surfaces().find_map(|surface| (surface.wrapper_prefix)(name))
 }
 
-/// Build the shell function definitions sourced from `~/.bashrs/sourcefile.sh`.
+/// The placeholder for the project directory this binary was compiled from.
+const PROJECT_ROOT: &str = "{PROJECT_ROOT}";
+/// The placeholder (fish) for the shell's own definition of an override's name.
+const ORIGINAL: &str = "{ORIGINAL}";
+
+/// A hand-written fragment with its generation-time substitutions made. The attributes only take
+/// string literals, but the generator runs inside the binary — which is exactly where compile-time
+/// knowledge lives — so these are baked into the emitted text instead of fetched through a
+/// subprocess at every call:
+/// - [`PROJECT_ROOT`] — the project directory, quoted for the shell the fragment is written in;
+/// - [`ORIGINAL`], fish only — the shell's own definition of `name`, which [`fish`] saves under
+///   another name before the override replaces it.
+fn substitute(text: &str, shell: Shell, name: &str) -> String {
+    let text = text.replace(PROJECT_ROOT, &shell.quote(env!("CARGO_MANIFEST_DIR")));
+    match shell {
+        Shell::Bash => text,
+        Shell::Fish => text.replace(ORIGINAL, &fish_original(name)),
+    }
+}
+
+/// One flag a command offers for completion, read from clap's model, so that neither shell's
+/// completion can drift from what the command accepts.
+struct Flag {
+    short: Option<char>,
+    long: Option<String>,
+    /// The first line of the flag's help.
+    help: Option<String>,
+}
+
+/// The flags `command` offers: every argument that is neither positional nor hidden (the pinned
+/// ones are hidden — [`HIDDEN_PINNED`]), plus the auto help flag, which only materializes when
+/// clap *builds* a command, which these introspection copies aren't (no command disables it).
+fn flags(command: &clap::Command) -> Vec<Flag> {
+    let mut flags: Vec<Flag> = command
+        .get_arguments()
+        .filter(|arg| !arg.is_positional() && !arg.is_hide_set())
+        .map(|arg| Flag { short: arg.get_short(), long: arg.get_long().map(str::to_string), help: first_line(arg.get_help()) })
+        .collect();
+    if !flags.iter().any(|flag| flag.long.as_deref() == Some("help")) {
+        flags.push(Flag { short: Some('h'), long: Some("help".into()), help: Some("Print help".to_string()) });
+    }
+    flags
+}
+
+/// The flags of the command named `name` (its clap name or a visible alias, so `upup` completes
+/// like `packages_upup`) as `shell`'s completer reads them — [`flags`], spelled `-short` and
+/// `--long`. Bash's takes them space-separated; fish's one per line, each with its help after a
+/// tab, which fish shows beside it. An unknown name yields nothing, so the completer simply
+/// offers no flags. Backs the hidden `complete-flags` command the generated completers call at
+/// TAB-time.
+pub(super) fn complete_flags(name: &str, shell: Shell) -> String {
+    for (_, category, _) in category_commands() {
+        for sub in category.get_subcommands() {
+            if sub.get_name() != name && !sub.get_visible_aliases().any(|alias| alias == name) {
+                continue;
+            }
+            let spelled = flags(sub).into_iter().flat_map(|flag| {
+                let names = [flag.short.map(|short| format!("-{short}")), flag.long.map(|long| format!("--{long}"))];
+                names.into_iter().flatten().map(move |spelling| (spelling, flag.help.clone()))
+            });
+            return match shell {
+                Shell::Bash => spelled.map(|(spelling, _)| spelling).collect::<Vec<_>>().join(" "),
+                Shell::Fish => spelled
+                    .map(|(spelling, help)| match help {
+                        Some(help) => format!("{spelling}\t{help}"),
+                        None => spelling,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
+        }
+    }
+    String::new()
+}
+
+/// The sourcefile for `shell` — [`generated`]'s text, which is all the `generate` command prints.
+pub(super) fn wrappers(shell: Shell) -> String {
+    generated(shell).0
+}
+
+/// Build the sourcefile for `shell` — `~/.bashrs/sourcefile.sh` for bash (which zsh also sources),
+/// `~/.bashrs/sourcefile.fish` for fish — and the names it gives completions to, which the install
+/// needs for fish (see [`fish::completion`]).
 ///
 /// Definitions are grouped by category, each under a comment header. Every
 /// wrapper — including unprefixed aliases — dispatches to the command's *real* name,
 /// so an alias is purely a shell-side convenience and never has to resolve as a
 /// clap alias. The binary path is inlined into each function rather than held in
 /// a shared variable, so sourcing leaves nothing behind in the user's shell.
-pub(super) fn wrappers() -> String {
-    // Quoted so `$HOME` expands at call time and paths with spaces stay intact.
-    const BIN: &str = "\"$HOME/.bashrs/bashrs\"";
-
+pub(super) fn generated(shell: Shell) -> (String, Vec<String>) {
+    let sections = sections();
     let mut body = String::new();
-    let mut completion_names: Vec<String> = Vec::new(); // every wrapper + alias, for `complete -F`
-    // Command name → one-line description, harvested while the loop below has them in hand;
-    // the keybind comments look their bound function up here.
-    let mut abouts: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    for (label, category, shell_fns) in category_commands() {
-        let mut lines: Vec<String> = Vec::new();
-        for sub in category.get_subcommands() {
-            if sub.is_hide_set() {
-                continue; // skip any command marked internal
-            }
-            let real = sub.get_name();
-            // The command's one-line description (its clap `about`), appended as
-            // an inline comment. First line only, so a comment can't run over.
-            let about = sub
-                .get_about()
-                .map(|a| a.to_string())
-                .and_then(|a| a.lines().next().map(str::to_string))
-                .filter(|a| !a.is_empty())
-                .map(|a| format!(" # {a}"))
-                .unwrap_or_default();
-            // Run the suffix (e.g. `shell_new`) only when the command signals a
-            // reload by exiting RELOAD_EXIT_CODE. A real success does; clap's
-            // `--help` (exit 0) and any failure (non-zero) do not.
-            let suffix = wrapper_suffix(real)
-                .map(|s| format!("; [ \"$?\" -eq {RELOAD_EXIT_CODE} ] && {s}"))
-                .unwrap_or_default();
-            // A command that consumes a builtin's output (e.g. `hg` ← `history`) has it piped
-            // in ahead of the binary; the shell must produce it, since we can't.
-            let prefix = wrapper_prefix(real).map(|cmd| format!("{cmd} | ")).unwrap_or_default();
-            if let Some(first_line) = about.strip_prefix(" # ") {
-                abouts.insert(real.to_string(), first_line.to_string());
-            }
-            for shell_name in std::iter::once(real).chain(sub.get_visible_aliases()) {
-                lines.push(format!("{shell_name}() {{ {prefix}{BIN} {real} \"$@\"{suffix}; }}{about}"));
-                completion_names.push(shell_name.to_string());
-            }
-        }
-        // The category's pure-shell commands (`#[shell_body]`): inline bodies, no binary call —
-        // and no completion registration, which would replace bash's default (filename)
-        // completion with a flagless void.
-        //
-        // No `unalias` guard here, deliberately. A live alias of the same name does break the
-        // definition as bash parses it — with `alias ..='cd ..'` already set, `..() {` is read as
-        // `cd ..() {`, a syntax error that aborts the whole sourced file — but every
-        // binary-backed wrapper above carries the same exposure unguarded, so shielding these
-        // few implied a safety the rest of the file does not have. The bundled `python3` shim
-        // keeps its own guard (see [`crate::tools`]): that one name collides often enough to
-        // earn the line.
-        for (name, fn_body, comment) in shell_fns {
-            if !comment.is_empty() {
-                abouts.insert(name.to_string(), comment.to_string());
-            }
-            // The one generation-time substitution a body may use: `{PROJECT_ROOT}` becomes the
-            // project directory this binary was compiled from, already shell-quoted. The
-            // attribute only takes a string literal, but the generator runs inside the binary —
-            // which is exactly where compile-time knowledge lives — so the path is baked into
-            // the emitted text instead of fetched through a subprocess at every call.
-            let fn_body = fn_body
-                .replace("{PROJECT_ROOT}", &crate::support::shell_quote::quote(env!("CARGO_MANIFEST_DIR")));
-            let about = if comment.is_empty() { String::new() } else { format!(" # {comment}") };
-            lines.push(format!("{name}() {{ {fn_body}; }}{about}"));
-        }
-        if !lines.is_empty() {
-            // Align each category's inline `# …` comments into a column with `table` (the
-            // library function, not the shell wrapper); `trim_trailing` drops the padding it
-            // adds to comment-less rows. The fallback is unreachable: only `sort` can error,
-            // and it's off.
-            body += &format!("\n# {label}\n");
-            // Every category is a table: name, `{`-opened body, `#` comment — each in its own
-            // column, so a section reads down as easily as across.
-            for line in align_columns(lines, &["{", "# "]) {
-                body.push_str(&line);
-                body.push('\n');
-            }
+    for section in &sections {
+        let definitions = match shell {
+            Shell::Bash => bash::definitions(section),
+            Shell::Fish => fish::definitions(section),
+        };
+        if !definitions.is_empty() {
+            body += &format!("\n# {}\n{definitions}", section.label);
         }
     }
 
     // Non-Rust companion repos (cloned by the hidden `install-stainless` command), aliased to their launchers.
-    let (comfy, stainless_flags) = stainless::aliases();
+    let (comfy, stainless_flags) = stainless::aliases(shell);
     if !comfy.is_empty() {
         body += &format!("\n# stainless comfy repos\n{comfy}");
     }
 
     // Bundled tools (fetched and kept current by the same bin): their shim dir wins by PATH.
-    body += &format!("\n# bundled tools\n{}", tools::shell_setup());
+    body += &format!("\n# bundled tools\n{}", tools::shell_setup(shell));
 
-    // Environment settings and keybinds: raw shell run when sourcefile.sh is sourced.
+    // Environment settings and keybinds: raw shell run when the sourcefile is sourced.
     // (The session commands are a category now — emitted above with the rest.)
-    body += &format!("\n# environment\n{}", environment::settings());
+    body += &format!("\n# environment\n{}", environment::settings(shell));
 
-    // Same column-alignment as the category blocks: two-plus spaces before `#` is the
-    // table split point, and the bind text itself only ever holds single spaces.
-    let bind_lines: Vec<String> = keybinds::bindings()
-        .iter()
-        .map(|(key, func)| {
-            let what = abouts.get(*func).map_or_else(|| (*func).to_string(), Clone::clone);
-            format!("bind '\"{key}\": \"{func}\\n\"' # {}: {what}", hotkey_label(key))
-        })
-        .collect();
-    let binds: String =
-        align_columns(bind_lines, &["# "]).into_iter().map(|line| format!("    {line}\n")).collect();
-    let desktop = keybinds::desktop_restart();
-    if !binds.is_empty() || !desktop.is_empty() {
-        // `bind` is a bash readline builtin; zsh (which also sources this) has none.
-        body += &format!("\n# keybinds (bash only)\nif [ -n \"$BASH_VERSION\" ]; then\n{binds}{desktop}fi\n");
-    }
-
-    // Flag completion: on TAB after a `-`, ask the binary which flags the command being completed
-    // accepts (`complete-flags`, always in sync with the real CLI); any other word falls back to
-    // filename completion via `-o default`. `complete` is a bash builtin, so zsh skips the block.
-    body += &format!(
-        "\n# completion (bash only)\n\
-         #   Optional flags displayed through tab-completion. Type `-` and follow up with <TAB><TAB>\n\
-         #   e.g. `gg -<TAB><TAB>` lists gg's flags\n\
-         #   e.g. `gg --de<TAB>` fills in `--delve`\n\
-         if [ -n \"$BASH_VERSION\" ]; then\n\
-         \x20   _bashrs_complete() {{\n\
-         \x20       local cur=${{COMP_WORDS[COMP_CWORD]}}\n\
-         \x20       [[ $cur == -* ]] && COMPREPLY=($(compgen -W \"$({BIN} complete-flags \"${{COMP_WORDS[0]}}\")\" -- \"$cur\"))\n\
-         \x20   }}\n\
-         \x20   complete -F _bashrs_complete -o default {}\n\
-         {}fi\n",
-        completion_names.join(" "),
-        stainless_flags_block(&stainless_flags)
-    );
+    let abouts = abouts(&sections);
+    body += &match shell {
+        Shell::Bash => bash::keybinds(&abouts),
+        Shell::Fish => fish::keybinds(&abouts),
+    };
+    let (completion, completed) = match shell {
+        Shell::Bash => bash::completion(&sections, &stainless_flags),
+        Shell::Fish => fish::completion(&sections, &stainless_flags),
+    };
+    body += &completion;
 
     // A load greeting — after the `gecho`/`boecho` wrappers it calls are defined.
-    body += &format!("\n# greeting\n{}", greeting::line());
+    body += &format!("\n# greeting\n{}", greeting::line(shell));
 
     // The very last lines, deliberately: while an archived config sits unmerged, the red nag
     // (via `errcho`, defined above) is the closest thing to the user's prompt.
-    body += &format!("\n\n# stale-config check\n{}", config_file::stale_config_notice());
+    body += &format!("\n\n# stale-config check\n{}", config_file::stale_config_notice(shell));
 
-    let mut out = String::from(
-        "#!/usr/bin/env bash\n\
-         # Auto-generated by `bashrs generate` — do not edit.\n\
-         # Regenerate by re-running COMPILE.sh.\n",
-    );
-    if !body.is_empty() {
-        // Interactive shells only, from the very top: a non-interactive shell that sources rc
-        // files (scp, `ssh host cmd`, wrapper scripts) must inherit NOTHING — not the greeting
-        // (stdout corrupts scp), and above all not the `python3` function, which would silently
-        // reroute an unsuspecting external script (a distro upgrade hook, say) onto the bundled
-        // interpreter. A PS1 probe would work equally well in bash, which sets PS1 in every
-        // interactive shell and even scrubs an inherited one from non-interactive shells
-        // (verified) — but `$-` *is* the interactivity flag, so it stays correct even in shells
-        // that don't maintain PS1's invariant (non-interactive zsh keeps a default PS1).
-        // `return 0` explicitly, so the early-out doesn't parrot the caller's stale status.
-        out += "\ncase $- in *i*) ;; *) return 0 ;; esac  # interactive shells only — non-interactive contexts must inherit nothing\n";
-        // The bashrs-free escape hatch: `shell_bare` starts a shell with this flag exported,
-        // and this guard CONSUMES it — unset, then return — so the shell comes up without the
-        // surface and without the flag lingering in its environment. One-shot by design: any
-        // later shell (or re-sourcing this file by hand) arms bashrs again.
-        out += "[ -n \"$_BASHRS_BARE\" ] && { unset _BASHRS_BARE ; return 0; }  # shell_bare: skip bashrs for THIS shell, flag consumed (any new shell arms again)\n";
-        // Bail early (before defining anything) if the binary isn't present. `return 0`, not a
-        // bare `return`: bare would silently forward the failed test's status 1 to whatever
-        // sourced this file, and a not-yet-installed bashrs is a quiet no-op, not an error.
-        out += &format!("[ -f {BIN} ] || return 0\n");
-        out += &body;
-    }
-    out
+    let file = match shell {
+        Shell::Bash => bash::file(&body),
+        Shell::Fish => fish::file(&body),
+    };
+    (file, completed)
 }
 
 #[cfg(test)]
@@ -447,11 +375,13 @@ mod tests {
         out
     }
     use crate::cli::Cli;
+    use crate::conf::{keybinds, RELOAD_EXIT_CODE};
     use clap::CommandFactory;
 
     #[test]
     fn complete_flags_reflect_each_variant() {
         let has = |flags: &str, want: &str| flags.split(' ').any(|flag| flag == want);
+        let complete_flags = |name| complete_flags(name, Shell::Bash);
         let gg = complete_flags("gg");
         for flag in ["-C", "--context", "--delve", "-E", "-e", "--regexp", "-s", "--help"] {
             assert!(has(&gg, flag), "gg should complete {flag}: {gg}");
@@ -475,9 +405,25 @@ mod tests {
         assert_eq!(complete_flags("no_such_command"), "");
     }
 
+    /// Fish's completer takes the same flags one per line, each with its help after a tab — the
+    /// description fish shows beside it — and both spellings of a flag carry the same one, which
+    /// fish's pager then lists together.
+    #[test]
+    fn fish_gets_the_same_flags_each_with_its_description() {
+        let fish = complete_flags("gg", Shell::Fish);
+        let bash = complete_flags("gg", Shell::Bash);
+        let spellings: Vec<&str> = fish.lines().map(|line| line.split('\t').next().unwrap_or(line)).collect();
+        assert_eq!(spellings.join(" "), bash, "the same flags, in the same order");
+        let help = |spelling: &str| fish.lines().find_map(|line| line.strip_prefix(&format!("{spelling}\t"))).map(str::to_string);
+        assert_eq!(help("-C"), help("--context"), "both spellings, one description");
+        assert!(help("--context").is_some_and(|help| !help.is_empty()), "{fish}");
+        assert_eq!(help("--help").as_deref(), Some("Print help"));
+        assert_eq!(complete_flags("no_such_command", Shell::Fish), "");
+    }
+
     #[test]
     fn wrappers_register_flag_completion() {
-        let script = wrappers();
+        let script = wrappers(Shell::Bash);
         assert!(script.contains("_bashrs_complete()"), "completer function missing");
         assert!(
             script.contains("complete-flags \"${COMP_WORDS[0]}\""),
@@ -507,7 +453,7 @@ mod tests {
         // (stainless), so this renders rows verbatim. No rows → no block at all.
         let rows = [("q".to_string(), "--explain --research -h --help".to_string()),
                     ("ai".to_string(), "--dry-run".to_string())];
-        let block = stainless_flags_block(&rows);
+        let block = bash::stainless_flags_block(&rows);
         // Arms hold their rows (spacing-agnostic — the gap is the aligner's), and `flags=`
         // sits in one column across them, so the case reads alias left, flag list right.
         assert!(block.contains("q)") && block.contains("flags=\"--explain --research -h --help\" ;;"), "{block}");
@@ -523,14 +469,14 @@ mod tests {
             block.contains("complete -F _bashrs_stainless_flags -o default q ai"),
             "both aliases registered: {block}"
         );
-        assert_eq!(stainless_flags_block(&[]), "", "no rows, no block");
+        assert_eq!(bash::stainless_flags_block(&[]), "", "no rows, no block");
     }
 
     #[test]
     fn wrappers_cover_every_command_and_alias() {
         // Collapsed before comparing: the aligner's gaps are asserted by the column tests,
         // and every line here states CONTENT only.
-        let script = flat(&wrappers());
+        let script = flat(&wrappers(Shell::Bash));
         let has = |line: &str| assert!(script.contains(line), "missing wrapper line: {line}");
         has("fs_usage() { \"$HOME/.bashrs/bashrs\" fs_usage \"$@\"; }");
         has("dl_page_links() { \"$HOME/.bashrs/bashrs\" dl_page_links \"$@\"; }");
@@ -550,9 +496,10 @@ mod tests {
         has("backup_diff() { \"$HOME/.bashrs/bashrs\" backup_diff \"$@\"; }"); // comfy: flattened filesync subcommand
         has("backup_find_bitrot() { \"$HOME/.bashrs/bashrs\" backup_find_bitrot \"$@\"; }"); // comfy: pinned variant
         has("diff() { \"$HOME/.bashrs/bashrs\" diff \"$@\"; }"); // overrides: a system command shadowed under its own name
-        // brs_compile starts a fresh session only when compile signals a reload (exit code)
+        // brs_compile starts a fresh session only when compile signals a reload (exit code), and
+        // returns the compile's own status otherwise
         has(&format!(
-            "brs_compile() {{ \"$HOME/.bashrs/bashrs\" brs_compile \"$@\"; [ \"$?\" -eq {RELOAD_EXIT_CODE} ] && shell_new; }}"
+            "brs_compile() {{ \"$HOME/.bashrs/bashrs\" brs_compile \"$@\"; local code=$?; [ \"$code\" -eq {RELOAD_EXIT_CODE} ] && shell_new; return \"$code\"; }}"
         ));
         has("brs_sourcefile() { \"$HOME/.bashrs/bashrs\" brs_sourcefile \"$@\"; }");
         has("brs_configure() { \"$HOME/.bashrs/bashrs\" brs_configure \"$@\"; }");
@@ -567,10 +514,11 @@ mod tests {
 
     #[test]
     fn wrappers_include_session_function_and_bash_guarded_keybind() {
-        let script = wrappers();
+        let script = wrappers(Shell::Bash);
         let content = flat(&script);
-        assert!(content.contains("shell_new() { exec bash; }"), "shell_new missing");
-        assert!(content.contains("shell_bare() { _BASHRS_BARE=1 exec bash; }"), "shell_bare missing");
+        // Bash's file is zsh's too: the session commands start whichever of the two runs them.
+        assert!(content.contains(r#"shell_new() { exec "${ZSH_NAME:-bash}"; }"#), "shell_new missing");
+        assert!(content.contains(r#"shell_bare() { _BASHRS_BARE=1 exec "${ZSH_NAME:-bash}"; }"#), "shell_bare missing");
         // The one-shot guard: consume the flag AND return, so a bare session starts with a clean
         // environment and the very next shell arms bashrs again.
         assert!(
@@ -596,7 +544,7 @@ mod tests {
         assert!(script.contains(r#"bind '"\eq": "brs_compile\n"'"#), "ALT+Q keybind missing");
         // Spacing-agnostic: the gap before `then` belongs to the aligner (keybinds' own test
         // asserts the column), this one only cares that the ALT+L chain is present.
-        assert!(script.contains("if pgrep -x cinnamon >/dev/null;"), "ALT+L desktop-restart missing");
+        assert!(script.contains(r#"if [[ $__bashrs_desktops == *" cinnamon "* ]];"#), "ALT+L desktop-restart missing");
         assert!(script.contains("if [ -n \"$BASH_VERSION\" ]; then"), "keybinds should be bash-guarded");
     }
 
@@ -607,7 +555,7 @@ mod tests {
     /// two are tied together here rather than left to be discovered by hand.
     #[test]
     fn every_keybind_targets_a_function_the_sourcefile_defines() {
-        let script = wrappers();
+        let script = wrappers(Shell::Bash);
         for (key, bound) in keybinds::bindings() {
             // A bind may carry arguments; only the command itself has to resolve.
             let command = bound.split_once(' ').map_or(*bound, |(name, _)| name);
@@ -640,7 +588,7 @@ mod tests {
     /// test can't see shell-body commands, so this is where the spelling is held.
     #[test]
     fn the_cd_and_define_commands_are_inline_shell() {
-        let script = wrappers();
+        let script = wrappers(Shell::Bash);
         let content = flat(&script);
         // The project root is baked at generation time, shell-quoted — no subprocess at `cd`
         // time. Asserted through the same quote + env the generator uses, so this test is
@@ -695,7 +643,7 @@ mod tests {
     /// to the longest name in the file).
     #[test]
     fn every_category_aligns_its_openers_into_a_column() {
-        let script = wrappers();
+        let script = wrappers(Shell::Bash);
         let mut sections_checked = 0_usize;
         // The category sections, plus the stainless block — not a category, but the same
         // three-column table and the same alignment promise.
@@ -730,7 +678,7 @@ mod tests {
     /// and the ordinary rows' comments snap back to their own width.
     #[test]
     fn the_shell_def_monster_does_not_stretch_its_category() {
-        let script = wrappers();
+        let script = wrappers(Shell::Bash);
         let shell: Vec<&str> = script
             .lines()
             .skip_while(|line| *line != "# shell")
@@ -764,7 +712,7 @@ mod tests {
     /// whole store), so offering them would only pollute the completion space.
     #[test]
     fn profile_commands_get_no_special_completion() {
-        let script = wrappers();
+        let script = wrappers(Shell::Bash);
         assert!(!script.contains("_bashrs_autokey_complete"), "the store completer was removed");
         assert!(
             !script.contains("user-data/sequencer/\"*.toml"),
@@ -774,7 +722,7 @@ mod tests {
 
     #[test]
     fn wrappers_include_environment_settings() {
-        let script = wrappers();
+        let script = wrappers(Shell::Bash);
         assert!(script.contains("\n# environment\n"), "environment section missing");
         assert!(script.contains("export GREP_COLORS='mt=7;31'"), "GREP_COLORS export missing");
         assert!(script.contains("export PS1=") && script.contains("(UTC)"), "PS1 export missing");
@@ -784,7 +732,7 @@ mod tests {
     fn the_interactivity_guard_tops_the_file_ahead_of_everything() {
         // Non-interactive shells must inherit nothing at all — most of all not the `python3`
         // function, which would reroute external scripts onto the bundled interpreter.
-        let script = wrappers();
+        let script = wrappers(Shell::Bash);
         let guard =
             script.find("case $- in *i*) ;; *) return 0 ;; esac").expect("interactivity guard missing");
         assert_eq!(script.matches("case $- in").count(), 1, "exactly one guard");
@@ -793,22 +741,11 @@ mod tests {
         assert!(guard < binary && binary < first_definition, "guards first, cheapest first");
     }
 
-    /// The chord spelling the comments use: modifiers in Ctrl, Alt, Shift order, key as the
-    /// keyboard labels it, an uppercase letter in the sequence meaning Shift.
-    #[test]
-    fn hotkeys_read_as_a_keyboard_labels_them() {
-        assert_eq!(hotkey_label(r"\en"), "Alt+N");
-        assert_eq!(hotkey_label(r"\e\C-n"), "Ctrl+Alt+N", "Ctrl before Alt");
-        assert_eq!(hotkey_label(r"\C-y"), "Ctrl+Y");
-        assert_eq!(hotkey_label(r"\C-\eY"), "Ctrl+Alt+Shift+Y", "Shift last, from the capital");
-        assert_eq!(hotkey_label(r"\eq"), "Alt+Q");
-    }
-
     #[test]
     fn shell_body_commands_emit_inline_functions_in_their_category() {
         // `..` must run in the calling shell (a child can't `cd` its parent), so its wrapper
         // carries the body itself — no binary call — grouped under its category like any command.
-        let script = wrappers();
+        let script = wrappers(Shell::Bash);
         let content = flat(&script);
         assert!(content.contains("..() { cd .. \"$@\"; }"), "`..` shell function missing:\n{script}");
         let filesystem = script.split("\n# ").find(|s| s.starts_with("filesystem")).expect("filesystem section");
@@ -820,12 +757,12 @@ mod tests {
 
     #[test]
     fn wrappers_end_with_the_load_greeting() {
-        assert!(wrappers().contains("gecho \"Loaded Bashrs!"), "load greeting missing");
+        assert!(wrappers(Shell::Bash).contains("gecho \"Loaded Bashrs!"), "load greeting missing");
     }
 
     #[test]
     fn wrappers_group_commands_under_a_category_comment() {
-        let script = wrappers();
+        let script = wrappers(Shell::Bash);
         // A blank line then a comment introduces each category's block.
         assert!(script.contains("\n# bashrs\n"));
         assert!(script.contains("\n# media\n"));
@@ -833,10 +770,10 @@ mod tests {
 
     #[test]
     fn wrappers_exclude_the_internal_commands() {
-        assert!(!wrappers().contains("generate() {"));
-        assert!(!wrappers().contains("complete-flags() {"));
-        assert!(!wrappers().contains("install-shell() {"));
-        assert!(!wrappers().contains("install-stainless() {"));
+        assert!(!wrappers(Shell::Bash).contains("generate() {"));
+        assert!(!wrappers(Shell::Bash).contains("complete-flags() {"));
+        assert!(!wrappers(Shell::Bash).contains("install-shell() {"));
+        assert!(!wrappers(Shell::Bash).contains("install-stainless() {"));
     }
 
     #[test]
@@ -844,7 +781,7 @@ mod tests {
         // The alias is emitted whether or not the repo has been cloned yet; only the trailing
         // `--help` comment varies with the environment, so assert just the alias line's stable
         // head — collapsed, since the block's `{` gaps belong to the aligner.
-        let content = flat(&wrappers());
+        let content = flat(&wrappers(Shell::Bash));
         assert!(content.contains("ai() { python3 \"$HOME/.bashrs/stainless_comfy/"), "stainless `ai` alias missing");
         // …and the same clone's auxiliary entry point: `ai_audit_self`, a `-m` module run from the tool's dir.
         assert!(
@@ -864,7 +801,7 @@ mod tests {
 
     #[test]
     fn wrappers_put_the_bundled_tools_on_path() {
-        let script = wrappers();
+        let script = wrappers(Shell::Bash);
         assert!(script.contains("\n# bundled tools\n"), "section missing");
         assert!(script.contains("PATH=\"$HOME/.bashrs/tools/bin:$PATH\""), "shim-dir prepend missing");
     }
@@ -873,19 +810,19 @@ mod tests {
     fn wrappers_leave_no_variable_behind_in_the_shell() {
         // The path is inlined per function, so sourcing defines functions only —
         // nothing lingers in the user's environment afterward.
-        assert!(!wrappers().contains("__bashrs_bin"));
+        assert!(!wrappers(Shell::Bash).contains("__bashrs_bin"));
     }
 
     #[test]
     fn wrappers_bail_early_when_the_binary_is_missing() {
         // `return 0` explicitly: a bare `return` would forward the failed test's status 1 to
         // whatever sourced the file, and "bashrs isn't installed" is a no-op, not an error.
-        assert!(wrappers().contains("[ -f \"$HOME/.bashrs/bashrs\" ] || return 0"));
+        assert!(wrappers(Shell::Bash).contains("[ -f \"$HOME/.bashrs/bashrs\" ] || return 0"));
     }
 
     #[test]
     fn file_opens_with_a_bash_shebang() {
-        assert!(wrappers().starts_with("#!/usr/bin/env bash\n"));
+        assert!(wrappers(Shell::Bash).starts_with("#!/usr/bin/env bash\n"));
     }
 
     #[test]
@@ -893,7 +830,7 @@ mod tests {
         // The command's clap `about` trails its wrapper as a `# ...` comment. Comments are
         // aligned into a column, so the wrapper and its comment are no longer adjacent —
         // assert each is present rather than expecting them side by side.
-        let script = wrappers();
+        let script = wrappers(Shell::Bash);
         assert!(flat(&script).contains("media_metadata() { \"$HOME/.bashrs/bashrs\" media_metadata \"$@\"; }"));
         assert!(script.contains("# Get metadata of an audio/video/image file"));
     }

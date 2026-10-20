@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::support::preferences;
+use crate::support::shell_dialect::Shell;
 
 /// The configuration file's name under `~/.bashrs` — the one place it's spelled.
 pub(crate) const CONFIG_FILE: &str = "configrs.toml";
@@ -186,19 +187,25 @@ fn qualify(section: &str, key: &str) -> String {
 /// that plain `find` would refuse to descend into. The trailing `|| true` matters: this is the
 /// sourcefile's last line, and without it a clean start (no archive) would leave the whole source
 /// with exit status 1.
-pub(crate) fn stale_config_notice() -> String {
+///
+/// Fish asks the same `find` in its own terms — whether it printed anything at all — and needs no
+/// `|| true`: an `if` whose test fails leaves status 0.
+pub(crate) fn stale_config_notice(shell: Shell) -> String {
     let stem = CONFIG_FILE.split('.').next().unwrap_or(CONFIG_FILE);
+    let find = format!("find -H \"$HOME/.bashrs\" -maxdepth 1 -name '{stem}*.old' -print -quit 2>/dev/null");
     // The command name is set off with single quotes, NOT backticks: this whole string is a
     // double-quoted argument to `errcho`, and a backtick there is command substitution — bash
     // would RUN `brs_configure -e` (opening an editor) on every interactive shell start while
     // an archive lingered, which is the opposite of an unobtrusive nag. Single quotes are literal
-    // inside double quotes, so they display and do nothing.
-    format!(
-        "[ -n \"$(find -H \"$HOME/.bashrs\" -maxdepth 1 -name '{stem}*.old' -print -quit 2>/dev/null)\" ] && \
-         errcho \"bashrs: an archived config (~/.bashrs/{stem}*.old) awaits merging into {CONFIG_FILE} \
-         (run 'brs_configure -e' to merge, then delete the .old file)\" \
-         || true\n"
-    )
+    // inside double quotes, so they display and do nothing — in fish's double quotes as in bash's.
+    let nag = format!(
+        "errcho \"bashrs: an archived config (~/.bashrs/{stem}*.old) awaits merging into {CONFIG_FILE} \
+         (run 'brs_configure -e' to merge, then delete the .old file)\""
+    );
+    match shell {
+        Shell::Bash => format!("[ -n \"$({find})\" ] && {nag} || true\n"),
+        Shell::Fish => format!("if {find} | string length -q\n    {nag}\nend\n"),
+    }
 }
 
 /// Bundle the programming languages (python + uv) even when the system provides them
@@ -385,7 +392,7 @@ mod tests {
 
     #[test]
     fn the_stale_notice_uses_symlink_following_find_and_errcho() {
-        let notice = stale_config_notice();
+        let notice = stale_config_notice(Shell::Bash);
         assert!(
             notice.contains("find -H \"$HOME/.bashrs\""),
             "glob-free (zsh-safe) and symlink-following (~/.bashrs may be a dotfiles symlink): {notice}"
@@ -403,7 +410,7 @@ mod tests {
     /// an editor in the user's face each session. It still has to name the command, so that stays.
     #[test]
     fn the_stale_notice_names_the_fix_without_executing_anything() {
-        let notice = stale_config_notice();
+        let notice = stale_config_notice(Shell::Bash);
         assert!(
             !notice.contains('`'),
             "a backtick in this errcho argument is command substitution, run every prompt: {notice}"
@@ -412,5 +419,22 @@ mod tests {
         // deliberate `$(find …)` guard, so any OTHER must be absent. (There's exactly one `$(`.)
         assert_eq!(notice.matches("$(").count(), 1, "only the find-guard may substitute: {notice}");
         assert!(notice.contains("brs_configure -e"), "it must still name the fix: {notice}");
+    }
+
+    /// Fish's nag asks the same `find`, as an `if` on whether it printed anything — and is held to
+    /// the same rule: nothing in the message may run.
+    #[test]
+    fn fish_s_stale_notice_is_the_same_check_in_fish_s_terms() {
+        let notice = stale_config_notice(Shell::Fish);
+        assert!(notice.starts_with("if find -H \"$HOME/.bashrs\" -maxdepth 1 -name 'configrs*.old' -print -quit 2>/dev/null | string length -q\n"), "{notice}");
+        assert!(notice.contains("\n    errcho \"bashrs: an archived config"), "{notice}");
+        assert!(notice.ends_with("\nend\n"), "{notice}");
+        assert!(!notice.contains('`') && !notice.contains("$(") && !notice.contains("|| true"), "{notice}");
+        let nag = |notice: &str| notice.lines().find(|line| line.contains("errcho")).map(|line| line.trim_start().to_string());
+        assert_eq!(
+            nag(&notice).as_deref().and_then(|line| line.strip_prefix("errcho ")),
+            nag(&stale_config_notice(Shell::Bash)).as_deref().and_then(|line| line.split(" && errcho ").nth(1)).and_then(|rest| rest.strip_suffix(" || true")),
+            "the same message in both shells"
+        );
     }
 }

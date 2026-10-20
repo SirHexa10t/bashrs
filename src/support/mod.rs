@@ -7,7 +7,8 @@
 //! resolution ([`input`]), the network-probing engines ([`net`]), an in-process stream grep
 //! ([`streamgrep`]), a
 //! recursive tree grep ([`treegrep`] — its `--delve` binary decoders are a private child), output
-//! capture and the stdout colour policy ([`shell`]), shell-word quoting shared by the
+//! capture and the stdout colour policy ([`shell`]), the shells the sourcefile is written for and
+//! the per-shell shape of hand-written shell ([`shell_dialect`]), shell-word quoting shared by the
 //! string-displaying commands ([`shell_quote`]), filename-stamp formatting ([`preferences`]),
 //! privilege escalation ([`superuser`]), and the system package-manager registry
 //! ([`package_management`]).
@@ -27,6 +28,7 @@ pub mod net;
 pub use software_inventory::{package_management, prog_langs};
 pub mod preferences;
 pub mod shell;
+pub mod shell_dialect;
 pub mod shell_quote;
 pub mod streamgrep;
 pub mod superuser;

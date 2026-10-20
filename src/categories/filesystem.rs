@@ -14,12 +14,13 @@ mod commands {
 
     use crate::support::doc_style::{self, _header};
     use crate::support::exec;
+    use crate::support::shell_dialect::Shell;
     use crate::support::shell_quote;
     use clap::Args;
 
     /// Hop one directory up
     #[name("..")]
-    #[shell_body("cd .. \"$@\"")]
+    #[shell_body(bash = "cd .. \"$@\"", fish = "cd .. $argv")]
     pub fn dir_up() {}
 
     /// Custom `ls` (like `ll`): a long, all-files listing aligned into a table. Extra
@@ -34,7 +35,7 @@ mod commands {
             // one at all — the common case stays a single `ls` and nothing more.
             let targets =
                 if output.contains(".lnk") { _lnk_targets(&args.passthrough) } else { HashMap::new() };
-            for row in _format_listing(&output, &targets) {
+            for row in _format_listing(&output, &targets, Shell::caller()) {
                 println!("{row}");
             }
         }
@@ -81,7 +82,7 @@ mod commands {
         let stats = _entry_stats(&root, &_entry_keys(&output));
         let targets =
             if output.contains(".lnk") { _lnk_targets(&args.passthrough) } else { HashMap::new() };
-        for row in _usage_listing(&output, &stats, &targets) {
+        for row in _usage_listing(&output, &stats, &targets, Shell::caller()) {
             println!("{row}");
         }
     }
@@ -215,6 +216,7 @@ mod commands {
         ls_output: &str,
         stats: &HashMap<String, Stats>,
         targets: &HashMap<String, String>,
+        shell: Shell,
     ) -> Vec<String> {
         let mut rows: Vec<(Option<u64>, String, String)> = Vec::new();
         for record in _records(ls_output) {
@@ -234,7 +236,7 @@ mod commands {
                 "{}\t{}\t{}",
                 figures.join("\t"),
                 kept.join("\t"),
-                _link_cell(&meta, name, targets)
+                _link_cell(&meta, name, targets, shell)
             );
             rows.push((measured.map(|s| s.bytes), key, row));
         }
@@ -280,11 +282,11 @@ mod commands {
     ///
     /// Records are NUL-separated, per [`LS_FLAGS`]'s `--zero`; the trailing NUL leaves an empty
     /// final record, which drops out with the block-count line.
-    fn _format_listing(ls_output: &str, targets: &HashMap<String, String>) -> Vec<String> {
+    fn _format_listing(ls_output: &str, targets: &HashMap<String, String>, shell: Shell) -> Vec<String> {
         let header = _header(&HEADER.join("\t"));
         let rows: Vec<String> = std::iter::once(header)
             .chain(
-                _records(ls_output).map(|record| _row(record, targets)),
+                _records(ls_output).map(|record| _row(record, targets, shell)),
             )
             .collect();
         // The fallback is unreachable: only `sort` can error, and it's off.
@@ -307,18 +309,18 @@ mod commands {
     /// spaces, tabs and newlines, and a symlink's ` -> target` rides in the same field. Only the
     /// metadata is consumed field by field, and only on spaces — `ls` pads those columns with
     /// spaces, so a tab that belongs to the name is never mistaken for a delimiter.
-    fn _row(record: &str, targets: &HashMap<String, String>) -> String {
+    fn _row(record: &str, targets: &HashMap<String, String>, shell: Shell) -> String {
         if record.is_empty() {
             return String::new();
         }
         let (meta, name) = _split_record(record);
         if meta.is_empty() {
-            return _display_name(name); // a fragment, not a listing row
+            return _display_name(name, shell); // a fragment, not a listing row
         }
         if name.is_empty() {
             return meta.join("\t");
         }
-        format!("{}\t{}", meta.join("\t"), _link_cell(&meta, name, targets))
+        format!("{}\t{}", meta.join("\t"), _link_cell(&meta, name, targets, shell))
     }
 
     /// A record's [`META_COLS`] metadata fields and the exact name remainder. Split only on
@@ -345,13 +347,13 @@ mod commands {
     /// file merely *named* `evil -> fake.txt` stays whole. When a symlink's own name also contains
     /// ` -> ` the split is genuinely ambiguous — `ls` gives us no delimiter to trust — and the
     /// first arrow wins.
-    fn _link_cell(meta: &[&str], name: &str, targets: &HashMap<String, String>) -> String {
+    fn _link_cell(meta: &[&str], name: &str, targets: &HashMap<String, String>, shell: Shell) -> String {
         let is_symlink = meta.get(1).is_some_and(|mode| mode.starts_with('l'));
         match name.split_once(" -> ").filter(|_| is_symlink) {
             Some((link, target)) => {
-                format!("{} -> {}", _name_cell(link, targets), _display_name(target))
+                format!("{} -> {}", _name_cell(link, targets, shell), _display_name(target, shell))
             }
-            None => _name_cell(name, targets),
+            None => _name_cell(name, targets, shell),
         }
     }
 
@@ -361,7 +363,9 @@ mod commands {
     /// How a name has to be spelled for bash to read back exactly the bytes on disk. The
     /// bare/`'…'`/`$'…'` decision is [`crate::support::shell_quote`]'s (shared with
     /// `shell_args_print`); this variant differs only by forcing `$'…'` on a two-space run, which
-    /// the table's column divider ([`TABLE_SEPARATOR`]) would otherwise cut the name at.
+    /// the table's column divider ([`TABLE_SEPARATOR`]) would otherwise cut the name at. Fish
+    /// needs only the first two tiers: its quotes hold a `'` (as `\'`), and what they cannot hold
+    /// is written between quoted runs ([`shell_quote::FishWord`]).
     #[derive(PartialEq, Eq, Debug)]
     enum _Quoting {
         /// Bare-safe — print it as it is.
@@ -383,8 +387,9 @@ mod commands {
         _Quoting::Single
     }
 
-    /// Render `name` so that it is unambiguous, safe in a table cell, and still a valid bash word
-    /// — paste it into a command and you get the file you were looking at.
+    /// Render `name` so that it is unambiguous, safe in a table cell, and still a valid word of
+    /// `shell`, the one `lll` was run from — paste it into a command and you get the file you were
+    /// looking at.
     ///
     /// Marking only appears where it carries meaning: an ordinary name prints untouched. When it
     /// is needed, the form itself distinguishes cases the eye cannot. A file whose name really
@@ -398,17 +403,26 @@ mod commands {
     /// `ls`'s colour sequences ride through untouched — they are control characters too, and
     /// escaping them would print the codes instead of colouring the name. The type marker `ls -F`
     /// appends stays outside the quotes, where it belongs: `'a dir'/`, not `'a dir/'`.
-    fn _display_name(name: &str) -> String {
+    ///
+    /// Fish spells the same names its own way: `'it\'s.txt'` where bash needs `$'it\'s.txt'`, and
+    /// a newline as `'aa'\n'bb.txt'` — fish has no `$'…'` to put it in.
+    fn _display_name(name: &str, shell: Shell) -> String {
         let (body, marker) = match name.strip_suffix(|ch: char| TYPE_MARKERS.contains(ch)) {
             Some(body) => (body, &name[body.len()..]),
             None => (name, ""),
         };
         let plain = console::strip_ansi_codes(body);
         let escape_spaces = plain.contains("  ");
-        match _quoting_for(&plain) {
-            _Quoting::Bare => name.to_string(),
-            _Quoting::Single => format!("'{body}'{marker}"),
-            _Quoting::Ansi => {
+        match (_quoting_for(&plain), shell) {
+            (_Quoting::Bare, _) => name.to_string(),
+            (_, Shell::Fish) => {
+                let mut word = shell_quote::FishWord::default();
+                let mut spelled = _map_outside_ansi(body, |ch, out| word.push(ch, escape_spaces, out));
+                word.finish(&mut spelled);
+                format!("{spelled}{marker}")
+            }
+            (_Quoting::Single, Shell::Bash) => format!("'{body}'{marker}"),
+            (_Quoting::Ansi, Shell::Bash) => {
                 // Escape outside ls's colour spans (they're control bytes too, but escaping them
                 // would print the codes instead of colouring the name); the per-character rule is
                 // the shared one.
@@ -446,18 +460,18 @@ mod commands {
     /// name and its target — or `?` when the target can't be read — go red via `recho`'s
     /// style, joined by a plain ` (Windows)-> ` marker so it fits `ls`'s aesthetic and
     /// reads unambiguously. Any other entry keeps `ls`'s own colouring untouched.
-    fn _name_cell(name: &str, targets: &HashMap<String, String>) -> String {
+    fn _name_cell(name: &str, targets: &HashMap<String, String>, shell: Shell) -> String {
         // Takes the name as `ls` gave it, before [`_display_name`] can wrap it in quotes — a
         // quoted `'shortcut.lnk'` would no longer end in `.lnk` and the check below would miss it.
         // Cheap reject first: no `.lnk` substring → not a shortcut, so skip the ANSI strip.
         // (`ls` colours a name as a single span, so `.lnk` survives contiguously in it.)
         if !name.contains(".lnk") {
-            return _display_name(name);
+            return _display_name(name, shell);
         }
         let plain = console::strip_ansi_codes(name);
         let plain = plain.strip_suffix(|c: char| TYPE_MARKERS.contains(c)).unwrap_or(&plain); // -F indicator
         if !plain.ends_with(".lnk") {
-            return _display_name(name); // `.lnk` appeared mid-name, not as the extension
+            return _display_name(name, shell); // `.lnk` appeared mid-name, not as the extension
         }
         let red = doc_style::broken_link_text;
         // `?` stands in when the shortcut's target can't be read (unparseable / uncorrelated).
@@ -465,7 +479,7 @@ mod commands {
             Some(t) => t.split_whitespace().collect::<Vec<_>>().join(" "),
             None => "?".to_string(),
         };
-        format!("{} (Windows)-> {}", red(&_display_name(plain)), red(&target))
+        format!("{} (Windows)-> {}", red(&_display_name(plain, shell)), red(&target))
     }
 
     // ——— `.lnk` targets (I/O + parsing) ——————————————————————————————————
@@ -788,7 +802,7 @@ mod commands {
         #[test]
         fn row_delimits_metadata_and_keeps_a_simple_name() {
             assert_eq!(
-                _row(&row("file.txt"), &HashMap::new()),
+                _row(&row("file.txt"), &HashMap::new(), Shell::Bash),
                 "4\t-rw-r--r--\t1\tuser\tgroup\t1.2K\t2024-01-01_12:00:00\tfile.txt"
             );
         }
@@ -800,7 +814,7 @@ mod commands {
 
         #[test]
         fn row_spells_a_spaced_name_as_one_shell_word() {
-            let out = _row(&row("my report final.txt"), &HashMap::new());
+            let out = _row(&row("my report final.txt"), &HashMap::new(), Shell::Bash);
             assert!(out.ends_with("\t'my report final.txt'"), "{out}");
         }
 
@@ -808,7 +822,7 @@ mod commands {
         fn row_spells_each_side_of_a_symlink_separately() {
             // Two paths, not one name — quoting the pair whole would claim a file exists under
             // the entire `a link -> real target.txt` string.
-            let out = _row(&link_row("a link -> real target.txt"), &HashMap::new());
+            let out = _row(&link_row("a link -> real target.txt"), &HashMap::new(), Shell::Bash);
             assert!(out.ends_with("\t'a link' -> 'real target.txt'"), "{out}");
         }
 
@@ -816,7 +830,7 @@ mod commands {
         fn row_leaves_an_arrow_in_an_ordinary_name_whole() {
             // Same text, but the mode says regular file: it is one name that merely looks like a
             // link, and splitting it would invent a target that does not exist.
-            let out = _row(&row("evil -> fake.txt"), &HashMap::new());
+            let out = _row(&row("evil -> fake.txt"), &HashMap::new(), Shell::Bash);
             assert!(out.ends_with("\t'evil -> fake.txt'"), "{out}");
         }
 
@@ -825,9 +839,9 @@ mod commands {
             // A run of two spaces is this table's column divider, so it cannot stand literally.
             // `$'…'` removes the run without the name losing a single byte — where the old
             // behaviour quietly collapsed it and reported a filename that did not exist.
-            let runs = _row(&row("two  spaces"), &HashMap::new());
+            let runs = _row(&row("two  spaces"), &HashMap::new(), Shell::Bash);
             assert!(runs.ends_with("\t$'two\\x20\\x20spaces'"), "{runs}");
-            let tabs = _row("4 -rw-r--r-- 1 u g 1K date a\tb\tc", &HashMap::new());
+            let tabs = _row("4 -rw-r--r-- 1 u g 1K date a\tb\tc", &HashMap::new(), Shell::Bash);
             assert!(tabs.ends_with("\t$'a\\tb\\tc'"), "a tab is escaped, not turned into a space: {tabs}");
         }
 
@@ -836,8 +850,8 @@ mod commands {
         /// literally named `aa\nbb.txt` would print identically, and neither could be acted on.
         #[test]
         fn a_real_newline_and_a_literal_backslash_n_are_told_apart() {
-            let real = _row(&row("aa\nbb.txt"), &HashMap::new());
-            let literal = _row(&row("aa\\nbb.txt"), &HashMap::new());
+            let real = _row(&row("aa\nbb.txt"), &HashMap::new(), Shell::Bash);
+            let literal = _row(&row("aa\\nbb.txt"), &HashMap::new(), Shell::Bash);
             assert!(real.ends_with("\t$'aa\\nbb.txt'"), "a real newline: {real}");
             assert!(literal.ends_with("\t'aa\\nbb.txt'"), "a literal backslash-n: {literal}");
             assert_ne!(real, literal, "the two must never render the same");
@@ -847,37 +861,60 @@ mod commands {
         /// (where it escapes as `\'`) while `"` is content like any other inside `'…'`.
         #[test]
         fn quotes_in_names_are_spelled_so_bash_reads_them_back() {
-            let single = _row(&row("quo'te.txt"), &HashMap::new());
+            let single = _row(&row("quo'te.txt"), &HashMap::new(), Shell::Bash);
             assert!(single.ends_with("\t$'quo\\'te.txt'"), "{single}");
-            let double = _row(&row("dou\"ble.txt"), &HashMap::new());
+            let double = _row(&row("dou\"ble.txt"), &HashMap::new(), Shell::Bash);
             assert!(double.ends_with("\t'dou\"ble.txt'"), "{double}");
-            let both = _row(&row("both'and\".txt"), &HashMap::new());
+            let both = _row(&row("both'and\".txt"), &HashMap::new(), Shell::Bash);
             assert!(both.ends_with("\t$'both\\'and\".txt'"), "{both}");
+        }
+
+        /// The same names spelled for fish, which has no `$'…'`: its quotes hold a `'` and double a
+        /// `\`, and what they cannot hold sits between quoted runs. Fish itself reads every
+        /// spelling back as the name on disk.
+        #[test]
+        fn names_are_spelled_so_fish_reads_them_back() {
+            let fish = |name: &str| {
+                let row = _row(&row(name), &HashMap::new(), Shell::Fish);
+                row.rsplit('\t').next().unwrap_or_default().to_string()
+            };
+            assert_eq!(fish("plain.txt"), "plain.txt", "bare, as for bash");
+            assert_eq!(fish("quo'te.txt"), r"'quo\'te.txt'");
+            assert_eq!(fish("aa\nbb.txt"), r"'aa'\n'bb.txt'");
+            assert_eq!(fish("aa\\nbb.txt"), r"'aa\\nbb.txt'", "a literal backslash, doubled in fish's quotes");
+            assert_eq!(fish("two  spaces"), r"'two'\x20\x20'spaces'", "the column divider can't cut it");
+            for name in ["quo'te.txt", "aa\nbb.txt", "aa\\nbb.txt", "two  spaces", "a\tb", "back\\", "dou\"ble $x * ~.txt"] {
+                let out = std::process::Command::new("fish")
+                    .args(["--no-config", "-c", &format!("printf '%s' {}", fish(name))])
+                    .output()
+                    .expect("fish is needed to check fish's spelling of names");
+                assert_eq!(String::from_utf8_lossy(&out.stdout), name, "`{}` reads back as another name", fish(name));
+            }
         }
 
         /// Marking is only for names that need it — an ordinary one must stay bare, or every
         /// listing turns into a wall of quotes.
         #[test]
         fn ordinary_names_are_left_unquoted() {
-            assert!(_row(&row("plain.txt"), &HashMap::new()).ends_with("\tplain.txt"));
-            assert!(_row(&row("dotted.name-v2_final.tar.gz"), &HashMap::new()).ends_with("\tdotted.name-v2_final.tar.gz"));
+            assert!(_row(&row("plain.txt"), &HashMap::new(), Shell::Bash).ends_with("\tplain.txt"));
+            assert!(_row(&row("dotted.name-v2_final.tar.gz"), &HashMap::new(), Shell::Bash).ends_with("\tdotted.name-v2_final.tar.gz"));
         }
 
         #[test]
         fn row_survives_short_lines() {
-            assert_eq!(_row("fragment", &HashMap::new()), "fragment");
-            assert_eq!(_row("", &HashMap::new()), "");
+            assert_eq!(_row("fragment", &HashMap::new(), Shell::Bash), "fragment");
+            assert_eq!(_row("", &HashMap::new(), Shell::Bash), "");
         }
 
         #[test]
         fn name_cell_leaves_a_regular_entry_untouched() {
             let colored = "\x1b[01;34mnotes.txt\x1b[0m";
-            assert_eq!(_name_cell(colored, &HashMap::new()), colored);
+            assert_eq!(_name_cell(colored, &HashMap::new(), Shell::Bash), colored);
         }
 
         #[test]
         fn name_cell_flags_a_lnk_with_its_target_in_red() {
-            let cell = _name_cell("shortcut.lnk", &one_target("shortcut.lnk", "C:\\app\\x.exe"));
+            let cell = _name_cell("shortcut.lnk", &one_target("shortcut.lnk", "C:\\app\\x.exe"), Shell::Bash);
             assert!(cell.contains("(Windows)->"), "marker missing: {cell}");
             assert!(cell.contains("C:\\app\\x.exe"), "target missing: {cell}");
             assert!(cell.contains("\x1b[1;31m"), "should be bold red: {cell}");
@@ -885,7 +922,7 @@ mod commands {
 
         #[test]
         fn name_cell_flags_a_lnk_with_a_question_mark_when_unresolved() {
-            let cell = _name_cell("mystery.lnk", &HashMap::new());
+            let cell = _name_cell("mystery.lnk", &HashMap::new(), Shell::Bash);
             assert!(cell.contains("(Windows)-> "), "marker missing: {cell}");
             assert!(cell.contains('?'), "unresolved target should show `?`: {cell}");
             assert!(cell.contains("\x1b[1;31m"), "should be bold red: {cell}");
@@ -894,20 +931,20 @@ mod commands {
         #[test]
         fn name_cell_detects_lnk_through_ansi_and_type_indicator() {
             // `ls --color=always -F` can wrap the name in colour codes and append `*`.
-            let cell = _name_cell("\x1b[01;32mrun.lnk\x1b[0m*", &HashMap::new());
+            let cell = _name_cell("\x1b[01;32mrun.lnk\x1b[0m*", &HashMap::new(), Shell::Bash);
             assert!(cell.contains("(Windows)->"), "should see .lnk under ANSI + indicator: {cell}");
         }
 
         #[test]
         fn format_listing_annotates_a_lnk_row_and_drops_total() {
-            let out = _format_listing(&format!("total 0\0{}\0", row("go.lnk")), &one_target("go.lnk", "C:\\tools\\go.exe"));
+            let out = _format_listing(&format!("total 0\0{}\0", row("go.lnk")), &one_target("go.lnk", "C:\\tools\\go.exe"), Shell::Bash);
             assert_eq!(out.len(), 2, "header + one row");
             assert!(out[1].contains("(Windows)->") && out[1].contains("C:\\tools\\go.exe"), "row: {}", out[1]);
         }
 
         #[test]
         fn format_listing_leads_with_a_header() {
-            let out = _format_listing(&format!("total 8\0{}\0{}\0", row("a.txt"), row("b.txt")), &HashMap::new());
+            let out = _format_listing(&format!("total 8\0{}\0{}\0", row("a.txt"), row("b.txt")), &HashMap::new(), Shell::Bash);
             assert_eq!(out.len(), 3, "header + two files");
             assert!(out[0].contains("Blocks") && out[0].contains("Filename"), "first row is the header");
         }
@@ -922,7 +959,7 @@ mod commands {
                 ["two\nlines.txt", "tab\there.txt", "spaces in name.txt", "trailing space .txt"];
             let listing =
                 format!("total 0\0{}\0", names.iter().map(|n| row(n)).collect::<Vec<_>>().join("\0"));
-            let out = _format_listing(&listing, &HashMap::new());
+            let out = _format_listing(&listing, &HashMap::new(), Shell::Bash);
 
             assert_eq!(out.len(), names.len() + 1, "header + exactly one row per entry: {out:#?}");
             assert!(
@@ -940,7 +977,7 @@ mod commands {
         #[test]
         fn arrows_in_names_and_symlink_targets_both_survive() {
             let listing = format!("total 0\0{}\0{}\0", row("evil -> fake.txt"), row("a link -> real target.txt"));
-            let out = _format_listing(&listing, &HashMap::new());
+            let out = _format_listing(&listing, &HashMap::new(), Shell::Bash);
             assert_eq!(out.len(), 3, "header + two entries: {out:#?}");
             assert!(out[1].contains("evil -> fake.txt"), "a name that looks like a link: {}", out[1]);
             assert!(out[2].contains("a link -> real target.txt"), "an actual link: {}", out[2]);
@@ -957,7 +994,7 @@ mod commands {
         fn joined(records: &[String], measured: &[(&str, Stats)]) -> Vec<String> {
             let map: HashMap<String, Stats> =
                 measured.iter().map(|(name, s)| ((*name).to_string(), *s)).collect();
-            _usage_listing(&format!("total 0\0{}\0", records.join("\0")), &map, &HashMap::new())
+            _usage_listing(&format!("total 0\0{}\0", records.join("\0")), &map, &HashMap::new(), Shell::Bash)
                 .into_iter()
                 .map(|line| console::strip_ansi_codes(&line).into_owned())
                 .collect()

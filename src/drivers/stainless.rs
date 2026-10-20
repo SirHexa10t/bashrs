@@ -1,5 +1,5 @@
 //! Non-Rust ("stainless" — Rust-resistant) companion repos, cloned under `~/.bashrs/stainless_comfy`
-//! and exposed as plain shell aliases in `sourcefile.sh`. Data-driven, like [`crate::conf::keybinds`]: a
+//! and exposed as plain shell aliases in the sourcefiles (bash's and fish's). Data-driven, like [`crate::conf::keybinds`]: a
 //! `const` table plus functions that turn it into shell lines — no macro, no clap command.
 //!
 //! Two consumers of the one table:
@@ -11,8 +11,12 @@
 //! `sync` runs first in `COMPILE.sh`, so the clones exist when `aliases` probes them. The clone is
 //! the only shared artifact — nothing copies the tool's own `--help` into a side file to go stale.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+
+use crate::support::shell_dialect::{fish_function, Shell, FISH_DESCRIPTION};
 
 /// One of your own non-Rust repos (a future external kind would be a sibling struct in this table).
 struct Comfy {
@@ -302,13 +306,26 @@ pub fn clone_revisions() -> Vec<(&'static str, Option<String>)> {
 const PROBE_COLUMNS: u32 = 10_000;
 
 /// Run a `--help` probe `script` through bash (so `$HOME` expands and a `cd` is possible) and
-/// return its full text. One probe serves both consumers — [`extract_about`] for the alias's
-/// inline comment and [`extract_flags`] for its TAB completion — so each tool starts (a python
-/// interpreter, at compile time) once, not twice. Best-effort: a spawn failure or a non-zero exit
-/// yields `None` (no comment, no completion).
+/// return its full text. One probe serves every consumer — [`extract_about`] for the alias's
+/// inline comment and [`extract_flags`] for its TAB completion, in bash's file and in fish's — so
+/// each tool starts (a python interpreter, at compile time) once per process: the install writes
+/// both files, and the second asks this memo. Best-effort: a spawn failure or a non-zero exit
+/// yields `None` (no comment, no completion), remembered like an answer.
 fn probe_help(script: &str) -> Option<String> {
-    let out = Command::new("bash").arg("-c").arg(script).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    static PROBED: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+    let probed = PROBED.get_or_init(Mutex::default);
+    if let Some(help) = probed.lock().ok()?.get(script) {
+        return help.clone();
+    }
+    let help = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
+    probed.lock().ok()?.insert(script.to_string(), help.clone());
+    help
 }
 
 /// Probe the main launcher or a sibling [`Script`]: `<run> "<clone-path>" --help`, run by absolute
@@ -383,7 +400,7 @@ fn extract_flags(help: &str) -> Vec<String> {
 /// dropped from its own row, like the CLI's `HIDDEN_PINNED`: `q2` never offers the `--explain`
 /// it already passes. The clone check keeps it from spawning anything before the first `sync`
 /// (or during tests).
-pub(crate) fn aliases() -> (String, Vec<(String, String)>) {
+pub(crate) fn aliases(shell: Shell) -> (String, Vec<(String, String)>) {
     let mut lines = String::new();
     let mut completions: Vec<(String, String)> = Vec::new();
     let mut complete = |alias: &str, flags: &[String], pinned: &str| {
@@ -401,12 +418,18 @@ pub(crate) fn aliases() -> (String, Vec<(String, String)>) {
         let exists = clone_dir(comfy).exists();
         let help = exists.then(|| fetch_help(comfy, comfy.exe)).flatten();
         let about = help.as_deref().and_then(extract_about);
-        lines.push_str(&alias_line(comfy, about.as_deref()));
+        lines.push_str(&match shell {
+            Shell::Bash => alias_line(comfy, about.as_deref()),
+            Shell::Fish => alias_fish(comfy, about.as_deref()),
+        });
         complete(comfy.alias, &help.as_deref().map(extract_flags).unwrap_or_default(), "");
         for aux in comfy.aux {
             let help = exists.then(|| fetch_help_aux(comfy, aux)).flatten();
             let about = help.as_deref().and_then(extract_about);
-            lines.push_str(&aux_line(comfy, aux, about.as_deref()));
+            lines.push_str(&match shell {
+                Shell::Bash => aux_line(comfy, aux, about.as_deref()),
+                Shell::Fish => aux_fish(comfy, aux, about.as_deref()),
+            });
             complete(aux.alias, &help.as_deref().map(extract_flags).unwrap_or_default(), "");
         }
         for script in comfy.scripts {
@@ -417,21 +440,25 @@ pub(crate) fn aliases() -> (String, Vec<(String, String)>) {
                 false => exists.then(|| fetch_help(comfy, script.exe)).flatten(),
             };
             let about = help.as_deref().and_then(extract_about);
-            lines.push_str(&script_lines(comfy, script, about.as_deref()));
+            lines.push_str(&match shell {
+                Shell::Bash => script_lines(comfy, script, about.as_deref()),
+                Shell::Fish => scripts_fish(comfy, script, about.as_deref()),
+            });
             let flags = help.as_deref().map(extract_flags).unwrap_or_default();
             for (alias, pinned) in script.variants {
                 complete(alias, &flags, pinned);
             }
         }
     }
-    // The block is a table like every category's: name, `{`-opened body, `#` comment, each in
-    // its own column. Aligned here, where the lines are born (the same division as
-    // `keybinds::desktop_restart`); the pure line builders below stay gap-free and their tests
-    // stay exact.
-    let aligned = crate::support::align::align_columns(
-        lines.lines().map(str::to_string).collect(),
-        &["{", "# "],
-    );
+    // The block is a table like every category's — bash's: name, `{`-opened body, `#` comment,
+    // each in its own column; fish's: name, then description and body. Aligned here, where the
+    // lines are born (the same division as `keybinds::desktop_restart`); the pure line builders
+    // below stay gap-free and their tests stay exact.
+    let lines: Vec<String> = lines.lines().map(str::to_string).collect();
+    let aligned = match shell {
+        Shell::Bash => crate::support::align::align_columns(lines, &["{", "# "]),
+        Shell::Fish => crate::support::align::align_columns(lines, &[FISH_DESCRIPTION]),
+    };
     let mut lines: String = aligned.join("\n");
     if !lines.is_empty() {
         lines.push('\n');
@@ -472,6 +499,40 @@ fn script_lines(comfy: &Comfy, script: &Script, about: Option<&str>) -> String {
                 Some(about) => format!("  # {about} ({args})"),
             };
             format!("{alias}() {{ {} \"{path}\"{flags} \"$@\"; }}{comment}\n", comfy.run)
+        })
+        .collect()
+}
+
+/// Pure: [`alias_line`] in fish — one function, the probed `about` as its description.
+fn alias_fish(comfy: &Comfy, about: Option<&str>) -> String {
+    fish_function(comfy.alias, about, &[format!("{} \"{}\" $argv", comfy.run, exe_shell(comfy))]) + "\n"
+}
+
+/// Pure: [`aux_line`] in fish. Fish has no subshell to confine a `cd` to, so `env -C` hands the
+/// interpreter its directory instead: the caller's working directory is never changed, not even
+/// by an interrupted run, which a `pushd`/`popd` pair would not survive. What that changes: `env`
+/// finds the interpreter on PATH, where bash's subshell meets the sourcefile's `python3` function
+/// first — the same interpreter while the bundled tools' directory leads PATH, as the sourcefile
+/// arranges, and not when `config.fish` later puts another `python3` ahead of it.
+fn aux_fish(comfy: &Comfy, aux: &Aux, about: Option<&str>) -> String {
+    let run = format!("env -C \"{}\" {} {} $argv", exe_dir_shell(comfy), comfy.run, aux.args);
+    fish_function(aux.alias, about, &[run]) + "\n"
+}
+
+/// Pure: [`script_lines`] in fish — one function per variant, its pinned flags after the path, and
+/// the description naming them as the bash comment does.
+fn scripts_fish(comfy: &Comfy, script: &Script, about: Option<&str>) -> String {
+    let path = clone_path_shell(comfy, script.exe);
+    script
+        .variants
+        .iter()
+        .map(|(alias, args)| {
+            let flags = if args.is_empty() { String::new() } else { format!(" {args}") };
+            let description = match about {
+                Some(about) if !args.is_empty() => Some(format!("{about} ({args})")),
+                about => about.map(str::to_string),
+            };
+            fish_function(alias, description.as_deref(), &[format!("{} \"{path}\"{flags} $argv", comfy.run)]) + "\n"
         })
         .collect()
 }
@@ -533,7 +594,7 @@ mod tests {
     /// emitted regardless, which is exactly what the aligner works on.
     #[test]
     fn aliases_align_their_openers_into_a_column() {
-        let (lines, _) = aliases();
+        let (lines, _) = aliases(Shell::Bash);
         let braces: std::collections::BTreeSet<usize> = lines
             .lines()
             .filter(|line| line.contains("() "))
@@ -562,6 +623,53 @@ mod tests {
             script_lines(SAMPLE, &SAMPLE.scripts[0], None).contains("q() { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" \"$@\"; }\n"),
             "no about → no comment"
         );
+    }
+
+    /// The same three alias kinds as fish functions: the main one and each script variant run
+    /// by absolute path, the aux from its own directory without ever moving the caller's.
+    #[test]
+    fn fish_aliases_are_functions_and_the_aux_runs_from_its_directory_without_a_cd() {
+        let clone = "$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code";
+        assert_eq!(
+            alias_fish(SAMPLE, Some("Launch an agent")),
+            format!("function ai -d 'Launch an agent'; python3 \"{clone}/run.py\" $argv; end\n")
+        );
+        let aux = aux_fish(SAMPLE, &SAMPLE.aux[0], Some("Audit the launcher's state"));
+        assert_eq!(
+            aux,
+            format!("function ai_audit_self -d 'Audit the launcher\\'s state'; env -C \"{clone}\" python3 -m launch.audit $argv; end\n")
+        );
+        let scripts = scripts_fish(SAMPLE, &SAMPLE.scripts[0], Some("Ask a quick question"));
+        assert!(scripts.contains(&format!("function q -d 'Ask a quick question'; python3 \"{clone}/quick_question.py\" $argv; end\n")), "{scripts}");
+        assert!(scripts.contains(&format!("function q2 -d 'Ask a quick question (--explain)'; python3 \"{clone}/quick_question.py\" --explain $argv; end\n")), "{scripts}");
+        assert!(scripts_fish(SAMPLE, &SAMPLE.scripts[0], None).contains("function q; "), "no probe → no description");
+        let (block, _) = aliases(Shell::Fish);
+        assert!(!block.contains("() {"), "nothing of bash's syntax in fish's block: {block}");
+    }
+
+    /// The fish block is a table too: every described alias's description starts in one column.
+    #[test]
+    fn fish_aliases_align_their_descriptions_into_a_column() {
+        let (block, _) = aliases(Shell::Fish);
+        let columns: std::collections::BTreeSet<usize> = block.lines().filter_map(|line| line.find(" -d ")).collect();
+        assert!(columns.len() <= 1, "stainless descriptions are not one column:\n{block}");
+        assert_eq!(block.lines().count(), aliases(Shell::Bash).0.lines().count(), "one function per bash alias");
+    }
+
+    /// Each tool's `--help` is asked once per process however many files are generated from it:
+    /// the second ask is answered from memory, a failed probe included.
+    #[test]
+    fn a_help_probe_runs_once_per_process() {
+        let counter = std::env::temp_dir().join(format!("bashrs_probe_count_{}", std::process::id()));
+        let _ = std::fs::remove_file(&counter);
+        let script = format!("echo ran >> '{}'; echo 'usage: x'", counter.display());
+        assert_eq!(probe_help(&script).as_deref(), Some("usage: x\n"));
+        assert_eq!(probe_help(&script).as_deref(), Some("usage: x\n"), "the same answer the second time");
+        assert_eq!(std::fs::read_to_string(&counter).unwrap_or_default(), "ran\n", "and the tool started once");
+        let failing = format!("echo ran >> '{}'; exit 3", counter.display());
+        assert_eq!((probe_help(&failing), probe_help(&failing)), (None, None));
+        assert_eq!(std::fs::read_to_string(&counter).unwrap_or_default(), "ran\nran\n", "a failure is remembered too");
+        let _ = std::fs::remove_file(&counter);
     }
 
     #[test]

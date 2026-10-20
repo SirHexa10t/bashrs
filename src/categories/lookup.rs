@@ -65,10 +65,12 @@ mod commands {
     /// `GG`/`GGG` variants: it searches a different haystack entirely, so it reads better as a
     /// tail-end sibling than as the thing standing in front of the search families.
     #[unprefixed]
-    #[piped("history")]
+    #[piped(bash = "history", fish = "history --reverse --show-time='%F_%T  '")]
     pub fn hg(args: HgArgs) {
-        // The wrapper pipes `history` — a bash builtin only the shell itself can produce —
-        // into our stdin; we read that stream and filter it in-process.
+        // The wrapper pipes the shell's `history` — which only the shell itself can produce —
+        // into our stdin; we read that stream and filter it in-process. Fish's lists newest
+        // first and leaves out the times unless asked, so its wrapper asks for bash's order and
+        // for timestamps in the shape bash's `HISTTIMEFORMAT` gives them.
         let Some(text) = input::bytes_reported("hg", None) else { return };
         let patterns: Vec<String> = args.pattern.into_iter().chain(args.regexp).collect();
         streamgrep::filter(&patterns, &text, &streamgrep::Options::default());

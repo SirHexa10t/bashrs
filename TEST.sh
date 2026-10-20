@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # TEST.sh — run ALL of bashrs's tests, including the live ones `cargo test` skips.
 #
-# Two categories, cheapest first:
+# Four categories, cheapest first:
 #   1. offline        unit + integration (stubbed yt-dlp, fixture cookie DBs) — hermetic, fast
-#   2. live-extended  one test: that the cookie store `dl --cookie-import` writes is readable by
+#   2. macros         the proc-macro crate's own tests: the attribute contracts the compiler
+#                     enforces, e.g. that every hand-written shell fragment names both bash and
+#                     fish. Plain `cargo test` builds the macros but never runs their tests.
+#   3. fish           the fish sourcefile through a real fish (and `fish_indent`'s check of its
+#                     layout), plus fish quoting read back by fish. These also run in offline;
+#                     listed apart so a fish regression has its own line, and REQUIRED — a machine
+#                     without fish or fish_indent fails this category by name instead of skipping.
+#   4. live-extended  one test: that the cookie store `dl --cookie-import` writes is readable by
 #                     the genuine yt-dlp loader. It skips-with-notice unless a store has been
 #                     imported, and sends no network requests — it only reads a real session.
 #
@@ -16,9 +23,11 @@ command -v cargo >/dev/null 2>&1 || { printf 'ERROR: cargo not found in PATH.\n'
 cd "$(dirname "$0")"
 
 declare -A RESULT
+ORDER=()   # every category, in the order it ran — the summary reads this, never a list of its own
 
 run_category() {
     local name="$1"; shift
+    ORDER+=("$name")
     echo
     echo "=== ${name} ==="
     if "$@"; then
@@ -33,13 +42,29 @@ run_category() {
 # line, when ffmpeg or a sqlite-capable python is unavailable). Without --nocapture libtest hides
 # a passing test's output, so a silent skip would read as a clean pass — grep the run for
 # "SKIPPED" to see exactly which, if any, opted out.
+# The fish checks need fish itself — and `script` (util-linux), which gives a new fish the terminal
+# its first prompt is drawn on. Not having one is a failure, named, rather than a skip: bashrs
+# supports fish, and a run that could not check that support has not passed it.
+fish_checks() {
+    local tool status=0
+    for tool in fish fish_indent script; do
+        command -v "$tool" >/dev/null 2>&1 || { printf 'ERROR: %s not found in PATH — the fish checks need it.\n' "$tool" >&2; return 1; }
+    done
+    cargo test --no-fail-fast --lib -- --nocapture shell_quote::tests::fish \
+        categories::filesystem::tests::names_are_spelled_so_fish_reads_them_back || status=1
+    cargo test --no-fail-fast --test sourcefile_fish -- --nocapture || status=1
+    return "$status"
+}
+
 run_category "offline"       cargo test --no-fail-fast -- --nocapture
+run_category "macros"        cargo test --no-fail-fast -p bashrs-macros -- --nocapture
+run_category "fish"          fish_checks
 run_category "live-extended" cargo test --test dl_live_extended -- --ignored --test-threads=1 --nocapture
 
 echo
 echo "=== summary ==="
 failed=0
-for name in offline live-extended; do
+for name in "${ORDER[@]}"; do
     printf '  %-14s %s\n' "$name" "${RESULT[$name]}"
     [ "${RESULT[$name]}" = "FAIL" ] && failed=1
 done

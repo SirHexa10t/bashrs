@@ -1,9 +1,9 @@
 //! The install itself — the tail end of COMPILE.sh, moved into one testable implementation:
 //! guard and create `~/.bashrs`, install the running binary into it (self-copy), write the
-//! generated sourcefile, then wire each rc file the user has to source it (idempotent-by-marker,
-//! so re-runs find the block and skip). Run via the hidden `install-shell` command, COMPILE.sh's
-//! last step — invoked from the freshly built `target/release/bashrs`, which is what makes the
-//! self-copy the installation.
+//! generated sourcefiles, then wire each rc file the user has to source them (idempotent-by-marker,
+//! so re-runs find the block and skip) — and fish, through a hook in its conf.d. Run via the hidden
+//! `install-shell` command, COMPILE.sh's last step — invoked from the freshly built
+//! `target/release/bashrs`, which is what makes the self-copy the installation.
 
 use std::path::{Path, PathBuf};
 
@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 /// users sharing one rc (dotfile repos), where an expanded home would freeze this machine's
 /// path in. (COMPILE.sh's old `SRC_PATH`, renamed for what it is.)
 const UNEXPANDED_SOURCEFILE_PATH: &str = "$HOME/.bashrs/sourcefile.sh";
+
+/// The fish sourcefile's path as fish's hook sources it — unexpanded for the same reason.
+const UNEXPANDED_FISH_SOURCEFILE_PATH: &str = "$HOME/.bashrs/sourcefile.fish";
 
 /// Markers bracketing the wired block — re-runs find the opener and skip instead of appending
 /// a duplicate.
@@ -29,10 +32,11 @@ enum Wired {
 }
 
 /// SIDE EFFECTS — the whole install: guard and create `~/.bashrs`, copy the running binary in,
-/// write `content` (the generated wrappers) to `~/.bashrs/sourcefile.sh`, then wire `.bashrc`
-/// and `.zshrc`. Any failure prints and exits non-zero, aborting COMPILE.sh like its old `die`
-/// did.
-pub fn install_shell(content: &str) {
+/// write the generated sourcefiles (`bash` to `~/.bashrs/sourcefile.sh`, `fish` to
+/// `~/.bashrs/sourcefile.fish`), make bashrs's completions win for the names in `fish_completed`
+/// that fish completes too (`shadow_fish_completions`), then wire `.bashrc`, `.zshrc` and fish's
+/// conf.d. Any failure prints and exits non-zero, aborting COMPILE.sh like its old `die` did.
+pub fn install_shell(bash: &str, fish: &str, fish_completed: &[String]) {
     let home = super::bashrs_home();
     let die = |msg: String| -> ! {
         eprintln!("ERROR: {msg}");
@@ -53,34 +57,43 @@ pub fn install_shell(content: &str) {
         Ok(None) => {} // already running as the installed copy — nothing to move
         Err(msg) => die(msg),
     }
-    let sourcefile = super::sourcefile();
-    if let Err(err) = std::fs::write(&sourcefile, content) {
-        die(format!("could not write {}: {err}", sourcefile.display()));
+    let (sourcefile, fish_sourcefile) = (super::sourcefile(), super::fish_sourcefile());
+    for (file, content) in [(&sourcefile, bash), (&fish_sourcefile, fish)] {
+        if let Err(err) = std::fs::write(file, content) {
+            die(format!("could not write {}: {err}", file.display()));
+        }
+        println!("Generated {}", file.display());
     }
-    println!("Generated {}", sourcefile.display());
+    let colliding = colliding(fish_completed, &fish_complete_path());
+    match shadow_fish_completions(&super::fish_completions_dir(), &colliding) {
+        Ok(()) if colliding.is_empty() => {}
+        Ok(()) => println!("Fish ships completions for {}; bashrs's own replace them", colliding.join(", ")),
+        Err(msg) => die(msg),
+    }
 
     // The user's own home now, not `~/.bashrs` — a different directory, so a distinct name.
     let user_home = super::home();
+    // Whether one target is wired, reporting what was found; a failure ends the install.
+    let wired = |target: &Path, outcome: Result<Wired, String>| match outcome {
+        Ok(Wired::Absent) => false,
+        Ok(Wired::AlreadyPresent) => {
+            println!("Source block already present in {} — leaving it untouched.", target.display());
+            true
+        }
+        Ok(Wired::Added) => {
+            println!("Added source block to {}", target.display());
+            true
+        }
+        Err(msg) => die(msg),
+    };
     let mut any_present = false;
     for rc in [user_home.join(".bashrc"), user_home.join(".zshrc")] {
-        match wire_rc(&rc) {
-            Ok(Wired::Absent) => {}
-            Ok(Wired::AlreadyPresent) => {
-                any_present = true;
-                println!("Source block already present in {} — leaving it untouched.", rc.display());
-            }
-            Ok(Wired::Added) => {
-                any_present = true;
-                println!("Added source block to {}", rc.display());
-            }
-            Err(msg) => {
-                eprintln!("ERROR: {msg}");
-                std::process::exit(1);
-            }
-        }
+        any_present |= wired(&rc, wire_rc(&rc));
     }
-    if !any_present {
-        println!("Note: neither ~/.bashrc nor ~/.zshrc exists; nothing was wired up.");
+    let fish_config = fish_config_dir(std::env::var_os("XDG_CONFIG_HOME").as_deref(), &user_home);
+    let fish_wired = wired(&fish_hook(&fish_config), wire_fish(&fish_config));
+    if !(any_present || fish_wired) {
+        println!("Note: neither ~/.bashrc nor ~/.zshrc exists, and fish has no configuration directory; nothing was wired up.");
     }
     println!();
     // A `brs_compile` (the everyday recompile) reloads the shell for you the instant this
@@ -88,21 +101,24 @@ pub fn install_shell(content: &str) {
     // run with no reload coming (a first-time `./COMPILE.sh`, or the script run by hand) needs
     // the manual instruction. Which one this is is read off the process tree, where the fact
     // already lives — see [`reload_follows`].
-    println!("{}", activation_line(reload_follows(), &sourcefile));
+    let fish_sourcefile = fish_wired.then_some(fish_sourcefile.as_path());
+    println!("{}", activation_line(reload_follows(), &sourcefile, fish_sourcefile));
 }
 
 /// The install's closing line. When a shell reload will follow (the `brs_compile` flow),
 /// say so — the prompt is about to reset under the user, and asking them to act would contradict
-/// what's happening. Otherwise (a first-time `./COMPILE.sh`), name the one step that activates it.
+/// what's happening. Otherwise (a first-time `./COMPILE.sh`), name the one step that activates it
+/// — and fish's own, when fish was wired (`fish_sourcefile`).
 ///
 /// The backticks around the command are display only: this string leaves through `println!`, not
 /// through a shell, so nothing here is ever evaluated — unlike the sourcefile's stale-config nag,
 /// where a backtick once meant command substitution at every prompt.
-fn activation_line(reload_follows: bool, sourcefile: &Path) -> String {
+fn activation_line(reload_follows: bool, sourcefile: &Path, fish_sourcefile: Option<&Path>) -> String {
     if reload_follows {
         "Done — reloading your shell.".to_string()
     } else {
-        format!("Done. Open a new shell, or run:  `. \"{}\"`", sourcefile.display())
+        let fish = fish_sourcefile.map(|fish| format!("  (in fish:  `source \"{}\"`)", fish.display()));
+        format!("Done. Open a new shell, or run:  `. \"{}\"`{}", sourcefile.display(), fish.unwrap_or_default())
     }
 }
 
@@ -218,23 +234,114 @@ fn wire_rc(rc: &Path) -> Result<Wired, String> {
     if !rc.exists() {
         return Ok(Wired::Absent);
     }
-    if !rc.is_file() {
-        return Err(format!("{} exists but is not a regular file.", rc.display()));
+    append_block(rc, &format!("[ -r \"{path}\" ] && . \"{path}\"", path = UNEXPANDED_SOURCEFILE_PATH))
+}
+
+/// Fish's configuration directory, by fish's own rule: `$XDG_CONFIG_HOME/fish`, else
+/// `~/.config/fish`. A relative `XDG_CONFIG_HOME` is ignored, as the XDG spec says to: fish would
+/// read it against wherever it happens to start, which no installer can know.
+fn fish_config_dir(xdg_config_home: Option<&std::ffi::OsStr>, home: &Path) -> PathBuf {
+    match xdg_config_home.map(Path::new).filter(|dir| dir.is_absolute()) {
+        Some(dir) => dir.join("fish"),
+        None => home.join(".config").join("fish"),
     }
-    let current = std::fs::read(rc).map_err(|err| format!("could not read {}: {err}", rc.display()))?;
+}
+
+/// The hook fish loads bashrs through: a file of bashrs's own in fish's conf.d.
+fn fish_hook(fish_config: &Path) -> PathBuf {
+    fish_config.join("conf.d").join("bashrs.fish")
+}
+
+/// Wire fish to its sourcefile through [`fish_hook`] — the place fish reads snippets a program
+/// installs, before `config.fish`, so the user's own config is never edited. Only where fish's
+/// configuration directory exists, which is fish having been run: the counterpart of touching only
+/// the rc files a user has. The hook is bashrs's own file, so it is created when absent, and
+/// otherwise held to the same marker rule as an rc file.
+fn wire_fish(fish_config: &Path) -> Result<Wired, String> {
+    if !fish_config.is_dir() {
+        return Ok(Wired::Absent);
+    }
+    let hook = fish_hook(fish_config);
+    let line = format!("test -r \"{path}\"; and source \"{path}\"", path = UNEXPANDED_FISH_SOURCEFILE_PATH);
+    if hook.exists() {
+        return append_block(&hook, &line);
+    }
+    let conf_d = fish_config.join("conf.d");
+    std::fs::create_dir_all(&conf_d).map_err(|err| format!("could not create {}: {err}", conf_d.display()))?;
+    std::fs::write(&hook, format!("{BLOCK_START}\n{line}\n{BLOCK_END}\n"))
+        .map_err(|err| format!("could not write {}: {err}", hook.display()))?;
+    Ok(Wired::Added)
+}
+
+/// Where the installed fish looks for completion files — its `$fish_complete_path`, asked of fish
+/// itself, since fish's own startup builds the list (and the user's config may add to it). Asked
+/// non-interactively, as any fish script would, so bashrs's own hook returns before touching it.
+/// Empty when fish is not installed.
+fn fish_complete_path() -> Vec<PathBuf> {
+    if !crate::support::exec::on_path("fish") {
+        return Vec::new();
+    }
+    let listing = crate::support::exec::capture_without_input("fish", ["-c", "string join \\n -- $fish_complete_path"]);
+    listing.unwrap_or_default().lines().filter(|line| !line.is_empty()).map(PathBuf::from).collect()
+}
+
+/// The names among `completed` that fish has a completion file for somewhere on `complete_path` —
+/// the names whose completions fish would load at the first TAB and merge with bashrs's.
+fn colliding<'a>(completed: &'a [String], complete_path: &[PathBuf]) -> Vec<&'a str> {
+    let ships = |name: &str| complete_path.iter().any(|dir| dir.join(format!("{name}.fish")).is_file());
+    completed.iter().map(String::as_str).filter(|name| ships(name)).collect()
+}
+
+/// Make bashrs's completions win for each name in `colliding`, through a file in `dir` — which the
+/// fish sourcefile puts first on `$fish_complete_path`. Fish loads the first `<name>.fish` it finds
+/// at that name's first TAB, so this one is loaded in place of fish's own, and none of fish's code
+/// runs; it defines nothing, as bashrs's completions are in the sourcefile already. A file for a
+/// name that no longer collides is removed, and `dir` with it once none is left. Only `*.fish`
+/// files are touched — anything else in `dir` is not bashrs's to remove.
+fn shadow_fish_completions(dir: &Path, colliding: &[&str]) -> Result<(), String> {
+    if !colliding.is_empty() {
+        std::fs::create_dir_all(dir).map_err(|err| format!("could not create {}: {err}", dir.display()))?;
+    }
+    for name in colliding {
+        let file = dir.join(format!("{name}.fish"));
+        let text = format!(
+            "# Generated by bashrs's install — do not edit.\n\
+             # bashrs completes `{name}` itself, in ~/.bashrs/sourcefile.fish. Fish has completions of its\n\
+             # own for the name; found first, this file is loaded in their place, so they never join bashrs's.\n"
+        );
+        std::fs::write(&file, text).map_err(|err| format!("could not write {}: {err}", file.display()))?;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return Ok(()) };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let stale = path.extension().is_some_and(|ext| ext == "fish")
+            && path.file_stem().and_then(|stem| stem.to_str()).is_some_and(|stem| !colliding.contains(&stem));
+        if stale {
+            std::fs::remove_file(&path).map_err(|err| format!("could not remove {}: {err}", path.display()))?;
+        }
+    }
+    let _ = std::fs::remove_dir(dir); // only succeeds once empty
+    Ok(())
+}
+
+/// Append the marker-bracketed block holding `line` to an existing `file`, once. The file must be
+/// a regular, appendable file — a directory or a read-only file is an error worth stopping the
+/// install for, not a silent skip.
+fn append_block(file: &Path, line: &str) -> Result<Wired, String> {
+    if !file.is_file() {
+        return Err(format!("{} exists but is not a regular file.", file.display()));
+    }
+    let current = std::fs::read(file).map_err(|err| format!("could not read {}: {err}", file.display()))?;
     if String::from_utf8_lossy(&current).contains(BLOCK_START) {
         return Ok(Wired::AlreadyPresent);
     }
-    let block = format!(
-        "\n{BLOCK_START}\n[ -r \"{path}\" ] && . \"{path}\"\n{BLOCK_END}\n",
-        path = UNEXPANDED_SOURCEFILE_PATH
-    );
+    let block = format!("\n{BLOCK_START}\n{line}\n{BLOCK_END}\n");
     use std::io::Write;
     std::fs::OpenOptions::new()
         .append(true)
-        .open(rc)
-        .and_then(|mut file| file.write_all(block.as_bytes()))
-        .map_err(|err| format!("failed to append the source block to {}: {err}", rc.display()))?;
+        .open(file)
+        .and_then(|mut handle| handle.write_all(block.as_bytes()))
+        .map_err(|err| format!("failed to append the source block to {}: {err}", file.display()))?;
     Ok(Wired::Added)
 }
 
@@ -264,14 +371,14 @@ mod tests {
     fn the_closing_line_tracks_whether_a_reload_will_follow() {
         let sourcefile = Path::new("/home/u/.bashrs/sourcefile.sh");
 
-        let reloading = activation_line(true, sourcefile);
+        let reloading = activation_line(true, sourcefile, None);
         assert!(reloading.contains("reloading"), "the recompile path says a reload is happening");
         assert!(
             !reloading.contains("Open a new shell") && !reloading.contains("run:"),
             "and does NOT ask the user to do what the wrapper already does: {reloading}"
         );
 
-        let manual = activation_line(false, sourcefile);
+        let manual = activation_line(false, sourcefile, None);
         assert!(manual.contains("Open a new shell"), "first-install names the manual step");
         assert!(manual.contains(&sourcefile.display().to_string()), "with the sourcing command");
         // The command is set off in backticks for readability. Safe here and ONLY here because
@@ -280,6 +387,95 @@ mod tests {
             manual.contains("`. \"/home/u/.bashrs/sourcefile.sh\"`"),
             "the runnable command is quoted as code: {manual}"
         );
+        assert!(!manual.contains("fish"), "fish is not mentioned where it was not wired: {manual}");
+
+        // Wired for fish too: its own command beside bash's, and still nothing on the reload path.
+        let fish = Path::new("/home/u/.bashrs/sourcefile.fish");
+        let both = activation_line(false, sourcefile, Some(fish));
+        assert!(both.contains("`. \"/home/u/.bashrs/sourcefile.sh\"`"), "{both}");
+        assert!(both.contains("(in fish:  `source \"/home/u/.bashrs/sourcefile.fish\"`)"), "{both}");
+        assert!(!activation_line(true, sourcefile, Some(fish)).contains("source"), "a reload needs no command");
+    }
+
+    /// Fish's own rule for where its configuration lives, minus the one case no installer can
+    /// follow: a relative `XDG_CONFIG_HOME`, which fish would read against its own working directory.
+    #[test]
+    fn fish_config_is_found_where_fish_looks_for_it() {
+        let home = Path::new("/home/u");
+        assert_eq!(fish_config_dir(None, home), Path::new("/home/u/.config/fish"));
+        assert_eq!(fish_config_dir(Some("/xdg".as_ref()), home), Path::new("/xdg/fish"));
+        assert_eq!(fish_config_dir(Some("relative".as_ref()), home), Path::new("/home/u/.config/fish"), "ignored, per the XDG spec");
+        assert_eq!(fish_config_dir(Some("".as_ref()), home), Path::new("/home/u/.config/fish"), "set but empty is unset");
+    }
+
+    /// A name collides exactly when a `<name>.fish` file sits in one of fish's completion directories —
+    /// a directory of that name, or a file for another name, does not count.
+    #[test]
+    fn a_name_collides_where_fish_has_a_completion_file_for_it() {
+        let dir = scratch("colliding");
+        let (shipped, vendor) = (dir.join("completions"), dir.join("vendor"));
+        std::fs::create_dir_all(shipped.join("gg.fish")).unwrap(); // a directory, not a file
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(shipped.join("diff.fish"), "").unwrap();
+        std::fs::write(vendor.join("hg.fish"), "").unwrap();
+        std::fs::write(vendor.join("unrelated.fish"), "").unwrap();
+        let completed: Vec<String> = ["diff", "gg", "hg", "lll"].map(String::from).to_vec();
+        assert_eq!(colliding(&completed, &[shipped, vendor]), ["diff", "hg"]);
+        assert!(colliding(&completed, &[]).is_empty(), "no fish, no collisions");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The stand-in files track the collisions: written for each, removed when a name stops
+    /// colliding, the directory gone once nothing is left — and nothing but `*.fish` touched.
+    #[test]
+    fn the_stand_in_completions_follow_the_collisions() {
+        let dir = scratch("shadow").join("fish_completions");
+        assert_eq!(shadow_fish_completions(&dir, &[]), Ok(()));
+        assert!(!dir.exists(), "no collisions: no directory at all");
+
+        assert_eq!(shadow_fish_completions(&dir, &["diff", "hg"]), Ok(()));
+        let diff = std::fs::read_to_string(dir.join("diff.fish")).unwrap();
+        assert!(diff.starts_with("# Generated by bashrs's install") && diff.contains("completes `diff` itself"), "{diff}");
+        assert!(diff.lines().all(|line| line.starts_with('#')), "it defines nothing — bashrs's are in the sourcefile");
+        assert!(dir.join("hg.fish").is_file());
+
+        assert_eq!(shadow_fish_completions(&dir, &["hg"]), Ok(()));
+        assert!(!dir.join("diff.fish").exists(), "a name that stopped colliding loses its file");
+        std::fs::write(dir.join("notes.txt"), "mine").unwrap();
+        assert_eq!(shadow_fish_completions(&dir, &[]), Ok(()));
+        assert!(!dir.join("hg.fish").exists());
+        assert!(dir.join("notes.txt").is_file(), "only bashrs's own files are removed — and the directory stays for it");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// Fish is wired only once it has a configuration directory — fish having been run — and then
+    /// through a file of bashrs's own in conf.d, so `config.fish` is never touched. Created when
+    /// absent, left alone on a re-run, and appended to like an rc file when the user made one.
+    #[test]
+    fn fish_is_wired_through_its_conf_d_and_only_where_fish_has_run() {
+        let dir = scratch("fish");
+        let config = dir.join("fish");
+        assert_eq!(wire_fish(&config), Ok(Wired::Absent), "no fish config: fish was never run here");
+        assert!(!config.exists(), "and nothing is created for a shell nobody uses");
+
+        std::fs::create_dir_all(&config).unwrap();
+        assert_eq!(wire_fish(&config), Ok(Wired::Added));
+        let hook = config.join("conf.d/bashrs.fish");
+        let wired = std::fs::read_to_string(&hook).unwrap();
+        assert_eq!(
+            wired,
+            "# >>> bashrs >>>\ntest -r \"$HOME/.bashrs/sourcefile.fish\"; and source \"$HOME/.bashrs/sourcefile.fish\"\n# <<< bashrs <<<\n",
+            "the exact guarded source line, literal $HOME"
+        );
+        assert!(!config.join("config.fish").exists(), "the user's config.fish is never created or edited");
+        assert_eq!(wire_fish(&config), Ok(Wired::AlreadyPresent), "re-runs find the marker and skip");
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), wired, "idempotent");
+
+        // A bashrs.fish the user wrote themselves keeps its content; the block joins it.
+        std::fs::write(&hook, "# mine\n").unwrap();
+        assert_eq!(wire_fish(&config), Ok(Wired::Added));
+        assert!(std::fs::read_to_string(&hook).unwrap().starts_with("# mine\n\n# >>> bashrs >>>\n"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The reload verdict comes off the process tree, so the recognizer decides everything: it

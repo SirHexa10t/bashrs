@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 /// Exit code a command returns to ask its generated wrapper to run its
 /// `#[after]` action (e.g. start a fresh shell). It's distinct from success (0)
 /// and failure (non-zero), so clap's `--help`/`-h` — which exit 0 — never
-/// trigger it. Kept trivial in shell (`[ "$?" -eq N ]`) to parse on any bash.
+/// trigger it. Kept trivial in shell (`[ "$code" -eq N ]`) to parse on any bash.
 /// Part of the wrapper↔binary protocol, so it lives here in the sourcefile's
 /// domain — used by both the [`crate::cli`] generator and the commands that
 /// signal a reload.
@@ -51,6 +51,19 @@ pub(crate) fn user_data_dir() -> PathBuf {
 /// unexpanded `$HOME/…` form the rc files are wired with is [`install`]'s own concern.
 pub(crate) fn sourcefile() -> PathBuf {
     bashrs_home().join("sourcefile.sh")
+}
+
+/// `~/.bashrs/sourcefile.fish` — the generated fish file, [`sourcefile`]'s counterpart; fish's
+/// conf.d hook sources it, in the unexpanded form that is [`install`]'s concern.
+pub(crate) fn fish_sourcefile() -> PathBuf {
+    bashrs_home().join("sourcefile.fish")
+}
+
+/// `~/.bashrs/fish_completions` — bashrs's completion files for the names fish completes too,
+/// written by [`install`]; the fish sourcefile puts the directory first on fish's search path
+/// under its own `$HOME/…` spelling.
+pub(crate) fn fish_completions_dir() -> PathBuf {
+    bashrs_home().join("fish_completions")
 }
 
 /// `~/.bashrs/stainless_comfy` — where the companion repos are cloned
@@ -96,6 +109,8 @@ mod tests {
         // or of any subdir — is a one-line change rather than a hunt across layers.
         let home = super::bashrs_home();
         assert_eq!(super::sourcefile(), home.join("sourcefile.sh"));
+        assert_eq!(super::fish_sourcefile(), home.join("sourcefile.fish"));
+        assert_eq!(super::fish_completions_dir(), home.join("fish_completions"));
         assert_eq!(super::user_data_dir(), home.join("user-data"));
         assert_eq!(super::clones_dir(), home.join("stainless_comfy"));
     }

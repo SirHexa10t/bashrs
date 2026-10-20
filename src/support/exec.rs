@@ -262,6 +262,17 @@ mod tests {
         assert_eq!(capture_with_code("bashrs_no_such_program_xyz", &[] as &[&str]), None);
     }
 
+    /// Its two departures, each pinned: the program's stdin is `/dev/null`, never the caller's —
+    /// asked of the child itself, so it holds whatever the test runner's own stdin is — and its
+    /// output comes back even from a failing exit. Only a program that cannot start yields nothing.
+    #[test]
+    fn capture_without_input_reads_nothing_and_keeps_output_whatever_the_exit() {
+        let stdin = capture_without_input("readlink", ["/proc/self/fd/0"]);
+        assert_eq!(stdin.as_deref(), Some("/dev/null\n"), "stdin is /dev/null, not inherited");
+        assert_eq!(capture_without_input("sh", ["-c", "echo certificate; exit 1"]).as_deref(), Some("certificate\n"));
+        assert_eq!(capture_without_input("bashrs_no_such_program_xyz", &[] as &[&str]), None);
+    }
+
     #[test]
     fn run_ignores_exit_status_without_panicking() {
         run("true", &[] as &[&str]);

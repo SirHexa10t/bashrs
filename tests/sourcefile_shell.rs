@@ -37,6 +37,17 @@ fn sourcefile_and_home(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     (file, base.join("home"))
 }
 
+/// The whole generated file, parsed by bash itself (`-n`: nothing runs). The tests below source it
+/// with stderr discarded and check what got defined, so a syntax error in a later section — the
+/// keybinds, the completion, the greeting — failed none of them.
+#[test]
+fn the_whole_generated_file_parses_in_bash() {
+    let (file, _) = sourcefile_and_home("parse");
+    let out = Command::new("bash").arg("-n").arg(&file).output().expect("bash -n");
+    assert!(out.status.success(), "bash rejects the generated file: {}", String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(file.parent().unwrap());
+}
+
 #[test]
 fn non_interactive_shells_inherit_nothing_at_all() {
     // scp, `ssh host cmd`, and wrapper scripts source bashrc too. They must see zero output
@@ -125,6 +136,67 @@ fn the_python3_function_survives_an_active_alias() {
     );
     let out = bash(&script);
     assert!(out.contains("python3 is a function"), "alias shadow must be cleared first: {out}");
+}
+
+/// The reload hook runs only on the reload code — and the wrapper returns the command's own status
+/// either way, which a bare `[ "$?" -eq N ] && hook` did not (it left the test's: 1 after a plain
+/// success and after a failure alike).
+#[test]
+fn the_compile_wrapper_reloads_only_on_its_code_and_keeps_its_status() {
+    let (file, home) = sourcefile_and_home("reload");
+    let binary = home.join(".bashrs/bashrs");
+    std::fs::write(&binary, "#!/bin/sh\nexit \"${FAKE_EXIT:-0}\"\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let wrapper = std::fs::read_to_string(&file)
+        .unwrap()
+        .lines()
+        .find(|line| line.starts_with("brs_compile()"))
+        .expect("brs_compile is defined")
+        .to_string();
+    let script = format!(
+        "HOME='{}'; shell_new() {{ echo reloading; }}\n{wrapper}\n\
+         export FAKE_EXIT=3; brs_compile; echo status:$?\n\
+         export FAKE_EXIT=0; brs_compile; echo status:$?\n\
+         export FAKE_EXIT=97; brs_compile",
+        home.display()
+    );
+    let out = bash(&script);
+    assert_eq!(out.lines().collect::<Vec<_>>(), ["status:3", "status:0", "reloading"], "{out}");
+    let _ = std::fs::remove_dir_all(file.parent().unwrap());
+}
+
+/// Alt+L binds the first LISTED desktop that runs — table order, not the order the processes
+/// started in — and takes its scratch variable with it. `pgrep` is stubbed to answer as the real
+/// one does (`PID NAME …` on one line), so no case needs a desktop actually running.
+#[test]
+fn alt_l_binds_the_first_listed_desktop_that_runs() {
+    let (file, home) = sourcefile_and_home("altl");
+    let bound = |running: &str, session: &str| {
+        let script = format!(
+            "pgrep() {{ printf '%s' '{running}'; }}; HOME='{}'; XDG_SESSION_TYPE={session}; source '{}' 2>/dev/null; \
+             bind -S 2>/dev/null; echo \"left:${{__bashrs_desktops-none}}\"",
+            home.display(),
+            file.display()
+        );
+        let out = Command::new("bash").args(["--norc", "-i", "-c", &script]).output().expect("bash -i");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let cases = [
+        ("1 openbox 2 i3", "x11", Some("i3-msg restart"), "table order, not process order"),
+        ("1 gnome-shell 2 sway", "wayland", Some("swaymsg reload"), "GNOME's X11-only row falls through"),
+        ("1 kwin_wayland 2 plasmashell", "wayland", Some("systemctl --user restart plasma-plasmashell.service"), "Plasma on Wayland"),
+        ("", "x11", None, "nothing listed running"),
+    ];
+    for (running, session, expected, why) in cases {
+        let out = bound(running, session);
+        match expected {
+            Some(command) => assert!(out.contains(&format!("\\el outputs {command}")), "{why}: {out}"),
+            None => assert!(!out.contains("\\el outputs"), "{why}: nothing bound: {out}"),
+        }
+        assert!(out.contains("left:none"), "{why}: the chain's variable must go: {out}");
+    }
+    let _ = std::fs::remove_dir_all(file.parent().unwrap());
 }
 
 #[test]

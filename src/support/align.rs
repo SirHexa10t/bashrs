@@ -3,42 +3,65 @@
 //! name the token(s) that should start a column; nothing else about the mechanism varies, so
 //! nothing else is a parameter.
 //!
-//! The mechanism is `table_formatter`'s own: a run of two-plus spaces is a column boundary.
-//! [`align_columns`] guarantees that gap before each requested token, then lets the library do
-//! the aligning — so this stays a thin adapter, not a second table engine.
+//! The mechanism is `table_formatter`'s own. [`align_columns`] puts a column boundary before each
+//! requested token, then lets the library do the aligning — so this stays a thin adapter, not a
+//! second table engine.
+//!
+//! The boundary is [`DIVIDER`], not the library's default of two spaces: shell text holds two-space
+//! runs of its own — `hg`'s fish probe asks for timestamps in `'%F_%T  '` — and with the default each
+//! would be one more boundary, padded out to the column's width, inside the quotes.
+
+/// The column boundary [`align_columns`] writes before each token: a character that never occurs
+/// in shell text, spaced as `table_formatter` wants a divider with a visible core. Only it divides;
+/// any run of spaces in a line is that line's own text.
+const DIVIDER: &str = " \u{1f} ";
 
 /// Align `lines` into a table at each of `columns`: every line's FIRST occurrence of each token
-/// gains the two-space gap `table_formatter` reads as a column boundary, then the block is
-/// aligned as one table. Rows missing a token simply contribute no cell there, and
-/// `trim_trailing` keeps them unpadded on the right.
+/// starts a column, and the block is aligned as one table, two spaces between columns. Rows
+/// missing a token simply contribute no cell there, and `trim_trailing` keeps them unpadded on the
+/// right; a line holding none of the tokens is no row at all — it comes back exactly as it went
+/// in, and the table's widths are the other lines' alone.
 ///
-/// Lines must arrive WITHOUT indentation — a leading run of spaces would read as an empty first
-/// column — and the caller indents the result. A token already at a column boundary (or opening
-/// the line) is left alone, so the function is idempotent.
+/// Lines must arrive WITHOUT indentation, and the caller indents the result. The spaces before a
+/// token are the gap the alignment sets, so aligned lines align again unchanged: the function is
+/// idempotent.
 pub(crate) fn align_columns(lines: Vec<String>, columns: &[&str]) -> Vec<String> {
-    let padded: Vec<String> = lines.into_iter().map(|line| _pad(line, columns)).collect();
+    let mut divided: Vec<String> = lines.into_iter().map(|line| _divide(line, columns)).collect();
+    // Only a line with a column is a row of the table; the rest are spliced back where they stood,
+    // or a long one (a comment line, say) would set the first column's width for all of them.
+    let rows: Vec<usize> = (0..divided.len()).filter(|&i| divided[i].contains(DIVIDER)).collect();
+    let table: Vec<String> = rows.iter().map(|&i| std::mem::take(&mut divided[i])).collect();
     // `reasonable_spacing`: one monstrous row (shell_def's probe loop, at four times anyone
     // else's width) must not drag every neighbour's columns out to meet it — the outlier keeps
     // its head aligned and goes minimal from the offending column, and the rest of the block
     // snaps back to its own natural width.
     let options = table_formatter::FormatOptions {
+        divide_by: DIVIDER.to_string(),
+        join_with: "  ".to_string(),
         trim_trailing: true,
         reasonable_spacing: true,
         ..Default::default()
     };
-    table_formatter::format_table(&padded, &options).unwrap_or(padded)
+    // The fallback is unreachable — only `sort` can error, and it's off — but it must not leave
+    // a divider in the text.
+    let aligned = table_formatter::format_table(&table, &options)
+        .unwrap_or_else(|_| table.iter().map(|line| line.replace(DIVIDER, "  ")).collect());
+    for (i, line) in rows.into_iter().zip(aligned) {
+        divided[i] = line;
+    }
+    divided
 }
 
-/// `line` with at least two spaces before each token's first occurrence (tokens in left-to-right
-/// order, since each insertion shifts what follows).
-fn _pad(mut line: String, columns: &[&str]) -> String {
+/// `line` with a [`DIVIDER`] before each token's first occurrence, in place of the spaces there
+/// (tokens in left-to-right order, since each insertion shifts what follows).
+fn _divide(mut line: String, columns: &[&str]) -> String {
     for token in columns {
         let Some(at) = line.find(token) else { continue };
-        let spaces = line[..at].chars().rev().take_while(|ch| *ch == ' ').count();
+        let start = line[..at].trim_end_matches(' ').len();
         // A token that opens the line (spaces reaching position 0 included) heads no column —
         // there is nothing to its left to align against.
-        if at > spaces && spaces < 2 {
-            line.insert_str(at, if spaces == 0 { "  " } else { " " });
+        if start > 0 {
+            line.replace_range(start..at, DIVIDER);
         }
     }
     line
@@ -91,5 +114,31 @@ mod tests {
     fn a_line_opening_token_is_not_padded() {
         let aligned = align_columns(lines(&["then alone", "x then paired"]), &["then "]);
         assert_eq!(aligned[0], "then alone");
+    }
+
+    /// Only the tokens start columns: a two-space run that is a line's own text — a timestamp
+    /// format, a description — stays exactly as written, wherever it sits.
+    #[test]
+    fn a_line_s_own_runs_of_spaces_are_not_columns() {
+        let aligned = align_columns(
+            lines(&[
+                "function g -d 'Search'; run g $argv; end",
+                "function hg -d 'History'; history --show-time='%F_%T  ' | run hg; end",
+            ]),
+            &["-d "],
+        );
+        assert_eq!(aligned[1], "function hg  -d 'History'; history --show-time='%F_%T  ' | run hg; end");
+        assert_eq!(aligned[0], "function g   -d 'Search'; run g $argv; end");
+    }
+
+    /// A line with none of the tokens is no row of the table: it comes back as it went in, in its
+    /// place, however long — and the rows around it align as if it were not there.
+    #[test]
+    fn a_line_without_a_token_takes_no_part_in_the_table() {
+        let aligned = align_columns(
+            lines(&["a  # one", "a much much longer line  with no token at all", "bb # two"]),
+            &["# "],
+        );
+        assert_eq!(aligned, ["a   # one", "a much much longer line  with no token at all", "bb  # two"]);
     }
 }

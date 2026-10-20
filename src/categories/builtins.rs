@@ -37,8 +37,17 @@ mod commands {
     /// otherwise, control characters as `$'…'`; GNU spells the odd case differently — `"it's"`
     /// where `lll` would write `$'it\'s'` — but every spelling reads back as the exact name),
     /// with the `-F` type markers and colour spans kept outside the quotes.
+    ///
+    /// In fish the original is not the builtin: `cd -` and the directory history live in fish's own
+    /// `cd` *function*, so `{ORIGINAL}` calls a copy of that, saved before this replaces it.
+    /// `command ls` skips any `ls` alias a fish config defines (an `eza` stand-in would reject
+    /// these flags). The listing's quoting is still GNU's bash-style `$'…'`, which fish cannot
+    /// paste back.
     #[unprefixed]
-    #[shell_body(r#"builtin cd "$@" && ls -AF --color=always --group-directories-first --quoting-style=shell-escape"#)]
+    #[shell_body(
+        bash = r#"builtin cd "$@" && ls -AF --color=always --group-directories-first --quoting-style=shell-escape"#,
+        fish = "{ORIGINAL} $argv && command ls -AF --color=always --group-directories-first --quoting-style=shell-escape"
+    )]
     pub fn cd() {}
 
     /// `git diff` between any two files or directories — no repository needed — with what changed

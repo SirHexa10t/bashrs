@@ -15,6 +15,11 @@
 //! - **`'…'`** — literal throughout: spaces, `$`, `*`, `"`, `\` all pass through. The common form.
 //! - **`$'…'`** (ANSI-C) — the only form that can hold a control character (a newline shows as
 //!   `\n`, never an actual line break) or a single quote (which `'…'` cannot contain at all).
+//!
+//! Fish reads quotes differently enough to need its own spelling, `FishWord` (and `quote_fish`
+//! for the all-in-one): `$'…'` is not fish syntax at all, and fish's `'…'` treats `\\` and `\'`
+//! as escapes where bash's takes them literally. `lll` and `shell_args_print` spell for whichever
+//! of the two shells they are run from; the fish sourcefile's generator writes fish's.
 
 /// Characters a word may hold and still be read back literally by bash — no shell metacharacter,
 /// no space, no control byte. Anything outside this set means the word has to be quoted to be
@@ -74,9 +79,168 @@ pub(crate) fn quote(s: &str) -> String {
     }
 }
 
+/// Quote `s` as a single fish word, always quoted — fish's counterpart of [`quote`]: a whole
+/// [`FishWord`].
+pub(crate) fn quote_fish(s: &str) -> String {
+    let mut word = FishWord::default();
+    let mut out = String::new();
+    for ch in s.chars() {
+        word.push(ch, false, &mut out);
+    }
+    word.finish(&mut out);
+    out
+}
+
+/// One fish word, spelled a character at a time — [`push_ansi_c`]'s counterpart, so that `lll` can
+/// spell around `ls`'s colour codes, which it hands to `out` itself. Inside fish's single quotes
+/// everything is literal except two escapes, `\\` and `\'`, so those are the only characters spelled
+/// differently there. What fish's quotes cannot hold — a control character, or a space where the
+/// caller's layout cannot have one (`escape_spaces`) — is written between quoted runs as fish's own
+/// unquoted escape (`\n`, `\x20`, or `\uNNNN` for a control character past ASCII, where `\xNN` would
+/// mean a raw byte): fish joins adjacent pieces into one word, so `a`, newline, `b` reads back from
+/// `'a'\n'b'` unchanged. A quote opens only before a character it holds, so escapes in a row share
+/// the gap between two runs.
+#[derive(Default)]
+pub(crate) struct FishWord {
+    /// A quote is open on `out`.
+    open: bool,
+    /// Something has been written: an empty word still needs its `''` to be seen.
+    started: bool,
+}
+
+impl FishWord {
+    pub(crate) fn push(&mut self, ch: char, escape_spaces: bool, out: &mut String) {
+        self.started = true;
+        let escape = match ch {
+            '\n' => Some(r"\n".to_string()),
+            '\t' => Some(r"\t".to_string()),
+            '\r' => Some(r"\r".to_string()),
+            ' ' if escape_spaces => Some(r"\x20".to_string()),
+            other if other.is_control() && other.is_ascii() => Some(format!(r"\x{:02x}", other as u32)),
+            other if other.is_control() => Some(format!(r"\u{:04x}", other as u32)),
+            _ => None,
+        };
+        if let Some(escape) = escape {
+            if std::mem::take(&mut self.open) {
+                out.push('\'');
+            }
+            out.push_str(&escape);
+            return;
+        }
+        if !std::mem::replace(&mut self.open, true) {
+            out.push('\'');
+        }
+        match ch {
+            '\\' => out.push_str(r"\\"),
+            '\'' => out.push_str(r"\'"),
+            other => out.push(other),
+        }
+    }
+
+    /// Close the word: the open quote, or — for a word with nothing in it — the `''` that shows it.
+    pub(crate) fn finish(self, out: &mut String) {
+        match (self.started, self.open) {
+            (false, _) => out.push_str("''"),
+            (true, true) => out.push('\''),
+            (true, false) => {}
+        }
+    }
+}
+
+/// `s` as one fish word, as the generated fish file writes a literal: bare when it is made only of
+/// letters, digits, `_`, `-` and `/` — none of them special to fish; the very words `fish_indent`
+/// strips the quotes from, which is where the rule comes from and how a test checks it — and
+/// [`quote_fish`]ed otherwise. Quoting a word does not change what a command receives, so the two
+/// spellings mean the same; the bare one reads more easily.
+pub(crate) fn fish_word(s: &str) -> String {
+    let plain = !s.is_empty() && s.chars().all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '/'));
+    if plain { s.to_string() } else { quote_fish(s) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rule `fish_word` follows is `fish_indent`'s, so `fish_indent` is asked: for every
+    /// sample, the spelling `fish_word` chose comes back from `fish_indent` untouched.
+    #[test]
+    fn fish_words_are_spelled_as_fish_indent_spells_them() {
+        let samples = [
+            "plain", "a/b", "/abs/path", "a-b", "a_b", "-a", "a1", "é", "a.b", "a+b", "a,b", "a@b",
+            "a%b", "a:b", "a=b", "a~b", "~a", "#a", "a!b", "a?b", "a*b", "a[b", "a{b", "a$b", "a(b",
+            "a b", "it's", "", r"a\b",
+        ];
+        let script: String = samples.iter().map(|sample| format!("echo {}\n", fish_word(sample))).collect();
+        let mut child = std::process::Command::new("fish_indent")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("fish_indent (fish's formatter) is needed to check fish spelling");
+        use std::io::Write as _;
+        child.stdin.take().expect("piped").write_all(script.as_bytes()).unwrap();
+        let indented = child.wait_with_output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&indented.stdout), script, "fish_indent respelled a word");
+        assert_eq!(fish_word("plain"), "plain");
+        assert_eq!(fish_word("a.b"), "'a.b'", "quoted where fish_indent keeps quotes");
+    }
+
+    /// The two escapes fish's quotes know are the two characters spelled differently; everything
+    /// else bash's `'…'` would leave alone, fish's leaves alone too.
+    #[test]
+    fn fish_quoting_escapes_only_what_fish_quotes_interpret() {
+        assert_eq!(quote_fish("hello"), "'hello'");
+        assert_eq!(quote_fish(""), "''", "an empty string must not vanish");
+        assert_eq!(quote_fish("it's"), r"'it\'s'", "no `$'…'` — fish has no such syntax");
+        assert_eq!(quote_fish(r"a\b"), r"'a\\b'", "a backslash doubles: `\\` IS an escape in fish quotes");
+        assert_eq!(quote_fish(r"ends with\"), r"'ends with\\'", "or it would escape the closing quote");
+        assert_eq!(quote_fish("$HOME *.rs {a,b} ~ (cmd)"), "'$HOME *.rs {a,b} ~ (cmd)'", "all literal in quotes");
+    }
+
+    /// A control character leaves the quotes, so a value stays on one line and still reads back
+    /// as one word.
+    #[test]
+    fn fish_quoting_writes_control_characters_as_unquoted_escapes() {
+        assert_eq!(quote_fish("a\nb"), r"'a'\n'b'");
+        assert_eq!(quote_fish("a\tb"), r"'a'\t'b'");
+        assert_eq!(quote_fish("\x07"), r"\x07", "a bell has no friendly name → \\xNN, and no empty quotes around it");
+        assert_eq!(quote_fish("\u{85}"), r"\u0085", "past ASCII \\xNN would be a raw byte");
+        assert_eq!(quote_fish("a\n\nb\n"), r"'a'\n\n'b'\n", "escapes in a row share one gap");
+        assert_eq!(quote_fish("café"), "'café'", "non-control Unicode is itself, never escaped");
+    }
+
+    /// The one axis on which `lll` differs: its two-space column divider would cut a name with a
+    /// run of spaces, so its spaces leave the quotes too.
+    #[test]
+    fn a_fish_word_escapes_spaces_only_when_asked() {
+        let spell = |s: &str, escape_spaces| {
+            let mut word = FishWord::default();
+            let mut out = String::new();
+            s.chars().for_each(|ch| word.push(ch, escape_spaces, &mut out));
+            word.finish(&mut out);
+            out
+        };
+        assert_eq!(spell("two  spaces", false), "'two  spaces'");
+        assert_eq!(spell("two  spaces", true), r"'two'\x20\x20'spaces'");
+    }
+
+    /// The claim that matters, checked by fish itself rather than by these spellings: every
+    /// quoted word reads back as exactly the string it came from.
+    #[test]
+    fn fish_quoted_words_read_back_unchanged_in_fish() {
+        let hostile = [
+            "plain", "", "a b", "it's", r"a\b", r"a\\b", r"ends with\", "'", r"\'", "$HOME", "*.rs",
+            "{a,b}", "~/x", "(echo no)", "a\nb", "tab\there", "\x07bell", "\u{85}next line", "café", "\n",
+            "a\n\nb\n", "~", "#not a comment",
+        ];
+        for original in hostile {
+            let out = std::process::Command::new("fish")
+                .args(["--no-config", "-c", &format!("printf '%s' {}", quote_fish(original))])
+                .output()
+                .expect("fish is needed to check fish quoting");
+            assert!(out.status.success(), "fish rejected the quoting of {original:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(String::from_utf8_lossy(&out.stdout), original, "{original:?} came back changed");
+        }
+    }
 
     #[test]
     fn bare_safe_is_printable_words_only() {
