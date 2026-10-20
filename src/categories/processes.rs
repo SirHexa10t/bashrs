@@ -74,7 +74,7 @@ mod commands {
         // With --choose the FORM is the tree view (printing it twice would just scroll it away);
         // otherwise the styled report prints and the whole match set is the target.
         if !args.choose {
-            for line in _render(&relevant, &needles, args.short) {
+            for line in _render(&relevant, &needles, args.short.then(table_formatter::terminal_width)) {
                 println!("{line}");
             }
         }
@@ -508,8 +508,9 @@ mod commands {
     /// consequence. Every process appears exactly once: two matches in one lineage share one tree,
     /// and the shared ancestry prints a single time. The command text is complete — never
     /// truncated to the window — because the tail of a long command line (a config path, a
-    /// `--profile` name) is often the part that tells two siblings apart.
-    fn _render(relevant: &BTreeMap<u32, Process>, needles: &[String], short: bool) -> Vec<String> {
+    /// `--profile` name) is often the part that tells two siblings apart; only `--short` clips
+    /// it, to the `window` width the caller measured.
+    fn _render(relevant: &BTreeMap<u32, Process>, needles: &[String], window: Option<usize>) -> Vec<String> {
         // A match found BY its PID glows there — the command text has nothing to show for it.
         let pid_shown = |process: &Process| {
             let plain = _pid_cell(process);
@@ -534,13 +535,7 @@ mod commands {
         // With `--short`, whatever the fixed columns and the branch drawing leave of the window
         // is all the command gets — computed per row, since deeper branches leave less.
         let fixed = pid_w + user_w + age_w + cpu_w + mem_w + 2 * 5;
-        let room = |branch: &str| {
-            short.then(|| {
-                table_formatter::terminal_width()
-                    .saturating_sub(fixed + branch.chars().count())
-                    .max(MIN_COMMAND)
-            })
-        };
+        let room = |branch: &str| window.map(|width| width.saturating_sub(fixed + branch.chars().count()).max(MIN_COMMAND));
 
         for (pid, branch) in _tree_order(relevant) {
             let process = &relevant[&pid];
@@ -1584,7 +1579,7 @@ mod commands {
             assert_eq!(relation(1), Some(Relation::Ancestor));
             assert_eq!(relation(999), None, "not in any match's lineage");
 
-            let lines = _render(&relevant, &needles(&["target"]), false);
+            let lines = _render(&relevant, &needles(&["target"]), None);
             for pid in ["100", "200", "250", "300"] {
                 let rows = lines.iter().filter(|l| l.contains(&format!("{pid} "))).count();
                 assert_eq!(rows, 1, "pid {pid} must appear exactly once:\n{lines:#?}");
@@ -1613,7 +1608,7 @@ mod commands {
             all.insert(1, sample(1, 0, "init"));
             all.insert(50, sample(50, 1, &long));
             let relevant = _relate(all, &[50]);
-            let lines = _render(&relevant, &needles(&["target"]), false);
+            let lines = _render(&relevant, &needles(&["target"]), None);
             let row = lines.iter().find(|l| l.contains("daemon")).expect("the match row");
             assert!(row.contains(&"x".repeat(300)), "nothing may be truncated");
             assert!(row.contains("\x1b[30;41m"), "the match glows in place: {row:?}");
@@ -1633,7 +1628,7 @@ mod commands {
             let mut with_marks = all;
             _mark_matches(with_marks.get_mut(&70).unwrap(), &needles(&["mullvad"]), None);
             let relevant = _relate(with_marks, &[70]);
-            let lines = _render(&relevant, &needles(&["mullvad"]), false);
+            let lines = _render(&relevant, &needles(&["mullvad"]), None);
             let row = lines.iter().find(|l| l.contains("/proc/self/exe")).expect("the match row");
             assert!(row.contains("name:") && row.contains("exe:"), "the hidden hits are named: {row:?}");
             assert!(row.contains("\x1b[30;41m"), "and they glow: {row:?}");
@@ -1648,7 +1643,7 @@ mod commands {
             all.insert(77, sample(77, 1, "quiet-daemon"));
             _mark_matches(all.get_mut(&77).unwrap(), &needles(&["77"]), None);
             let relevant = _relate(all, &[77]);
-            let lines = _render(&relevant, &needles(&["77"]), false);
+            let lines = _render(&relevant, &needles(&["77"]), None);
             let row = lines.iter().find(|l| l.contains("quiet-daemon")).expect("the match row");
             assert!(row.contains("\x1b[30;41m77"), "the PID cell carries the glow: {row:?}");
         }
@@ -1751,8 +1746,9 @@ mod commands {
             all.insert(50, sample(50, 1, &long));
             _mark_matches(all.get_mut(&50).unwrap(), &needles(&["target"]), None);
             let relevant = _relate(all, &[50]);
-            let full = _render(&relevant, &needles(&["target"]), false);
-            let clipped = _render(&relevant, &needles(&["target"]), true);
+            let full = _render(&relevant, &needles(&["target"]), None);
+            // A fixed window: the test must not depend on the terminal it happens to run in.
+            let clipped = _render(&relevant, &needles(&["target"]), Some(80));
             let row = |lines: &[String]| lines.iter().find(|l| l.contains("daemon")).unwrap().clone();
             assert!(row(&full).contains(&"x".repeat(300)), "unclipped shows everything");
             assert!(!row(&clipped).contains(&"x".repeat(100)), "clipped does not");

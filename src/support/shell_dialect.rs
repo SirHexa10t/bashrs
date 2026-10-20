@@ -5,8 +5,7 @@
 //! per-shell authoring: [`crate::cli`]'s generator renders it in each [`Shell`]'s syntax. What is
 //! written by hand is a handful of fragments: a command's `#[shell_body]`, a `#[piped]` probe, a
 //! contributor's setup lines. Each is a [`ShellText`], which cannot be built without saying what
-//! fish does, even when the answer is that fish has no equivalent — and then the reason, which is
-//! printed for the person who reaches for the command there.
+//! fish runs.
 //!
 //! [`fish_function`] is here for the same reason: every layer that contributes fish text writes
 //! functions, and they share one layout — one function per line, a block aligned into a table at
@@ -64,33 +63,25 @@ impl Shell {
     }
 }
 
-/// One hand-written piece of shell, in each shell's own syntax — or, for a shell that cannot
-/// express it, the reason why not.
+/// One hand-written piece of shell, in each shell's own syntax.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShellText {
     bash: &'static str,
-    fish: Result<&'static str, &'static str>,
+    fish: &'static str,
 }
 
 impl ShellText {
-    /// A piece both shells can express.
     pub const fn new(bash: &'static str, fish: &'static str) -> Self {
-        ShellText { bash, fish: Ok(fish) }
+        ShellText { bash, fish }
     }
 
-    /// A piece only bash can express. `why` is shown to whoever runs the command in fish, so it is
-    /// written for them: what fish lacks, and what to use there instead.
-    pub const fn bash_only(bash: &'static str, why: &'static str) -> Self {
-        ShellText { bash, fish: Err(why) }
-    }
-
-    /// The piece in bash — which every piece has.
+    /// The piece in bash.
     pub fn bash(&self) -> &'static str {
         self.bash
     }
 
-    /// The piece in fish, or the reason fish has none.
-    pub fn fish(&self) -> Result<&'static str, &'static str> {
+    /// The piece in fish.
+    pub fn fish(&self) -> &'static str {
         self.fish
     }
 }
@@ -155,12 +146,9 @@ mod tests {
     }
 
     #[test]
-    fn a_piece_answers_for_each_shell_or_says_why_not() {
+    fn a_piece_holds_each_shell_s_own_text() {
         let both = ShellText::new("exec bash", "exec fish");
-        assert_eq!((both.bash(), both.fish()), ("exec bash", Ok("exec fish")));
-        let bash_only = ShellText::bash_only("declare -p x", "fish has no declare; try `set --show x`");
-        assert_eq!(bash_only.bash(), "declare -p x");
-        assert_eq!(bash_only.fish(), Err("fish has no declare; try `set --show x`"));
+        assert_eq!((both.bash(), both.fish()), ("exec bash", "exec fish"));
     }
 
     #[test]

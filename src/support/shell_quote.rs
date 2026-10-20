@@ -1,53 +1,99 @@
-//! Rendering a string as a shell word a person can read and paste back — the quoting shared by
-//! the two places bashrs shows raw strings to a human: `lll`'s file-name column
-//! ([`crate::categories::filesystem`]) and `shell_args_print`
-//! ([`crate::categories::shell`]). Both must turn an arbitrary string into something bash reads
-//! back as the exact bytes; only the framing differs, and that framing stays with each caller —
-//! `lll` preserves `ls`'s colour spans and `-F` type markers and lives in a two-space-delimited
-//! table, `shell_args_print` always quotes and has neither. The three of those are why they can't
-//! be one function (stripping a trailing `@` as a type marker would corrupt an argument that ends
-//! in one), so what lives here is the shared *core*, not a merged command.
+//! Writing a string as a word of a shell, for a person to read and paste back — in the syntax of
+//! the shell it is for. Every place bashrs writes words for a shell asks here: the name columns of
+//! `lll` and the `cd` listing (`cell`), `shell_args_print` (`word`), and the generated
+//! sourcefiles' literals (`quote` and `fish_word`, through `Shell::quote`). A caller says which
+//! shell, and what the word must survive; which form it takes, and what is escaped in it, is
+//! decided here for each dialect — so no caller holds a `match` on the shell of its own.
 //!
-//! Three spellings, in ascending capability — the choice of which is [`is_bare_safe`] /
-//! [`needs_ansi_c`]; the rendering is [`push_ansi_c`] (and [`quote`] for the common all-in-one):
-//! - **bare** — only [`BARE_SAFE`] characters, which bash reads back literally; safe to print
-//!   untouched (a policy the caller opts into — `lll` does, an always-quoting list does not).
-//! - **`'…'`** — literal throughout: spaces, `$`, `*`, `"`, `\` all pass through. The common form.
+//! Bash has three spellings, in ascending capability:
+//! - **bare** — only [`BARE_SAFE`] characters, which bash reads back literally;
+//! - **`'…'`** — literal throughout: spaces, `$`, `*`, `"`, `\` all pass through. The common form;
 //! - **`$'…'`** (ANSI-C) — the only form that can hold a control character (a newline shows as
 //!   `\n`, never an actual line break) or a single quote (which `'…'` cannot contain at all).
 //!
-//! Fish reads quotes differently enough to need its own spelling, `FishWord` (and `quote_fish`
-//! for the all-in-one): `$'…'` is not fish syntax at all, and fish's `'…'` treats `\\` and `\'`
-//! as escapes where bash's takes them literally. `lll` and `shell_args_print` spell for whichever
-//! of the two shells they are run from; the fish sourcefile's generator writes fish's.
+//! Fish has two: bare, by the same rule, and quoted — `FishWord`. `$'…'` is no fish syntax, and
+//! fish's quotes take `\\` and `\'` as escapes where bash's take them literally; what they cannot
+//! hold at all, a control character, goes between quoted runs as fish's own unquoted escape.
 
-/// Characters a word may hold and still be read back literally by bash — no shell metacharacter,
-/// no space, no control byte. Anything outside this set means the word has to be quoted to be
-/// unambiguous.
+use crate::support::shell_dialect::Shell;
+
+/// Whether a word may go bare.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Quoting {
+    /// Always quoted — for a list where uniform quoting makes an empty word (`''`) and the edges of
+    /// a spaced one impossible to miss: `shell_args_print`.
+    Always,
+    /// Bare where nothing in the word needs quoting — for a listing, where quotes around every
+    /// ordinary name would be a wall of noise.
+    WhereNeeded,
+}
+
+/// `s` as one word of `shell`, reading back there as exactly `s`.
+pub(crate) fn word(shell: Shell, s: &str, quoting: Quoting) -> String {
+    if quoting == Quoting::WhereNeeded && is_bare_safe(s) {
+        return s.to_string();
+    }
+    match shell {
+        Shell::Bash => quote(s),
+        Shell::Fish => quote_fish(s),
+    }
+}
+
+/// `s` — a name as `ls` printed it, colour codes and all — as one word of `shell` for a column of
+/// names: bare where it may be, and unlike [`word`] in two ways. `ls`'s colour sequences ride
+/// through untouched: they are control characters too, and escaping them would print the codes
+/// instead of colouring the name. And a run of two spaces — what divides the columns these cells
+/// sit in — is escaped, so a name cannot read as two cells; in bash that takes `$'…'`, where the
+/// spaces become `\x20`.
+///
+/// The form tells apart what the eye cannot. A name holding a real newline prints `$'aa\nbb.txt'`
+/// in bash and `'aa'\n'bb.txt'` in fish; one literally called `aa\nbb.txt` prints `'aa\nbb.txt'`
+/// in bash and `'aa\\nbb.txt'` in fish, whose quotes take a backslash as an escape.
+pub(crate) fn cell(shell: Shell, s: &str) -> String {
+    let plain = console::strip_ansi_codes(s);
+    if is_bare_safe(&plain) {
+        return s.to_string();
+    }
+    let escape_spaces = plain.contains("  ");
+    match shell {
+        Shell::Bash if !escape_spaces && !needs_ansi_c(&plain) => format!("'{s}'"),
+        Shell::Bash => format!("$'{}'", map_outside_ansi(s, |ch, out| push_ansi_c(ch, escape_spaces, out))),
+        Shell::Fish => {
+            let mut word = FishWord::default();
+            let mut spelled = String::new();
+            // A name its quote can open on gets the quote ahead of `ls`'s colour code, outside the
+            // colour, as bash's `'…'` sits.
+            if plain.chars().next().is_some_and(|first| FishWord::escape(first, escape_spaces).is_none()) {
+                word.open(&mut spelled);
+            }
+            spelled += &map_outside_ansi(s, |ch, out| word.push(ch, escape_spaces, out));
+            word.finish(&mut spelled);
+            spelled
+        }
+    }
+}
+
+/// Characters a word may hold and still be read back literally by bash and by fish — no shell
+/// metacharacter, no space, no control byte. Anything outside this set means the word has to be
+/// quoted to be unambiguous.
 const BARE_SAFE: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-+,:@%";
 
 /// Whether `plain` can be printed with no quoting at all: non-empty and every character in
 /// [`BARE_SAFE`]. (Empty is *not* bare-safe — it would vanish; it needs `''` to be seen.)
-pub(crate) fn is_bare_safe(plain: &str) -> bool {
+fn is_bare_safe(plain: &str) -> bool {
     !plain.is_empty() && plain.chars().all(|ch| BARE_SAFE.contains(ch))
 }
 
-/// Whether `plain` holds something `'…'` cannot express — a control character, or a single quote
-/// — and so must be spelled with `$'…'` instead. (A caller with its own layout reasons to force
-/// `$'…'`, like `lll`'s two-space column divider, ORs that in on top of this.)
-pub(crate) fn needs_ansi_c(plain: &str) -> bool {
+/// Whether `plain` holds something bash's `'…'` cannot express — a control character, or a single
+/// quote — and so must be spelled with `$'…'` instead.
+fn needs_ansi_c(plain: &str) -> bool {
     plain.chars().any(char::is_control) || plain.contains('\'')
 }
 
 /// Append `ch` to `out` as it must appear *inside* a `$'…'` (ANSI-C) literal. `escape_spaces`
-/// turns a space into `\x20` — for a caller whose layout can't tolerate a literal space (`lll`'s
-/// two-space column divider would cut the name); a caller quoting for its own sake leaves spaces
-/// alone, since inside the quotes they're already unambiguous.
-///
-/// Exposed as a per-character step, not a whole-string pass, because `lll` must apply it *around*
-/// `ls`'s colour escapes (mapping only outside them) while an ordinary caller applies it to every
-/// character — same rule, different iteration.
-pub(crate) fn push_ansi_c(ch: char, escape_spaces: bool, out: &mut String) {
+/// turns a space into `\x20`, for a [`cell`] whose name holds a run of them; a word quoted for its
+/// own sake leaves spaces alone, since inside the quotes they are already unambiguous.
+fn push_ansi_c(ch: char, escape_spaces: bool, out: &mut String) {
     match ch {
         '\n' => out.push_str("\\n"),
         '\t' => out.push_str("\\t"),
@@ -62,11 +108,31 @@ pub(crate) fn push_ansi_c(ch: char, escape_spaces: bool, out: &mut String) {
     }
 }
 
-/// Quote `s` as a single shell word, ALWAYS quoted (never bare) — for a map or list where uniform
-/// quoting makes an empty string (`''`) and the edges of a spaced value impossible to miss. Spaces
-/// stay literal inside the quotes (no `escape_spaces`): there's no column divider to protect, and
-/// a visible space is the point. A caller that wants the bare-when-safe tier adds it with
-/// [`is_bare_safe`]; this is the two-tier `'…'`/`$'…'` core.
+/// Copy `text`, handing every ordinary character to `escape` while letting ANSI colour sequences
+/// through verbatim. A sequence runs from `ESC` to its final letter (`m`, for the colour codes `ls`
+/// emits), and nothing inside it is a filename character.
+fn map_outside_ansi(text: &str, mut escape: impl FnMut(char, &mut String)) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            escape(ch, &mut out);
+            continue;
+        }
+        out.push(ch);
+        for code in chars.by_ref() {
+            out.push(code);
+            if code.is_ascii_alphabetic() {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Quote `s` as a single bash word, ALWAYS quoted (never bare): `'…'`, or `$'…'` where `'…'`
+/// cannot hold it. Spaces stay literal inside the quotes: there is no column to protect, and a
+/// visible space is the point. Also the generated bash file's spelling of a literal.
 pub(crate) fn quote(s: &str) -> String {
     if needs_ansi_c(s) {
         let mut inner = String::new();
@@ -81,7 +147,7 @@ pub(crate) fn quote(s: &str) -> String {
 
 /// Quote `s` as a single fish word, always quoted — fish's counterpart of [`quote`]: a whole
 /// [`FishWord`].
-pub(crate) fn quote_fish(s: &str) -> String {
+fn quote_fish(s: &str) -> String {
     let mut word = FishWord::default();
     let mut out = String::new();
     for ch in s.chars() {
@@ -91,17 +157,17 @@ pub(crate) fn quote_fish(s: &str) -> String {
     out
 }
 
-/// One fish word, spelled a character at a time — [`push_ansi_c`]'s counterpart, so that `lll` can
-/// spell around `ls`'s colour codes, which it hands to `out` itself. Inside fish's single quotes
-/// everything is literal except two escapes, `\\` and `\'`, so those are the only characters spelled
-/// differently there. What fish's quotes cannot hold — a control character, or a space where the
-/// caller's layout cannot have one (`escape_spaces`) — is written between quoted runs as fish's own
-/// unquoted escape (`\n`, `\x20`, or `\uNNNN` for a control character past ASCII, where `\xNN` would
-/// mean a raw byte): fish joins adjacent pieces into one word, so `a`, newline, `b` reads back from
-/// `'a'\n'b'` unchanged. A quote opens only before a character it holds, so escapes in a row share
-/// the gap between two runs.
+/// One fish word, spelled a character at a time — [`push_ansi_c`]'s counterpart, so that [`cell`]
+/// can spell around `ls`'s colour codes, which it writes to `out` itself. Inside fish's single
+/// quotes everything is literal except two escapes, `\\` and `\'`, so those are the only characters
+/// spelled differently there. What fish's quotes cannot hold — a control character, or a space
+/// where the cell's column cannot have one (`escape_spaces`) — is written between quoted runs as
+/// fish's own unquoted escape (`\n`, `\x20`, or `\uNNNN` for a control character past ASCII, where
+/// `\xNN` would mean a raw byte): fish joins adjacent pieces into one word, so `a`, newline, `b`
+/// reads back from `'a'\n'b'` unchanged. A quote opens only before a character it holds, so escapes
+/// in a row share the gap between two runs.
 #[derive(Default)]
-pub(crate) struct FishWord {
+struct FishWord {
     /// A quote is open on `out`.
     open: bool,
     /// Something has been written: an empty word still needs its `''` to be seen.
@@ -109,9 +175,10 @@ pub(crate) struct FishWord {
 }
 
 impl FishWord {
-    pub(crate) fn push(&mut self, ch: char, escape_spaces: bool, out: &mut String) {
-        self.started = true;
-        let escape = match ch {
+    /// The unquoted escape `ch` is written as, where fish's quotes cannot hold it — `None` for a
+    /// character they hold.
+    fn escape(ch: char, escape_spaces: bool) -> Option<String> {
+        match ch {
             '\n' => Some(r"\n".to_string()),
             '\t' => Some(r"\t".to_string()),
             '\r' => Some(r"\r".to_string()),
@@ -119,17 +186,28 @@ impl FishWord {
             other if other.is_control() && other.is_ascii() => Some(format!(r"\x{:02x}", other as u32)),
             other if other.is_control() => Some(format!(r"\u{:04x}", other as u32)),
             _ => None,
-        };
-        if let Some(escape) = escape {
+        }
+    }
+
+    /// Open the quote now, ahead of what the caller writes to `out` itself before the next
+    /// character — the first character must be one the quote holds.
+    fn open(&mut self, out: &mut String) {
+        if !std::mem::replace(&mut self.open, true) {
+            out.push('\'');
+        }
+        self.started = true;
+    }
+
+    fn push(&mut self, ch: char, escape_spaces: bool, out: &mut String) {
+        self.started = true;
+        if let Some(escape) = Self::escape(ch, escape_spaces) {
             if std::mem::take(&mut self.open) {
                 out.push('\'');
             }
             out.push_str(&escape);
             return;
         }
-        if !std::mem::replace(&mut self.open, true) {
-            out.push('\'');
-        }
+        self.open(out);
         match ch {
             '\\' => out.push_str(r"\\"),
             '\'' => out.push_str(r"\'"),
@@ -138,7 +216,7 @@ impl FishWord {
     }
 
     /// Close the word: the open quote, or — for a word with nothing in it — the `''` that shows it.
-    pub(crate) fn finish(self, out: &mut String) {
+    fn finish(self, out: &mut String) {
         match (self.started, self.open) {
             (false, _) => out.push_str("''"),
             (true, true) => out.push('\''),
@@ -151,7 +229,8 @@ impl FishWord {
 /// letters, digits, `_`, `-` and `/` — none of them special to fish; the very words `fish_indent`
 /// strips the quotes from, which is where the rule comes from and how a test checks it — and
 /// [`quote_fish`]ed otherwise. Quoting a word does not change what a command receives, so the two
-/// spellings mean the same; the bare one reads more easily.
+/// spellings mean the same; the bare one reads more easily. (A file's literals are paths and
+/// descriptions, where `/` is common, which is why this is not [`BARE_SAFE`]'s rule.)
 pub(crate) fn fish_word(s: &str) -> String {
     let plain = !s.is_empty() && s.chars().all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '/'));
     if plain { s.to_string() } else { quote_fish(s) }
@@ -206,6 +285,20 @@ mod tests {
         assert_eq!(quote_fish("\u{85}"), r"\u0085", "past ASCII \\xNN would be a raw byte");
         assert_eq!(quote_fish("a\n\nb\n"), r"'a'\n\n'b'\n", "escapes in a row share one gap");
         assert_eq!(quote_fish("café"), "'café'", "non-control Unicode is itself, never escaped");
+    }
+
+    /// A cell keeps `ls`'s colour on the name and the quotes outside it, in both shells; what must
+    /// be escaped is escaped outside the colour codes, never inside them.
+    #[test]
+    fn a_cell_keeps_the_colour_inside_its_quotes() {
+        let blue = |name: &str| format!("\u{1b}[01;34m{name}\u{1b}[0m");
+        assert_eq!(cell(Shell::Bash, &blue("my dir")), format!("'{}'", blue("my dir")));
+        assert_eq!(cell(Shell::Fish, &blue("my dir")), format!("'{}'", blue("my dir")));
+        assert_eq!(cell(Shell::Fish, &blue("it's")), format!("'{}'", blue(r"it\'s")));
+        assert_eq!(cell(Shell::Bash, &blue("it's")), format!("$'{}'", blue(r"it\'s")));
+        assert_eq!(cell(Shell::Fish, &blue("\nx")), "\u{1b}[01;34m\\n'x\u{1b}[0m'", "an escape first: no quote to open early");
+        assert_eq!(cell(Shell::Bash, &blue("plain")), blue("plain"), "bare stays bare, colour and all");
+        assert_eq!(cell(Shell::Fish, "two  spaces"), r"'two'\x20\x20'spaces'", "a run of spaces cannot cut the cell");
     }
 
     /// The one axis on which `lll` differs: its two-space column divider would cut a name with a

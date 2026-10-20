@@ -31,7 +31,7 @@
 mod commands {
     use crate::support::args::NoArgs;
     use crate::support::shell_dialect::Shell;
-    use crate::support::shell_quote;
+    use crate::support::shell_quote::{self, Quoting};
     use crate::support::superuser;
     use clap::Args;
 
@@ -57,11 +57,7 @@ mod commands {
         for (index, arg) in args.iter().enumerate() {
             // 1-based, to read alongside the shell's own `$1 $2 …`. The quoting — always-on, so an
             // empty arg shows as `''` and every boundary is explicit — is the shared one.
-            let quoted = match shell {
-                Shell::Bash => shell_quote::quote(arg),
-                Shell::Fish => shell_quote::quote_fish(arg),
-            };
-            out += &format!("  arg{}: {quoted}\n", index + 1);
+            out += &format!("  arg{}: {}\n", index + 1, shell_quote::word(shell, arg, Quoting::Always));
         }
         out
     }

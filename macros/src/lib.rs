@@ -39,8 +39,7 @@ use syn::{
 /// - `#[piped(bash = "…", fish = "…")]` — prepend `… |` to the generated wrapper, feeding the
 ///   probe's output in as the command's stdin, e.g. `history` to search the shell history (a
 ///   builtin only the shell can produce). Each shell's probe is its own syntax, so both are
-///   given; where fish cannot ask what bash asks, `fish_unsupported = "why"` replaces `fish`,
-///   and the fish file defines the command as that explanation instead.
+///   given.
 /// - `#[trailing_newline]` — print a blank line after the command runs, sparing the last row
 ///   from terminals that drop it when the window is enlarged.
 /// - `#[shell_body(bash = "…", fish = "…")]` — the command is a pure shell function with these
@@ -48,13 +47,13 @@ use syn::{
 ///   environment changes), which a child process can't do. The function takes no arguments and
 ///   never enters the clap graph (there is nothing for the binary to run); its name and doc
 ///   comment surface in the sourcefile as usual, via the generated `shell_functions()`. Like
-///   `#[piped]`, it names every shell, and `fish_unsupported = "why"` stands in for a fish body
-///   that cannot exist. The attribute only takes string literals, so compile-time values can't
-///   be spliced here — but a body may embed `{PROJECT_ROOT}`, which the sourcefile generator
-///   (running inside the binary) replaces with the project directory quoted for that shell, and
-///   a fish body may embed `{ORIGINAL}`, the shell's own definition of the same name, saved
-///   before the override replaces it. Keep bodies to one line: anything with real logic belongs
-///   in Rust, with `#[piped]` feeding it whatever only the shell knows.
+///   `#[piped]`, it names every shell. The attribute only takes string literals, so compile-time
+///   values can't be spliced here — but a body may embed `{PROJECT_ROOT}`, which the sourcefile
+///   generator (running inside the binary) replaces with the project directory quoted for that
+///   shell, `{BINARY}`, the installed binary as every wrapper calls it, and — in fish —
+///   `{ORIGINAL}`, the shell's own definition of the same name, saved before the override
+///   replaces it. Keep bodies to one line: anything with real logic belongs in Rust, with
+///   `#[piped]` feeding it whatever only the shell knows, or the body calling the binary.
 ///
 /// Both per-shell attributes are checked here, not at generation time: a body or probe that
 /// leaves fish out does not compile.
@@ -347,25 +346,22 @@ struct CommandAttrs {
     shell_body: Option<PerShell>,
 }
 
-/// A hand-written shell fragment in every shell the sourcefile is written for: `bash = "…"`, plus
-/// either `fish = "…"` or — where fish has no equivalent — `fish_unsupported = "why"`. Parsed
-/// here so that leaving a shell out is a compile error at the attribute, not a gap noticed later.
+/// A hand-written shell fragment in every shell the sourcefile is written for: `bash = "…"` and
+/// `fish = "…"`. Parsed here so that leaving a shell out is a compile error at the attribute, not a
+/// gap noticed later.
 struct PerShell {
     bash: String,
-    /// The fish fragment, or the reason there is none.
-    fish: Result<String, String>,
+    fish: String,
 }
 
 impl PerShell {
     fn parse(attr: &Attribute) -> syn::Result<Self> {
         let name = attr.path().get_ident().map(ToString::to_string).unwrap_or_default();
-        let shape = format!(
-            "write #[{name}(bash = \"…\", fish = \"…\")], or fish_unsupported = \"why\" where fish has no equivalent"
-        );
+        let shape = format!("write #[{name}(bash = \"…\", fish = \"…\")]");
         let pairs = attr
             .parse_args_with(Punctuated::<MetaNameValue, Token![,]>::parse_terminated)
             .map_err(|err| syn::Error::new(err.span(), format!("#[{name}] names each shell: {shape}")))?;
-        let (mut bash, mut fish, mut unsupported) = (None, None, None);
+        let (mut bash, mut fish) = (None, None);
         for pair in pairs {
             let key = pair.path.get_ident().map(ToString::to_string).unwrap_or_default();
             let Expr::Lit(ExprLit { lit: Lit::Str(text), .. }) = &pair.value else {
@@ -374,42 +370,21 @@ impl PerShell {
             let slot = match key.as_str() {
                 "bash" => &mut bash,
                 "fish" => &mut fish,
-                "fish_unsupported" => &mut unsupported,
-                _ => {
-                    return Err(syn::Error::new_spanned(
-                        &pair.path,
-                        format!("expected `bash`, `fish` or `fish_unsupported`: {shape}"),
-                    ))
-                }
+                _ => return Err(syn::Error::new_spanned(&pair.path, format!("expected `bash` or `fish`: {shape}"))),
             };
             if slot.replace(text.value()).is_some() {
                 return Err(syn::Error::new_spanned(&pair.path, format!("`{key}` is given twice")));
             }
         }
         let bash = bash.ok_or_else(|| syn::Error::new_spanned(attr, format!("#[{name}] has no `bash`: {shape}")))?;
-        let fish = match (fish, unsupported) {
-            (Some(text), None) => Ok(text),
-            (None, Some(why)) => Err(why),
-            (Some(_), Some(_)) => {
-                return Err(syn::Error::new_spanned(
-                    attr,
-                    format!("#[{name}] gives both `fish` and `fish_unsupported`: keep the one that is true"),
-                ))
-            }
-            (None, None) => {
-                return Err(syn::Error::new_spanned(attr, format!("#[{name}] says nothing about fish: {shape}")))
-            }
-        };
+        let fish = fish.ok_or_else(|| syn::Error::new_spanned(attr, format!("#[{name}] says nothing about fish: {shape}")))?;
         Ok(PerShell { bash, fish })
     }
 
     /// The fragment as the value the generated code hands the sourcefile generator.
     fn tokens(&self) -> TokenStream2 {
-        let bash = &self.bash;
-        match &self.fish {
-            Ok(fish) => quote!(crate::support::shell_dialect::ShellText::new(#bash, #fish)),
-            Err(why) => quote!(crate::support::shell_dialect::ShellText::bash_only(#bash, #why)),
-        }
+        let (bash, fish) = (&self.bash, &self.fish);
+        quote!(crate::support::shell_dialect::ShellText::new(#bash, #fish))
     }
 }
 
@@ -676,20 +651,21 @@ fn expand_elevated(func: ItemFn) -> syn::Result<TokenStream2> {
 mod tests {
     use super::*;
 
-    fn parsed(attr: Attribute) -> Result<(String, Result<String, String>), String> {
+    fn parsed(attr: Attribute) -> Result<(String, String), String> {
         PerShell::parse(&attr).map(|text| (text.bash, text.fish)).map_err(|err| err.to_string())
     }
 
-    /// The contract every hand-written fragment meets: bash, and fish or the reason fish has none.
+    /// The contract every hand-written fragment meets: what bash runs, and what fish runs.
     #[test]
-    fn a_fragment_names_bash_and_says_what_fish_does() {
+    fn a_fragment_names_bash_and_fish() {
         assert_eq!(
             parsed(syn::parse_quote!(#[shell_body(bash = "exec bash", fish = "exec fish")])),
-            Ok(("exec bash".to_string(), Ok("exec fish".to_string())))
+            Ok(("exec bash".to_string(), "exec fish".to_string()))
         );
         assert_eq!(
-            parsed(syn::parse_quote!(#[piped(bash = "declare -p x", fish_unsupported = "fish has no declare")])),
-            Ok(("declare -p x".to_string(), Err("fish has no declare".to_string())))
+            parsed(syn::parse_quote!(#[piped(fish = "history --reverse", bash = "history")])),
+            Ok(("history".to_string(), "history --reverse".to_string())),
+            "in either order"
         );
     }
 
@@ -702,8 +678,8 @@ mod tests {
         assert!(silent.contains("says nothing about fish"), "{silent}");
         let old_form = refused(syn::parse_quote!(#[piped("history")]));
         assert!(old_form.contains("names each shell") && old_form.contains("fish = "), "{old_form}");
-        let both = refused(syn::parse_quote!(#[shell_body(bash = "a", fish = "b", fish_unsupported = "c")]));
-        assert!(both.contains("keep the one that is true"), "{both}");
+        let excused = refused(syn::parse_quote!(#[piped(bash = "declare -p x", fish_unsupported = "fish has no declare")]));
+        assert!(excused.contains("expected `bash` or `fish`"), "fish has no way out — it says what it runs: {excused}");
         assert!(refused(syn::parse_quote!(#[shell_body(fish = "b")])).contains("has no `bash`"));
         assert!(refused(syn::parse_quote!(#[shell_body(bash = "a", zsh = "b")])).contains("expected `bash`"));
         assert!(refused(syn::parse_quote!(#[shell_body(bash = "a", bash = "b", fish = "c")])).contains("given twice"));

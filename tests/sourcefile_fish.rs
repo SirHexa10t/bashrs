@@ -6,8 +6,14 @@
 //!
 //! Fish starts with its stock startup — `--no-config` would also skip the part that sets
 //! `$fish_complete_path` — but with nothing personal: each test points `HOME` at a fresh directory,
-//! which is where fish keeps user config, history and universal variables.
+//! which is where fish keeps user config, history and universal variables, and every shell starts
+//! through [`common::shell`] — detached from the terminal running the tests, and without its
+//! bashrs session. What a distribution adds to fish's own startup still runs, so nothing here
+//! assumes the stock prompt or greeting.
 
+mod common;
+
+use common::{shell, Captured};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -29,7 +35,7 @@ fn stand_in() -> String {
          \x20 hg) exec cat ;;\n\
          \x20 brs_compile) exit \"${{FAKE_EXIT:-0}}\" ;;\n\
          \x20 errcho) shift; printf '%s\\n' \"$*\" >&2 ;;\n\
-         \x20 complete-flags|brs_sourcefile|shell_def|shell_args_print|lll) exec '{}' \"$@\" ;;\n\
+         \x20 complete-flags|brs_sourcefile|shell_def|shell_args_print|lll|cd-listing) exec '{}' \"$@\" ;;\n\
          esac\n",
         env!("CARGO_BIN_EXE_bashrs")
     )
@@ -74,7 +80,7 @@ impl Home {
     /// Run `script` in fish under this `HOME` — interactive (`-i`) or not — with the fish
     /// sourcefile's path in `$sourcefile`, so no script has to quote it.
     fn fish(&self, interactive: bool, script: &str) -> Output {
-        let mut fish = Command::new("fish");
+        let mut fish = shell("fish");
         fish.env("HOME", &self.dir)
             .env("sourcefile", self.fish_sourcefile())
             .env("TZ", "UTC")
@@ -88,8 +94,8 @@ impl Home {
     }
 
     /// [`Self::fish`], interactive, returning stdout.
-    fn interactive(&self, script: &str) -> String {
-        String::from_utf8_lossy(&self.fish(true, script).stdout).into_owned()
+    fn interactive(&self, script: &str) -> Captured {
+        Captured::new(&self.fish(true, script).stdout)
     }
 }
 
@@ -110,8 +116,8 @@ fn lines(text: &str) -> Vec<&str> {
 #[test]
 fn the_whole_file_parses_in_fish() {
     let home = Home::new("parse");
-    let parse = Command::new("fish").arg("--no-execute").arg(home.fish_sourcefile()).output().expect("fish");
-    assert!(parse.status.success(), "fish rejects the file: {}", String::from_utf8_lossy(&parse.stderr));
+    let parse = shell("fish").arg("--no-execute").arg(home.fish_sourcefile()).output().expect("fish");
+    assert!(parse.status.success(), "fish rejects the file: {}", Captured::new(&parse.stderr));
 }
 
 /// Every section is a table, as bash's are: one function per line, the descriptions starting in
@@ -146,7 +152,7 @@ fn every_section_aligns_its_descriptions_into_a_column() {
 fn non_interactive_fish_inherits_nothing_at_all() {
     let home = Home::new("inert");
     let out = home.fish(false, "source $sourcefile; echo status:$status; functions -q lll; and echo lll-defined; functions -q python3; and echo python3-defined");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "status:0\n", "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(&*Captured::new(&out.stdout), "status:0\n", "{}", Captured::new(&out.stderr));
     let silence = home.fish(false, "source $sourcefile");
     assert_eq!(silence.stdout, b"", "a non-interactive source must write nothing to stdout");
 }
@@ -158,7 +164,7 @@ fn non_interactive_fish_inherits_nothing_at_all() {
 fn interactive_sourcing_writes_nothing_to_stderr() {
     let home = Home::new("quiet");
     let out = home.fish(true, "source $sourcefile");
-    assert_eq!(String::from_utf8_lossy(&out.stderr), "", "sourcing must not complain");
+    assert_eq!(&*Captured::new(&out.stderr), "", "sourcing must not complain");
 }
 
 #[test]
@@ -194,7 +200,7 @@ fn the_file_bails_early_when_the_binary_is_missing() {
 #[test]
 fn every_function_bash_gets_fish_gets_too() {
     let home = Home::new("parity");
-    let bash = Command::new("bash")
+    let bash = shell("bash")
         .args(["--norc", "-i", "-c", "source \"$HOME/.bashrs/sourcefile.sh\" 2>/dev/null; declare -F"])
         .env("HOME", &home.dir)
         .output()
@@ -262,11 +268,32 @@ fn the_cd_override_lists_and_keeps_fishs_own_cd_minus() {
         "source $sourcefile; source $sourcefile; cd $HOME/from; cd $HOME/to; cd -; echo back:(path basename $PWD)
          cd $HOME/to/inner; ..; echo up:(path basename $PWD)",
     );
-    let (said, complained) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let (said, complained) = (Captured::new(&out.stdout), Captured::new(&out.stderr));
     assert!(said.contains("marker.txt"), "landing in `to` lists it: {said}");
     assert!(said.contains("back:from"), "`cd -` still returns: {said}{complained}");
     assert!(said.contains("up:to"), "`..` climbs one directory: {said}");
-    assert_eq!(complained, "", "sourcing again keeps the saved original without a word");
+    assert_eq!(&*complained, "", "sourcing again keeps the saved original without a word");
+}
+
+/// Where `cd` lands it lists, each name spelled for the shell it is shown in: fish's quoting in
+/// fish — which no quoting style of `ls`'s writes — and bash's in bash.
+#[test]
+fn the_cd_listing_spells_names_for_the_shell_it_is_shown_in() {
+    let home = Home::new("cdnames");
+    let dir = home.dir.join("landing");
+    std::fs::create_dir_all(dir.join("a_dir")).unwrap();
+    for name in ["it's.txt", "new\nline.txt"] {
+        std::fs::write(dir.join(name), "").unwrap();
+    }
+    let fish = home.interactive(&format!("source $sourcefile; cd {}", dir.display())).plain();
+    assert_eq!(lines(&fish), ["a_dir/", r"'it\'s.txt'", r"'new'\n'line.txt'"], "{fish}");
+    let bash = shell("bash")
+        .args(["--norc", "-i", "-c", &format!("source \"$HOME/.bashrs/sourcefile.sh\" 2>/dev/null; cd '{}'", dir.display())])
+        .env("HOME", &home.dir)
+        .output()
+        .expect("bash");
+    let bash = Captured::new(&bash.stdout).plain();
+    assert_eq!(lines(&bash), ["a_dir/", r"$'it\'s.txt'", r"$'new\nline.txt'"], "{bash}");
 }
 
 /// The reload hook runs only on the reload code, and — unlike bash's one-line `&&` — the wrapper
@@ -304,12 +331,12 @@ fn hg_reads_fish_history_oldest_first_with_bashs_timestamps() {
 #[test]
 fn shell_def_ranks_fish_s_meanings_of_a_name() {
     let home = Home::new("def");
-    let plain = |out: &Output| console::strip_ansi_codes(&String::from_utf8_lossy(&out.stdout)).into_owned();
+    let plain = |out: &Output| Captured::new(&out.stdout).plain();
     let cd = home.fish(true, "source $sourcefile; shell_def cd");
-    assert_eq!(String::from_utf8_lossy(&cd.stderr), "", "nothing from the probes");
+    assert_eq!(&*Captured::new(&cd.stderr), "", "nothing from the probes");
     let report = plain(&cd);
     assert!(report.starts_with("cd is a FUNCTION - this is what runs:\n"), "{report}");
-    assert!(report.contains("__bashrs_original_cd $argv && command ls"), "the override's own source: {report}");
+    assert!(report.contains("__bashrs_original_cd $argv && \"$HOME/.bashrs/bashrs\" cd-listing"), "the override's own source: {report}");
     assert!(report.contains("outranked BUILTIN - runs via: builtin cd"), "{report}");
     let variable = home.fish(true, "source $sourcefile; set -g lll value; shell_def lll");
     assert!(plain(&variable).contains("also a VARIABLE, unrelated to running 'lll': $lll: set in global scope"), "{}", plain(&variable));
@@ -321,7 +348,7 @@ fn shell_def_ranks_fish_s_meanings_of_a_name() {
     let nothing = home.fish(true, "source $sourcefile; shell_def no_such_name_here");
     assert_eq!(nothing.status.code(), Some(1));
     assert_eq!(
-        String::from_utf8_lossy(&nothing.stderr),
+        &*Captured::new(&nothing.stderr),
         "shell_def: 'no_such_name_here' is nothing here - no alias, function, builtin, binary, or variable\n",
         "the report alone: each probe that finds nothing stays silent"
     );
@@ -348,7 +375,7 @@ fn lll_spells_names_so_fish_reads_them_back() {
         std::fs::write(dir.join(name), "").unwrap();
     }
     let out = home.interactive(&format!("source $sourcefile; builtin cd {}; lll", dir.display()));
-    let shown = console::strip_ansi_codes(&out).into_owned();
+    let shown = out.plain();
     assert!(shown.contains(r"'it\'s.txt'") && !shown.contains("$'"), "fish's quoting, not bash's: {shown}");
     // The name is each row's last column; the header names it `Filename`, and `.`/`..` lead.
     let words: Vec<&str> = shown.lines().skip(1).filter_map(|row| row.trim_end().rsplit("  ").next()).map(str::trim).collect();
@@ -385,27 +412,38 @@ fn flags_and_commands_complete_with_their_descriptions() {
 fn the_install_wires_fish_so_a_new_fish_has_bashrs_and_its_completions_win() {
     let home = Home::empty("install");
     std::fs::create_dir_all(home.dir.join(".config/fish")).unwrap();
+    // Asked before the install wires bashrs in, so the answer is fish's alone — once bashrs is
+    // armed, its greeting would be in this output too. Asked of what fish does, not of where it
+    // keeps it: its own `diff` completions offer `--brief`, whether they are a file on its
+    // completion path or, as in fish 4.9, built into the binary.
+    let ships_diff = home.interactive("complete -C 'diff --br'");
+    let complete_path = home.interactive("string join \\n -- $fish_complete_path");
     let install = Command::new(env!("CARGO_BIN_EXE_bashrs"))
         .arg("install-shell")
         .env("HOME", &home.dir)
         .env_remove("XDG_CONFIG_HOME")
         .output()
         .expect("install-shell");
-    assert!(install.status.success(), "{}", String::from_utf8_lossy(&install.stderr));
+    assert!(install.status.success(), "{}", Captured::new(&install.stderr));
     assert!(home.dir.join(".config/fish/conf.d/bashrs.fish").is_file(), "fish is wired through its conf.d");
     assert!(!home.dir.join(".config/fish/config.fish").exists(), "and the user's config.fish is never touched");
 
     // Exactly the names this fish has completions for get a stand-in — whatever this fish ships.
-    let ships_diff = home.interactive("path filter -f -- $fish_complete_path/diff.fish");
     let stand_in = home.dir.join(".bashrs/fish_completions/diff.fish");
-    assert_eq!(stand_in.is_file(), !ships_diff.is_empty(), "a stand-in for diff exactly when fish ships diff's completions");
+    let said = Captured::new(&install.stdout);
+    assert_eq!(
+        stand_in.is_file(),
+        !ships_diff.trim().is_empty(),
+        "a stand-in for diff exactly when fish completes diff itself — fish offers: [{ships_diff}]; \
+         its completion path:\n{complete_path}\nthe install said:\n{said}"
+    );
 
     let started = home.fish(true, "functions -q lll; and echo bashrs-armed; complete -C 'diff --'");
-    let out = String::from_utf8_lossy(&started.stdout);
+    let out = Captured::new(&started.stdout);
     assert!(out.contains("bashrs-armed"), "the conf.d hook arms bashrs in a new interactive fish: {out}");
     assert!(out.contains("--line-number\t") && out.contains("--recursive\t"), "bashrs's diff flags: {out}");
     assert!(!out.contains("--brief") && !out.contains("--unified"), "GNU diff's never joined them: {out}");
-    assert_eq!(String::from_utf8_lossy(&started.stderr), "", "a new fish starts in silence");
+    assert_eq!(&*Captured::new(&started.stderr), "", "a new fish starts in silence");
 }
 
 /// A pure-shell command registers nothing, so fish's own completion stays — `cd` still completes
@@ -438,8 +476,8 @@ fn brs_sourcefile_shows_the_file_of_the_shell_it_runs_in() {
     let last_line = |out: &[u8]| String::from_utf8_lossy(out).lines().last().unwrap_or_default().to_string();
     let fish = home.fish(true, "source $sourcefile; brs_sourcefile");
     assert_eq!(last_line(&fish.stdout), format!("# source file: {}", home.fish_sourcefile().display()));
-    assert!(console::strip_ansi_codes(&String::from_utf8_lossy(&fish.stdout)).contains("status is-interactive; or return 0"), "fish's text");
-    let bash = Command::new("bash")
+    assert!(Captured::new(&fish.stdout).plain().contains("status is-interactive; or return 0"), "fish's text");
+    let bash = shell("bash")
         .args(["--norc", "-i", "-c", "source \"$HOME/.bashrs/sourcefile.sh\" 2>/dev/null; brs_sourcefile; :"])
         .env("HOME", &home.dir)
         .output()
@@ -452,11 +490,12 @@ fn brs_sourcefile_shows_the_file_of_the_shell_it_runs_in() {
 fn the_stale_config_nag_speaks_only_while_an_archive_waits() {
     let home = Home::new("stale");
     let quiet = home.fish(true, "source $sourcefile; echo status:$status");
-    assert_eq!(String::from_utf8_lossy(&quiet.stderr), "");
-    assert_eq!(String::from_utf8_lossy(&quiet.stdout), "status:0\n", "a clean start ends the source in success");
+    assert_eq!(&*Captured::new(&quiet.stderr), "");
+    assert_eq!(&*Captured::new(&quiet.stdout), "status:0\n", "a clean start ends the source in success");
     std::fs::write(home.dir.join(".bashrs/configrs.toml.20260101.old"), "").unwrap();
     let nagged = home.fish(true, "source $sourcefile");
-    assert!(String::from_utf8_lossy(&nagged.stderr).contains("an archived config (~/.bashrs/configrs*.old) awaits merging"), "{nagged:?}");
+    let nag = Captured::new(&nagged.stderr);
+    assert!(nag.contains("an archived config (~/.bashrs/configrs*.old) awaits merging"), "{nag}");
 }
 
 /// Alt+L binds the first LISTED desktop that runs — table order, not the order the processes
@@ -491,15 +530,21 @@ fn alt_l_binds_the_first_listed_desktop_that_runs() {
 }
 
 /// The prompt clock, with the first prompt stood in for by its event: the clock goes in front of the
-/// prompt in place by then — fish's own, or one set up after the file (as config.fish does) — which
-/// sees the last command's status as if unwrapped; and a second source wraps nothing twice.
+/// prompt in place by then — one set up after the file (as config.fish does), or whichever this
+/// machine's fish has — which sees the last command's status as if unwrapped; and a second source
+/// wraps nothing twice. The event also runs fish's own first-prompt setup, so each script first
+/// silences the greeting a distribution's fish may print there.
 #[test]
 fn the_utc_clock_goes_in_front_of_whatever_prompt_is_in_place() {
     let home = Home::new("clock");
-    // The event also runs fish's own first-prompt setup, which greets; the prompts follow that.
+    let run = |script: &str| home.interactive(&format!("function fish_greeting; end; {script}")).plain();
+    // A line as the eye reads it: a distribution's fish may lead the prompt with a carriage return.
     let prompts = |script: &str| -> Vec<String> {
-        let out = console::strip_ansi_codes(&home.interactive(script)).into_owned();
-        out.lines().filter(|line| line.contains("(UTC)]") || line.contains("left")).map(str::to_string).collect()
+        run(script)
+            .lines()
+            .filter(|line| line.contains("(UTC)]") || line.contains("HANDLER-LEFT"))
+            .map(|line| line.trim_start_matches(|ch: char| ch.is_control()).to_string())
+            .collect()
     };
     let theirs = prompts("source $sourcefile; function fish_prompt; printf 'mine> '; end; emit fish_prompt; fish_prompt");
     assert_eq!(theirs.len(), 1, "{theirs:?}");
@@ -511,15 +556,20 @@ fn the_utc_clock_goes_in_front_of_whatever_prompt_is_in_place() {
     );
     let after_clock: Vec<&str> = status.iter().filter_map(|line| line.split_once("(UTC)]").map(|(_, prompt)| prompt)).collect();
     assert_eq!(after_clock, ["s=0 p=1 0", "s=1 p=1"], "the prompt sees the last command's status: {status:?}");
-    let resourced = "source $sourcefile; emit fish_prompt; source $sourcefile; emit fish_prompt; fish_prompt; functions -q __bashrs_prompt_clock; and echo handler-left";
+    let resourced = "source $sourcefile; emit fish_prompt; source $sourcefile; emit fish_prompt; fish_prompt; functions -q __bashrs_prompt_clock; and echo HANDLER-LEFT";
     let again = prompts(resourced);
     assert_eq!(again.iter().map(|line| line.matches("(UTC)]").count()).sum::<usize>(), 1, "one clock however often the file is sourced: {again:?}");
-    assert!(!again.iter().any(|line| line.contains("handler-left")), "{again:?}");
-    assert_eq!(String::from_utf8_lossy(&home.fish(true, resourced).stderr), "", "and sourcing again says nothing");
-    let ending = console::strip_ansi_codes(&home.interactive("source $sourcefile; function fish_prompt; printf 'mine\\n'; end; emit fish_prompt; fish_prompt; echo END")).into_owned();
+    assert!(!again.iter().any(|line| line.contains("HANDLER-LEFT")), "{again:?}");
+    let resourced = home.fish(true, &format!("function fish_greeting; end; {resourced}"));
+    assert_eq!(&*Captured::new(&resourced.stderr), "", "and sourcing again says nothing");
+    let ending = run("source $sourcefile; function fish_prompt; printf 'mine\\n'; end; emit fish_prompt; fish_prompt; echo END");
     assert!(ending.contains("(UTC)]mine\nEND"), "a prompt's own last newline is kept: {ending}");
-    let stock = prompts("source $sourcefile; emit fish_prompt; fish_prompt");
-    assert!(stock.len() == 1 && stock[0].starts_with('[') && stock[0].trim_end().ends_with('>'), "fish's own prompt, behind the clock: {stock:?}");
+    // This machine's own prompt, whatever it is: the wrapped one is exactly the clock, then it.
+    let both = run("source $sourcefile; emit fish_prompt; fish_prompt; printf '\\x1e'; __bashrs_original_fish_prompt");
+    let (wrapped, original) = both.rsplit_once('\u{1e}').expect("both prompts printed");
+    let clock = wrapped.strip_suffix(original).unwrap_or_else(|| panic!("the original prompt is not what follows the clock: {both}"));
+    let clock = clock.rsplit('\n').next().unwrap_or(clock).trim_start_matches(|ch: char| ch.is_control());
+    assert!(clock.len() == "[00:00:00(UTC)]".len() && clock.starts_with('[') && clock.ends_with("(UTC)]"), "{both}");
 }
 
 /// The real thing, through a terminal: a new interactive fish, its prompt set up by config.fish —
@@ -531,7 +581,7 @@ fn the_first_prompt_of_a_new_fish_has_the_clock_in_front() {
     std::fs::create_dir_all(config.join("conf.d")).unwrap();
     std::fs::write(config.join("conf.d/bashrs.fish"), "source \"$HOME/.bashrs/sourcefile.fish\"\n").unwrap();
     std::fs::write(config.join("config.fish"), "function fish_prompt; printf 'mine> '; end\n").unwrap();
-    let mut session = Command::new("timeout")
+    let mut session = shell("timeout")
         .args(["20", "script", "-qfc", "fish -i", "/dev/null"])
         .env("HOME", &home.dir)
         .env("TERM", "xterm")
@@ -545,7 +595,7 @@ fn the_first_prompt_of_a_new_fish_has_the_clock_in_front() {
     use std::io::Write as _;
     session.stdin.take().expect("piped").write_all(b"exit\r").unwrap();
     let out = session.wait_with_output().unwrap();
-    let screen = console::strip_ansi_codes(&String::from_utf8_lossy(&out.stdout)).into_owned();
+    let screen = Captured::new(&out.stdout).plain();
     assert!(out.status.success(), "the session ended on its own: {screen}");
     assert!(screen.contains("(UTC)]mine> "), "the first prompt: {screen}");
 }

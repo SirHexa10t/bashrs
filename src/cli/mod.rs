@@ -1,6 +1,6 @@
 //! The command-line interface: parse argv against the assembled command tree (`Cli` /
 //! `Command`) and dispatch — including the binary's hidden self-commands (generate,
-//! install-shell, install-stainless, complete-flags). The other half of the crate root's
+//! install-shell, install-stainless, complete-flags, cd-listing). The other half of the crate root's
 //! job, assembling `sourcefile.sh` and the completion data those hidden commands serve,
 //! lives in the [`sourcefile`] child.
 
@@ -116,6 +116,10 @@ pub enum Command {
         #[arg(long)]
         use_stable_carstay: bool,
     },
+    /// Print what the `cd` override lists where it lands — `ls -AF`'s listing, its names spelled
+    /// for the shell it runs in (the generated `cd` calls it).
+    #[command(hide = true)]
+    CdListing,
     /// Print one command's completable flags (asked by the generated completer at TAB-time).
     #[command(hide = true)]
     CompleteFlags {
@@ -161,6 +165,7 @@ impl Command {
             Command::InstallStainless { use_stable_carstay } => {
                 crate::drivers::install_stainless(use_stable_carstay)
             }
+            Command::CdListing => std::process::exit(crate::categories::filesystem::_landing_listing()),
             Command::CompleteFlags { command, shell } => println!("{}", sourcefile::complete_flags(&command, shell)),
         }
     }

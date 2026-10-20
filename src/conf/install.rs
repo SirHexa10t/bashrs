@@ -5,6 +5,7 @@
 //! `install-shell` command, COMPILE.sh's last step — invoked from the freshly built
 //! `target/release/bashrs`, which is what makes the self-copy the installation.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// The sourcefile path as written INTO rc files — deliberately UNEXPANDED: the literal `$HOME`
@@ -64,7 +65,7 @@ pub fn install_shell(bash: &str, fish: &str, fish_completed: &[String]) {
         }
         println!("Generated {}", file.display());
     }
-    let colliding = colliding(fish_completed, &fish_complete_path());
+    let colliding = colliding(fish_completed, &fish_complete_path(), &fish_built_in_completions());
     match shadow_fish_completions(&super::fish_completions_dir(), &colliding) {
         Ok(()) if colliding.is_empty() => {}
         Ok(()) => println!("Fish ships completions for {}; bashrs's own replace them", colliding.join(", ")),
@@ -285,17 +286,47 @@ fn fish_complete_path() -> Vec<PathBuf> {
     listing.unwrap_or_default().lines().filter(|line| !line.is_empty()).map(PathBuf::from).collect()
 }
 
-/// The names among `completed` that fish has a completion file for somewhere on `complete_path` —
-/// the names whose completions fish would load at the first TAB and merge with bashrs's.
-fn colliding<'a>(completed: &'a [String], complete_path: &[PathBuf]) -> Vec<&'a str> {
-    let ships = |name: &str| complete_path.iter().any(|dir| dir.join(format!("{name}.fish")).is_file());
+/// The completions fish carries inside its own binary, by command name, as `status list-files
+/// completions` lists them. Fish 4.9 keeps its own completions there, and no longer has their
+/// directory on `$fish_complete_path` at all, so a search of the path alone finds none of them —
+/// yet fish still loads them at a name's first TAB, unless a file of the same name on the path comes
+/// first. An older fish has no such subcommand (its error is discarded) and keeps its completions
+/// as files on the path, which [`fish_complete_path`] covers; for it, this is empty.
+fn fish_built_in_completions() -> BTreeSet<String> {
+    if !crate::support::exec::on_path("fish") {
+        return BTreeSet::new();
+    }
+    let listing = crate::support::exec::capture_without_input("fish", ["-c", "status list-files completions 2>/dev/null"]);
+    built_in_names(&listing.unwrap_or_default())
+}
+
+/// The command names in a `status list-files completions` listing: its `completions/NAME.fish`
+/// lines.
+fn built_in_names(listing: &str) -> BTreeSet<String> {
+    listing
+        .lines()
+        .filter_map(|line| line.strip_prefix("completions/")?.strip_suffix(".fish"))
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The names among `completed` that fish completes too — with a file somewhere on `complete_path`,
+/// or one `built_in` to fish: the names whose completions fish would load at the first TAB and
+/// merge with bashrs's.
+fn colliding<'a>(completed: &'a [String], complete_path: &[PathBuf], built_in: &BTreeSet<String>) -> Vec<&'a str> {
+    let ships = |name: &str| {
+        built_in.contains(name) || complete_path.iter().any(|dir| dir.join(format!("{name}.fish")).is_file())
+    };
     completed.iter().map(String::as_str).filter(|name| ships(name)).collect()
 }
 
 /// Make bashrs's completions win for each name in `colliding`, through a file in `dir` — which the
 /// fish sourcefile puts first on `$fish_complete_path`. Fish loads the first `<name>.fish` it finds
-/// at that name's first TAB, so this one is loaded in place of fish's own, and none of fish's code
-/// runs; it defines nothing, as bashrs's completions are in the sourcefile already. A file for a
+/// on that path at the name's first TAB — and turns to a completion built into it (fish 4.9 keeps
+/// its own there) only where the path has none — so this one is loaded in place of fish's own, and
+/// none of fish's code runs; it defines nothing, as bashrs's completions are in the sourcefile
+/// already. A file for a
 /// name that no longer collides is removed, and `dir` with it once none is left. Only `*.fish`
 /// files are touched — anything else in `dir` is not bashrs's to remove.
 fn shadow_fish_completions(dir: &Path, colliding: &[&str]) -> Result<(), String> {
@@ -420,9 +451,20 @@ mod tests {
         std::fs::write(vendor.join("hg.fish"), "").unwrap();
         std::fs::write(vendor.join("unrelated.fish"), "").unwrap();
         let completed: Vec<String> = ["diff", "gg", "hg", "lll"].map(String::from).to_vec();
-        assert_eq!(colliding(&completed, &[shipped, vendor]), ["diff", "hg"]);
-        assert!(colliding(&completed, &[]).is_empty(), "no fish, no collisions");
+        assert_eq!(colliding(&completed, &[shipped, vendor], &BTreeSet::new()), ["diff", "hg"]);
+        assert!(colliding(&completed, &[], &BTreeSet::new()).is_empty(), "no fish, no collisions");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fish 4.9 keeps its own completions inside its binary, off the completion path: a name it
+    /// completes there collides as a file on the path would — and only a whole name counts.
+    #[test]
+    fn a_completion_built_into_fish_collides_too() {
+        let built_in = built_in_names("completions/adiff.fish\ncompletions/diff.fish\ncompletions/hg.fish\nfunctions/ls.fish\ncompletions/.fish\n");
+        assert_eq!(built_in, BTreeSet::from(["adiff".to_string(), "diff".to_string(), "hg".to_string()]), "completions only, by name");
+        let completed: Vec<String> = ["diff", "gg", "hg", "lll"].map(String::from).to_vec();
+        assert_eq!(colliding(&completed, &[], &built_in), ["diff", "hg"]);
+        assert!(built_in_names("").is_empty(), "an older fish lists nothing");
     }
 
     /// The stand-in files track the collisions: written for each, removed when a name stops

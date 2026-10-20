@@ -213,8 +213,14 @@ fn wrapper_prefix(name: &str) -> Option<ShellText> {
     surfaces().find_map(|surface| (surface.wrapper_prefix)(name))
 }
 
+/// The installed binary, as every function in both files calls it — quoted so `$HOME` expands at
+/// call time and a path with spaces stays one word, which bash and fish read alike.
+const BIN: &str = "\"$HOME/.bashrs/bashrs\"";
+
 /// The placeholder for the project directory this binary was compiled from.
 const PROJECT_ROOT: &str = "{PROJECT_ROOT}";
+/// The placeholder for the installed binary, [`BIN`].
+const BINARY: &str = "{BINARY}";
 /// The placeholder (fish) for the shell's own definition of an override's name.
 const ORIGINAL: &str = "{ORIGINAL}";
 
@@ -223,10 +229,11 @@ const ORIGINAL: &str = "{ORIGINAL}";
 /// knowledge lives — so these are baked into the emitted text instead of fetched through a
 /// subprocess at every call:
 /// - [`PROJECT_ROOT`] — the project directory, quoted for the shell the fragment is written in;
+/// - [`BINARY`] — the installed binary, spelled as every generated wrapper calls it ([`BIN`]);
 /// - [`ORIGINAL`], fish only — the shell's own definition of `name`, which [`fish`] saves under
 ///   another name before the override replaces it.
 fn substitute(text: &str, shell: Shell, name: &str) -> String {
-    let text = text.replace(PROJECT_ROOT, &shell.quote(env!("CARGO_MANIFEST_DIR")));
+    let text = text.replace(PROJECT_ROOT, &shell.quote(env!("CARGO_MANIFEST_DIR"))).replace(BINARY, BIN);
     match shell {
         Shell::Bash => text,
         Shell::Fish => text.replace(ORIGINAL, &fish_original(name)),
@@ -598,22 +605,23 @@ mod tests {
             crate::support::shell_quote::quote(env!("CARGO_MANIFEST_DIR"))
         );
         assert!(content.contains(&baked), "brs_cd must cd to the baked project root: {baked}");
-        assert!(
-            !script.contains("{PROJECT_ROOT}"),
-            "the placeholder must never survive into the emitted script"
-        );
+        for placeholder in [PROJECT_ROOT, BINARY, ORIGINAL] {
+            for shell in [Shell::Bash, Shell::Fish] {
+                assert!(!wrappers(shell).contains(placeholder), "{placeholder} must never survive into the emitted script");
+            }
+        }
         assert!(
             content.contains(r#"dotbashrs_cd() { cd -- "$HOME/.bashrs"; }"#),
             "dotbashrs_cd must cd to the installation directory"
         );
         // The `cd` builtin override: the real builtin (every native behavior kept), and on
-        // success the landing directory's contents — with GNU ls's own shell-escape quoting,
-        // so a problematic name pastes back like lll's do. Its section header proves the
-        // category registered end-to-end.
+        // success the landing directory's contents — listed by the binary, which spells each name
+        // for the shell it is shown in. Its section header proves the category registered
+        // end-to-end.
         assert!(script.contains("\n# overrides\n"), "the overrides section is missing");
         assert!(
-            content.contains(r#"cd() { builtin cd "$@" && ls -AF --color=always --group-directories-first --quoting-style=shell-escape; }"#),
-            "the cd override must run the builtin, then list escaped on success"
+            content.contains(r#"cd() { builtin cd "$@" && "$HOME/.bashrs/bashrs" cd-listing; }"#),
+            "the cd override must run the builtin, then list on success"
         );
         // shell_def's wrapper pipes the four shell-only probes into the binary (NUL-delimited),
         // where the ranking/labeling logic lives in tested Rust — the shell half is only what a

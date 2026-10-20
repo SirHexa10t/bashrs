@@ -1,7 +1,12 @@
 //! Behavioral tests of the generated `sourcefile.sh`'s shell surface, run through a real bash —
 //! the parts unit tests can only assert as strings (function precedence, PATH idempotence).
-//! Kept environment-independent: nothing here requires the bundled tools to actually exist.
+//! Kept environment-independent: nothing here requires the bundled tools to actually exist, and
+//! every bash starts through [`common::shell`] — detached from the terminal running the tests, and
+//! without its bashrs session.
 
+mod common;
+
+use common::{shell, Captured};
 use std::process::Command;
 
 /// The first `lines` of a `# `-headed section of the real generated sourcefile.
@@ -18,9 +23,16 @@ fn tools_section() -> String {
 }
 
 /// Run `script` in bash and return its stdout.
-fn bash(script: &str) -> String {
-    let out = Command::new("bash").arg("-c").arg(script).output().expect("bash");
-    String::from_utf8_lossy(&out.stdout).into_owned()
+fn bash(script: &str) -> Captured {
+    let out = shell("bash").arg("-c").arg(script).output().expect("bash");
+    Captured::new(&out.stdout)
+}
+
+/// Run `script` in an interactive bash — the shell the sourcefile arms itself in — returning its
+/// stdout.
+fn interactive_bash(script: &str) -> Captured {
+    let out = shell("bash").args(["--norc", "-i", "-c", script]).output().expect("bash -i");
+    Captured::new(&out.stdout)
 }
 
 /// The full generated sourcefile on disk, plus a fake `$HOME` whose `.bashrs/bashrs` exists —
@@ -37,14 +49,42 @@ fn sourcefile_and_home(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     (file, base.join("home"))
 }
 
+/// Every shell a test starts leads a session of its own, so it has no terminal to take: an
+/// interactive bash would otherwise open the terminal running the tests and take its foreground —
+/// in parallel, leaving it to a group that is gone, and the run stopped. Told by the session id,
+/// which is the shell's own pid exactly when it leads one, with a terminal around or not.
+#[test]
+fn test_shells_start_in_a_session_of_their_own() {
+    let said = Captured::new(&shell("sh").args(["-c", "echo $$ $(ps -o sid= -p $$)"]).output().expect("sh").stdout);
+    let ids: Vec<&str> = said.split_whitespace().collect();
+    assert_eq!(ids.len(), 2, "{said}");
+    assert_eq!(ids[0], ids[1], "the shell leads its own session: {said}");
+}
+
+/// And it starts without the bashrs session of whoever runs the tests: the variables a bashrs-armed
+/// shell exports are removed, and its tools directory is off `PATH`.
+#[test]
+fn test_shells_start_without_a_bashrs_session() {
+    let command = shell("sh");
+    let set: std::collections::BTreeMap<String, Option<String>> = command
+        .get_envs()
+        .map(|(name, value)| (name.to_string_lossy().into_owned(), value.map(|value| value.to_string_lossy().into_owned())))
+        .collect();
+    for variable in ["GREP_COLORS", "HISTTIMEFORMAT", "PS1", "_BASHRS_BARE"] {
+        assert_eq!(set.get(variable), Some(&None), "{variable} is removed");
+    }
+    let path = set.get("PATH").cloned().flatten().unwrap_or_default();
+    assert!(!path.split(':').any(|dir| dir.ends_with(".bashrs/tools/bin")), "{path}");
+}
+
 /// The whole generated file, parsed by bash itself (`-n`: nothing runs). The tests below source it
 /// with stderr discarded and check what got defined, so a syntax error in a later section — the
 /// keybinds, the completion, the greeting — failed none of them.
 #[test]
 fn the_whole_generated_file_parses_in_bash() {
     let (file, _) = sourcefile_and_home("parse");
-    let out = Command::new("bash").arg("-n").arg(&file).output().expect("bash -n");
-    assert!(out.status.success(), "bash rejects the generated file: {}", String::from_utf8_lossy(&out.stderr));
+    let out = shell("bash").arg("-n").arg(&file).output().expect("bash -n");
+    assert!(out.status.success(), "bash rejects the generated file: {}", Captured::new(&out.stderr));
     let _ = std::fs::remove_dir_all(file.parent().unwrap());
 }
 
@@ -64,7 +104,7 @@ fn non_interactive_shells_inherit_nothing_at_all() {
     assert!(!out.contains("python3-is:function"), "system python3 must stay untouched: {out}");
     assert!(!out.contains("lll-is:function"), "no definitions non-interactively: {out}");
     let silence = bash(&format!("HOME='{}'; source '{}'", home.display(), file.display()));
-    assert_eq!(silence, "", "a non-interactive source must write nothing to stdout");
+    assert_eq!(&*silence, "", "a non-interactive source must write nothing to stdout");
     let _ = std::fs::remove_dir_all(file.parent().unwrap());
 }
 
@@ -78,12 +118,8 @@ fn the_sourcefile_arms_fully_in_interactive_shells() {
         home.display(),
         file.display()
     );
-    let out = Command::new("bash").args(["--norc", "-i", "-c", &script]).output().expect("bash -i");
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("defined"),
-        "interactive shells must get the full surface: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
+    let out = interactive_bash(&script);
+    assert!(out.contains("defined"), "interactive shells must get the full surface: {out}");
     let _ = std::fs::remove_dir_all(file.parent().unwrap());
 }
 
@@ -101,8 +137,7 @@ fn a_bare_session_defines_nothing_and_consumes_its_flag() {
         home.display(),
         file.display()
     );
-    let out = Command::new("bash").args(["--norc", "-i", "-c", &script]).output().expect("bash -i");
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = interactive_bash(&script);
     assert!(text.contains("status:0"), "the bare-session return must be quiet success: {text}");
     assert!(!text.contains("lll-bare:function"), "a bare session must get NO bashrs surface: {text}");
     assert!(text.contains("flag-after:[gone]"), "the guard must consume the flag: {text}");
@@ -179,8 +214,7 @@ fn alt_l_binds_the_first_listed_desktop_that_runs() {
             home.display(),
             file.display()
         );
-        let out = Command::new("bash").args(["--norc", "-i", "-c", &script]).output().expect("bash -i");
-        String::from_utf8_lossy(&out.stdout).into_owned()
+        interactive_bash(&script)
     };
     let cases = [
         ("1 openbox 2 i3", "x11", Some("i3-msg restart"), "table order, not process order"),
@@ -216,10 +250,12 @@ fn the_dotdot_function_climbs_one_directory() {
 
 #[test]
 fn the_path_prepend_is_idempotent_across_resources() {
-    // Sourcing the section twice (nested shells re-source the rc) must not stack PATH entries.
+    // Sourcing the section twice (nested shells re-source the rc) must not stack PATH entries —
+    // counted exactly, under a HOME of the test's own, so no other bashrs's directory can count.
     let section = tools_section();
     let script = format!(
-        "{section}\n{section}\nprintf '%s' \":$PATH:\" | grep -o ':[^:]*\\.bashrs/tools/bin:' | wc -l"
+        "HOME=/nonexistent/bashrs-test-home\n{section}\n{section}\n\
+         printf '%s' \":$PATH:\" | grep -oF \":$HOME/.bashrs/tools/bin:\" | wc -l"
     );
     assert_eq!(bash(&script).trim(), "1");
 }

@@ -63,7 +63,7 @@ mod commands {
     ///
     /// **The join rests entirely on `--zero`.** Names arrive literal and exact (see [`LS_FLAGS`]),
     /// so every row keys straight onto the entry [`_scan`] measured: nothing to un-escape, nothing
-    /// to guess at. Quoting happens afterwards and for display only ([`_display_name`]), never to
+    /// to guess at. Quoting happens afterwards and for display only (`shell_quote::cell`), never to
     /// the key — which is why a file whose name holds a newline still gets measured.
     ///
     /// **What it refuses, and why** — [`_measured_root`]: an ordering flag it would silently
@@ -135,35 +135,9 @@ mod commands {
                 && arg.chars().skip(1).any(|ch| SORT_FLAGS.contains(ch)))
     }
 
-    /// The plain on-disk name each listing record refers to: colour stripped, `ls -F`'s type
-    /// marker removed, and a symlink's ` -> target` dropped. This is the join key, and `--zero`
-    /// is what makes it exact — the bytes here are the bytes in the directory entry.
-    ///
-    /// The marker is only removed when the mode says one was added, so a regular file genuinely
-    /// named `report@` keeps its `@`.
-    fn _entry_key(meta: &[&str], name: &str) -> String {
-        let mode = meta.get(1).copied().unwrap_or_default();
-        let head = match name.split_once(" -> ").filter(|_| mode.starts_with('l')) {
-            Some((link, _)) => link,
-            None => name,
-        };
-        let plain = console::strip_ansi_codes(head);
-        let marked = matches!(mode.as_bytes().first(), Some(b'd' | b'l' | b'p' | b's'))
-            || mode.contains('x');
-        match marked {
-            true => plain.strip_suffix(|ch: char| TYPE_MARKERS.contains(ch)).unwrap_or(&plain).to_string(),
-            false => plain.into_owned(),
-        }
-    }
-
     /// Every entry named by the listing, in listing order.
     fn _entry_keys(ls_output: &str) -> Vec<String> {
-        _records(ls_output)
-            .map(|record| {
-                let (meta, name) = _split_record(record);
-                _entry_key(&meta, name)
-            })
-            .collect()
+        _records(ls_output).filter_map(_Entry::parse).map(|entry| entry.key()).collect()
     }
 
     /// The data records of a listing: NUL-separated, minus the trailing empty one and `ls -l`'s
@@ -219,24 +193,20 @@ mod commands {
         shell: Shell,
     ) -> Vec<String> {
         let mut rows: Vec<(Option<u64>, String, String)> = Vec::new();
-        for record in _records(ls_output) {
-            let (meta, name) = _split_record(record);
-            if meta.is_empty() || name.is_empty() {
-                continue;
-            }
-            let key = _entry_key(&meta, name);
+        for entry in _records(ls_output).filter_map(_Entry::parse) {
+            let key = entry.key();
             let measured = stats.get(&key);
             let figures = measured.map_or_else(
                 || ["-".to_string(), "-".to_string(), "-".to_string()],
                 |s| [_human_size(s.bytes), s.files.to_string(), s.inodes.to_string()],
             );
             let kept: Vec<&str> =
-                meta.iter().enumerate().filter(|(i, _)| *i != SIZE_COL).map(|(_, f)| *f).collect();
+                entry.meta.iter().enumerate().filter(|(i, _)| *i != SIZE_COL).map(|(_, f)| *f).collect();
             let row = format!(
                 "{}\t{}\t{}",
                 figures.join("\t"),
                 kept.join("\t"),
-                _link_cell(&meta, name, targets, shell)
+                _name_column(&entry, targets, shell)
             );
             rows.push((measured.map(|s| s.bytes), key, row));
         }
@@ -263,6 +233,7 @@ mod commands {
     /// a name, so it is the only safe record separator. It also forces literal names, which keeps
     /// each name usable as an identity — nothing to un-escape and guess at — where `-b` would
     /// backslash every space and, outside a UTF-8 locale, octal-escape every accented character.
+    /// It turns colour off, too, which is why `--color=always` comes AFTER it: the last word wins.
     const LS_FLAGS: &[&str] =
         &["-tarlushF", "--zero", "--color=always", "--time-style=+%F_%T", "--group-directories-first"];
     /// Metadata fields `ls -l` prints before the name: blocks, permissions, hard-links,
@@ -310,17 +281,14 @@ mod commands {
     /// metadata is consumed field by field, and only on spaces — `ls` pads those columns with
     /// spaces, so a tab that belongs to the name is never mistaken for a delimiter.
     fn _row(record: &str, targets: &HashMap<String, String>, shell: Shell) -> String {
-        if record.is_empty() {
-            return String::new();
+        if let Some(entry) = _Entry::parse(record) {
+            return format!("{}\t{}", entry.meta.join("\t"), _name_column(&entry, targets, shell));
         }
-        let (meta, name) = _split_record(record);
-        if meta.is_empty() {
-            return _display_name(name, shell); // a fragment, not a listing row
+        match _split_record(record) {
+            (_, "") if record.is_empty() => String::new(),
+            (meta, name) if meta.is_empty() => shell_quote::cell(shell, name), // a fragment, not a listing row
+            (meta, _) => meta.join("\t"),
         }
-        if name.is_empty() {
-            return meta.join("\t");
-        }
-        format!("{}\t{}", meta.join("\t"), _link_cell(&meta, name, targets, shell))
     }
 
     /// A record's [`META_COLS`] metadata fields and the exact name remainder. Split only on
@@ -338,149 +306,255 @@ mod commands {
         (meta, rest.trim_start_matches(' '))
     }
 
-    /// The name column, aware that a symlink's field is *two* paths and an arrow rather than one
-    /// name — so each side is spelled separately (`'a link' -> 'real target.txt'`), the way `ls`'s
-    /// own shell quoting does it. Quoting the pair as a single word would claim a file exists
-    /// under that whole string, which is a lie.
-    ///
-    /// The permissions column decides: only an `l` mode makes the arrow a separator, so a plain
-    /// file merely *named* `evil -> fake.txt` stays whole. When a symlink's own name also contains
-    /// ` -> ` the split is genuinely ambiguous — `ls` gives us no delimiter to trust — and the
-    /// first arrow wins.
-    fn _link_cell(meta: &[&str], name: &str, targets: &HashMap<String, String>, shell: Shell) -> String {
-        let is_symlink = meta.get(1).is_some_and(|mode| mode.starts_with('l'));
-        match name.split_once(" -> ").filter(|_| is_symlink) {
-            Some((link, target)) => {
-                format!("{} -> {}", _name_cell(link, targets, shell), _display_name(target, shell))
+    /// One record of a long listing in [`LS_FLAGS`]' shape, taken apart: its [`META_COLS`]
+    /// metadata fields, and the name exactly as `ls` printed it — colour codes and all — with the
+    /// type marker `-F` put after it split off; for a symlink, its target likewise.
+    struct _Entry<'a> {
+        meta: Vec<&'a str>,
+        /// The name, without its marker.
+        name: &'a str,
+        /// What `-F` put after the name: one of [`TYPE_MARKERS`], or nothing.
+        marker: &'a str,
+        /// A symlink's target, and the marker `-F` put after it.
+        target: Option<(&'a str, &'a str)>,
+    }
+
+    impl<'a> _Entry<'a> {
+        /// Take `record` apart; `None` for what is no listing row — a fragment with no metadata, or
+        /// metadata with no name.
+        ///
+        /// Which trailing character is a marker is decided, never guessed from the character: a
+        /// name carries the marker its type gets ([`_name_marker`]), so a plain file named `x *`
+        /// keeps its `*`. A symlink's name carries none in this long form; its target carries its
+        /// own type's, which the listing does not state — but `ls` writes it after the colour reset
+        /// that closes the target ([`_after_colour`]), so an uncoloured target has none.
+        ///
+        /// The arrow splits only a symlink: only an `l` mode makes ` -> ` a separator, so a plain
+        /// file merely *named* `evil -> fake.txt` stays whole. When a symlink's own name holds
+        /// ` -> ` too, the split is genuinely ambiguous — `ls` gives no delimiter to trust — and
+        /// the first arrow wins.
+        fn parse(record: &'a str) -> Option<Self> {
+            let (meta, rest) = _split_record(record);
+            if meta.is_empty() || rest.is_empty() {
+                return None;
             }
-            None => _name_cell(name, targets, shell),
+            let mode = meta.get(1).copied().unwrap_or_default();
+            let (named, target) = match rest.split_once(" -> ").filter(|_| mode.starts_with('l')) {
+                Some((link, target)) => (link, Some(_after_colour(target))),
+                None => (rest, None),
+            };
+            let (name, marker) = match _name_marker(mode) {
+                Some(marker) if named.ends_with(marker) => named.split_at(named.len() - marker.len_utf8()),
+                _ => (named, ""),
+            };
+            Some(_Entry { meta, name, marker, target })
+        }
+
+        /// The mode column, `drwxr-xr-x` and the like.
+        fn mode(&self) -> &'a str {
+            self.meta.get(1).copied().unwrap_or_default()
+        }
+
+        /// The name as it is on disk: colour gone, marker off — `LLL`'s join key, which `--zero`
+        /// makes exact, since the bytes here are the bytes in the directory entry.
+        fn key(&self) -> String {
+            console::strip_ansi_codes(self.name).into_owned()
         }
     }
 
-    /// `ls -F`'s type markers, appended after the name (and after its colour reset).
+    /// `ls -F`'s type markers, appended after a name (and after its colour reset).
     const TYPE_MARKERS: &str = "*/=>@|";
 
-    /// How a name has to be spelled for bash to read back exactly the bytes on disk. The
-    /// bare/`'…'`/`$'…'` decision is [`crate::support::shell_quote`]'s (shared with
-    /// `shell_args_print`); this variant differs only by forcing `$'…'` on a two-space run, which
-    /// the table's column divider ([`TABLE_SEPARATOR`]) would otherwise cut the name at. Fish
-    /// needs only the first two tiers: its quotes hold a `'` (as `\'`), and what they cannot hold
-    /// is written between quoted runs ([`shell_quote::FishWord`]).
-    #[derive(PartialEq, Eq, Debug)]
-    enum _Quoting {
-        /// Bare-safe — print it as it is.
-        Bare,
-        /// `'…'`: everything inside is literal, which covers spaces, globs, `$`, `"` and `\`.
-        Single,
-        /// `$'…'`: a control character, a `'`, or a two-space run the column divider can't survive.
-        Ansi,
+    /// The marker `ls -lF` puts after an entry's name, by the type its mode states — GNU's
+    /// classify rule: `/` a directory, `*` a regular file anyone may execute, `|` a FIFO, `=` a
+    /// socket, `>` a door. A plain file or a device gets none, and so does a symlink: in the long
+    /// form its target carries the marker. (The short form writes a symlink as `name@`.)
+    fn _name_marker(mode: &str) -> Option<char> {
+        // The execute bits are the third of each `rwx` triplet; `s` and `t` there mean set *and*
+        // executable (`S` and `T` mean set without it).
+        let executable = mode.bytes().enumerate().any(|(i, bit)| matches!(i, 3 | 6 | 9) && matches!(bit, b'x' | b's' | b't'));
+        match mode.bytes().next()? {
+            b'd' => Some('/'),
+            b'p' => Some('|'),
+            b's' => Some('='),
+            b'D' => Some('>'),
+            b'-' if executable => Some('*'),
+            _ => None,
+        }
     }
 
-    /// Which spelling `plain` (already stripped of colour and of its type marker) needs.
-    fn _quoting_for(plain: &str) -> _Quoting {
-        if shell_quote::needs_ansi_c(plain) || plain.contains("  ") {
-            return _Quoting::Ansi;
-        }
-        if shell_quote::is_bare_safe(plain) {
-            return _Quoting::Bare;
-        }
-        _Quoting::Single
-    }
-
-    /// Render `name` so that it is unambiguous, safe in a table cell, and still a valid word of
-    /// `shell`, the one `lll` was run from — paste it into a command and you get the file you were
-    /// looking at.
-    ///
-    /// Marking only appears where it carries meaning: an ordinary name prints untouched. When it
-    /// is needed, the form itself distinguishes cases the eye cannot. A file whose name really
-    /// contains a newline prints `$'aa\nbb.txt'`; one literally called `aa\nbb.txt` prints
-    /// `'aa\nbb.txt'` — the `$` is the difference, exactly as bash reads them.
-    ///
-    /// The quotes also solve a layout problem: a run of two or more spaces is this table's column
-    /// divider ([`TABLE_SEPARATOR`]), so a name containing one would be cut in half. In `$'…'`
-    /// those spaces become `\x20` and the run disappears without the name losing a character.
-    ///
-    /// `ls`'s colour sequences ride through untouched — they are control characters too, and
-    /// escaping them would print the codes instead of colouring the name. The type marker `ls -F`
-    /// appends stays outside the quotes, where it belongs: `'a dir'/`, not `'a dir/'`.
-    ///
-    /// Fish spells the same names its own way: `'it\'s.txt'` where bash needs `$'it\'s.txt'`, and
-    /// a newline as `'aa'\n'bb.txt'` — fish has no `$'…'` to put it in.
-    fn _display_name(name: &str, shell: Shell) -> String {
-        let (body, marker) = match name.strip_suffix(|ch: char| TYPE_MARKERS.contains(ch)) {
-            Some(body) => (body, &name[body.len()..]),
-            None => (name, ""),
+    /// A symlink's target and the marker `ls -lF` put after it. Only one of [`TYPE_MARKERS`] right
+    /// after a colour code counts — the reset `ls` closes a coloured target with, before writing
+    /// the marker; an uncoloured target has none. That misreads only a target whose type
+    /// `LS_COLORS` leaves uncoloured although `-F` marks it (a directory or an executable).
+    fn _after_colour(target: &str) -> (&str, &str) {
+        let Some(last) = target.chars().next_back().filter(|ch| TYPE_MARKERS.contains(*ch)) else {
+            return (target, "");
         };
-        let plain = console::strip_ansi_codes(body);
-        let escape_spaces = plain.contains("  ");
-        match (_quoting_for(&plain), shell) {
-            (_Quoting::Bare, _) => name.to_string(),
-            (_, Shell::Fish) => {
-                let mut word = shell_quote::FishWord::default();
-                let mut spelled = _map_outside_ansi(body, |ch, out| word.push(ch, escape_spaces, out));
-                word.finish(&mut spelled);
-                format!("{spelled}{marker}")
-            }
-            (_Quoting::Single, Shell::Bash) => format!("'{body}'{marker}"),
-            (_Quoting::Ansi, Shell::Bash) => {
-                // Escape outside ls's colour spans (they're control bytes too, but escaping them
-                // would print the codes instead of colouring the name); the per-character rule is
-                // the shared one.
-                let inner = _map_outside_ansi(body, |ch, out| {
-                    shell_quote::push_ansi_c(ch, escape_spaces, out)
-                });
-                format!("$'{inner}'{marker}")
-            }
-        }
+        let (before, marker) = target.split_at(target.len() - last.len_utf8());
+        let closed = before.rfind('\u{1b}').is_some_and(|at| {
+            let code = &before[at..];
+            code.starts_with("\u{1b}[")
+                && code.ends_with('m')
+                && code[2..code.len() - 1].bytes().all(|byte| byte.is_ascii_digit() || byte == b';')
+        });
+        if closed { (before, marker) } else { (target, "") }
     }
 
-    /// Copy `text`, handing every ordinary character to `escape` while letting ANSI colour
-    /// sequences through verbatim. A sequence runs from `ESC` to its final letter (`m`, for the
-    /// colour codes `ls` emits), and nothing inside it is a filename character.
-    fn _map_outside_ansi(text: &str, mut escape: impl FnMut(char, &mut String)) -> String {
-        let mut out = String::with_capacity(text.len());
-        let mut chars = text.chars();
-        while let Some(ch) = chars.next() {
-            if ch != '\u{1b}' {
-                escape(ch, &mut out);
-                continue;
-            }
-            out.push(ch);
-            for code in chars.by_ref() {
-                out.push(code);
-                if code.is_ascii_alphabetic() {
-                    break;
-                }
-            }
+    /// The name column: the name ([`_name_cell`]), then for a symlink an arrow and its target —
+    /// each side spelled on its own (`'a link' -> 'real target.txt'`), the way `ls`'s own shell
+    /// quoting does it. Quoting the pair as one word would claim a file exists under that whole
+    /// string, which is a lie.
+    fn _name_column(entry: &_Entry, targets: &HashMap<String, String>, shell: Shell) -> String {
+        let name = _name_cell(entry.name, entry.marker, targets, shell);
+        match entry.target {
+            Some((target, marker)) => format!("{name} -> {}{marker}", shell_quote::cell(shell, target)),
+            None => name,
         }
-        out
     }
 
     /// Render the name column. A `.lnk` shortcut is treated as a broken Windows link: the
     /// name and its target — or `?` when the target can't be read — go red via `recho`'s
     /// style, joined by a plain ` (Windows)-> ` marker so it fits `ls`'s aesthetic and
     /// reads unambiguously. Any other entry keeps `ls`'s own colouring untouched.
-    fn _name_cell(name: &str, targets: &HashMap<String, String>, shell: Shell) -> String {
-        // Takes the name as `ls` gave it, before [`_display_name`] can wrap it in quotes — a
-        // quoted `'shortcut.lnk'` would no longer end in `.lnk` and the check below would miss it.
-        // Cheap reject first: no `.lnk` substring → not a shortcut, so skip the ANSI strip.
-        // (`ls` colours a name as a single span, so `.lnk` survives contiguously in it.)
+    fn _name_cell(name: &str, marker: &str, targets: &HashMap<String, String>, shell: Shell) -> String {
+        let spelled = || format!("{}{marker}", shell_quote::cell(shell, name));
+        // Takes the name as `ls` gave it, before it is spelled — a quoted `'shortcut.lnk'` would
+        // no longer end in `.lnk` and the check below would miss it. Cheap reject first: no
+        // `.lnk` substring → not a shortcut, so skip the ANSI strip. (`ls` colours a name as a
+        // single span, so `.lnk` survives contiguously in it.)
         if !name.contains(".lnk") {
-            return _display_name(name, shell);
+            return spelled();
         }
         let plain = console::strip_ansi_codes(name);
-        let plain = plain.strip_suffix(|c: char| TYPE_MARKERS.contains(c)).unwrap_or(&plain); // -F indicator
         if !plain.ends_with(".lnk") {
-            return _display_name(name, shell); // `.lnk` appeared mid-name, not as the extension
+            return spelled(); // `.lnk` appeared mid-name, not as the extension
         }
         let red = doc_style::broken_link_text;
         // `?` stands in when the shortcut's target can't be read (unparseable / uncorrelated).
-        let target = match targets.get(plain) {
+        let target = match targets.get(plain.as_ref()) {
             Some(t) => t.split_whitespace().collect::<Vec<_>>().join(" "),
             None => "?".to_string(),
         };
-        format!("{} (Windows)-> {}", red(&_display_name(plain, shell)), red(&target))
+        format!("{} (Windows)-> {}", red(&shell_quote::cell(shell, &plain)), red(&target))
     }
+
+    // ——— The `cd` listing ——————————————————————————————————————————————————
+
+    /// The listing the `cd` override prints where it lands — `ls -AF`'s: every entry but `.` and
+    /// `..`, directories first, each in `ls`'s colours and with its type marker, in `ls`'s columns —
+    /// with every name spelled for the shell it is shown in ([`shell_quote::cell`]), which no
+    /// quoting style of `ls`'s can do for fish. Read from the same long records `lll` reads
+    /// ([`_Entry`]), where the mode says exactly which marker a name has; the short form's `@` for
+    /// a symlink is added here. Columns on a terminal, one entry per line otherwise, as `ls`
+    /// decides. Returns `ls`'s exit status, as the override's own `ls` used to.
+    pub(crate) fn _landing_listing() -> i32 {
+        let Some((code, output)) = exec::capture_with_code("ls", LANDING_FLAGS) else { return 1 };
+        let cells = _landing_cells(&String::from_utf8_lossy(&output), Shell::caller());
+        let lines = match std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            true => _columns(&cells, _window_width()),
+            false => cells,
+        };
+        for line in lines {
+            println!("{line}");
+        }
+        code
+    }
+
+    /// The `ls` flags behind the `cd` listing: [`LS_FLAGS`]' long shape — the mode column is what
+    /// says a name's marker, `--zero` is what keeps names exact, and the block count and time style
+    /// only keep a record reading as `lll`'s — with `ls -A`'s selection and order: every entry but
+    /// `.` and `..`, by name, directories first.
+    const LANDING_FLAGS: &[&str] = &["-lsAF", "--zero", "--color=always", "--time-style=+%F_%T", "--group-directories-first"];
+
+    /// Each listed entry as its cell: the name spelled for `shell`, then its marker as the short
+    /// form writes it.
+    fn _landing_cells(ls_output: &str, shell: Shell) -> Vec<String> {
+        _records(ls_output)
+            .filter_map(_Entry::parse)
+            .map(|entry| {
+                let marker = if entry.mode().starts_with('l') { "@" } else { entry.marker };
+                format!("{}{marker}", shell_quote::cell(shell, entry.name))
+            })
+            .collect()
+    }
+
+    /// How wide a window the `cd` listing lays its columns out for: [`_width_of`] the terminal
+    /// on stdout and `$COLUMNS`.
+    fn _window_width() -> usize {
+        let terminal = console::Term::stdout().size_checked().map(|(_rows, columns)| usize::from(columns));
+        _width_of(terminal, std::env::var("COLUMNS").ok().as_deref())
+    }
+
+    /// The window width as GNU `ls` decides it: the terminal's own, then `$COLUMNS`, then 80 —
+    /// the terminal first, since a `COLUMNS` some shell exported before the window was resized
+    /// would lay the listing out for the old width. A width of zero counts as none.
+    fn _width_of(terminal: Option<usize>, columns: Option<&str>) -> usize {
+        terminal
+            .filter(|&width| width > 0)
+            .or_else(|| columns.and_then(|columns| columns.trim().parse().ok()).filter(|&width| width > 0))
+            .unwrap_or(80)
+    }
+
+    /// `cells` laid out as GNU `ls` lays out a short listing on a terminal `width` columns wide: as
+    /// many columns as fit, filled top to bottom, every column but the last as wide as its widest
+    /// cell and two spaces more. GNU's own algorithm, `calculate_columns` as coreutils has it
+    /// today: every column count is tried at once, each column but the last starting
+    /// [`MIN_COLUMN_WIDTH`] wide and the last one wide, and the most columns whose line still fits
+    /// the window win — a line may fill it exactly. (Older coreutils — 9.7, for one — kept the
+    /// window's last column free and started the last column at the minimum too, so it can break a
+    /// listing into one column fewer than this.) Widths are as displayed: colour codes take no
+    /// room, a wide character takes two.
+    fn _columns(cells: &[String], width: usize) -> Vec<String> {
+        let count = cells.len();
+        if count == 0 {
+            return Vec::new();
+        }
+        let lengths: Vec<usize> = cells.iter().map(|cell| console::measure_text_width(cell)).collect();
+        let most = width.div_ceil(MIN_COLUMN_WIDTH).clamp(1, count);
+        // For each column count: every column's width, the line they make, and whether it fits.
+        let mut layouts: Vec<(Vec<usize>, usize, bool)> = (0..most)
+            .map(|last| {
+                let mut widths = vec![MIN_COLUMN_WIDTH; last + 1];
+                widths[last] = 1;
+                (widths, last * MIN_COLUMN_WIDTH + 1, true)
+            })
+            .collect();
+        for (index, &length) in lengths.iter().enumerate() {
+            // `last`: the layout's last column — the one with no gap after it.
+            for (last, (widths, line, fits)) in layouts.iter_mut().enumerate() {
+                if !*fits {
+                    continue;
+                }
+                let column = index / count.div_ceil(last + 1);
+                let needed = length + if column == last { 0 } else { 2 };
+                if widths[column] < needed {
+                    *line += needed - widths[column];
+                    widths[column] = needed;
+                    *fits = *line <= width;
+                }
+            }
+        }
+        let columns = (1..=most).rev().find(|columns| layouts[columns - 1].2).unwrap_or(1);
+        let widths = &layouts[columns - 1].0;
+        let rows = count.div_ceil(columns);
+        (0..rows)
+            .map(|row| {
+                let mut line = String::new();
+                for (column, index) in (row..count).step_by(rows).enumerate() {
+                    if column > 0 {
+                        let previous = index - rows;
+                        line += &" ".repeat(widths[column - 1] - lengths[previous]);
+                    }
+                    line += &cells[index];
+                }
+                line
+            })
+            .collect()
+    }
+
+    /// GNU `ls`'s narrowest column: one character and the two spaces before the next.
+    const MIN_COLUMN_WIDTH: usize = 3;
 
     // ——— `.lnk` targets (I/O + parsing) ——————————————————————————————————
 
@@ -777,7 +851,12 @@ mod commands {
 
         /// A realistic `ls -tarlushFN -l` data line: 7 metadata fields, then `name`.
         fn row(name: &str) -> String {
-            format!("4 -rw-r--r-- 1 user group 1.2K 2024-01-01_12:00:00 {name}")
+            record("-rw-r--r--", name)
+        }
+
+        /// [`row`] for an entry of any mode.
+        fn record(mode: &str, name: &str) -> String {
+            format!("4 {mode} 1 user group 1.2K 2024-01-01_12:00:00 {name}")
         }
 
         fn one_target(name: &str, target: &str) -> HashMap<String, String> {
@@ -892,6 +971,96 @@ mod commands {
             }
         }
 
+        // ——— The `cd` listing ——————————————————————————————————————————————
+
+        /// Each entry's cell: the name spelled for the shell, then the short form's marker — the
+        /// long form's for its type, `@` for a symlink, whose target is not shown here.
+        #[test]
+        fn landing_cells_carry_the_short_form_s_markers_and_each_shell_s_spelling() {
+            let listing: String = [
+                record("drwxr-xr-x", "\u{1b}[01;34mdocs\u{1b}[0m/"),
+                record("lrwxrwxrwx", "\u{1b}[01;36mlatest\u{1b}[0m -> \u{1b}[01;34mdocs\u{1b}[0m/"),
+                record("-rwxr-xr-x", "\u{1b}[01;32mrun\u{1b}[0m*"),
+                record("-rw-r--r--", "it's.txt"),
+                record("-rw-r--r--", "x *"),
+            ]
+            .iter()
+            .map(|record| format!("{record}\0"))
+            .collect();
+            let plain = |cells: Vec<String>| -> Vec<String> { cells.iter().map(|cell| console::strip_ansi_codes(cell).into_owned()).collect() };
+            assert_eq!(plain(_landing_cells(&listing, Shell::Bash)), ["docs/", "latest@", "run*", r"$'it\'s.txt'", "'x *'"]);
+            assert_eq!(plain(_landing_cells(&listing, Shell::Fish)), ["docs/", "latest@", "run*", r"'it\'s.txt'", "'x *'"]);
+        }
+
+        /// The columns are GNU's — checked against `ls -C` itself, for the same names in the same
+        /// order, at several widths: the same rows, the same cells in each.
+        #[test]
+        fn landing_columns_are_laid_out_as_gnu_ls_lays_them_out() {
+            let dir = std::env::temp_dir().join(format!("bashrs_columns_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut names: Vec<String> = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa", "lambda", "mu", "nu", "xi", "omicron", "pi", "rho", "a_much_longer_name_than_the_rest", "b", "cc"]
+                .map(str::to_string)
+                .to_vec();
+            names.sort(); // bytewise, as `LC_ALL=C ls` sorts
+            let gnu = |dir: &Path, width: usize| -> Vec<String> {
+                let out = std::process::Command::new("ls")
+                    .args(["-C", "-T", "0", "-w", &width.to_string()])
+                    .arg(dir)
+                    .env("LC_ALL", "C")
+                    .output()
+                    .expect("ls");
+                String::from_utf8_lossy(&out.stdout).lines().map(|line| line.trim_end().to_string()).collect()
+            };
+            let ours = |names: &[String], width: usize| -> Vec<String> {
+                _columns(names, width).into_iter().map(|line| line.trim_end().to_string()).collect()
+            };
+            for name in &names {
+                std::fs::write(dir.join(name), "").unwrap();
+            }
+            // Widths where every coreutils lays these names out alike; where a line would fill the
+            // window exactly, older releases differ, which the next test pins instead.
+            for width in [20, 40, 60, 80, 120, 300] {
+                assert_eq!(ours(&names, width), gnu(&dir, width), "at width {width}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Where a line would fill the window exactly, today's coreutils lets it — and the last
+        /// column starts one wide, so a narrow last cell costs only itself. Two cells, a
+        /// four-wide one and a two-wide one, make an eight-wide line of two columns.
+        #[test]
+        fn a_line_may_fill_the_window_exactly() {
+            let cells: Vec<String> = ["aaaa", "bb"].map(str::to_string).to_vec();
+            assert_eq!(_columns(&cells, 8), ["aaaa  bb"], "exactly full: two columns");
+            assert_eq!(_columns(&cells, 7), ["aaaa", "bb"], "one short: one column");
+            let three: Vec<String> = ["a", "b", "c"].map(str::to_string).to_vec();
+            assert_eq!(_columns(&three, 7), ["a  b  c"], "1 + 2 + 1 + 2 + 1");
+            assert_eq!(_columns(&three, 6), ["a  c", "b"], "a column fewer, filled top to bottom");
+        }
+
+        /// The width comes from the terminal before `$COLUMNS`, and 80 stands in for neither.
+        #[test]
+        fn the_window_is_the_terminal_s_then_columns_then_80() {
+            assert_eq!(_width_of(Some(132), Some("100")), 132, "the terminal over a stale COLUMNS");
+            assert_eq!(_width_of(None, Some("100")), 100);
+            assert_eq!(_width_of(None, Some(" 90 ")), 90);
+            assert_eq!(_width_of(None, Some("wide")), 80, "a COLUMNS that is no number counts as none");
+            assert_eq!(_width_of(Some(0), Some("0")), 80, "zero counts as none");
+            assert_eq!(_width_of(None, None), 80);
+        }
+
+        /// What a cell takes on screen decides the layout: colour codes take nothing, so coloured
+        /// cells fall into the same columns as plain ones.
+        #[test]
+        fn colour_codes_take_no_room_in_the_columns() {
+            let plain: Vec<String> = ["one", "two", "three", "four"].map(str::to_string).to_vec();
+            let coloured: Vec<String> = plain.iter().map(|cell| format!("\u{1b}[01;34m{cell}\u{1b}[0m")).collect();
+            let strip = |lines: Vec<String>| -> Vec<String> { lines.iter().map(|line| console::strip_ansi_codes(line).into_owned()).collect() };
+            assert_eq!(strip(_columns(&coloured, 20)), _columns(&plain, 20));
+            assert!(_columns(&[], 80).is_empty(), "nothing to list, no lines");
+        }
+
         /// Marking is only for names that need it — an ordinary one must stay bare, or every
         /// listing turns into a wall of quotes.
         #[test]
@@ -909,12 +1078,12 @@ mod commands {
         #[test]
         fn name_cell_leaves_a_regular_entry_untouched() {
             let colored = "\x1b[01;34mnotes.txt\x1b[0m";
-            assert_eq!(_name_cell(colored, &HashMap::new(), Shell::Bash), colored);
+            assert_eq!(_name_cell(colored, "", &HashMap::new(), Shell::Bash), colored);
         }
 
         #[test]
         fn name_cell_flags_a_lnk_with_its_target_in_red() {
-            let cell = _name_cell("shortcut.lnk", &one_target("shortcut.lnk", "C:\\app\\x.exe"), Shell::Bash);
+            let cell = _name_cell("shortcut.lnk", "", &one_target("shortcut.lnk", "C:\\app\\x.exe"), Shell::Bash);
             assert!(cell.contains("(Windows)->"), "marker missing: {cell}");
             assert!(cell.contains("C:\\app\\x.exe"), "target missing: {cell}");
             assert!(cell.contains("\x1b[1;31m"), "should be bold red: {cell}");
@@ -922,7 +1091,7 @@ mod commands {
 
         #[test]
         fn name_cell_flags_a_lnk_with_a_question_mark_when_unresolved() {
-            let cell = _name_cell("mystery.lnk", &HashMap::new(), Shell::Bash);
+            let cell = _name_cell("mystery.lnk", "", &HashMap::new(), Shell::Bash);
             assert!(cell.contains("(Windows)-> "), "marker missing: {cell}");
             assert!(cell.contains('?'), "unresolved target should show `?`: {cell}");
             assert!(cell.contains("\x1b[1;31m"), "should be bold red: {cell}");
@@ -931,7 +1100,7 @@ mod commands {
         #[test]
         fn name_cell_detects_lnk_through_ansi_and_type_indicator() {
             // `ls --color=always -F` can wrap the name in colour codes and append `*`.
-            let cell = _name_cell("\x1b[01;32mrun.lnk\x1b[0m*", &HashMap::new(), Shell::Bash);
+            let cell = _row(&record("-rwxr-xr-x", "\x1b[01;32mrun.lnk\x1b[0m*"), &HashMap::new(), Shell::Bash);
             assert!(cell.contains("(Windows)->"), "should see .lnk under ANSI + indicator: {cell}");
         }
 
@@ -1057,13 +1226,53 @@ mod commands {
         /// a symlink's target all have to come off, or the entry never matches what was scanned.
         #[test]
         fn entry_key_recovers_the_name_on_disk() {
-            assert_eq!(_entry_key(&["4", "drwxr-xr-x"], "\u{1b}[01;34ma dir\u{1b}[0m/"), "a dir");
-            assert_eq!(_entry_key(&["4", "lrwxrwxrwx"], "a link -> real target.txt"), "a link");
-            assert_eq!(_entry_key(&["4", "-rw-r--r--"], "evil -> fake.txt"), "evil -> fake.txt");
-            assert_eq!(_entry_key(&["4", "-rw-r--r--"], "plain.txt"), "plain.txt");
+            let key = |mode: &str, name: &str| _Entry::parse(&record(mode, name)).map(|entry| entry.key());
+            assert_eq!(key("drwxr-xr-x", "\u{1b}[01;34ma dir\u{1b}[0m/").as_deref(), Some("a dir"));
+            assert_eq!(key("lrwxrwxrwx", "a link -> real target.txt").as_deref(), Some("a link"));
+            assert_eq!(key("-rw-r--r--", "evil -> fake.txt").as_deref(), Some("evil -> fake.txt"));
+            assert_eq!(key("-rw-r--r--", "plain.txt").as_deref(), Some("plain.txt"));
             // A marker is only stripped when the mode says one was appended.
-            assert_eq!(_entry_key(&["4", "-rw-r--r--"], "report@"), "report@");
-            assert_eq!(_entry_key(&["4", "-rwxr-xr-x"], "run.sh*"), "run.sh");
+            assert_eq!(key("-rw-r--r--", "report@").as_deref(), Some("report@"));
+            assert_eq!(key("-rwxr-xr-x", "run.sh*").as_deref(), Some("run.sh"));
+            assert_eq!(key("lrwxrwxrwx", "link* -> run.sh*").as_deref(), Some("link*"), "a symlink's name gets no marker here");
+        }
+
+        /// The marker is the one the type gets, read from the mode — so a trailing `*`, `@` or `|`
+        /// that `-F` did not add stays part of the name, whatever the name's type.
+        #[test]
+        fn a_marker_comes_off_only_where_the_mode_put_it_on() {
+            let parts = |mode: &str, name: &str| {
+                let record = record(mode, name);
+                let entry = _Entry::parse(&record).expect("a listing row");
+                (entry.name.to_string(), entry.marker.to_string())
+            };
+            let pair = |name: &str, marker: &str| (name.to_string(), marker.to_string());
+            assert_eq!(parts("-rw-r--r--", "x *"), pair("x *", ""), "a plain file's own asterisk");
+            assert_eq!(parts("-rw-r--r--", "pipe|"), pair("pipe|", ""));
+            assert_eq!(parts("-rwxr-xr-x", "run**"), pair("run*", "*"), "only the one -F added");
+            assert_eq!(parts("-rwsr--r--", "setuid*"), pair("setuid", "*"), "`s` there is set and executable");
+            assert_eq!(parts("-rwSr--r--", "setuid*"), pair("setuid*", ""), "`S` is set without it");
+            assert_eq!(parts("drwxr-xr-x", "\u{1b}[01;34mdir\u{1b}[0m/"), pair("\u{1b}[01;34mdir\u{1b}[0m", "/"));
+            assert_eq!(parts("prw-r--r--", "fifo|"), pair("fifo", "|"));
+            assert_eq!(parts("srwxr-xr-x", "sock="), pair("sock", "="));
+            assert_eq!(parts("crw-rw-rw-", "null"), pair("null", ""), "a device gets none");
+        }
+
+        /// A symlink's target carries its own type's marker, which `ls` writes after the target's
+        /// colour reset: a marker character that is the target's own last character stays.
+        #[test]
+        fn a_symlink_target_keeps_its_own_last_character() {
+            let target = |name: &str| {
+                let record = record("lrwxrwxrwx", name);
+                let entry = _Entry::parse(&record).expect("a listing row");
+                entry.target.map(|(target, marker)| (target.to_string(), marker.to_string()))
+            };
+            let pair = |target: &str, marker: &str| Some((target.to_string(), marker.to_string()));
+            assert_eq!(target("to_dir -> \u{1b}[01;34mdir\u{1b}[0m/"), pair("\u{1b}[01;34mdir\u{1b}[0m", "/"));
+            assert_eq!(target("to_exe -> \u{1b}[01;32mexe\u{1b}[0m*"), pair("\u{1b}[01;32mexe\u{1b}[0m", "*"));
+            assert_eq!(target("to_star -> plain*"), pair("plain*", ""), "an uncoloured target: its own `*`");
+            assert_eq!(target("to_slash -> \u{1b}[01;34mdir/\u{1b}[0m/"), pair("\u{1b}[01;34mdir/\u{1b}[0m", "/"));
+            assert_eq!(target("broken -> missing"), pair("missing", ""));
         }
 
         #[test]

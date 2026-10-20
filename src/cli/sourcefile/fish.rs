@@ -5,15 +5,11 @@
 
 use std::collections::BTreeMap;
 
-use super::{substitute, Section, Wrapper, ORIGINAL};
+use super::{substitute, Section, Wrapper, BIN, ORIGINAL};
 use crate::conf::keybinds::{self, Chord};
 use crate::conf::RELOAD_EXIT_CODE;
 use crate::support::align::align_columns;
 use crate::support::shell_dialect::{fish_function, fish_original, Shell, FISH_DESCRIPTION};
-
-/// The installed binary, as every wrapper spells it — quoted so `$HOME` expands at call time and a
-/// path with spaces stays one word, as in bash.
-const BIN: &str = "\"$HOME/.bashrs/bashrs\"";
 
 /// The file around `body`: the header, then bash's three early returns in fish's terms — before
 /// anything is defined, cheapest first.
@@ -46,15 +42,10 @@ pub(super) fn definitions(section: &Section) -> String {
     }
     for (name, body, comment) in &section.bodies {
         let description = Some(*comment).filter(|comment| !comment.is_empty());
-        match body.fish() {
-            Ok(body) => {
-                if body.contains(ORIGINAL) {
-                    lines.push(save_original(name));
-                }
-                lines.push(fish_function(name, description, &[substitute(body, Shell::Fish, name)]));
-            }
-            Err(why) => lines.push(unavailable(name, description, why)),
+        if body.fish().contains(ORIGINAL) {
+            lines.push(save_original(name));
         }
+        lines.push(fish_function(name, description, &[substitute(body.fish(), Shell::Fish, name)]));
     }
     align_columns(lines, &[FISH_DESCRIPTION]).into_iter().map(|line| line + "\n").collect()
 }
@@ -64,10 +55,9 @@ pub(super) fn definitions(section: &Section) -> String {
 fn wrapper_function(wrapper: &Wrapper, name: &str) -> String {
     let description = wrapper.about.as_deref();
     let call = format!("{BIN} {} $argv", wrapper.real);
-    let call = match wrapper.piped.map(|piped| piped.fish()) {
+    let call = match wrapper.piped {
         None => call,
-        Some(Ok(probe)) => format!("{} | {call}", substitute(probe, Shell::Fish, name)),
-        Some(Err(why)) => return unavailable(name, description, why),
+        Some(probe) => format!("{} | {call}", substitute(probe.fish(), Shell::Fish, name)),
     };
     let body = match wrapper.after {
         Some(hook) => vec![
@@ -79,14 +69,6 @@ fn wrapper_function(wrapper: &Wrapper, name: &str) -> String {
         None => vec![call],
     };
     fish_function(name, description, &body)
-}
-
-/// A command fish cannot run, defined as the explanation of why — what fish lacks, and what to use
-/// there — so typing its name says so, rather than "unknown command", which would read as a broken
-/// install.
-fn unavailable(name: &str, description: Option<&str>, why: &str) -> String {
-    let message = Shell::Fish.quote(&format!("{name}: not available in fish — {why}"));
-    fish_function(name, description, &[format!("echo {message} >&2"), "return 1".to_string()])
 }
 
 /// Keeps fish's own definition of `name` as [`fish_original`] — once, so that sourcing the file
@@ -128,20 +110,21 @@ pub(super) fn keybinds(abouts: &BTreeMap<String, String>) -> String {
 /// bare, since that help says no more per flag than its name. Returns the section and the names it
 /// completes.
 ///
-/// A name fish already has a completion file for (it ships them for `diff`, and for Mercurial's
-/// `hg`) would get that file loaded at its first TAB, merged with these — so the install writes a
-/// file of bashrs's for each such name into `~/.bashrs/fish_completions`, which this section puts
-/// first on `$fish_complete_path`: fish loads the first file it finds, so its own never run.
+/// A name fish completes already (it ships completions for `diff`, and for Mercurial's `hg` — as
+/// files on its completion path, or, from fish 4.9, inside its binary) would get those loaded at
+/// its first TAB, merged with these — so the install writes a file of bashrs's for each such name
+/// into `~/.bashrs/fish_completions`, which this section puts first on `$fish_complete_path`: fish
+/// loads the first file it finds there, and falls back to a built-in one only where it finds
+/// none, so its own never run.
 /// Rejected: loading fish's file at startup and erasing what it defined. Loading means running it,
 /// and Mercurial's runs Mercurial — at every shell start, and with an error where it is missing.
 ///
-/// Pure-shell commands, the explained-away ones and `python3` register nothing, keeping fish's own
-/// (`cd`'s directories, python's flags) — as bash keeps its default completion for them.
+/// Pure-shell commands and `python3` register nothing, keeping fish's own (`cd`'s directories,
+/// python's flags) — as bash keeps its default completion for them.
 pub(super) fn completion(sections: &[Section], stainless: &[(String, String)]) -> (String, Vec<String>) {
     let mut names: Vec<String> = sections
         .iter()
         .flat_map(|section| &section.wrappers)
-        .filter(|wrapper| !wrapper.piped.is_some_and(|piped| piped.fish().is_err()))
         .flat_map(|wrapper| wrapper.names.iter().cloned())
         .collect();
     let section = format!(

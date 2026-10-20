@@ -106,13 +106,15 @@ fn fish_exports() -> String {
 /// The UTC clock at the front of the prompt, as bash's prompt string evaluates it at every prompt.
 const CLOCK: &str = "$(date -u +%T)(UTC)]";
 
-/// Bash's prompt clock: `PS1` with the time prepended, in red — once. Sourcing the file again would
-/// otherwise stack a second clock, and so would a nested shell, which inherits the exported `PS1`
-/// with the clock already in it. Told by the clock's own text, which nothing else puts in a prompt.
+/// Bash's prompt clock: `PS1` with the time prepended, in red — the clock alone, the colour reset
+/// after it, so the prompt that follows (and the command typed after that) keeps its own — and
+/// once. Sourcing the file again would otherwise stack a second clock, and so would a nested shell,
+/// which inherits the exported `PS1` with the clock already in it. Told by the clock's own text,
+/// which nothing else puts in a prompt.
 fn bash_prompt_clock() -> String {
     format!(
         "# prepends UTC-time to prompt, colored in red — unless it is there already, as it is after sourcing again or in a nested shell\n\
-         case $PS1 in *'{CLOCK}'*) ;; *) export PS1=\"\\[\\033[01;31m\\][\\{CLOCK}$PS1\" ;; esac\n"
+         case $PS1 in *'{CLOCK}'*) ;; *) export PS1=\"\\[\\033[01;31m\\][\\{CLOCK}\\[\\033[0m\\]$PS1\" ;; esac\n"
     )
 }
 
@@ -180,7 +182,11 @@ mod tests {
         let script = format!("PS1='$ '\n{clock}{clock}printf '%s' \"$PS1\"");
         let out = std::process::Command::new("bash").args(["--norc", "-c", &script]).output().expect("bash");
         let ps1 = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(ps1, "\\[\\033[01;31m\\][$(date -u +%T)(UTC)]$ ", "one clock, then the prompt it was put in front of");
+        assert_eq!(
+            ps1,
+            "\\[\\033[01;31m\\][$(date -u +%T)(UTC)]\\[\\033[0m\\]$ ",
+            "one clock, red alone — the colour reset after it — then the prompt it was put in front of"
+        );
     }
 
     /// Fish gets the variables it shares with bash, and for each bash-only one the comment saying

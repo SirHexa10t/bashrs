@@ -31,23 +31,18 @@ mod commands {
     /// `cd`, then print what you landed in: `ls -AF`, directories first, colours on
     ///
     /// The follow-up runs only when the `cd` itself succeeded, and `builtin cd "$@"` keeps every
-    /// native behavior — `cd -`, `-P`/`-L`, `CDPATH` — exactly as it was. Problematic filenames
-    /// arrive escaped by GNU ls's own `--quoting-style=shell-escape`: the same paste-back-safe
-    /// discipline `lll` implements through `support::shell_quote` (bare when safe, quoted
-    /// otherwise, control characters as `$'…'`; GNU spells the odd case differently — `"it's"`
-    /// where `lll` would write `$'it\'s'` — but every spelling reads back as the exact name),
-    /// with the `-F` type markers and colour spans kept outside the quotes.
+    /// native behavior — `cd -`, `-P`/`-L`, `CDPATH` — exactly as it was. The listing is the
+    /// binary's (`cd-listing`): GNU ls's selection, order, colours and columns, with every name
+    /// spelled for the shell it is shown in by `support::shell_quote` — `lll`'s paste-back-safe
+    /// discipline: bare when safe, quoted otherwise, control characters escaped the way that shell
+    /// reads them back, the `-F` type markers outside the quotes. No quoting style of GNU ls's own
+    /// is fish's. The binary runs `ls` itself, so no shell alias of `ls` (an `eza` stand-in) can
+    /// take the listing over.
     ///
     /// In fish the original is not the builtin: `cd -` and the directory history live in fish's own
     /// `cd` *function*, so `{ORIGINAL}` calls a copy of that, saved before this replaces it.
-    /// `command ls` skips any `ls` alias a fish config defines (an `eza` stand-in would reject
-    /// these flags). The listing's quoting is still GNU's bash-style `$'…'`, which fish cannot
-    /// paste back.
     #[unprefixed]
-    #[shell_body(
-        bash = r#"builtin cd "$@" && ls -AF --color=always --group-directories-first --quoting-style=shell-escape"#,
-        fish = "{ORIGINAL} $argv && command ls -AF --color=always --group-directories-first --quoting-style=shell-escape"
-    )]
+    #[shell_body(bash = r#"builtin cd "$@" && {BINARY} cd-listing"#, fish = "{ORIGINAL} $argv && {BINARY} cd-listing")]
     pub fn cd() {}
 
     /// `git diff` between any two files or directories — no repository needed — with what changed

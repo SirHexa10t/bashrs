@@ -3,15 +3,11 @@
 
 use std::collections::BTreeMap;
 
-use super::{substitute, Section};
+use super::{substitute, Section, BIN};
 use crate::conf::keybinds::{self, Chord};
 use crate::conf::RELOAD_EXIT_CODE;
 use crate::support::align::align_columns;
 use crate::support::shell_dialect::{Shell, ShellText};
-
-/// The installed binary, as every wrapper spells it — quoted so `$HOME` expands at call time and
-/// paths with spaces stay intact.
-const BIN: &str = "\"$HOME/.bashrs/bashrs\"";
 
 /// The file around `body`: the header, then the guards that must run before anything is defined.
 pub(super) fn file(body: &str) -> String {
