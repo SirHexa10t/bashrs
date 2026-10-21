@@ -231,13 +231,12 @@ mod commands {
     /// compile-time knowledge lives, so no subprocess is needed at `cd` time). If the project
     /// has moved since, the `cd` fails naming the stale path, and a recompile re-teaches it.
     /// Pure shell because a child process can't move its parent.
-    #[shell_body(bash = "cd -- {PROJECT_ROOT}", fish = "cd -- {PROJECT_ROOT}")]
+    #[shell_body(both = "cd -- {PROJECT_ROOT}")]
     pub fn cd() {}
 
     /// `cd` to ~/.bashrs — the installation: binary, sourcefile, config, tools, user-data
-    #[name("dotbashrs_cd")]
-    #[shell_body(bash = r#"cd -- "$HOME/.bashrs""#, fish = r#"cd -- "$HOME/.bashrs""#)]
-    pub fn dot_cd() {}
+    #[shell_body(both = r#"cd -- "$HOME/.bashrs""#)]
+    pub fn conf_cd() {}
 
     /// Resolve `script` inside the project directory, or explain why it can't be found.
     fn _locate_script(project: &Path, script: &str) -> Result<PathBuf, String> {

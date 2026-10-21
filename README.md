@@ -55,40 +55,35 @@ completions for one of bashrs's command names (`diff`, Mercurial's `hg`), it als
 file per name to `~/.bashrs/fish_completions/`, so that bashrs's completions replace fish's rather
 than mixing with them.
 
-If the next shell greets you with a syntax error rather than a prompt, consult the **Troubleshooting** section. It is likely the expected bump when moving from an rc that already defines some of the same names.
+If a bashrs command does something else when you type it, consult the **Troubleshooting** section: something of the same name, defined after bashrs's block, outranks it.
 
 ## Troubleshooting
 
 Entries are keyed by the message you actually see, so search this section for the text in front
 of you.
 
-### `syntax error near unexpected token '('`
+### A bashrs command runs something else
 
-**What you see:** At shell startup/refresh, two lines naming the sourcefile — and afterwards none of the
-bashrs commands exist:
+**What you see:** One of bashrs's commands does something else when you type it — `g foo` runs
+`git foo`, say — while the rest of bashrs works.
 
-```
-/home/you/.bashrs/sourcefile.sh: line 214: syntax error near unexpected token `('
-/home/you/.bashrs/sourcefile.sh: line 214: `..() { cd .. "$@"; }'
-```
+**Why:** Something of the same name was defined *after* bashrs's block, and the last definition
+wins: an alias later in your rc file, or from a plugin that loads after it — or in fish, a
+function in `config.fish`, which fish reads after `conf.d`. An alias defined *before* the block
+(oh-my-zsh's `g` for `git`, say), bashrs sets aside as it loads, and a fish function it replaces.
+A fish abbreviation, though, expands as you type it, wherever it was defined.
 
-**Why:** Bash expands aliases as it *reads* a line, and a function's name is the first word on its
-line. If one of your own rc files still defines an alias by that name, the definition is rewritten
-before it is parsed — with `alias ..='cd ..'` active, `..() {` is read as `cd ..() {`, which is not
-valid syntax. The failure then aborts the entire sourcefile, so every command defined below that
-point never comes into existence. That is why the symptom looks like "bashrs did nothing" rather
-than "one command is broken".
-
-**Fix:** The second line bash prints is the definition it choked on; the name in front of `()` is
-the culprit — `..` in the example above. Remove that alias from your own rc files:
+**Fix:** Remove the later definition, or move it ahead of bashrs's block — in fish, into a
+`conf.d` file that sorts before `bashrs.fish` — and remove or rename a fish abbreviation.
+`shell_def` shows what runs, what it outranks, and what bashrs set aside, with the line that
+brings it back — to keep yours over bashrs's, put that line after the block.
 
 ```sh
-alias ..    # confirm it is an alias, and see what it expands to
-grep -rnF 'alias ..=' ~/.bashrc ~/.bash_aliases ~/.profile ~/.bash_profile 2>/dev/null
+shell_def g    # "g is an ALIAS - the top rank, this is what runs", then the outranked FUNCTION
+\g foo         # runs bashrs's `g` past an alias or abbreviation, this once
+grep -rnF 'alias g=' ~/.bashrc ~/.bash_aliases ~/.zshrc 2>/dev/null                 # bash, zsh
+grep -rnwE 'alias|abbr|function' ~/.config/fish 2>/dev/null | grep -w g             # fish
 ```
-
-Delete or comment out the line it reports, then open a new shell. If more than one name collides,
-each will surface the same way, one per restart.
 
 Expect this while migrating. bashrs re-implements commands that used to live in your rc, so your
 old definitions are precisely the ones that collide — and clearing them out is the point.

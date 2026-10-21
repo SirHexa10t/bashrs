@@ -78,17 +78,21 @@ mod commands {
     /// `shell_def` prints the winner FIRST, marked as what runs, and every outranked meaning
     /// after it, each labeled with how to reach it anyway (`\name` skips the alias,
     /// `builtin name` skips both, `command name` runs the binary). A variable of the same name
-    /// is orthogonal to all of that and reported as such, value and attributes included.
+    /// is orthogonal to all of that and reported as such, value and attributes included. So is
+    /// what bashrs set aside for its own command of the name — an alias, or in fish a function or
+    /// an abbreviation — each shown with the line restoring it.
     /// Commentary prints blue so it can't be mistaken for the definitions themselves, and the
     /// rank talk only appears when a name actually holds rival meanings — a sole meaning is
     /// stated plainly.
     ///
     /// Split along what each side alone can know: only the calling shell sees its aliases,
     /// functions, unexported variables, and builtin set, so the wrapper's `#[piped]` prefix
-    /// probes those four (`--`-terminated, so a name starting with `-` can't read as flags)
-    /// and pipes them in NUL-delimited — a shell string can't contain NUL, so no probe output
-    /// can fake a boundary. One `printf` per name frames all four: command substitutions run
-    /// independently (a failing probe yields an empty field, never blocks the next), and the
+    /// probes those four (`--`-terminated, so a name starting with `-` can't read as flags),
+    /// plus what was set aside under the name in `{SET_ASIDE}`, and pipes them in NUL-delimited
+    /// — a shell string can't contain NUL, so no probe output can fake a boundary. One `printf`
+    /// per name frames all five: command substitutions run independently (a failing probe
+    /// yields an empty field, never blocks the next; the set-aside lookup defaults to empty,
+    /// unset-variable checks or not), and the
     /// trailing newline `$()` strips is one [`_def_report`] trims anyway. The probes' stderr is
     /// discarded once, on the loop's `done` (a missing meaning is data here, not an error) —
     /// and only there: the redirect sits inside the pipeline segment, so the BINARY's stderr,
@@ -100,7 +104,10 @@ mod commands {
     /// builtins it cannot see.
     ///
     /// Fish probes in its own terms. It has no aliases — `alias` there defines a function, which
-    /// the function probe shows — so that field is always empty; the function is `functions`,
+    /// the function probe shows — so that field carries the name's abbreviation instead, fish's
+    /// nearest thing to one: its `abbr --show` line, picked by the name's place in `abbr --list`,
+    /// which lists them in the same order; the set-aside one is always empty, fish's file setting
+    /// nothing aside; the function is `functions`,
     /// the variable `set --show` (every scope, universal included), the kinds `type -a -t`, which
     /// names them as bash's `type -at` does. Each probe is `string collect -a`'d into exactly one
     /// argument: without `-a`, an empty answer becomes no argument at all, and every later field
@@ -108,8 +115,8 @@ mod commands {
     /// not reach the substitutions inside it.
     #[name("shell_def")]
     #[piped(
-        bash = r#"local __n; for __n in "$@"; do printf '%s\0%s\0%s\0%s\0' "$(alias -- "$__n")" "$(declare -f -- "$__n")" "$(declare -p -- "$__n")" "$(type -at -- "$__n")"; done 2>/dev/null"#,
-        fish = r#"for __n in $argv; printf '%s\0%s\0%s\0%s\0' '' (functions -- $__n 2>/dev/null | string collect -a) (set --show -- $__n 2>/dev/null | string collect -a) (type -a -t -- $__n 2>/dev/null | string collect -a); end"#
+        bash = r#"local __n; for __n in "$@"; do printf '%s\0%s\0%s\0%s\0%s\0' "$(alias -- "$__n")" "$(declare -f -- "$__n")" "$(declare -p -- "$__n")" "$(type -at -- "$__n")" "${{SET_ASIDE}[$__n]-}"; done 2>/dev/null"#,
+        fish = r#"for __n in $argv; printf '%s\0%s\0%s\0%s\0%s\0' (begin; set -l __a (abbr --show); set -l __i (contains -i -- $__n (abbr --list)); and printf '%s' $__a[$__i]; end | string collect -a) (functions -- $__n 2>/dev/null | string collect -a) (set --show -- $__n 2>/dev/null | string collect -a) (type -a -t -- $__n 2>/dev/null | string collect -a) ''; end"#
     )]
     pub fn def(args: DefArgs) {
         let mut piped = Vec::new();
@@ -148,7 +155,8 @@ mod commands {
 
     /// What the wrapper's probes said about one name, in the order they were piped.
     struct Probes<'a> {
-        /// `alias -- NAME` — the exact re-creatable definition, or empty.
+        /// `alias -- NAME` — the exact re-creatable definition, or empty. In fish, the name's
+        /// abbreviation, as its `abbr` line.
         alias: &'a str,
         /// `declare -f -- NAME` — the function body, or empty.
         function: &'a str,
@@ -157,26 +165,33 @@ mod commands {
         /// `type -at -- NAME` — every meaning in resolution order, one per line (bash only;
         /// empty under zsh, where the ranking is derived from the other probes instead).
         kinds: &'a str,
+        /// The line bringing back the alias bashrs set aside for its own command of the name
+        /// (`alias NAME='…'`), or empty — always, in fish, whose file sets nothing aside.
+        set_aside: &'a str,
     }
+
+    /// How many fields the wrapper's probes pipe per name: one per [`Probes`] field.
+    const PROBES_PER_NAME: usize = 5;
 
     /// The whole report: the piped probe stream split against `names`, each name described.
     /// `Ok((report, missing))` — the printable text, plus the names that meant nothing (the
     /// caller reports those on stderr and exits 1). `Err` is a protocol violation: the stream
-    /// didn't hold four fields per name, i.e. the binary was run without its shell wrapper.
+    /// didn't hold [`PROBES_PER_NAME`] fields per name, i.e. the binary was run without its shell
+    /// wrapper.
     fn _def_report(
         names: &[String],
         piped: &[u8],
         path_dirs: &[std::path::PathBuf],
     ) -> Result<(String, Vec<String>), String> {
         let mut fields: Vec<&[u8]> = piped.split(|byte| *byte == 0).collect();
-        // Every field is NUL-terminated, so a well-formed stream splits into 4N fields plus
-        // one empty trailer.
+        // Every field is NUL-terminated, so a well-formed stream splits into a whole number of
+        // names' fields plus one empty trailer.
         if fields.last().is_some_and(|last| last.is_empty()) {
             fields.pop();
         }
-        if fields.len() != names.len() * 4 {
+        if fields.len() != names.len() * PROBES_PER_NAME {
             return Err(format!(
-                "probe stream holds {} fields for {} names (4 expected per name) — \
+                "probe stream holds {} fields for {} names ({PROBES_PER_NAME} expected per name) — \
                  shell_def is driven by its shell wrapper, not run directly",
                 fields.len(),
                 names.len()
@@ -184,14 +199,16 @@ mod commands {
         }
         let mut report = String::new();
         let mut missing = Vec::new();
-        for (index, name) in names.iter().enumerate() {
-            let text: Vec<std::borrow::Cow<'_, str>> =
-                fields[index * 4..index * 4 + 4].iter().map(|f| String::from_utf8_lossy(f)).collect();
+        for (index, (name, fields)) in names.iter().zip(fields.chunks(PROBES_PER_NAME)).enumerate() {
+            let text: Vec<std::borrow::Cow<'_, str>> = fields.iter().map(|f| String::from_utf8_lossy(f)).collect();
             let probes = Probes {
                 alias: text[0].trim_end(),
                 function: text[1].trim_end(),
                 variable: text[2].trim_end(),
                 kinds: text[3].trim_end(),
+                // Untrimmed: a plain lookup, not a `$(…)`, so it arrives exact — and an alias may
+                // end in a space that matters (`alias sudo='sudo '` expands the next word too).
+                set_aside: &text[4],
             };
             if index > 0 {
                 report.push('\n');
@@ -215,34 +232,51 @@ mod commands {
     }
 
     /// One name's story: the effective meaning first, every outranked meaning after it labeled
-    /// with its escape hatch, a same-named variable last, labeled orthogonal. Rank talk ("the
+    /// with its escape hatch, then what bashrs set aside and an abbreviation scoped elsewhere, and
+    /// a same-named variable last, labeled orthogonal. Rank talk ("the
     /// top rank, this is what runs") appears only when there IS a rivalry — a name with a
     /// single meaning is stated plainly. `None` when the name means nothing at all.
     fn _describe(name: &str, probes: &Probes<'_>, binaries: &[String]) -> Option<String> {
+        // Fish's alias field holds the name's abbreviation: typed, one that expands as a command
+        // goes ahead of everything `type` lists, so none of those is the effective kind; one its
+        // options scope elsewhere is only noted.
+        let abbreviation = probes.alias.starts_with("abbr ").then_some(probes.alias);
+        let alias = if abbreviation.is_some() { "" } else { probes.alias };
+        let (typed_first, scoped) = match abbreviation {
+            Some(line) if _expands_as_a_command(line) => (Some(line), None),
+            other => (None, other),
+        };
         // The effective kind: bash's `type -at` first line is the shell's own verdict. With no
         // verdict (zsh), derive it from which probes answered — the precedence is fixed, so
         // presence is enough; only builtin/keyword can't be derived, so they're never claimed.
         let mut kinds = probes.kinds.lines();
-        let effective = kinds.next().map(str::to_string).or_else(|| {
-            if !probes.alias.is_empty() {
-                Some("alias".into())
-            } else if !probes.function.is_empty() {
-                Some("function".into())
-            } else if !binaries.is_empty() {
-                Some("file".into())
-            } else {
-                None
-            }
-        });
+        let effective = match typed_first {
+            Some(_) => Some("abbreviation".to_string()),
+            None => kinds.next().map(str::to_string).or_else(|| {
+                if !alias.is_empty() {
+                    Some("alias".into())
+                } else if !probes.function.is_empty() {
+                    Some("function".into())
+                } else if !binaries.is_empty() {
+                    Some("file".into())
+                } else {
+                    None
+                }
+            }),
+        };
         let outranked: Vec<&str> = kinds.collect();
         let function_outranked = outranked.contains(&"function")
             || (probes.kinds.is_empty()
                 && effective.as_deref() == Some("alias")
                 && !probes.function.is_empty());
+        // The word an escape hatch takes: fish (4.0 on) expands an abbreviation after `command`
+        // too, but never a backslashed word.
+        let word = if typed_first.is_some() { format!("\\{name}") } else { name.to_string() };
         // Whether anything is outranked at all — only then is "this is what runs" saying
         // something, and only then does the winner get the qualifier.
         let contested = function_outranked
             || outranked.contains(&"builtin")
+            || !probes.set_aside.is_empty()
             || match effective.as_deref() {
                 Some("file") => binaries.len() > 1,
                 _ => !binaries.is_empty(),
@@ -251,6 +285,16 @@ mod commands {
 
         let mut out = String::new();
         match effective.as_deref() {
+            Some("abbreviation") => {
+                out += &format!(
+                    "{}\n",
+                    _note(&qualified(
+                        &format!("{name} is an ABBREVIATION:"),
+                        &format!("{name} is an ABBREVIATION - the top rank, typed it expands first:"),
+                    ))
+                );
+                out += &format!("{}\n", probes.alias);
+            }
             Some("alias") => {
                 out += &format!(
                     "{}\n",
@@ -296,7 +340,7 @@ mod commands {
             out += &format!("{}\n", probes.function);
         }
         if outranked.contains(&"builtin") {
-            out += &format!("{}\n", _note(&format!("outranked BUILTIN - runs via: builtin {name}")));
+            out += &format!("{}\n", _note(&format!("outranked BUILTIN - runs via: builtin {word}")));
         }
         if effective.as_deref() == Some("file") {
             if binaries.len() > 1 {
@@ -308,11 +352,21 @@ mod commands {
         } else if !binaries.is_empty() {
             out += &format!(
                 "{}\n",
-                _note(&format!("outranked BINARIES (not run) - the first runs via: command {name}"))
+                _note(&format!("outranked BINARIES (not run) - the first runs via: command {word}"))
             );
             for path in binaries {
                 out += &format!("{path}\n");
             }
+        }
+        if !probes.set_aside.is_empty() {
+            out += &format!(
+                "{}\n{}\n",
+                _note("set-aside ALIAS - defined before bashrs, which put its own command in its place; this brings it back:"),
+                probes.set_aside.trim_end_matches('\n')
+            );
+        }
+        if let Some(line) = scoped {
+            out += &format!("{}\n{line}\n", _note(&format!("also an ABBREVIATION named '{name}', which expands only where its options say:")));
         }
         if !probes.variable.is_empty() {
             out += &format!(
@@ -322,6 +376,15 @@ mod commands {
             );
         }
         (!out.is_empty()).then_some(out)
+    }
+
+    /// Whether a fish abbreviation, as `abbr --show` writes it, expands its name typed as a
+    /// command — unless its options, the words ahead of the `--` before its name, scope it to
+    /// another command's arguments (`--command`) or to whatever its pattern matches (`--regex`).
+    /// Read as words: an option's value is escaped as one, and only a `--regex` one, which is
+    /// scoped either way, plausibly holds a space.
+    fn _expands_as_a_command(line: &str) -> bool {
+        !line.split_whitespace().take_while(|word| *word != "--").any(|word| word == "--command" || word == "--regex")
     }
 
     /// Every executable named `name` on the caller's PATH, in PATH order — this process
@@ -340,15 +403,14 @@ mod commands {
 
     /// Start a fresh shell session
     ///
-    /// Bash's file is zsh's too, so its body starts whichever of the two is running it: zsh sets
-    /// `ZSH_NAME` (to the name it was started as), and bash leaves it unset.
+    /// The shell running it, whichever that is — bash's file is zsh's too (`{SHELL}`).
     #[name("shell_new")]
-    #[shell_body(bash = r#"exec "${ZSH_NAME:-bash}""#, fish = "exec fish")]
+    #[shell_body(both = "exec {SHELL}")]
     pub fn new() {}
 
     /// Fresh shell WITHOUT bashrs (one-shot: any later shell, or re-sourcing, arms it again)
     #[name("shell_bare")]
-    #[shell_body(bash = r#"_BASHRS_BARE=1 exec "${ZSH_NAME:-bash}""#, fish = "_BASHRS_BARE=1 exec fish")]
+    #[shell_body(both = "_BASHRS_BARE=1 exec {SHELL}")]
     pub fn bare() {}
 
     /// Move into a root shell with bashrs sourced — for running several elevated commands
@@ -400,7 +462,7 @@ mod commands {
         use super::*;
 
         const NONE: &Probes<'_> =
-            &Probes { alias: "", function: "", variable: "", kinds: "" };
+            &Probes { alias: "", function: "", variable: "", kinds: "", set_aside: "" };
 
         /// The originating complaint, exactly: an alias laid over a generated wrapper function
         /// must read in rank order — the alias first, marked as what runs, the function below
@@ -414,6 +476,7 @@ mod commands {
                 function: "lll () \n{ \n    \"$HOME/.bashrs/bashrs\" lll \"$@\"\n}",
                 variable: "",
                 kinds: "alias\nfunction",
+                set_aside: "",
             };
             let text = _describe("lll", &probes, &[]).expect("both meanings exist");
             assert_eq!(
@@ -422,6 +485,29 @@ mod commands {
                     "{}\nalias lll='echo ll'\n{}\nlll () \n{{ \n    \"$HOME/.bashrs/bashrs\" lll \"$@\"\n}}\n",
                     _note("lll is an ALIAS - the top rank, this is what runs:"),
                     _note("outranked FUNCTION - still defined, runs via \\lll:"),
+                )
+            );
+        }
+
+        /// An alias bashrs set aside for its own command: the function is what runs now, said so,
+        /// and the alias follows with the line that brings it back, exactly as the shell recorded
+        /// it — its expansion quoted whole, a trailing space (which makes the next word expand as
+        /// an alias too) kept.
+        #[test]
+        fn a_set_aside_alias_is_shown_with_the_line_restoring_it() {
+            let probes = Probes {
+                function: "g () \n{ \n    \"$HOME/.bashrs/bashrs\" g \"$@\"\n}",
+                kinds: "function",
+                set_aside: "alias g='git '",
+                ..*NONE
+            };
+            let text = _describe("g", &probes, &[]).expect("a function and a set-aside alias");
+            assert_eq!(
+                text,
+                format!(
+                    "{}\ng () \n{{ \n    \"$HOME/.bashrs/bashrs\" g \"$@\"\n}}\n{}\nalias g='git '\n",
+                    _note("g is a FUNCTION - this is what runs:"),
+                    _note("set-aside ALIAS - defined before bashrs, which put its own command in its place; this brings it back:"),
                 )
             );
         }
@@ -462,6 +548,7 @@ mod commands {
                 function: "lll () { true }",
                 variable: "",
                 kinds: "",
+                set_aside: "",
             };
             let text = _describe("lll", &probes, &[]).unwrap();
             assert!(
@@ -528,20 +615,70 @@ mod commands {
             assert_eq!(_describe("nothing", NONE, &[]), None, "no meaning anywhere is None");
         }
 
-        /// The report layer: fields are cut on NUL (4 per name, one empty trailer), names are
+        /// The report layer: fields are cut on NUL (5 per name, one empty trailer), names are
         /// separated by a blank line, meaningless names collect into `missing`, and a stream
         /// that doesn't match the names is refused as a protocol error — the symptom of
         /// running the binary without its wrapper.
         #[test]
         fn the_report_splits_the_stream_and_collects_the_missing() {
             let names = vec!["cd".to_string(), "ghost".to_string()];
-            let stream = b"\0\0\0builtin\0\0\0\0\0";
+            let stream = b"\0\0\0builtin\0\0\0\0\0\0\0";
             let (report, missing) = _def_report(&names, stream, &[]).unwrap();
             assert_eq!(report, format!("{}\n\n", _note("cd is a shell BUILTIN")));
             assert_eq!(missing, vec!["ghost"]);
 
             let err = _def_report(&names, b"only\0two\0", &[]).unwrap_err();
             assert!(err.contains("driven by its shell wrapper"), "{err}");
+        }
+
+        /// The set-aside field is taken exactly as the shell recorded it — zsh quotes a newline in
+        /// an alias's expansion as itself, so one alias's line can span two.
+        #[test]
+        fn the_set_aside_field_is_taken_exactly() {
+            let names = vec!["g".to_string()];
+            let record = "alias g='first\nsecond '";
+            let stream = format!("\0g () {{ true; }}\0\0\0{record}\0");
+            let (report, missing) = _def_report(&names, stream.as_bytes(), &[]).unwrap();
+            let shown = format!("{}\n{record}\n", _note("set-aside ALIAS - defined before bashrs, which put its own command in its place; this brings it back:"));
+            assert!(report.ends_with(&shown), "{report}");
+            assert!(missing.is_empty());
+        }
+
+        /// In fish the alias field holds the name's abbreviation, which, typed, expands ahead of
+        /// everything `type` lists: it reads first, and every escape hatch past it takes the
+        /// backslashed word — fish expands an abbreviation after `command` too.
+        #[test]
+        fn a_fish_abbreviation_outranks_everything_type_lists() {
+            let probes = Probes { alias: "abbr -a -- g 'git status'", function: "function g; true; end", kinds: "function\nbuiltin", ..*NONE };
+            let binaries = vec!["/usr/bin/g".to_string()];
+            let text = _describe("g", &probes, &binaries).expect("an abbreviation and more");
+            assert_eq!(
+                text,
+                format!(
+                    "{}\nabbr -a -- g 'git status'\n{}\nfunction g; true; end\n{}\n{}\n/usr/bin/g\n",
+                    _note("g is an ABBREVIATION - the top rank, typed it expands first:"),
+                    _note("outranked FUNCTION - still defined, runs via \\g:"),
+                    _note("outranked BUILTIN - runs via: builtin \\g"),
+                    _note("outranked BINARIES (not run) - the first runs via: command \\g"),
+                )
+            );
+            let alone = _describe("zz", &Probes { alias: "abbr -a -- zz 'ls -l'", ..*NONE }, &[]).unwrap();
+            assert_eq!(alone, format!("{}\nabbr -a -- zz 'ls -l'\n", _note("zz is an ABBREVIATION:")), "a sole meaning, stated plainly");
+        }
+
+        /// An abbreviation its options scope elsewhere — to another command's arguments, or to
+        /// whatever its pattern matches — is not what typing the name runs: it is noted, not
+        /// ranked. Only the options say so; the words past the `--` are the name's and its
+        /// expansion's.
+        #[test]
+        fn a_scoped_abbreviation_is_noted_not_ranked() {
+            for line in ["abbr -a --position anywhere --command git -- co checkout", "abbr -a --regex '^c o$' -- co 'echo x'"] {
+                let probes = Probes { alias: line, function: "function co; end", kinds: "function", ..*NONE };
+                let text = _describe("co", &probes, &[]).unwrap();
+                let note = _note("also an ABBREVIATION named 'co', which expands only where its options say:");
+                assert_eq!(text, format!("{}\nfunction co; end\n{note}\n{line}\n", _note("co is a FUNCTION:")), "{line}");
+            }
+            assert!(_expands_as_a_command("abbr -a -- g 'git --command x' # imported from a universal variable, see `help abbr`"));
         }
 
         /// The PATH walk honors order and the executable bit — a plain file of the right name

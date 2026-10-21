@@ -20,7 +20,7 @@ mod commands {
 
     /// Hop one directory up
     #[name("..")]
-    #[shell_body(bash = "cd .. \"$@\"", fish = "cd .. $argv")]
+    #[shell_body(both = "cd .. {ARGS}")]
     pub fn dir_up() {}
 
     /// Custom `ls` (like `ll`): a long, all-files listing aligned into a table. Extra

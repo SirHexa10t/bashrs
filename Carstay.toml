@@ -12,7 +12,7 @@ ffmpeg = "n9.0 @ autobuild-2026-08-24-13-10"
 yt-dlp = "2026.08.19"
 uv = "0.13.4"
 python = "3.14.6"
-deno = "v2.9.7"
+deno = "v2.9.8"
 git-lfs = "v3.8.0"
 
 [stainless_comfy]

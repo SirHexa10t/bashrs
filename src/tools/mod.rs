@@ -16,7 +16,7 @@ pub use fetch::sync;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use crate::support::shell_dialect::{fish_function, Shell};
+use crate::support::shell_dialect::{bash_function, fish_function, Shell};
 
 /// A bundled tool: where it lives, what it provides, and how its bundle comes to exist.
 struct Tool {
@@ -213,8 +213,9 @@ const TOOLS_ROOT_SHELL: &str = "$HOME/.bashrs/tools";
 /// layers. The PATH prepend (idempotent; harmless when nothing is bundled) makes the shims win in
 /// *argument* position — `which`, `env`, shebangs. The `python3` function covers what PATH can't:
 /// sourced last in the rc chain, it replaces any same-named function the user's own rc defined
-/// earlier (the `unalias` clears an alias shadow likewise). An activated venv still wins either
-/// way, and a machine with no bundle falls through to its PATH python.
+/// earlier (an alias shadow is set aside at the file's top, with every other bashrs name's). An
+/// activated venv still wins either way, and a machine with no bundle falls through to its PATH
+/// python.
 ///
 /// Fish gets the same two layers in its own terms. The prepend is a session-only `set -gx`, not
 /// fish's usual `fish_add_path`, which stores the directory in a universal variable that would
@@ -249,13 +250,16 @@ fn fish_shell_setup() -> String {
 
 fn bash_shell_setup() -> String {
     let root = TOOLS_ROOT_SHELL;
+    let python3 = bash_function(
+        "python3",
+        &format!(
+            "if [ -z \"$VIRTUAL_ENV\" ] && [ -x \"{root}/bin/python3\" ]; then \"{root}/bin/python3\" \"$@\"; else command python3 \"$@\"; fi"
+        ),
+    );
     format!(
         "case \":$PATH:\" in *\":{root}/bin:\"*) ;; *) export PATH=\"{root}/bin:$PATH\";; esac  \
          # bundled tools (python3, ffmpeg, …) win by PATH — as arguments and in shebangs\n\
-         unalias python3 2>/dev/null || true  \
-         # own line, on purpose: an active alias would mangle the function definition at parse time\n\
-         python3() {{ if [ -z \"$VIRTUAL_ENV\" ] && [ -x \"{root}/bin/python3\" ]; \
-         then \"{root}/bin/python3\" \"$@\"; else command python3 \"$@\"; fi; }}  \
+         {python3}  \
          # defined last so it beats older same-named rc definitions; a venv (or a missing bundle) falls through to PATH\n"
     )
 }
@@ -323,10 +327,11 @@ mod tests {
         let setup = shell_setup(Shell::Bash);
         assert!(setup.contains("PATH=\"$HOME/.bashrs/tools/bin:$PATH\""), "{setup}");
         assert!(setup.starts_with("case \":$PATH:\" in"), "re-sourcing must not stack duplicates: {setup}");
-        // The function layer: beats older same-named rc functions/aliases, respects venvs,
-        // routes through the shim so both layers name one canonical binary.
-        assert!(setup.contains("unalias python3"), "{setup}");
-        assert!(setup.contains("python3() {"), "{setup}");
+        // The function layer: beats older same-named rc functions, respects venvs, routes
+        // through the shim so both layers name one canonical binary. An alias shadow is no
+        // longer this section's to clear: the file sets aside every alias of its names.
+        assert!(!setup.contains("unalias"), "{setup}");
+        assert!(setup.contains("function python3 { if "), "{setup}");
         assert!(setup.contains("VIRTUAL_ENV"), "{setup}");
         assert!(setup.contains("$HOME/.bashrs/tools/bin/python3"), "{setup}");
         assert!(setup.contains("command python3"), "fall-throughs bypass the function itself: {setup}");
@@ -343,7 +348,8 @@ mod tests {
         );
         assert!(!setup.contains("fish_add_path") && !setup.contains("set -U"), "nothing universal: {setup}");
         assert!(!setup.contains("unalias"), "{setup}");
-        assert!(setup.contains("function python3 -d "), "{setup}");
+        assert!(setup.contains("function python3; if "), "{setup}");
+        assert!(setup.contains("; end; end; functions -d 'The bundled python3, unless a venv is active' python3  # "), "{setup}");
         assert!(setup.contains("test -z \"$VIRTUAL_ENV\"") && setup.contains("command python3 $argv"), "{setup}");
     }
 }

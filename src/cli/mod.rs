@@ -120,14 +120,14 @@ pub enum Command {
     /// for the shell it runs in (the generated `cd` calls it).
     #[command(hide = true)]
     CdListing,
-    /// Print one command's completable flags (asked by the generated completer at TAB-time).
+    /// Print one command's completable flags (asked by the generated completer at TAB-time), in the
+    /// form the asking shell's completer takes — fish's with each flag's description — as the
+    /// binary reads that shell off its parent process (`Shell::caller`), like every command that
+    /// answers in its shell's terms.
     #[command(hide = true)]
     CompleteFlags {
         /// The shell function name being completed (a command's clap name or visible alias).
         command: String,
-        /// The shell whose completer is asking — fish's takes each flag with its description.
-        #[arg(long, value_enum, default_value = "bash")]
-        shell: Shell,
     },
 }
 
@@ -166,7 +166,7 @@ impl Command {
                 crate::drivers::install_stainless(use_stable_carstay)
             }
             Command::CdListing => std::process::exit(crate::categories::filesystem::_landing_listing()),
-            Command::CompleteFlags { command, shell } => println!("{}", sourcefile::complete_flags(&command, shell)),
+            Command::CompleteFlags { command } => println!("{}", sourcefile::complete_flags(&command, Shell::caller())),
         }
     }
 }
@@ -406,8 +406,7 @@ mod tests {
     }
 
     /// Only the clap-backed commands appear here — `#[shell_body]` ones (`brs_cd`,
-    /// `dotbashrs_cd`) never enter the clap graph, and `dotbashrs_cd`'s deliberate off-prefix
-    /// name (the dot names the DIRECTORY, ~/.bashrs) is asserted where the shell functions
+    /// `brs_conf_cd`) never enter the clap graph, and are asserted where the shell functions
     /// are emitted, in `sourcefile`'s tests.
     #[test]
     fn bashrs_commands_follow_naming_standard() {

@@ -12,11 +12,12 @@
 //! the only shared artifact — nothing copies the tool's own `--help` into a side file to go stale.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
-use crate::support::shell_dialect::{fish_function, Shell, FISH_DESCRIPTION};
+use crate::support::shell_dialect::{bash_function, fish_function, Shell, FISH_COLUMNS};
 
 /// One of your own non-Rust repos (a future external kind would be a sibling struct in this table).
 struct Comfy {
@@ -42,8 +43,8 @@ struct Comfy {
 }
 
 /// A secondary alias for a [`Comfy`]'s clone: the same tool, a different entry point. Run by the
-/// repo's own `run` interpreter, from the directory holding its `exe` — so `-m` module invocations
-/// resolve — inside a subshell, leaving the caller's working directory untouched.
+/// repo's own `run` interpreter, started in the directory holding its `exe` — so `-m` module
+/// invocations resolve — while the caller's working directory stays untouched.
 struct Aux {
     /// Shell function name to expose.
     alias: &'static str,
@@ -114,9 +115,17 @@ fn exe_shell(comfy: &Comfy) -> String {
     clone_path_shell(comfy, comfy.exe)
 }
 
-/// The `$HOME`-relative directory holding the executable — where [`Aux`] commands `cd` before
-/// running, so a `-m package.module` finds its package. Falls back to the clone root for an `exe`
-/// that sits there directly.
+/// The directory holding the executable — where [`Aux`] commands run, so a `-m package.module`
+/// finds its package; the clone root for an `exe` that sits there directly.
+fn exe_dir(comfy: &Comfy) -> PathBuf {
+    let root = clone_dir(comfy);
+    match Path::new(comfy.exe).parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        Some(dir) => root.join(dir),
+        None => root,
+    }
+}
+
+/// [`exe_dir`] as the aliases spell it: `$HOME`-relative, for the shell to expand.
 fn exe_dir_shell(comfy: &Comfy) -> String {
     let root = format!("$HOME/{CLONE_BASE}/{}", repo_name(comfy.repo));
     match Path::new(comfy.exe).parent().and_then(Path::to_str).filter(|dir| !dir.is_empty()) {
@@ -305,43 +314,71 @@ pub fn clone_revisions() -> Vec<(&'static str, Option<String>)> {
 /// result is the same on any terminal.
 const PROBE_COLUMNS: u32 = 10_000;
 
-/// Run a `--help` probe `script` through bash (so `$HOME` expands and a `cd` is possible) and
-/// return its full text. One probe serves every consumer — [`extract_about`] for the alias's
-/// inline comment and [`extract_flags`] for its TAB completion, in bash's file and in fish's — so
-/// each tool starts (a python interpreter, at compile time) once per process: the install writes
-/// both files, and the second asks this memo. Best-effort: a spawn failure or a non-zero exit
-/// yields `None` (no comment, no completion), remembered like an answer.
-fn probe_help(script: &str) -> Option<String> {
-    static PROBED: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+/// One `--help` probe: the program, its arguments, and the directory to start it in — run as is,
+/// with no shell between: everything a shell did for it (expand `$HOME`, `cd`, set `COLUMNS`, merge
+/// stderr into stdout) is done here instead.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Probe {
+    program: OsString,
+    args: Vec<OsString>,
+    dir: Option<PathBuf>,
+}
+
+/// Run a `--help` probe and return its full text: stdout and stderr together, in the order the
+/// tool wrote them, through one pipe for both (some tools print their help on stderr), with
+/// `COLUMNS` set to [`PROBE_COLUMNS`]. One probe serves every consumer — [`extract_about`] for the
+/// alias's inline comment and [`extract_flags`] for its TAB completion, in bash's file and in
+/// fish's — so each tool starts (a python interpreter, at compile time) once per process: the
+/// install writes both files, and the second asks this memo. Best-effort: a spawn failure or a
+/// non-zero exit yields `None` (no comment, no completion), remembered like an answer.
+fn probe_help(probe: &Probe) -> Option<String> {
+    static PROBED: OnceLock<Mutex<HashMap<Probe, Option<String>>>> = OnceLock::new();
     let probed = PROBED.get_or_init(Mutex::default);
-    if let Some(help) = probed.lock().ok()?.get(script) {
+    if let Some(help) = probed.lock().ok()?.get(probe) {
         return help.clone();
     }
-    let help = Command::new("bash")
-        .arg("-c")
-        .arg(script)
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
-    probed.lock().ok()?.insert(script.to_string(), help.clone());
+    let help = run_probe(probe);
+    probed.lock().ok()?.insert(probe.clone(), help.clone());
     help
 }
 
-/// Probe the main launcher or a sibling [`Script`]: `<run> "<clone-path>" --help`, run by absolute
-/// path (no `cd`), `exe` clone-relative. `run` goes through [`crate::tools::resolve`], mirroring the
-/// sourcefile's PATH shim, so the probe works even when the interpreter is only bundled.
-fn fetch_help(comfy: &Comfy, exe: &str) -> Option<String> {
-    let run = crate::tools::resolve(comfy.run);
-    probe_help(&format!("COLUMNS={PROBE_COLUMNS} \"{}\" \"{}\" --help 2>&1", run.to_string_lossy(), clone_path_shell(comfy, exe)))
+/// [`probe_help`]'s run itself, unremembered.
+fn run_probe(probe: &Probe) -> Option<String> {
+    use std::io::Read as _;
+    let (mut reader, writer) = std::io::pipe().ok()?;
+    let mut command = Command::new(&probe.program);
+    command
+        .args(&probe.args)
+        .env("COLUMNS", PROBE_COLUMNS.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(writer.try_clone().ok()?)
+        .stderr(writer);
+    if let Some(dir) = &probe.dir {
+        command.current_dir(dir);
+    }
+    let mut child = command.spawn().ok()?;
+    // The command still holds the pipe's writing ends; until they close, the read never ends.
+    drop(command);
+    let mut text = Vec::new();
+    reader.read_to_end(&mut text).ok()?;
+    child.wait().ok()?.success().then(|| String::from_utf8_lossy(&text).into_owned())
 }
 
-/// Probe an [`Aux`] exactly as it runs — `cd` into the exe's directory so a `-m module` resolves,
-/// then `<run> <args> --help`. `extract_about` keeps just the first description line, so a
-/// multi-line `--help` (like `launch.audit`'s) still yields a one-line comment.
+/// Probe the main launcher or a sibling [`Script`]: `<run> <clone-path> --help`, run by absolute
+/// path, `exe` clone-relative. `run` goes through [`crate::tools::resolve`], mirroring the
+/// sourcefile's PATH shim, so the probe works even when the interpreter is only bundled.
+fn fetch_help(comfy: &Comfy, exe: &str) -> Option<String> {
+    let args = vec![clone_dir(comfy).join(exe).into_os_string(), "--help".into()];
+    probe_help(&Probe { program: crate::tools::resolve(comfy.run), args, dir: None })
+}
+
+/// Probe an [`Aux`] exactly as it runs — from the exe's directory, so a `-m module` resolves — as
+/// `<run> <args> --help`. `extract_about` keeps just the first description line, so a multi-line
+/// `--help` (like `launch.audit`'s) still yields a one-line comment.
 fn fetch_help_aux(comfy: &Comfy, aux: &Aux) -> Option<String> {
-    let run = crate::tools::resolve(comfy.run);
-    probe_help(&format!("cd \"{}\" && COLUMNS={PROBE_COLUMNS} \"{}\" {} --help 2>&1", exe_dir_shell(comfy), run.to_string_lossy(), aux.args))
+    let mut args: Vec<OsString> = aux.args.split_whitespace().map(OsString::from).collect();
+    args.push("--help".into());
+    probe_help(&Probe { program: crate::tools::resolve(comfy.run), args, dir: Some(exe_dir(comfy)) })
 }
 
 /// Pure: the one-line description from `--help` text — the first *paragraph* after the (possibly
@@ -451,13 +488,13 @@ pub(crate) fn aliases(shell: Shell) -> (String, Vec<(String, String)>) {
         }
     }
     // The block is a table like every category's — bash's: name, `{`-opened body, `#` comment,
-    // each in its own column; fish's: name, then description and body. Aligned here, where the
-    // lines are born (the same division as `keybinds::desktop_restart`); the pure line builders
-    // below stay gap-free and their tests stay exact.
+    // each in its own column; fish's: name, `;`-opened body, `functions -d` description. Aligned
+    // here, where the lines are born; the pure line builders below stay gap-free and their tests
+    // stay exact.
     let lines: Vec<String> = lines.lines().map(str::to_string).collect();
     let aligned = match shell {
         Shell::Bash => crate::support::align::align_columns(lines, &["{", "# "]),
-        Shell::Fish => crate::support::align::align_columns(lines, &[FISH_DESCRIPTION]),
+        Shell::Fish => crate::support::align::align_columns(lines, &FISH_COLUMNS),
     };
     let mut lines: String = aligned.join("\n");
     if !lines.is_empty() {
@@ -469,17 +506,19 @@ pub(crate) fn aliases(shell: Shell) -> (String, Vec<(String, String)>) {
 /// Pure: one alias definition line (`about` becomes an inline `#` comment when present).
 fn alias_line(comfy: &Comfy, about: Option<&str>) -> String {
     let comment = about.map(|about| format!("  # {about}")).unwrap_or_default();
-    format!("{}() {{ {} \"{}\" \"$@\"; }}{comment}\n", comfy.alias, comfy.run, exe_shell(comfy))
+    bash_function(comfy.alias, &format!("{} \"{}\" \"$@\"", comfy.run, exe_shell(comfy))) + &comment + "\n"
 }
 
-/// Pure: one auxiliary alias line (`about` becomes an inline `#` comment when present) — `cd` to
-/// the executable's directory (in a subshell, so the caller's cwd is unchanged) and run the repo's
-/// interpreter with the aux's own arguments. The `cd`'s own stdout is discarded — a customised `cd`
-/// or a `CDPATH` hit echoes the directory, which would otherwise pollute the tool's output — while
-/// its errors still reach stderr and `&&` still gates the run on a successful `cd`.
+/// Pure: one auxiliary alias line (`about` becomes an inline `#` comment when present) — the
+/// repo's interpreter with the aux's own arguments, started in the executable's directory by
+/// `env -C`. No `cd` runs, so the caller's directory never changes, not even by an interrupted run,
+/// and no customised `cd` or `CDPATH` hit can print into the tool's output; `env` fails, naming the
+/// directory, when it cannot enter it. The same in both shells ([`aux_fish`]): `env` finds the
+/// interpreter on PATH, which the sourcefile leads with the bundled tools' directory.
 fn aux_line(comfy: &Comfy, aux: &Aux, about: Option<&str>) -> String {
     let comment = about.map(|about| format!("  # {about}")).unwrap_or_default();
-    format!("{}() {{ (cd \"{}\" >/dev/null && {} {} \"$@\"); }}{comment}\n", aux.alias, exe_dir_shell(comfy), comfy.run, aux.args)
+    let run = format!("env -C \"{}\" {} {} \"$@\"", exe_dir_shell(comfy), comfy.run, aux.args);
+    bash_function(aux.alias, &run) + &comment + "\n"
 }
 
 /// Pure: the alias lines for one [`Script`] — one per flag variant, each running the script by
@@ -498,7 +537,7 @@ fn script_lines(comfy: &Comfy, script: &Script, about: Option<&str>) -> String {
                 Some(about) if args.is_empty() => format!("  # {about}"),
                 Some(about) => format!("  # {about} ({args})"),
             };
-            format!("{alias}() {{ {} \"{path}\"{flags} \"$@\"; }}{comment}\n", comfy.run)
+            bash_function(alias, &format!("{} \"{path}\"{flags} \"$@\"", comfy.run)) + &comment + "\n"
         })
         .collect()
 }
@@ -508,12 +547,7 @@ fn alias_fish(comfy: &Comfy, about: Option<&str>) -> String {
     fish_function(comfy.alias, about, &[format!("{} \"{}\" $argv", comfy.run, exe_shell(comfy))]) + "\n"
 }
 
-/// Pure: [`aux_line`] in fish. Fish has no subshell to confine a `cd` to, so `env -C` hands the
-/// interpreter its directory instead: the caller's working directory is never changed, not even
-/// by an interrupted run, which a `pushd`/`popd` pair would not survive. What that changes: `env`
-/// finds the interpreter on PATH, where bash's subshell meets the sourcefile's `python3` function
-/// first — the same interpreter while the bundled tools' directory leads PATH, as the sourcefile
-/// arranges, and not when `config.fish` later puts another `python3` ahead of it.
+/// Pure: [`aux_line`] in fish — the same `env -C`.
 fn aux_fish(comfy: &Comfy, aux: &Aux, about: Option<&str>) -> String {
     let run = format!("env -C \"{}\" {} {} $argv", exe_dir_shell(comfy), comfy.run, aux.args);
     fish_function(aux.alias, about, &[run]) + "\n"
@@ -565,26 +599,26 @@ mod tests {
     fn alias_line_wires_run_and_exe_with_an_optional_comment() {
         assert_eq!(
             alias_line(SAMPLE, None),
-            "ai() { python3 \
+            "function ai { python3 \
              \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/run.py\" \"$@\"; }\n"
         );
         assert!(alias_line(SAMPLE, Some("Launch an agent")).contains("; }  # Launch an agent\n"));
     }
 
     #[test]
-    fn aux_line_cds_into_the_exe_dir_and_runs_the_module_in_a_subshell() {
-        // The subshell `(cd … && …)` keeps the caller's cwd; the cd target is the exe's directory,
-        // so `python3 -m launch.audit` can import the `launch` package that lives beside run.py.
-        // The probed `--help` first line rides along as an inline comment.
+    fn aux_line_runs_the_module_from_the_exe_dir_without_a_cd() {
+        // `env -C` starts the interpreter in the exe's directory, so `python3 -m launch.audit` can
+        // import the `launch` package that lives beside run.py — and the caller's cwd is never
+        // touched. The probed `--help` first line rides along as an inline comment.
         assert_eq!(
             aux_line(SAMPLE, &SAMPLE.aux[0], Some("Audit the launcher's state")),
-            "ai_audit_self() { (cd \
-             \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code\" >/dev/null \
-             && python3 -m launch.audit \"$@\"); }  # Audit the launcher's state\n"
+            "function ai_audit_self { env -C \
+             \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code\" \
+             python3 -m launch.audit \"$@\"; }  # Audit the launcher's state\n"
         );
         // No probe (clone absent) → no comment.
         assert!(
-            aux_line(SAMPLE, &SAMPLE.aux[0], None).ends_with("\"$@\"); }\n"),
+            aux_line(SAMPLE, &SAMPLE.aux[0], None).ends_with("\"$@\"; }\n"),
             "no about → no trailing comment"
         );
     }
@@ -597,7 +631,7 @@ mod tests {
         let (lines, _) = aliases(Shell::Bash);
         let braces: std::collections::BTreeSet<usize> = lines
             .lines()
-            .filter(|line| line.contains("() "))
+            .filter(|line| line.starts_with("function "))
             .filter_map(|line| line.find('{'))
             .collect();
         assert!(!lines.is_empty(), "the table always emits its aliases");
@@ -611,16 +645,16 @@ mod tests {
         // flag named so variants differ; an empty-flag variant leaves no stray space before "$@".
         let out = script_lines(SAMPLE, &SAMPLE.scripts[0], Some("Ask a quick question"));
         assert!(
-            out.contains("q() { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" \"$@\"; }  # Ask a quick question\n"),
+            out.contains("function q { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" \"$@\"; }  # Ask a quick question\n"),
             "bare variant + comment: {out}"
         );
         assert!(
-            out.contains("q2() { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" --explain \"$@\"; }  # Ask a quick question (--explain)\n"),
+            out.contains("function q2 { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" --explain \"$@\"; }  # Ask a quick question (--explain)\n"),
             "flag variant names the pinned flag: {out}"
         );
         // No probe (clone absent) → no comment, and still no stray space on the bare variant.
         assert!(
-            script_lines(SAMPLE, &SAMPLE.scripts[0], None).contains("q() { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" \"$@\"; }\n"),
+            script_lines(SAMPLE, &SAMPLE.scripts[0], None).contains("function q { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" \"$@\"; }\n"),
             "no about → no comment"
         );
     }
@@ -632,27 +666,27 @@ mod tests {
         let clone = "$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code";
         assert_eq!(
             alias_fish(SAMPLE, Some("Launch an agent")),
-            format!("function ai -d 'Launch an agent'; python3 \"{clone}/run.py\" $argv; end\n")
+            format!("function ai; python3 \"{clone}/run.py\" $argv; end; functions -d 'Launch an agent' ai\n")
         );
         let aux = aux_fish(SAMPLE, &SAMPLE.aux[0], Some("Audit the launcher's state"));
         assert_eq!(
             aux,
-            format!("function ai_audit_self -d 'Audit the launcher\\'s state'; env -C \"{clone}\" python3 -m launch.audit $argv; end\n")
+            format!("function ai_audit_self; env -C \"{clone}\" python3 -m launch.audit $argv; end; functions -d 'Audit the launcher\\'s state' ai_audit_self\n")
         );
         let scripts = scripts_fish(SAMPLE, &SAMPLE.scripts[0], Some("Ask a quick question"));
-        assert!(scripts.contains(&format!("function q -d 'Ask a quick question'; python3 \"{clone}/quick_question.py\" $argv; end\n")), "{scripts}");
-        assert!(scripts.contains(&format!("function q2 -d 'Ask a quick question (--explain)'; python3 \"{clone}/quick_question.py\" --explain $argv; end\n")), "{scripts}");
-        assert!(scripts_fish(SAMPLE, &SAMPLE.scripts[0], None).contains("function q; "), "no probe → no description");
+        assert!(scripts.contains(&format!("function q; python3 \"{clone}/quick_question.py\" $argv; end; functions -d 'Ask a quick question' q\n")), "{scripts}");
+        assert!(scripts.contains(&format!("function q2; python3 \"{clone}/quick_question.py\" --explain $argv; end; functions -d 'Ask a quick question (--explain)' q2\n")), "{scripts}");
+        assert!(!scripts_fish(SAMPLE, &SAMPLE.scripts[0], None).contains("functions -d"), "no probe → no description");
         let (block, _) = aliases(Shell::Fish);
         assert!(!block.contains("() {"), "nothing of bash's syntax in fish's block: {block}");
     }
 
-    /// The fish block is a table too: every described alias's description starts in one column.
+    /// The fish block is a table too, as bash's is: every alias's body opens in one column.
     #[test]
-    fn fish_aliases_align_their_descriptions_into_a_column() {
+    fn fish_aliases_align_their_bodies_into_a_column() {
         let (block, _) = aliases(Shell::Fish);
-        let columns: std::collections::BTreeSet<usize> = block.lines().filter_map(|line| line.find(" -d ")).collect();
-        assert!(columns.len() <= 1, "stainless descriptions are not one column:\n{block}");
+        let columns: std::collections::BTreeSet<usize> = block.lines().filter_map(|line| line.find(';')).collect();
+        assert!(columns.len() <= 1, "stainless bodies are not one column:\n{block}");
         assert_eq!(block.lines().count(), aliases(Shell::Bash).0.lines().count(), "one function per bash alias");
     }
 
@@ -662,14 +696,28 @@ mod tests {
     fn a_help_probe_runs_once_per_process() {
         let counter = std::env::temp_dir().join(format!("bashrs_probe_count_{}", std::process::id()));
         let _ = std::fs::remove_file(&counter);
-        let script = format!("echo ran >> '{}'; echo 'usage: x'", counter.display());
-        assert_eq!(probe_help(&script).as_deref(), Some("usage: x\n"));
-        assert_eq!(probe_help(&script).as_deref(), Some("usage: x\n"), "the same answer the second time");
+        let sh = |script: String| Probe { program: "sh".into(), args: vec!["-c".into(), script.into()], dir: None };
+        let probe = sh(format!("echo ran >> '{}'; echo 'usage: x'", counter.display()));
+        assert_eq!(probe_help(&probe).as_deref(), Some("usage: x\n"));
+        assert_eq!(probe_help(&probe).as_deref(), Some("usage: x\n"), "the same answer the second time");
         assert_eq!(std::fs::read_to_string(&counter).unwrap_or_default(), "ran\n", "and the tool started once");
-        let failing = format!("echo ran >> '{}'; exit 3", counter.display());
+        let failing = sh(format!("echo ran >> '{}'; exit 3", counter.display()));
         assert_eq!((probe_help(&failing), probe_help(&failing)), (None, None));
         assert_eq!(std::fs::read_to_string(&counter).unwrap_or_default(), "ran\nran\n", "a failure is remembered too");
         let _ = std::fs::remove_file(&counter);
+    }
+
+    /// What the shell used to do for a probe, done without one: stdout and stderr in the order
+    /// they were written, `COLUMNS` set, and the directory to start in.
+    #[test]
+    fn a_probe_runs_as_its_shell_ran_it() {
+        let sh = |script: &str, dir: Option<PathBuf>| Probe { program: "sh".into(), args: vec!["-c".into(), script.into()], dir };
+        assert_eq!(run_probe(&sh("echo out; echo err >&2; echo out", None)).as_deref(), Some("out\nerr\nout\n"), "one stream, in order");
+        assert_eq!(run_probe(&sh("echo $COLUMNS", None)).as_deref(), Some(format!("{PROBE_COLUMNS}\n").as_str()));
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        assert_eq!(run_probe(&sh("pwd -P", Some(dir.clone()))), Some(format!("{}\n", dir.display())));
+        let missing = Probe { program: "bashrs_no_such_program_xyz".into(), args: Vec::new(), dir: None };
+        assert_eq!(run_probe(&missing), None, "a program that cannot start: no help");
     }
 
     #[test]

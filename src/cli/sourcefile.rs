@@ -43,7 +43,7 @@ use crate::categories::shell::ShellCommand;
 use crate::categories::styles::StyleCommand;
 use crate::conf::{config_file, environment, greeting};
 use crate::drivers::stainless;
-use crate::support::shell_dialect::{fish_original, Shell, ShellText};
+use crate::support::shell_dialect::{fish_original, Shell, ShellText, SET_ASIDE_RECORD};
 use crate::tools;
 
 /// A category's pure-shell command (`#[shell_body]`): `(name, bodies, comment)` — emitted as a
@@ -217,27 +217,56 @@ fn wrapper_prefix(name: &str) -> Option<ShellText> {
 /// call time and a path with spaces stays one word, which bash and fish read alike.
 const BIN: &str = "\"$HOME/.bashrs/bashrs\"";
 
+/// The placeholder for the arguments a function was called with.
+const ARGS: &str = "{ARGS}";
+/// The placeholder for the shell running a function — what an `exec` starts afresh.
+const SHELL: &str = "{SHELL}";
 /// The placeholder for the project directory this binary was compiled from.
 const PROJECT_ROOT: &str = "{PROJECT_ROOT}";
 /// The placeholder for the installed binary, [`BIN`].
 const BINARY: &str = "{BINARY}";
 /// The placeholder (fish) for the shell's own definition of an override's name.
 const ORIGINAL: &str = "{ORIGINAL}";
+/// The placeholder (bash) for the record of the aliases the file set aside.
+const SET_ASIDE: &str = "{SET_ASIDE}";
 
-/// A hand-written fragment with its generation-time substitutions made. The attributes only take
+/// A hand-written fragment with its generation-time substitutions made — what lets a body be one
+/// text for both shells (`both = "…"`), the differences filled in here. The attributes only take
 /// string literals, but the generator runs inside the binary — which is exactly where compile-time
 /// knowledge lives — so these are baked into the emitted text instead of fetched through a
 /// subprocess at every call:
+/// - [`ARGS`] — the function's arguments: `"$@"` in bash, `$argv` in fish;
+/// - [`SHELL`] — the shell running the function: `fish`, or, in bash's file — which zsh sources
+///   too — `"${ZSH_NAME:-bash}"`, since zsh names itself there and bash leaves it unset;
 /// - [`PROJECT_ROOT`] — the project directory, quoted for the shell the fragment is written in;
 /// - [`BINARY`] — the installed binary, spelled as every generated wrapper calls it ([`BIN`]);
 /// - [`ORIGINAL`], fish only — the shell's own definition of `name`, which [`fish`] saves under
-///   another name before the override replaces it.
+///   another name before the override replaces it;
+/// - [`SET_ASIDE`], bash only — the record of the aliases the file set aside under bashrs's names
+///   ([`SET_ASIDE_RECORD`]), the associative array `shell_def` reads.
 fn substitute(text: &str, shell: Shell, name: &str) -> String {
-    let text = text.replace(PROJECT_ROOT, &shell.quote(env!("CARGO_MANIFEST_DIR"))).replace(BINARY, BIN);
+    let text = text
+        .replace(PROJECT_ROOT, &shell.quote(env!("CARGO_MANIFEST_DIR")))
+        .replace(BINARY, BIN);
     match shell {
-        Shell::Bash => text,
-        Shell::Fish => text.replace(ORIGINAL, &fish_original(name)),
+        Shell::Bash => text.replace(ARGS, "\"$@\"").replace(SHELL, "\"${ZSH_NAME:-bash}\"").replace(SET_ASIDE, SET_ASIDE_RECORD),
+        Shell::Fish => text.replace(ARGS, "$argv").replace(SHELL, "fish").replace(ORIGINAL, &fish_original(name)),
     }
+}
+
+/// The names `body` defines a function for at its top level — every command's, whichever layer
+/// wrote it: a definition starts at the margin (`function NAME {` in bash's file, `function NAME;`
+/// in fish's), while the helpers inside one shell's block are indented. In the order they are
+/// defined, each once — the names each file sets aside what came first for.
+fn defined_functions(body: &str) -> Vec<&str> {
+    let mut names: Vec<&str> = Vec::new();
+    let defined = body.lines().filter_map(|line| line.strip_prefix("function ")?.split([' ', ';']).next());
+    for name in defined.filter(|name| !name.is_empty()) {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 /// One flag a command offers for completion, read from clap's model, so that neither shell's
@@ -346,12 +375,17 @@ pub(super) fn generated(shell: Shell) -> (String, Vec<String>) {
     };
     body += &completion;
 
-    // A load greeting — after the `gecho`/`boecho` wrappers it calls are defined.
-    body += &format!("\n# greeting\n{}", greeting::line(shell));
-
-    // The very last lines, deliberately: while an archived config sits unmerged, the red nag
-    // (via `errcho`, defined above) is the closest thing to the user's prompt.
-    body += &format!("\n\n# stale-config check\n{}", config_file::stale_config_notice(shell));
+    // The very end, deliberately: the greeting, and — while an archived config sits unmerged —
+    // its red warning, which is then the closest thing to the user's prompt. Written in, their
+    // text resolved here (`conf::greeting`), so a shell start runs no process for them — made in
+    // a terminal's first shell only, which each file tells itself; zsh makes them at its first
+    // prompt (`bash::greeting`, `fish::greeting`).
+    let (text, warning, archives) = (greeting::text(), greeting::warning(), config_file::archive_glob());
+    body += "\n# greeting — and, while an archived config waits to be merged, the warning — in a terminal's first shell: the one leading its session\n";
+    body += &match shell {
+        Shell::Bash => bash::greeting(&text, &warning, &archives),
+        Shell::Fish => fish::greeting(&text, &warning, &archives),
+    };
 
     let file = match shell {
         Shell::Bash => bash::file(&body),
@@ -383,6 +417,7 @@ mod tests {
     }
     use crate::cli::Cli;
     use crate::conf::{keybinds, RELOAD_EXIT_CODE};
+    use crate::support::shell_dialect::printf_line;
     use clap::CommandFactory;
 
     #[test]
@@ -431,7 +466,7 @@ mod tests {
     #[test]
     fn wrappers_register_flag_completion() {
         let script = wrappers(Shell::Bash);
-        assert!(script.contains("_bashrs_complete()"), "completer function missing");
+        assert!(script.contains("function _bashrs_complete {"), "completer function missing");
         assert!(
             script.contains("complete-flags \"${COMP_WORDS[0]}\""),
             "the completer should ask the binary at TAB-time"
@@ -485,38 +520,39 @@ mod tests {
         // and every line here states CONTENT only.
         let script = flat(&wrappers(Shell::Bash));
         let has = |line: &str| assert!(script.contains(line), "missing wrapper line: {line}");
-        has("fs_usage() { \"$HOME/.bashrs/bashrs\" fs_usage \"$@\"; }");
-        has("dl_page_links() { \"$HOME/.bashrs/bashrs\" dl_page_links \"$@\"; }");
-        has("dl() { \"$HOME/.bashrs/bashrs\" dl \"$@\"; }");
-        has("media_convert() { \"$HOME/.bashrs/bashrs\" media_convert \"$@\"; }");
-        has("media_convert_quality() { \"$HOME/.bashrs/bashrs\" media_convert_quality \"$@\"; }");
-        has("media_convert_compact() { \"$HOME/.bashrs/bashrs\" media_convert_compact \"$@\"; }");
-        has("media_trim() { \"$HOME/.bashrs/bashrs\" media_trim \"$@\"; }");
-        has("media_metadata() { \"$HOME/.bashrs/bashrs\" media_metadata \"$@\"; }");
-        has("media_hmerge_imgs() { \"$HOME/.bashrs/bashrs\" media_hmerge_imgs \"$@\"; }");
-        has("media_vmerge_imgs() { \"$HOME/.bashrs/bashrs\" media_vmerge_imgs \"$@\"; }");
-        has("packages_upup() { \"$HOME/.bashrs/bashrs\" packages_upup \"$@\"; }"); // packages (both)
-        has("upup() { \"$HOME/.bashrs/bashrs\" packages_upup \"$@\"; }"); // unprefixed alias -> packages_upup
-        has("packages_print() { \"$HOME/.bashrs/bashrs\" packages_print \"$@\"; }"); // prefixed only
-        has("packages_update_toolchains() { \"$HOME/.bashrs/bashrs\" packages_update_toolchains \"$@\"; }"); // prefixed only
-        has("UPUP() { \"$HOME/.bashrs/bashrs\" UPUP \"$@\"; }"); // custom-named: update everything
-        has("backup_diff() { \"$HOME/.bashrs/bashrs\" backup_diff \"$@\"; }"); // comfy: flattened filesync subcommand
-        has("backup_find_bitrot() { \"$HOME/.bashrs/bashrs\" backup_find_bitrot \"$@\"; }"); // comfy: pinned variant
-        has("diff() { \"$HOME/.bashrs/bashrs\" diff \"$@\"; }"); // overrides: a system command shadowed under its own name
+        has("function fs_usage { \"$HOME/.bashrs/bashrs\" fs_usage \"$@\"; }");
+        has("function dl_page_links { \"$HOME/.bashrs/bashrs\" dl_page_links \"$@\"; }");
+        has("function dl { \"$HOME/.bashrs/bashrs\" dl \"$@\"; }");
+        has("function media_convert { \"$HOME/.bashrs/bashrs\" media_convert \"$@\"; }");
+        has("function media_convert_quality { \"$HOME/.bashrs/bashrs\" media_convert_quality \"$@\"; }");
+        has("function media_convert_compact { \"$HOME/.bashrs/bashrs\" media_convert_compact \"$@\"; }");
+        has("function media_trim { \"$HOME/.bashrs/bashrs\" media_trim \"$@\"; }");
+        has("function media_metadata { \"$HOME/.bashrs/bashrs\" media_metadata \"$@\"; }");
+        has("function media_hmerge_imgs { \"$HOME/.bashrs/bashrs\" media_hmerge_imgs \"$@\"; }");
+        has("function media_vmerge_imgs { \"$HOME/.bashrs/bashrs\" media_vmerge_imgs \"$@\"; }");
+        has("function packages_upup { \"$HOME/.bashrs/bashrs\" packages_upup \"$@\"; }"); // packages (both)
+        has("function upup { \"$HOME/.bashrs/bashrs\" packages_upup \"$@\"; }"); // unprefixed alias -> packages_upup
+        has("function packages_print { \"$HOME/.bashrs/bashrs\" packages_print \"$@\"; }"); // prefixed only
+        has("function packages_update_toolchains { \"$HOME/.bashrs/bashrs\" packages_update_toolchains \"$@\"; }"); // prefixed only
+        has("function UPUP { \"$HOME/.bashrs/bashrs\" UPUP \"$@\"; }"); // custom-named: update everything
+        has("function backup_diff { \"$HOME/.bashrs/bashrs\" backup_diff \"$@\"; }"); // comfy: flattened filesync subcommand
+        has("function backup_find_bitrot { \"$HOME/.bashrs/bashrs\" backup_find_bitrot \"$@\"; }"); // comfy: pinned variant
+        has("function diff { \"$HOME/.bashrs/bashrs\" diff \"$@\"; }"); // overrides: a system command shadowed under its own name
         // brs_compile starts a fresh session only when compile signals a reload (exit code), and
         // returns the compile's own status otherwise
         has(&format!(
-            "brs_compile() {{ \"$HOME/.bashrs/bashrs\" brs_compile \"$@\"; local code=$?; [ \"$code\" -eq {RELOAD_EXIT_CODE} ] && shell_new; return \"$code\"; }}"
+            "function brs_compile {{ \"$HOME/.bashrs/bashrs\" brs_compile \"$@\"; local code=$?; [ \"$code\" -eq {RELOAD_EXIT_CODE} ] && shell_new; return \"$code\"; }}"
         ));
-        has("brs_sourcefile() { \"$HOME/.bashrs/bashrs\" brs_sourcefile \"$@\"; }");
-        has("brs_configure() { \"$HOME/.bashrs/bashrs\" brs_configure \"$@\"; }");
-        has("recho() { \"$HOME/.bashrs/bashrs\" recho \"$@\"; }"); // style: bare, unprefixed
-        has("py_install() { \"$HOME/.bashrs/bashrs\" py_install \"$@\"; }"); // python: bundled-env packages
-        has("hg() { history | \"$HOME/.bashrs/bashrs\" hg \"$@\"; }"); // #[piped]: history fed in
-        has("g() { \"$HOME/.bashrs/bashrs\" g \"$@\"; }"); // generated g-family (bare)
-        has("g3() { \"$HOME/.bashrs/bashrs\" g3 \"$@\"; }");
-        has("gg() { \"$HOME/.bashrs/bashrs\" gg \"$@\"; }"); // recursive tree grep (bare)
-        has("GG() { \"$HOME/.bashrs/bashrs\" GG \"$@\"; }"); // gg with --delve forced, à la UPUP
+        has("function brs_sourcefile { \"$HOME/.bashrs/bashrs\" brs_sourcefile \"$@\"; }");
+        has("function brs_configure { \"$HOME/.bashrs/bashrs\" brs_configure \"$@\"; }");
+        has("function recho { \"$HOME/.bashrs/bashrs\" recho \"$@\"; }"); // style: bare, unprefixed
+        has("function py_install { \"$HOME/.bashrs/bashrs\" py_install \"$@\"; }"); // python: bundled-env packages
+        // #[piped]: history fed in — zsh's whole history, in bash's shape, where zsh runs this file
+        has(r#"function hg { if [ -n "$ZSH_VERSION" ]; then history -t '%F_%T' 1 2>/dev/null; else history; fi | "$HOME/.bashrs/bashrs" hg "$@"; }"#);
+        has("function g { \"$HOME/.bashrs/bashrs\" g \"$@\"; }"); // generated g-family (bare)
+        has("function g3 { \"$HOME/.bashrs/bashrs\" g3 \"$@\"; }");
+        has("function gg { \"$HOME/.bashrs/bashrs\" gg \"$@\"; }"); // recursive tree grep (bare)
+        has("function GG { \"$HOME/.bashrs/bashrs\" GG \"$@\"; }"); // gg with --delve forced, à la UPUP
     }
 
     #[test]
@@ -524,8 +560,8 @@ mod tests {
         let script = wrappers(Shell::Bash);
         let content = flat(&script);
         // Bash's file is zsh's too: the session commands start whichever of the two runs them.
-        assert!(content.contains(r#"shell_new() { exec "${ZSH_NAME:-bash}"; }"#), "shell_new missing");
-        assert!(content.contains(r#"shell_bare() { _BASHRS_BARE=1 exec "${ZSH_NAME:-bash}"; }"#), "shell_bare missing");
+        assert!(content.contains(r#"function shell_new { exec "${ZSH_NAME:-bash}"; }"#), "shell_new missing");
+        assert!(content.contains(r#"function shell_bare { _BASHRS_BARE=1 exec "${ZSH_NAME:-bash}"; }"#), "shell_bare missing");
         // The one-shot guard: consume the flag AND return, so a bare session starts with a clean
         // environment and the very next shell arms bashrs again.
         assert!(
@@ -549,10 +585,32 @@ mod tests {
         assert!(script.contains(r#"bind '"\eh": "brs_sourcefile\n"'"#), "ALT+H keybind missing");
         assert!(script.contains(r#"bind '"\ew": "brs_configure\n"'"#), "ALT+W keybind missing");
         assert!(script.contains(r#"bind '"\eq": "brs_compile\n"'"#), "ALT+Q keybind missing");
-        // Spacing-agnostic: the gap before `then` belongs to the aligner (keybinds' own test
-        // asserts the column), this one only cares that the ALT+L chain is present.
-        assert!(script.contains(r#"if [[ $__bashrs_desktops == *" cinnamon "* ]];"#), "ALT+L desktop-restart missing");
+        assert!(script.contains(r#"bind '"\el": "proc_restart_desktop\n"'"#), "ALT+L keybind missing");
         assert!(script.contains("if [ -n \"$BASH_VERSION\" ]; then"), "keybinds should be bash-guarded");
+    }
+
+    /// Zsh sources this file too, and binds the very keys bash does: the same table, through zsh's
+    /// `bindkey -s`, behind zsh's guard — their comments in the column bash's use.
+    #[test]
+    fn zsh_binds_the_keys_bash_binds() {
+        let script = wrappers(Shell::Bash);
+        let block: Vec<&str> =
+            script.lines().skip_while(|line| *line != "# keybinds").skip(1).take_while(|line| !line.is_empty()).collect();
+        let zsh: Vec<&str> = block
+            .iter()
+            .copied()
+            .skip_while(|line| *line != "elif [ -n \"$ZSH_VERSION\" ]; then")
+            .skip(1)
+            .take_while(|line| *line != "fi")
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect();
+        assert_eq!(zsh.len(), keybinds::bindings().len(), "one zsh line per binding: {block:#?}");
+        for (line, (key, func)) in zsh.iter().zip(keybinds::bindings()) {
+            assert!(line.trim_start().starts_with(&format!("bindkey -s '{key}' '{func}\\n'")), "{line}");
+        }
+        let binds = block.iter().filter(|line| line.trim_start().starts_with("bind"));
+        let columns: std::collections::BTreeSet<usize> = binds.filter_map(|line| line.find("  # ")).collect();
+        assert_eq!(columns.len(), 1, "both shells' comments share one column: {block:#?}");
     }
 
     /// A keybind pointing at a command that does not exist fails *silently*: readline binds the
@@ -566,7 +624,7 @@ mod tests {
         for (key, bound) in keybinds::bindings() {
             // A bind may carry arguments; only the command itself has to resolve.
             let command = bound.split_once(' ').map_or(*bound, |(name, _)| name);
-            let definition = format!("{command}() {{");
+            let definition = format!("function {command} {{");
             assert!(
                 script.lines().any(|line| flat(line).starts_with(&definition)),
                 "{key} binds `{command}`, which this sourcefile never defines — \
@@ -590,9 +648,8 @@ mod tests {
 
     /// The `cd` commands and `shell_def` are pure shell — a child process can't move its
     /// parent, and only the calling shell knows its own aliases/functions/variables — so what
-    /// the sourcefile defines IS the implementation, pinned here. `dotbashrs_cd`'s off-prefix
-    /// name is deliberate: the dot names the directory (~/.bashrs), and the clap-side naming
-    /// test can't see shell-body commands, so this is where the spelling is held.
+    /// the sourcefile defines IS the implementation, pinned here. The clap-side naming test
+    /// can't see shell-body commands, so this is where their spelling is held.
     #[test]
     fn the_cd_and_define_commands_are_inline_shell() {
         let script = wrappers(Shell::Bash);
@@ -601,18 +658,18 @@ mod tests {
         // time. Asserted through the same quote + env the generator uses, so this test is
         // location-independent.
         let baked = format!(
-            "brs_cd() {{ cd -- {}; }}",
+            "function brs_cd {{ cd -- {}; }}",
             crate::support::shell_quote::quote(env!("CARGO_MANIFEST_DIR"))
         );
         assert!(content.contains(&baked), "brs_cd must cd to the baked project root: {baked}");
-        for placeholder in [PROJECT_ROOT, BINARY, ORIGINAL] {
+        for placeholder in [ARGS, SHELL, PROJECT_ROOT, BINARY, ORIGINAL, SET_ASIDE] {
             for shell in [Shell::Bash, Shell::Fish] {
                 assert!(!wrappers(shell).contains(placeholder), "{placeholder} must never survive into the emitted script");
             }
         }
         assert!(
-            content.contains(r#"dotbashrs_cd() { cd -- "$HOME/.bashrs"; }"#),
-            "dotbashrs_cd must cd to the installation directory"
+            content.contains(r#"function brs_conf_cd { cd -- "$HOME/.bashrs"; }"#),
+            "brs_conf_cd must cd to the installation directory"
         );
         // The `cd` builtin override: the real builtin (every native behavior kept), and on
         // success the landing directory's contents — listed by the binary, which spells each name
@@ -620,7 +677,7 @@ mod tests {
         // end-to-end.
         assert!(script.contains("\n# overrides\n"), "the overrides section is missing");
         assert!(
-            content.contains(r#"cd() { builtin cd "$@" && "$HOME/.bashrs/bashrs" cd-listing; }"#),
+            content.contains(r#"function cd { builtin cd "$@" && "$HOME/.bashrs/bashrs" cd-listing; }"#),
             "the cd override must run the builtin, then list on success"
         );
         // shell_def's wrapper pipes the four shell-only probes into the binary (NUL-delimited),
@@ -628,15 +685,18 @@ mod tests {
         // child process cannot see. Every probe silenced and `--`-terminated.
         let def = script
             .lines()
-            .find(|line| line.trim_start().starts_with("shell_def()"))
+            .find(|line| line.trim_start().starts_with("function shell_def "))
             .expect("shell_def must be emitted");
         for needed in [
             r#""$(alias -- "$__n")""#,
             r#""$(declare -f -- "$__n")""#,
             r#""$(declare -p -- "$__n")""#,
             r#""$(type -at -- "$__n")""#,
-            // One printf frames all four fields; substitutions never short-circuit.
-            r"printf '%s\0%s\0%s\0%s\0'",
+            // The alias the file set aside under the name, from the variable the file keeps
+            // them in — empty by default, never an error.
+            &format!(r#""${{{SET_ASIDE_RECORD}[$__n]-}}""#),
+            // One printf frames all five fields; substitutions never short-circuit.
+            r"printf '%s\0%s\0%s\0%s\0%s\0'",
             // ONE stderr discard for the whole probe loop, sitting inside the pipeline
             // segment — the binary's own stderr (the not-found reports) stays audible.
             r#"done 2>/dev/null | "$HOME/.bashrs/bashrs" shell_def "$@""#,
@@ -667,7 +727,7 @@ mod tests {
                 .skip_while(|line| *line != header)
                 .skip(1)
                 .take_while(|line| !line.starts_with("# ") && !line.is_empty())
-                .filter(|line| line.contains("() "))
+                .filter(|line| line.starts_with("function "))
                 .filter_map(|line| line.find('{'))
                 .collect();
             if braces.is_empty() {
@@ -692,10 +752,10 @@ mod tests {
             .skip_while(|line| *line != "# shell")
             .skip(1)
             .take_while(|line| !line.starts_with("# ") && !line.is_empty())
-            .filter(|line| line.contains("() "))
+            .filter(|line| line.starts_with("function "))
             .collect();
         let (monster, ordinary): (Vec<&str>, Vec<&str>) =
-            shell.iter().partition(|line| line.starts_with("shell_def()"));
+            shell.iter().partition(|line| line.starts_with("function shell_def "));
         assert_eq!(monster.len(), 1, "shell_def is emitted once: {shell:?}");
 
         // The ordinary rows share a comment column of their own natural width…
@@ -711,6 +771,31 @@ mod tests {
             "shell_def's own comment sits at minimal spacing: {}",
             monster[0]
         );
+    }
+
+    /// The same in fish, whose descriptions follow the bodies as bash's comments do: the ordinary
+    /// rows' descriptions share a column left of where shell_def's body ends, and shell_def's own
+    /// sits just past its body.
+    #[test]
+    fn the_shell_def_monster_does_not_stretch_its_category_in_fish_either() {
+        let script = wrappers(Shell::Fish);
+        let shell: Vec<&str> = script
+            .lines()
+            .skip_while(|line| *line != "# shell")
+            .skip(1)
+            .take_while(|line| !line.starts_with("# ") && !line.is_empty())
+            .filter(|line| line.starts_with("function "))
+            .collect();
+        let (monster, ordinary): (Vec<&str>, Vec<&str>) =
+            shell.iter().partition(|line| line.starts_with("function shell_def "));
+        assert_eq!(monster.len(), 1, "shell_def is emitted once: {shell:?}");
+
+        let description_columns: std::collections::BTreeSet<usize> =
+            ordinary.iter().filter_map(|line| line.find("  functions -d ")).collect();
+        assert_eq!(description_columns.len(), 1, "ordinary rows align among themselves: {ordinary:?}");
+        let column = *description_columns.iter().next().expect("one column");
+        let own = monster[0].find("$argv; end;  functions -d ").expect("shell_def's description sits at minimal spacing");
+        assert!(column < own, "…no longer stretched by shell_def: {column} vs its body's end at {own}");
     }
 
     /// The `autokey_*` commands take real paths and complete like any other command — flags
@@ -733,7 +818,7 @@ mod tests {
         let script = wrappers(Shell::Bash);
         assert!(script.contains("\n# environment\n"), "environment section missing");
         assert!(script.contains("export GREP_COLORS='mt=7;31'"), "GREP_COLORS export missing");
-        assert!(script.contains("export PS1=") && script.contains("(UTC)"), "PS1 export missing");
+        assert!(script.contains(" PS1=\"") && script.contains("(UTC)"), "the prompt clock missing");
     }
 
     #[test]
@@ -745,7 +830,7 @@ mod tests {
             script.find("case $- in *i*) ;; *) return 0 ;; esac").expect("interactivity guard missing");
         assert_eq!(script.matches("case $- in").count(), 1, "exactly one guard");
         let binary = script.find("[ -f \"$HOME/.bashrs/bashrs\" ] || return 0").expect("binary guard");
-        let first_definition = script.find("() {").expect("some wrapper");
+        let first_definition = script.find("\nfunction ").expect("some wrapper");
         assert!(guard < binary && binary < first_definition, "guards first, cheapest first");
     }
 
@@ -755,17 +840,63 @@ mod tests {
         // carries the body itself — no binary call — grouped under its category like any command.
         let script = wrappers(Shell::Bash);
         let content = flat(&script);
-        assert!(content.contains("..() { cd .. \"$@\"; }"), "`..` shell function missing:\n{script}");
+        assert!(content.contains("function .. { cd .. \"$@\"; }"), "`..` shell function missing:\n{script}");
         let filesystem = script.split("\n# ").find(|s| s.starts_with("filesystem")).expect("filesystem section");
-        assert!(filesystem.contains("..()") && filesystem.contains("# Hop one directory up"),
+        assert!(filesystem.contains("function ..") && filesystem.contains("# Hop one directory up"),
             "the shell function belongs to its category, doc comment included: {filesystem}");
-        assert!(!script.contains("..() { \"$HOME/.bashrs/bashrs\""),
+        assert!(!content.contains("function .. { \"$HOME/.bashrs/bashrs\""),
             "a shell-body command must not call the binary");
     }
 
+    /// Every function the bash file defines takes the `function NAME` form (`bash_function`), out
+    /// of an alias's reach: a `NAME()` among them would be the one an alias of its name breaks, in
+    /// zsh, or turns into the aliased command, in bash.
     #[test]
-    fn wrappers_end_with_the_load_greeting() {
-        assert!(wrappers(Shell::Bash).contains("gecho \"Loaded Bashrs!"), "load greeting missing");
+    fn every_bash_function_is_defined_out_of_an_alias_s_reach() {
+        let script = wrappers(Shell::Bash);
+        let parenthesised: Vec<&str> = script
+            .lines()
+            .filter(|line| {
+                line.trim_start().split_once("()").is_some_and(|(name, rest)| {
+                    !name.is_empty() && !name.contains(char::is_whitespace) && rest.trim_start().starts_with('{')
+                })
+            })
+            .collect();
+        assert!(parenthesised.is_empty(), "defined as `NAME()`: {parenthesised:#?}");
+        assert!(script.lines().filter(|line| line.trim_start().starts_with("function ")).count() > 100);
+    }
+
+    /// Both files end with the greeting and, while an archived config waits, its warning — the last
+    /// thing before the prompt — written in, so that no shell start runs the binary for them: each
+    /// file's last section prints both texts, their escapes spelled out, and calls nothing. Which
+    /// shells greet, and when the warning comes, is driven through the real shells, in each one's
+    /// suite under tests/.
+    #[test]
+    fn both_files_end_with_the_greeting_written_in() {
+        let (text, warning, archives) = (greeting::text(), greeting::warning(), config_file::archive_glob());
+        for (shell, ending) in [
+            (Shell::Bash, bash::greeting(&text, &warning, &archives)),
+            (Shell::Fish, fish::greeting(&text, &warning, &archives)),
+        ] {
+            assert!(wrappers(shell).ends_with(&ending), "{shell:?}'s file ends with its greeting: {ending}");
+            for printed in [&text, &warning] {
+                assert!(ending.contains(&printf_line(printed, shell)), "{shell:?} prints it: {ending}");
+            }
+            assert!(!ending.contains(BIN) && !ending.contains('\x1b'), "{shell:?}: no binary call, no raw escape: {ending}");
+        }
+    }
+
+    /// The generated files call two hidden commands by name; each must be one the binary has, and
+    /// hidden — or a key or a TAB would fail where nothing tells of it.
+    #[test]
+    fn the_hidden_commands_the_files_call_exist() {
+        let cli = Cli::command();
+        for name in ["cd-listing", "complete-flags"] {
+            let both = [Shell::Bash, Shell::Fish].map(wrappers);
+            assert!(both.iter().all(|file| file.contains(&format!(" {name}"))), "the files call `{name}`");
+            let command = cli.find_subcommand(name).unwrap_or_else(|| panic!("no `{name}` command"));
+            assert!(command.is_hide_set(), "`{name}` is machinery: hidden");
+        }
     }
 
     #[test]
@@ -778,10 +909,10 @@ mod tests {
 
     #[test]
     fn wrappers_exclude_the_internal_commands() {
-        assert!(!wrappers(Shell::Bash).contains("generate() {"));
-        assert!(!wrappers(Shell::Bash).contains("complete-flags() {"));
-        assert!(!wrappers(Shell::Bash).contains("install-shell() {"));
-        assert!(!wrappers(Shell::Bash).contains("install-stainless() {"));
+        assert!(!flat(&wrappers(Shell::Bash)).contains("function generate {"));
+        assert!(!flat(&wrappers(Shell::Bash)).contains("function complete-flags {"));
+        assert!(!flat(&wrappers(Shell::Bash)).contains("function install-shell {"));
+        assert!(!flat(&wrappers(Shell::Bash)).contains("function install-stainless {"));
     }
 
     #[test]
@@ -790,19 +921,19 @@ mod tests {
         // `--help` comment varies with the environment, so assert just the alias line's stable
         // head — collapsed, since the block's `{` gaps belong to the aligner.
         let content = flat(&wrappers(Shell::Bash));
-        assert!(content.contains("ai() { python3 \"$HOME/.bashrs/stainless_comfy/"), "stainless `ai` alias missing");
+        assert!(content.contains("function ai { python3 \"$HOME/.bashrs/stainless_comfy/"), "stainless `ai` alias missing");
         // …and the same clone's auxiliary entry point: `ai_audit_self`, a `-m` module run from the tool's dir.
         assert!(
-            content.contains("ai_audit_self() { (cd \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code\" >/dev/null && python3 -m launch.audit \"$@\"); }"),
+            content.contains("function ai_audit_self { env -C \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code\" python3 -m launch.audit \"$@\"; }"),
             "stainless `ai_audit_self` aux alias missing"
         );
         // …and the same clone's `quick_question.py` script family: `q` bare, `q3` with a pinned flag.
         assert!(
-            content.contains("q() { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" \"$@\"; }"),
+            content.contains("function q { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" \"$@\"; }"),
             "stainless `q` script alias missing"
         );
         assert!(
-            content.contains("q3() { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" --research \"$@\"; }"),
+            content.contains("function q3 { python3 \"$HOME/.bashrs/stainless_comfy/contAInerized/dockerized_claude_code/quick_question.py\" --research \"$@\"; }"),
             "stainless `q3` script alias missing"
         );
     }
@@ -839,7 +970,7 @@ mod tests {
         // aligned into a column, so the wrapper and its comment are no longer adjacent —
         // assert each is present rather than expecting them side by side.
         let script = wrappers(Shell::Bash);
-        assert!(flat(&script).contains("media_metadata() { \"$HOME/.bashrs/bashrs\" media_metadata \"$@\"; }"));
+        assert!(flat(&script).contains("function media_metadata { \"$HOME/.bashrs/bashrs\" media_metadata \"$@\"; }"));
         assert!(script.contains("# Get metadata of an audio/video/image file"));
     }
 

@@ -1,5 +1,6 @@
 //! The bash sourcefile's own syntax: everything [`super::wrappers`] lays out, written as bash —
-//! which zsh also sources, skipping the blocks guarded as bash-only.
+//! which zsh also sources, skipping the blocks guarded as bash-only and running its own where the
+//! two shells write a part differently ([`bash_or_zsh`]).
 
 use std::collections::BTreeMap;
 
@@ -7,9 +8,10 @@ use super::{substitute, Section, BIN};
 use crate::conf::keybinds::{self, Chord};
 use crate::conf::RELOAD_EXIT_CODE;
 use crate::support::align::align_columns;
-use crate::support::shell_dialect::{Shell, ShellText};
+use crate::support::shell_dialect::{bash_function, bash_or_zsh, printf_line, Shell, ShellText, SET_ASIDE_RECORD};
 
-/// The file around `body`: the header, then the guards that must run before anything is defined.
+/// The file around `body`: the header, then the guards that must run before anything is defined,
+/// then the aliases of the names `body` defines set aside.
 pub(super) fn file(body: &str) -> String {
     let mut out = String::from(
         "#!/usr/bin/env bash\n\
@@ -36,9 +38,72 @@ pub(super) fn file(body: &str) -> String {
         // bare `return`: bare would silently forward the failed test's status 1 to whatever
         // sourced this file, and a not-yet-installed bashrs is a quiet no-op, not an error.
         out += &format!("[ -f {BIN} ] || return 0\n");
+        out += &set_aside_aliases(&super::defined_functions(body));
         out += body;
     }
     out
+}
+
+/// Every alias of one of `names`, set aside before the file defines its functions. An alias
+/// outranks a function whichever was defined first, so the file being sourced last — which lets
+/// its functions replace same-named functions defined before it — cannot make a typed command
+/// run bashrs's while an alias of the name stands. Set aside rather than lost: each is kept in
+/// [`SET_ASIDE_RECORD`] (name → the line bringing it back), where `shell_def` shows it; zsh also
+/// keeps it in its own table, disabled, while bash can only remove one.
+/// An alias defined after the file wins again: the last definition does, of either kind.
+///
+/// The shells share all of it but the finding, which is each one's own: bash has no way to
+/// disable an alias (`enable -n` switches off builtins only), and each keeps its aliases in a
+/// table of its own name. The record is declared even with nothing in it: undeclared, it is no
+/// associative array, and bash reads `shell_def`'s lookup of a name like `..` in it as arithmetic,
+/// which fails. The names are one plain list, and the variables the finding uses are gone once
+/// it is done.
+///
+/// It runs at every shell start, so the finding is each shell's measured cheapest. Bash matches
+/// each of its aliases in the list: its interpreted loop costs ~2.7 µs a step whatever the step
+/// does, so it runs as many steps as there are aliases, usually few. Zsh intersects the two lists
+/// natively (`${a:*b}`), and loops over the matches alone. Whole block, bash 5.2 and zsh 5.9: bash
+/// ~0.05 ms with no aliases, ~0.09 with one to set aside, ~0.14 with 10 more, ~1.0 with the ~200
+/// a framework brings; zsh ~0.06–0.09 ms at any count. Rejected: bashrs's names as a lookup
+/// array's keys, for bash to look each alias up in — written into the file or filled from the list
+/// at start, the keys cost ~0.13–0.17 ms to build at every start, so it is slower up to ~45
+/// aliases (~0.6 ms against ~1.0 at 200); filled from one expansion as a key/value list it would
+/// cost nothing to build, but bash makes the expansion one key there; looping over the names,
+/// each looked up in the shell's alias table — 3.8 ms in bash,
+/// which rebuilds `BASH_ALIASES` from every alias at each lookup; and a copy of that table as a
+/// lookup array — bash has no copy without `eval` (`@k` is joined back into one key inside an
+/// array assignment), and a loop to make one is the loop above, plus another.
+fn set_aside_aliases(names: &[&str]) -> String {
+    // Each records the line bringing the alias back, its expansion quoted by the shell's own
+    // operator (bash's `@Q`, zsh's `(qq)`), so that `shell_def` shows a record as it is.
+    let set_aside = |quoted: &str, put_away: &str| {
+        format!("{SET_ASIDE_RECORD}[$__bashrs_name]=\"alias $__bashrs_name={quoted}\"; {put_away}")
+    };
+    let bash = format!(
+        "for __bashrs_name in \"${{!BASH_ALIASES[@]}}\"; do\n    \
+         case \"$__bashrs_names\" in *\" $__bashrs_name \"*) {} ;; esac\n\
+         done",
+        set_aside("${BASH_ALIASES[$__bashrs_name]@Q}", "unalias \"$__bashrs_name\"")
+    );
+    // Split on spaces (`s: :`), not on the user's IFS; and quoted, as bash's are: zsh splits no
+    // unquoted variable by default, but a user's `sh_word_split` would.
+    let zsh = format!(
+        "__bashrs_list=(${{(s: :)__bashrs_names}})\n\
+         for __bashrs_name in \"${{(@k)aliases:*__bashrs_list}}\"; do\n    \
+         {}\n\
+         done",
+        set_aside("${(qq)aliases[$__bashrs_name]}", "disable -a \"$__bashrs_name\"")
+    );
+    format!(
+        "\n# aliases of the names defined below, set aside so that typing one runs bashrs's command — kept in {SET_ASIDE_RECORD} \
+         for shell_def to show; one defined after this file still wins\n\
+         typeset -gA {SET_ASIDE_RECORD}\n\
+         __bashrs_names=\" {} \"\n\
+         {}\
+         unset __bashrs_name __bashrs_names __bashrs_list\n",
+        names.join(" "),
+        bash_or_zsh(&bash, &zsh)
+    )
 }
 
 /// One category's functions as a table: a wrapper line for every name a command answers to, then
@@ -64,23 +129,19 @@ pub(super) fn definitions(section: &Section) -> String {
             .map(|piped| format!("{} | ", text(piped, &wrapper.real)))
             .unwrap_or_default();
         for name in &wrapper.names {
-            lines.push(format!("{name}() {{ {prefix}{BIN} {} \"$@\"{suffix}; }}{about}", wrapper.real));
+            lines.push(bash_function(name, &format!("{prefix}{BIN} {} \"$@\"{suffix}", wrapper.real)) + &about);
         }
     }
     // The category's pure-shell commands (`#[shell_body]`): inline bodies, no binary call —
     // and no completion registration, which would replace bash's default (filename)
     // completion with a flagless void.
     //
-    // No `unalias` guard here, deliberately. A live alias of the same name does break the
-    // definition as bash parses it — with `alias ..='cd ..'` already set, `..() {` is read as
-    // `cd ..() {`, a syntax error that aborts the whole sourced file — but every
-    // binary-backed wrapper above carries the same exposure unguarded, so shielding these
-    // few implied a safety the rest of the file does not have. The bundled `python3` shim
-    // keeps its own guard (see [`crate::tools`]): that one name collides often enough to
-    // earn the line.
+    // No `unalias` guard here, deliberately: a `bash_function` is out of an alias's reach as it
+    // is defined, and an alias that would outrank it at the prompt is set aside at the file's
+    // top (`set_aside_aliases`), with every other bashrs name's.
     for (name, body, comment) in &section.bodies {
         let about = if comment.is_empty() { String::new() } else { format!(" # {comment}") };
-        lines.push(format!("{name}() {{ {}; }}{about}", text(*body, name)));
+        lines.push(bash_function(name, &text(*body, name)) + &about);
     }
     if lines.is_empty() {
         return String::new();
@@ -98,27 +159,94 @@ fn text(text: ShellText, name: &str) -> String {
     substitute(text.bash(), Shell::Bash, name)
 }
 
-/// The keybinds, inside a guard: `bind` is a bash readline builtin, and zsh — which also sources
-/// this file — has none. Each is commented with its chord as a keyboard labels it and what it
-/// runs, looked up in `abouts` by the bound command's name.
+/// The keybinds, each shell's behind its own guard: bash binds through readline's `bind`, zsh
+/// through its line editor's `bindkey -s`, which reads a key in readline's spelling as bash does —
+/// so the table is written once, and in either shell a key types its command and Enter. Each is
+/// commented with its chord as a keyboard labels it and what it runs, looked up in `abouts` by the
+/// bound command's name.
+///
+/// Zsh's emacs keymap binds five of these keys itself, which bashrs's bindings replace — noted in
+/// its block, as fish's own are in fish's file.
 pub(super) fn keybinds(abouts: &BTreeMap<String, String>) -> String {
+    let bindings = keybinds::bindings();
+    let comment = |key: &str, func: &str| {
+        let what = abouts.get(func).map_or_else(|| func.to_string(), Clone::clone);
+        format!("# {}: {what}", Chord::parse(key).label())
+    };
     // Same column-alignment as the category blocks: two-plus spaces before `#` is the
     // table split point, and the bind text itself only ever holds single spaces.
-    let bind_lines: Vec<String> = keybinds::bindings()
-        .iter()
-        .map(|(key, func)| {
-            let what = abouts.get(*func).map_or_else(|| (*func).to_string(), Clone::clone);
-            format!("bind '\"{key}\": \"{func}\\n\"' # {}: {what}", Chord::parse(key).label())
-        })
-        .collect();
-    let binds: String =
-        align_columns(bind_lines, &["# "]).into_iter().map(|line| format!("    {line}\n")).collect();
-    let desktop = keybinds::desktop_restart(Shell::Bash);
-    if binds.is_empty() && desktop.is_empty() {
+    let bash = bindings.iter().map(|(key, func)| format!("bind '\"{key}\": \"{func}\\n\"' {}", comment(key, func)));
+    let zsh = bindings.iter().map(|(key, func)| format!("bindkey -s '{key}' '{func}\\n' {}", comment(key, func)));
+    // One table for both shells' lines, so the comments share a column across the two blocks.
+    let mut lines = align_columns(bash.chain(zsh).collect(), &["# "]);
+    if lines.is_empty() {
         return String::new();
     }
-    format!("\n# keybinds (bash only)\nif [ -n \"$BASH_VERSION\" ]; then\n{binds}{desktop}fi\n")
+    let zsh = lines.split_off(bindings.len());
+    let zsh = format!("{ZSH_KEYS_REPLACED}\n{}", zsh.join("\n"));
+    format!("\n# keybinds\n{}", bash_or_zsh(&lines.join("\n"), &zsh))
 }
+
+/// The greeting, `text`, and — while an entry of `~/.bashrs` matches `archives` — the stale-config
+/// `warning` on stderr: written in, printed by the shell itself, in a terminal's first shell only,
+/// the one leading its session. Both shells define the one function printing them, as zsh can run
+/// nothing at its first prompt but a function (its `precmd` hooks): bash calls it as the file
+/// ends, zsh registers it for its first prompt — once, however often the file is sourced first —
+/// so that it is no output of zsh's start-up, which a theme's instant prompt (Powerlevel10k's)
+/// reports, at every shell start, as a fault. It removes itself once it has run, from zsh's hooks
+/// too.
+///
+/// The archives are matched the same way in both shells, without a word to stderr: the function
+/// globs the whole of `~/.bashrs` — which holds the binary at least, or the file would have
+/// returned at its top — and `case` matches each entry against `archives`. A glob of the archives
+/// themselves would match nothing while none waits, a fatal error in zsh, and in bash under the
+/// user's `failglob`, ending the function there. With globbing switched off (`set -f`, zsh's
+/// `noglob`), the function switches it on for its glob — `set +o noglob`, which both shells read
+/// alike — and back off after. Measured ~15–25 µs in either shell. Rejected: each shell's own
+/// quiet glob, bash's `compgen -G` and zsh's `nullglob` — the same cost, two checks, and zsh's
+/// warned with globbing switched off, its pattern then left as a word; one `compgen` for both,
+/// which zsh only emulates once its completion system's `bashcompinit` is loaded, and whose `-G`
+/// succeeds where nothing matches; and `ls` or `find`, a process at every terminal's start —
+/// ~0.4 ms, measured.
+///
+/// The session is told from the shell's own `/proc/$$/stat`, read without starting a process: its
+/// session field (the fourth past the parenthesised name, which may hold spaces) is its own pid
+/// exactly when it leads one. Cut out exactly, not matched loosely: a later field — the
+/// terminal's foreground group — holds the same pid in a shell started from another. Unreadable,
+/// the file greets: a greeting too many beats a warning lost.
+pub(super) fn greeting(text: &str, warning: &str, archives: &str) -> String {
+    let (text, warning) = (printf_line(text, Shell::Bash), printf_line(warning, Shell::Bash));
+    format!(
+        "__bashrs_stat=\n\
+         [ -r /proc/$$/stat ] && read -r __bashrs_stat < /proc/$$/stat\n\
+         __bashrs_stat=${{__bashrs_stat##*') '}}  # past the shell's name: its state, parent, group, then session\n\
+         __bashrs_stat=${{__bashrs_stat#* * * }}\n\
+         if [ -z \"$__bashrs_stat\" ] || [ \"${{__bashrs_stat%% *}}\" = \"$$\" ]; then\n    \
+         # a function, which zsh runs at its first prompt (printed during its start-up, it trips Powerlevel10k's instant-prompt warning) and bash at once; it removes itself once run\n    \
+         function {GREET} {{\n        \
+         local __bashrs_entry __bashrs_noglob=\n        \
+         {text}\n        \
+         [[ -o noglob ]] && __bashrs_noglob=1 && set +o noglob  # globbing off: on for the glob below\n        \
+         for __bashrs_entry in \"$HOME\"/.bashrs/*; do  # the whole directory, the binary's at least: no glob here matches nothing, an error in zsh\n            \
+         case $__bashrs_entry in */{archives}) {warning} >&2; break ;; esac\n        \
+         done\n        \
+         [ -n \"$__bashrs_noglob\" ] && set -o noglob\n        \
+         [ -n \"$ZSH_VERSION\" ] && precmd_functions=(${{precmd_functions:#{GREET}}})  # out of zsh's hooks\n        \
+         unset -f {GREET}\n    \
+         }}\n    \
+         if [ -n \"$ZSH_VERSION\" ]; then precmd_functions=(${{precmd_functions:#{GREET}}} {GREET}); else {GREET}; fi\n\
+         fi\n\
+         unset __bashrs_stat\n"
+    )
+}
+
+/// The greeting's function, both shells' (see [`greeting`]).
+const GREET: &str = "__bashrs_greet";
+
+/// The keys of zsh's own that the bindings replace: its emacs keymap's defaults for them, as zsh
+/// 5.9's `bindkey` lists them (its vi insert keymap binds none of them).
+const ZSH_KEYS_REPLACED: &str = "# these replace zsh's own emacs-mode Alt+N (history-search-forward), Alt+H (run-help), \
+                                 Alt+W (copy-region-as-kill), Alt+Q (push-line) and Alt+L (down-case-word)";
 
 /// Flag completion: on TAB after a `-`, ask the binary which flags the command being completed
 /// accepts (`complete-flags`, always in sync with the real CLI); any other word falls back to
@@ -136,7 +264,7 @@ pub(super) fn completion(sections: &[Section], stainless_flags: &[(String, Strin
          #   e.g. `gg -<TAB><TAB>` lists gg's flags\n\
          #   e.g. `gg --de<TAB>` fills in `--delve`\n\
          if [ -n \"$BASH_VERSION\" ]; then\n\
-         \x20   _bashrs_complete() {{\n\
+         \x20   function _bashrs_complete {{\n\
          \x20       local cur=${{COMP_WORDS[COMP_CWORD]}}\n\
          \x20       [[ $cur == -* ]] && COMPREPLY=($(compgen -W \"$({BIN} complete-flags \"${{COMP_WORDS[0]}}\")\" -- \"$cur\"))\n\
          \x20   }}\n\
@@ -172,7 +300,7 @@ pub(super) fn stainless_flags_block(entries: &[(String, String)]) -> String {
     .collect();
     let names: Vec<&str> = entries.iter().map(|(alias, _)| alias.as_str()).collect();
     format!(
-        "\x20   _bashrs_stainless_flags() {{\n\
+        "\x20   function _bashrs_stainless_flags {{\n\
          \x20       local cur=${{COMP_WORDS[COMP_CWORD]}}\n\
          \x20       [[ $cur == -* ]] || return 0\n\
          \x20       local flags=\"\"\n\

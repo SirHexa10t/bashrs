@@ -8,9 +8,9 @@
 //! the variable configures bash itself and fish does that job its own way — `hg` asks fish's
 //! history for the timestamps `HISTTIMEFORMAT` gives bash. The prompt clock is no row: bash
 //! prepends it to `PS1`, while fish draws its prompt with a function, which bashrs wraps — see
-//! `prompt_clock`.
+//! `prompt_clock` — and zsh keeps its own prompt.
 
-use crate::support::shell_dialect::{fish_original, Shell};
+use crate::support::shell_dialect::{bash_or_zsh, fish_original, Shell};
 
 /// One `export`: the variable, its shell-quoted value (quotes and all, since single vs.
 /// double quoting is significant), a trailing comment (`""` for none), and its fish counterpart.
@@ -52,10 +52,16 @@ const EXPORTS: &[Export] = &[
     },
 ];
 
-/// The settings for `shell`: `EXPORTS` in that shell's syntax, then the prompt clock.
+/// The settings for `shell`: `EXPORTS` in that shell's syntax, then the prompt clock — in the file
+/// bash and zsh share, bash's alone.
+///
+/// Zsh keeps its own prompt. A zsh prompt is as often as not a theme's — Powerlevel10k's shows a
+/// time of its own — and a clock put in front of one reads as foreign to it. Rejected for that: a
+/// zsh clock, a `precmd` hook writing the time into `PS1` (zsh runs no `$(…)` in a prompt without
+/// the user's `PROMPT_SUBST`), which was built and taken out again.
 pub fn settings(shell: Shell) -> String {
     match shell {
-        Shell::Bash => bash_exports() + &bash_prompt_clock(),
+        Shell::Bash => bash_exports() + &bash_or_zsh(&bash_prompt_clock(), ""),
         Shell::Fish => fish_exports() + &fish_prompt_clock(),
     }
 }
@@ -108,13 +114,15 @@ const CLOCK: &str = "$(date -u +%T)(UTC)]";
 
 /// Bash's prompt clock: `PS1` with the time prepended, in red — the clock alone, the colour reset
 /// after it, so the prompt that follows (and the command typed after that) keeps its own — and
-/// once. Sourcing the file again would otherwise stack a second clock, and so would a nested shell,
-/// which inherits the exported `PS1` with the clock already in it. Told by the clock's own text,
-/// which nothing else puts in a prompt.
+/// once: sourcing the file again would otherwise stack a second clock. Told by the clock's own
+/// text, which nothing else puts in a prompt. Not exported, as a distribution's rc files set it:
+/// exported, every program started from bash inherited it — a zsh or an `sh` showing bash's
+/// prompt syntax, raw, as its own — while a nested bash builds its own from its rc file, clock and
+/// all. (A `PS1` that arrives exported stays so, as any rc file leaves it.)
 fn bash_prompt_clock() -> String {
     format!(
-        "# prepends UTC-time to prompt, colored in red — unless it is there already, as it is after sourcing again or in a nested shell\n\
-         case $PS1 in *'{CLOCK}'*) ;; *) export PS1=\"\\[\\033[01;31m\\][\\{CLOCK}\\[\\033[0m\\]$PS1\" ;; esac\n"
+        "# prepends UTC-time to prompt, colored in red — unless it is there already, as it is after sourcing again\n\
+         case $PS1 in *'{CLOCK}'*) ;; *) PS1=\"\\[\\033[01;31m\\][\\{CLOCK}\\[\\033[0m\\]$PS1\" ;; esac\n"
     )
 }
 
@@ -155,7 +163,6 @@ mod tests {
         assert!(s.contains("export GREP_COLORS='mt=7;31'"));
         assert!(s.contains("export HISTTIMEFORMAT=") && s.contains("%F_%T"));
         assert!(s.contains("Makes \"history\" command")); // comment quotes survive
-        assert!(s.contains("export PS1=") && s.contains("(UTC)"));
     }
 
     #[test]
@@ -175,7 +182,7 @@ mod tests {
     }
 
     /// Bash itself evaluates the clock line, twice over: a prompt without the clock gains it, and
-    /// one that has it — sourced again, or inherited by a nested shell — does not gain a second.
+    /// one that has it — sourced again — does not gain a second.
     #[test]
     fn the_bash_clock_is_prepended_once() {
         let clock = bash_prompt_clock();
@@ -187,6 +194,25 @@ mod tests {
             "\\[\\033[01;31m\\][$(date -u +%T)(UTC)]\\[\\033[0m\\]$ ",
             "one clock, red alone — the colour reset after it — then the prompt it was put in front of"
         );
+    }
+
+    /// In the file bash and zsh share, the clock is bash's alone, behind bash's guard: zsh keeps its
+    /// own prompt (tests/sourcefile_zsh.rs holds a real zsh to that).
+    #[test]
+    fn the_clock_in_the_shared_file_is_bash_s_alone() {
+        let s = settings(Shell::Bash);
+        let guarded = s.split_once("if [ -n \"$BASH_VERSION\" ]; then\n").map(|(_, rest)| rest).unwrap_or_default();
+        assert!(guarded.contains(" PS1=\"") && guarded.trim_end().ends_with("fi"), "bash's clock, behind bash's guard: {s}");
+        assert!(!s.contains("ZSH_VERSION") && !s.contains("precmd"), "nothing of the clock for zsh: {s}");
+    }
+
+    /// The clocked prompt stays bash's own: a program bash starts — a zsh, an `sh` — inherits no
+    /// `PS1` from it, and so draws its own prompt rather than bash's syntax, raw.
+    #[test]
+    fn the_clocked_prompt_is_not_handed_to_the_programs_bash_starts() {
+        let script = format!("PS1='$ '\n{}printenv PS1 || echo not-inherited", bash_prompt_clock());
+        let out = std::process::Command::new("bash").args(["--norc", "-c", &script]).env_remove("PS1").output().expect("bash");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "not-inherited\n");
     }
 
     /// Fish gets the variables it shares with bash, and for each bash-only one the comment saying

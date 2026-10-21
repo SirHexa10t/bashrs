@@ -8,6 +8,7 @@
 
 #[bashrs_macros::category(command = ProcessesCommand, prefix = "proc_")]
 mod commands {
+    use crate::support::args::NoArgs;
     use crate::support::doc_style::{self, _header, notice, problematic};
     use terminal_choice::prompt_yN;
     use crate::support::theme::Weight;
@@ -240,6 +241,106 @@ mod commands {
         /// at all, murder is a picker already, so this adds nothing there)
         #[arg(short = 'c', long)]
         pub choose: bool,
+    }
+
+    /// Restart or reload the running desktop environment, resetting its visuals and keeping your session
+    ///
+    /// Alt+L runs it. Which desktop runs is told by the processes running when it is pressed —
+    /// the first of `DESKTOPS` found, in the table's order. Where none of them runs, it says so and
+    /// changes nothing; the key is bound everywhere, whatever runs.
+    pub fn restart_desktop(_args: NoArgs) {
+        let session = std::env::var("XDG_SESSION_TYPE").ok();
+        let Some(desktop) = _desktop(&_running_names(), session.as_deref()) else {
+            eprintln!("proc_restart_desktop: no desktop it knows how to restart is running here");
+            std::process::exit(1);
+        };
+        if desktop.replaces {
+            _replace(desktop.restart);
+        } else {
+            std::process::exit(crate::support::exec::run_reporting_code(desktop.restart[0], &desktop.restart[1..]));
+        }
+    }
+
+    /// A desktop environment or window manager [`restart_desktop`] can reset.
+    struct Desktop {
+        /// The process that shows it runs, as `/proc/<pid>/comm` names it.
+        process: &'static str,
+        /// What resets it — a command line, never shell.
+        restart: &'static [&'static str],
+        /// Whether the reset is a replacement — a window manager's `--replace`, which goes on
+        /// running as the new instance, so it must outlive this command and the terminal.
+        replaces: bool,
+        /// Only on an X11 session: GNOME's `--replace` ends a Wayland session instead.
+        x11_only: bool,
+    }
+
+    /// The desktops [`restart_desktop`] can reset. Most X11 window managers take `<wm> --replace`
+    /// (resets the visuals without dropping the session); tiling and Wayland compositors use their
+    /// own in-place restart or config reload. A Wayland compositor can't restart without dropping
+    /// its clients, so the best it can do is reload its config (Sway, Hyprland, labwc); the rest
+    /// (GNOME on Wayland, COSMIC, niri, Wayfire, …) expose no session-preserving reset and are left
+    /// out.
+    ///
+    /// KDE Plasma on Wayland is the same kind of compositor (`kwin_wayland`), but its desktop shell
+    /// — panels, wallpaper, widgets — is a separate process, restartable in place as a systemd user
+    /// unit. It is listed LAST: `plasmashell` runs in every Plasma session, so anywhere earlier it
+    /// would answer before `kwin_x11` on X11, or before a tiling WM someone runs Plasma under; last,
+    /// it answers exactly where no listed window manager does.
+    const DESKTOPS: &[Desktop] = &[
+        Desktop { process: "cinnamon", restart: &["cinnamon", "--replace"], replaces: true, x11_only: false }, // Cinnamon (X11)
+        Desktop { process: "gnome-shell", restart: &["gnome-shell", "--replace"], replaces: true, x11_only: true }, // GNOME
+        Desktop { process: "kwin_x11", restart: &["kwin_x11", "--replace"], replaces: true, x11_only: false }, // KDE Plasma on X11
+        Desktop { process: "xfwm4", restart: &["xfwm4", "--replace"], replaces: true, x11_only: false }, // XFCE
+        Desktop { process: "marco", restart: &["marco", "--replace"], replaces: true, x11_only: false }, // MATE
+        Desktop { process: "budgie-wm", restart: &["budgie-wm", "--replace"], replaces: true, x11_only: false }, // Budgie
+        Desktop { process: "gala", restart: &["gala", "--replace"], replaces: true, x11_only: false }, // Pantheon
+        Desktop { process: "deepin-wm", restart: &["deepin-wm", "--replace"], replaces: true, x11_only: false }, // Deepin
+        Desktop { process: "i3", restart: &["i3-msg", "restart"], replaces: false, x11_only: false }, // i3
+        Desktop { process: "qtile", restart: &["qtile", "cmd-obj", "-o", "cmd", "-f", "restart"], replaces: false, x11_only: false }, // Qtile
+        Desktop { process: "sway", restart: &["swaymsg", "reload"], replaces: false, x11_only: false }, // Sway (reloads its config)
+        Desktop { process: "Hyprland", restart: &["hyprctl", "reload"], replaces: false, x11_only: false }, // Hyprland (reloads its config)
+        Desktop { process: "labwc", restart: &["labwc", "--reconfigure"], replaces: false, x11_only: false }, // labwc (reloads its config)
+        Desktop { process: "openbox", restart: &["openbox", "--replace"], replaces: true, x11_only: false }, // Openbox (LXQt / LXDE)
+        // KDE Plasma's desktop shell (on Wayland, kwin_wayland itself can't restart) — LAST, see above.
+        Desktop { process: "plasmashell", restart: &["systemctl", "--user", "restart", "plasma-plasmashell.service"], replaces: false, x11_only: false },
+    ];
+
+    /// The desktop to reset: the first of [`DESKTOPS`] among the `running` process names — table
+    /// order, not the order they started in — that the `session` type allows.
+    fn _desktop<'a>(running: &std::collections::BTreeSet<String>, session: Option<&str>) -> Option<&'a Desktop> {
+        DESKTOPS
+            .iter()
+            .find(|desktop| running.contains(desktop.process) && (!desktop.x11_only || session == Some("x11")))
+    }
+
+    /// The names of the processes running, as `/proc/<pid>/comm` holds them — what `pgrep -x`
+    /// matches against.
+    fn _running_names() -> std::collections::BTreeSet<String> {
+        _pids()
+            .into_iter()
+            .filter_map(|pid| std::fs::read_to_string(format!("/proc/{pid}/comm")).ok())
+            .map(|name| name.trim_end().to_string())
+            .collect()
+    }
+
+    /// Start a window manager's replacement in a session of its own, and leave it running — what
+    /// `<wm> --replace & disown` did in the shell, minus the shell: closing the terminal later
+    /// leaves the new window manager be.
+    fn _replace(restart: &[&str]) {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new(restart[0]);
+        command.args(&restart[1..]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null());
+        // SAFETY: `setsid` is async-signal-safe, which is all a `pre_exec` hook may require.
+        unsafe {
+            command.pre_exec(|| match libc::setsid() {
+                -1 => Err(std::io::Error::last_os_error()),
+                _ => Ok(()),
+            });
+        }
+        if let Err(err) = command.spawn() {
+            eprintln!("proc_restart_desktop: could not start {}: {err}", restart[0]);
+            std::process::exit(1);
+        }
     }
 
     /// Why a process is in the report at all.
@@ -1753,6 +1854,64 @@ mod commands {
             assert!(row(&full).contains(&"x".repeat(300)), "unclipped shows everything");
             assert!(!row(&clipped).contains(&"x".repeat(100)), "clipped does not");
             assert!(row(&clipped).contains('…'), "and says something was removed: {:?}", row(&clipped));
+        }
+
+        // ——— the desktop restart ————————————————————————————————————————————
+
+        fn names(running: &[&str]) -> std::collections::BTreeSet<String> {
+            running.iter().map(|name| name.to_string()).collect()
+        }
+
+        /// The first LISTED desktop that runs is the one reset — table order, not the order the
+        /// processes started in; GNOME only on X11; Plasma's shell only where no window manager
+        /// listed before it runs; nothing where none of them does.
+        #[test]
+        fn the_first_listed_desktop_that_runs_is_the_one_reset() {
+            let chosen = |running: &[&str], session| _desktop(&names(running), session).map(|desktop| desktop.process);
+            assert_eq!(chosen(&["openbox", "i3"], Some("x11")), Some("i3"), "table order");
+            assert_eq!(chosen(&["gnome-shell", "sway"], Some("wayland")), Some("sway"), "GNOME's X11-only row falls through");
+            assert_eq!(chosen(&["gnome-shell"], Some("x11")), Some("gnome-shell"));
+            assert_eq!(chosen(&["gnome-shell"], None), None, "no session type: not known to be X11");
+            assert_eq!(chosen(&["kwin_wayland", "plasmashell"], Some("wayland")), Some("plasmashell"), "Plasma on Wayland");
+            assert_eq!(chosen(&["kwin_x11", "plasmashell"], Some("x11")), Some("kwin_x11"), "Plasma on X11: the window manager");
+            assert_eq!(chosen(&["bash", "fish"], Some("x11")), None, "nothing listed running");
+        }
+
+        /// A window manager's replacement is left running in a session of its own — so closing the
+        /// terminal it was started from leaves it be — and this command does not wait for it.
+        #[test]
+        fn a_replacement_runs_in_a_session_of_its_own() {
+            let report = std::env::temp_dir().join(format!("bashrs_replace_{}", std::process::id()));
+            let _ = std::fs::remove_file(&report);
+            let script = format!("echo $$ $(ps -o sid= -p $$) > '{}'", report.display());
+            _replace(&["sh", "-c", &script]);
+            let said = (0..200)
+                .find_map(|_| {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::fs::read_to_string(&report).ok().filter(|text| text.ends_with('\n'))
+                })
+                .expect("the replacement ran");
+            let ids: Vec<&str> = said.split_whitespace().collect();
+            assert_eq!(ids.len(), 2, "{said}");
+            assert_eq!(ids[0], ids[1], "it leads its own session: {said}");
+            let _ = std::fs::remove_file(&report);
+        }
+
+        /// The table's invariants: Plasma's shell is the last word; every process name is a plain
+        /// name, as `/proc` holds it; a window manager's `--replace` is a replacement that must
+        /// outlive the command, and nothing else is.
+        #[test]
+        fn the_desktop_table_is_well_formed() {
+            assert_eq!(DESKTOPS.last().map(|desktop| desktop.process), Some("plasmashell"));
+            for desktop in DESKTOPS {
+                assert!(
+                    !desktop.process.is_empty() && desktop.process.len() < 16 && desktop.process.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')),
+                    "`{}` is not a process name as /proc/<pid>/comm holds one",
+                    desktop.process
+                );
+                assert!(!desktop.restart.is_empty(), "{} has a reset", desktop.process);
+                assert_eq!(desktop.replaces, desktop.restart.contains(&"--replace"), "{}: a replacement exactly when --replace", desktop.process);
+            }
         }
 
         // ——— the no-pattern picker ————————————————————————————————————————

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TEST.sh — run ALL of bashrs's tests, including the live ones `cargo test` skips.
 #
-# Four categories, cheapest first:
+# Five categories, cheapest first:
 #   1. offline        unit + integration (stubbed yt-dlp, fixture cookie DBs) — hermetic, fast
 #   2. macros         the proc-macro crate's own tests: the attribute contracts the compiler
 #                     enforces, e.g. that every hand-written shell fragment names both bash and
@@ -10,7 +10,12 @@
 #                     layout), plus fish quoting read back by fish. These also run in offline;
 #                     listed apart so a fish regression has its own line, and REQUIRED — a machine
 #                     without fish or fish_indent fails this category by name instead of skipping.
-#   4. live-extended  one test: that the cookie store `dl --cookie-import` writes is readable by
+#   4. zsh            the bash sourcefile through a real zsh, whose .zshrc sources it too: the
+#                     parts zsh does its own way (greeting at the first prompt, keybinds, `hg`'s
+#                     history, its prompt left alone), aliases of the commands' names, and the
+#                     contracts bash's file keeps. These also run in offline; REQUIRED, as
+#                     fish's are — a machine without zsh fails this category by name.
+#   5. live-extended  one test: that the cookie store `dl --cookie-import` writes is readable by
 #                     the genuine yt-dlp loader. It skips-with-notice unless a store has been
 #                     imported, and sends no network requests — it only reads a real session.
 #
@@ -56,9 +61,17 @@ fish_checks() {
     return "$status"
 }
 
+# The zsh checks need zsh itself, and not having it is a failure, named, for the same reason:
+# bashrs supports zsh — the install wires ~/.zshrc to the bash sourcefile.
+zsh_checks() {
+    command -v zsh >/dev/null 2>&1 || { printf 'ERROR: zsh not found in PATH — the zsh checks need it.\n' >&2; return 1; }
+    cargo test --no-fail-fast --test sourcefile_zsh -- --nocapture
+}
+
 run_category "offline"       cargo test --no-fail-fast -- --nocapture
 run_category "macros"        cargo test --no-fail-fast -p bashrs-macros -- --nocapture
 run_category "fish"          fish_checks
+run_category "zsh"           zsh_checks
 run_category "live-extended" cargo test --test dl_live_extended -- --ignored --test-threads=1 --nocapture
 
 echo

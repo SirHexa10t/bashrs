@@ -1,5 +1,6 @@
 //! End-to-end tests of assorted non-search commands, driving the real binary.
 
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};

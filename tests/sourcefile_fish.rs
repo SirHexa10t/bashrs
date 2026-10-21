@@ -13,74 +13,30 @@
 
 mod common;
 
-use common::{shell, Captured};
+use common::{generated, leading_shell, lines, shell, Captured, Home};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-/// A generated sourcefile, as `bashrs generate --shell <shell>` prints it.
-fn generated(shell: &str) -> Vec<u8> {
-    let out = Command::new(env!("CARGO_BIN_EXE_bashrs")).args(["generate", "--shell", shell]).output().expect("generate");
-    assert!(out.status.success(), "generate --shell {shell} failed");
-    out.stdout
-}
-
-/// A stand-in for the installed binary: enough behaviour to watch a wrapper work — `hg` echoes its
-/// stdin, `brs_compile` exits with `$FAKE_EXIT`, `errcho` writes its words to stderr — and silent
-/// otherwise, so the load greeting (a call to `gecho`) adds nothing to what the tests read. The
-/// commands a test needs for real are handed to the real binary by `exec`, which leaves the shell
-/// it was called from as its parent, as the installed binary would have it.
-fn stand_in() -> String {
-    format!(
-        "#!/bin/sh\ncase \"$1\" in\n\
-         \x20 hg) exec cat ;;\n\
-         \x20 brs_compile) exit \"${{FAKE_EXIT:-0}}\" ;;\n\
-         \x20 errcho) shift; printf '%s\\n' \"$*\" >&2 ;;\n\
-         \x20 complete-flags|brs_sourcefile|shell_def|shell_args_print|lll|cd-listing) exec '{}' \"$@\" ;;\n\
-         esac\n",
-        env!("CARGO_BIN_EXE_bashrs")
-    )
-}
-
-/// A scratch `HOME` holding both generated sourcefiles and — unless the test is about its absence —
-/// the stand-in binary at `.bashrs/bashrs`. Removed when dropped, so a failing assertion leaves
-/// nothing behind.
-struct Home {
-    dir: PathBuf,
-}
-
 impl Home {
-    fn new(tag: &str) -> Self {
-        let home = Self::without_binary(tag);
-        let binary = home.dir.join(".bashrs/bashrs");
-        std::fs::write(&binary, stand_in()).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        home
-    }
-
-    fn without_binary(tag: &str) -> Self {
-        let home = Self::empty(tag);
-        std::fs::write(home.dir.join(".bashrs/sourcefile.fish"), generated("fish")).unwrap();
-        std::fs::write(home.dir.join(".bashrs/sourcefile.sh"), generated("bash")).unwrap();
-        home
-    }
-
-    /// Just the directory and its `.bashrs` — for the install to fill.
-    fn empty(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("bashrs_fish_{tag}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".bashrs")).unwrap();
-        Home { dir }
-    }
-
     fn fish_sourcefile(&self) -> PathBuf {
         self.dir.join(".bashrs/sourcefile.fish")
     }
 
-    /// Run `script` in fish under this `HOME` — interactive (`-i`) or not — with the fish
-    /// sourcefile's path in `$sourcefile`, so no script has to quote it.
+    /// Run `script` in fish under this `HOME` — interactive (`-i`) or not; one started from
+    /// another, as [`shell`] starts it — with the fish sourcefile's path in `$sourcefile`, so no
+    /// script has to quote it.
     fn fish(&self, interactive: bool, script: &str) -> Output {
-        let mut fish = shell("fish");
+        self.fish_in(shell("fish"), interactive, script)
+    }
+
+    /// [`Self::fish`], interactive, but in a terminal's first fish, leading its session — the one
+    /// that greets.
+    fn first_fish(&self, script: &str) -> Output {
+        self.fish_in(leading_shell("fish"), true, script)
+    }
+
+    /// `script` in `fish`, set up as both of those run it.
+    fn fish_in(&self, mut fish: Command, interactive: bool, script: &str) -> Output {
         fish.env("HOME", &self.dir)
             .env("sourcefile", self.fish_sourcefile())
             .env("TZ", "UTC")
@@ -99,16 +55,6 @@ impl Home {
     }
 }
 
-impl Drop for Home {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-fn lines(text: &str) -> Vec<&str> {
-    text.lines().collect()
-}
-
 // ——— The file ————————————————————————————————————————————————————————————
 
 /// Fish itself judges the whole file (`--no-execute`: nothing runs). The tests below source it and
@@ -120,20 +66,29 @@ fn the_whole_file_parses_in_fish() {
     assert!(parse.status.success(), "fish rejects the file: {}", Captured::new(&parse.stderr));
 }
 
-/// Every section is a table, as bash's are: one function per line, the descriptions starting in
-/// one column — checked per section against the real file, since each section aligns on its own.
+/// Every section is a table, as bash's are: one function per line — name, `;`-opened body,
+/// description — the bodies opening in one column, checked per section against the real file,
+/// since each section aligns on its own. The descriptions' column is `reasonable_spacing`'s, as
+/// bash's comments' is (`the_shell_def_monster_does_not_stretch_its_category`).
 #[test]
-fn every_section_aligns_its_descriptions_into_a_column() {
+fn every_section_aligns_its_bodies_into_a_column() {
     let file = String::from_utf8(generated("fish")).unwrap();
     let mut sections_checked = 0;
     for section in file.split("\n\n").filter(|section| section.starts_with("# ")) {
-        let columns: std::collections::BTreeSet<usize> = section
-            .lines()
-            .filter(|line| line.starts_with("function ") && !line.ends_with(" -a key cmd"))
-            .filter_map(|line| line.find(" -d "))
-            .collect();
-        assert!(columns.len() <= 1, "the descriptions in `{}` are not one column", section.lines().next().unwrap_or_default());
+        let rows: Vec<&str> = section.lines().filter(|line| line.starts_with("function ") && line.contains("; end")).collect();
+        let columns: std::collections::BTreeSet<usize> = rows.iter().filter_map(|line| line.find(';')).collect();
+        assert!(columns.len() <= 1, "the bodies in `{}` are not one column", section.lines().next().unwrap_or_default());
         sections_checked += usize::from(columns.len() == 1);
+        // …no wider than its longest name needs (two spaces past it, or none where a lone function
+        // is not aligned) — as a line that is no function would make it, were it a row (an
+        // override's original, kept ahead of the table).
+        let gaps = rows.iter().filter_map(|row| row.find(';').map(|at| at - row[..at].trim_end().len()));
+        assert!(gaps.min().is_none_or(|gap| gap <= 2), "the name column in `{}` is wider than its names", section.lines().next().unwrap_or_default());
+        for row in rows {
+            // The description's column is found at a line's first `functions -d`: a body running
+            // one would be taken for it.
+            assert!(row.matches("functions -d ").count() <= 1, "a body sets a description: {row}");
+        }
     }
     assert!(sections_checked >= 15, "sections actually checked: {sections_checked}");
     let multi_line: Vec<&str> = file.lines().filter(|line| line.starts_with("function ") && !line.contains("; end")).collect();
@@ -142,6 +97,21 @@ fn every_section_aligns_its_descriptions_into_a_column() {
         ["function __bashrs_prompt_clock --on-event fish_prompt", "function __bashrs_bind -a key cmd"],
         "every command is a one-line function; only the two pieces of machinery are blocks"
     );
+}
+
+/// The alignment padding is the header's — between a name and its `;` — which fish writes anew
+/// whenever it prints a function back. After the `;` it would be the body's own text, and
+/// `functions`, `funced` and `shell_def` would show each body pushed right by its row's padding.
+/// `cd` and `diff` share a section with names of different lengths, so their padding differs;
+/// printed back, their bodies are indented alike.
+#[test]
+fn a_function_prints_back_without_its_alignment_padding() {
+    let home = Home::new("printback");
+    let out = home.interactive("source $sourcefile; for name in cd diff; functions $name | string match -rv '^(#|function |end$)'; end");
+    let bodies = lines(&out);
+    assert_eq!(bodies.len(), 2, "one body line each: {out}");
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    assert_eq!(indent(bodies[0]), indent(bodies[1]), "{out}");
 }
 
 // ——— Who gets bashrs ———————————————————————————————————————————————————————
@@ -221,16 +191,115 @@ fn every_function_bash_gets_fish_gets_too() {
 }
 
 /// Sourcing defines functions and sets the one variable it means to, `GREP_COLORS` (`PATH` it only
-/// extends) — nothing else is left behind, a loop variable included.
+/// extends) — nothing else is left behind, a loop variable or the greeting's own included, in a
+/// terminal's first fish, which greets.
 #[test]
 fn sourcing_leaves_no_variable_of_its_own_behind() {
     let home = Home::new("novars");
-    let out = home.interactive(
-        "set -l before (set -n); source $sourcefile
+    let out = home.first_fish(
+        "set -l before (set -n); source $sourcefile; echo ---
          for name in (set -n); contains -- $name $before; or echo $name; end",
     );
+    let out = Captured::new(&out.stdout);
+    let (_, new) = out.split_once("---\n").unwrap_or_else(|| panic!("the listing after the greeting: {out}"));
     // `before` is this probe's own; everything else must be the intended export.
-    assert_eq!(lines(&out), ["GREP_COLORS", "before"], "new variables after sourcing: {out}");
+    assert_eq!(lines(new), ["GREP_COLORS", "before"], "new variables after sourcing: {out}");
+}
+
+/// The greeting comes in a terminal's first fish — the one leading its session — printed by the
+/// file itself, styled, and not in a fish started from it, which would only repeat it. The nested
+/// fish speaks before it sources the file, so the output shows which fish greeted.
+#[test]
+fn only_a_terminal_s_first_fish_greets() {
+    let home = Home::new("fish_greet");
+    let out = home.first_fish("source $sourcefile; fish -i -c 'echo nested; source $sourcefile'; echo back");
+    let said = Captured::new(&out.stdout);
+    assert!(said.contains('\x1b') && !said.contains("\\033"), "styled: its escapes printed as such, not spelled: {said}");
+    let said = said.plain();
+    let said = lines(&said);
+    assert_eq!(said.len(), 3, "{said:?}");
+    assert!(said[0].starts_with("Loaded Bashrs! Press ALT+H"), "{said:?}");
+    assert_eq!(said[1..], ["nested", "back"]);
+}
+
+/// The warning comes, on stderr, exactly while an archived config waits in `~/.bashrs` — one
+/// named `configrs*.old`, as an archive is now or was before the name gained `.toml.` — and not
+/// for the config itself or for another `.old`: fish's glob matching nothing is no error there.
+#[test]
+fn the_warning_comes_while_an_archived_config_waits() {
+    let home = Home::new("fish_warn");
+    let bashrs = home.dir.join(".bashrs");
+    let stderr = || Captured::new(&home.first_fish("source $sourcefile").stderr).plain().to_string();
+    std::fs::write(bashrs.join("configrs.toml"), "").unwrap();
+    std::fs::write(bashrs.join("other.old"), "").unwrap();
+    assert_eq!(stderr(), "", "the config itself, or another archive, is no cue");
+    std::fs::write(bashrs.join("configrs.toml.2026102112.old"), "").unwrap();
+    assert!(stderr().contains("an archived config (~/.bashrs/configrs*.old) awaits merging"), "an archive waits");
+    std::fs::remove_file(bashrs.join("configrs.toml.2026102112.old")).unwrap();
+    std::fs::write(bashrs.join("configrs.old"), "").unwrap();
+    assert!(stderr().contains("awaits merging"), "so does one from before the name gained .toml.");
+}
+
+// ——— What was there before bashrs ———————————————————————————————————————
+
+/// A fish alias is a function, which bashrs's of the name replaces — fish's last definition wins —
+/// but its link to the completions of what it wrapped would outlive the replacing, and does not:
+/// bashrs's command completes as itself. An unrelated alias of the same command keeps its link,
+/// which erasing the others' by their target would have taken too. Exhaustive, and read from fish
+/// itself: every name the file gives fish is aliased first. Where this fish keeps a link through
+/// erasing its command's completions (4.0), every link stays, as without the file.
+#[test]
+fn an_alias_defined_first_leaves_no_completion_link() {
+    let home = Home::new("fish_links");
+    let keeps = home.interactive("alias probe git; complete -c probe --erase; complete | string match -q -- 'complete probe --wraps*'; and echo kept");
+    let defined = home.interactive(
+        "source $sourcefile
+         for name in (functions --all -n)
+             test \"$(functions --details -- $name)\" = $sourcefile; and echo $name
+         end",
+    );
+    let names: Vec<&str> = defined.lines().filter(|name| !name.starts_with("__bashrs_")).collect();
+    assert!(names.len() > 100, "fish defined too little to check: {names:?}");
+    let aliases: String = names.iter().map(|name| format!("alias {name} 'git status'\n")).collect();
+    let out = home.interactive(&format!("{aliases}alias keep 'git status'\nsource $sourcefile\ncomplete | string match -e -- ' --wraps '"));
+    let left = lines(&out);
+    assert!(left.contains(&"complete keep --wraps 'git status'"), "the unrelated alias keeps its link: {left:?}");
+    let expected = if keeps.trim() == "kept" { names.len() + 1 } else { 1 };
+    assert_eq!(left.len(), expected, "links left, this fish {}: {left:?}", if expected == 1 { "clearing them" } else { "keeping them" });
+}
+
+/// Abbreviations are left as they are, named like a command or not: one expands as it is typed,
+/// wherever it was defined — and `shell_def` shows it ahead of the command, with the `\NAME` that
+/// gets past it.
+#[test]
+fn abbreviations_are_left_as_they_are() {
+    let home = Home::new("fish_abbrs");
+    let made = "abbr -a -- g 'git status'; abbr -a --command git -- co checkout; abbr -a -- keep true";
+    let before = home.interactive(&format!("{made}; abbr --show"));
+    let after = home.interactive(&format!("{made}; source $sourcefile; abbr --show"));
+    assert_eq!(lines(&before).len(), 3, "{before}");
+    assert_eq!(&*after, &*before, "sourcing changes no abbreviation");
+}
+
+/// Nothing the file runs at start loads fish's own `diff`, whose file runs a `diff` (to see whether
+/// it can colour) — a process at every shell start, as a set-aside that asked where each function
+/// was defined once cost. Here a `diff` on `PATH` leaves a file whenever it runs (fish's sends its
+/// output nowhere): loading fish's own runs one, sourcing the file none.
+#[test]
+fn sourcing_leaves_fish_s_own_diff_unloaded() {
+    let home = Home::new("fish_unloaded");
+    let bin = home.dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("diff"), "#!/bin/sh\ntouch \"$HOME/diff_ran\"\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(bin.join("diff"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let runs_diff = |script: &str| {
+        let _ = std::fs::remove_file(home.dir.join("diff_ran"));
+        home.interactive(&format!("set -gx PATH {} $PATH; {script}", bin.display()));
+        home.dir.join("diff_ran").exists()
+    };
+    assert!(runs_diff("functions -q diff"), "loading fish's own `diff` runs one — the premise");
+    assert!(!runs_diff("source $sourcefile"), "sourcing the file runs none");
 }
 
 // ——— The bundled tools ————————————————————————————————————————————————————
@@ -354,6 +423,26 @@ fn shell_def_ranks_fish_s_meanings_of_a_name() {
     );
 }
 
+/// `shell_def` sees fish's abbreviations wherever they were made — here after the file, as
+/// config.fish makes them: typed, one expands ahead of the function, so it reads first, with the
+/// backslash that gets past it; one scoped to another command's arguments is only noted.
+#[test]
+fn shell_def_reads_an_abbreviation_as_what_typing_runs() {
+    let home = Home::new("def_abbr");
+    let out = home.fish(true, "source $sourcefile; abbr -a -- g 'git status'; abbr -a --command git -- lll log; shell_def g lll");
+    assert_eq!(&*Captured::new(&out.stderr), "", "nothing from the probes");
+    let report = Captured::new(&out.stdout).plain();
+    assert!(
+        report.starts_with("g is an ABBREVIATION - the top rank, typed it expands first:\nabbr -a -- g 'git status'\noutranked FUNCTION - still defined, runs via \\g:\n"),
+        "{report}"
+    );
+    assert!(report.contains("\nlll is a FUNCTION:\n"), "an abbreviation within git's arguments is no rival: {report}");
+    assert!(
+        report.ends_with("also an ABBREVIATION named 'lll', which expands only where its options say:\nabbr -a --position anywhere --command git -- lll log\n"),
+        "{report}"
+    );
+}
+
 /// The words `shell_args_print` is handed, quoted in fish's syntax when fish ran it — the one
 /// shell where bash's `$'…'` would not paste back.
 #[test]
@@ -461,8 +550,9 @@ fn pure_shell_commands_keep_fishs_own_completion() {
 #[test]
 fn the_keybinds_run_their_commands_as_if_typed() {
     let home = Home::new("binds");
-    let out = home.interactive("source $sourcefile; bind alt-q; bind ctrl-alt-n; bind -M insert alt-h; functions -q __bashrs_bind; and echo helper-left");
+    let out = home.interactive("source $sourcefile; bind alt-q; bind ctrl-alt-n; bind alt-l; bind -M insert alt-h; functions -q __bashrs_bind; and echo helper-left");
     assert!(out.contains("bind alt-q 'commandline -r brs_compile; commandline -f execute'"), "{out}");
+    assert!(out.contains("bind alt-l 'commandline -r proc_restart_desktop; commandline -f execute'"), "bound whatever desktop runs: {out}");
     assert!(out.contains("bind ctrl-alt-n 'commandline -r shell_bare; commandline -f execute'"), "{out}");
     assert!(out.contains("bind -M insert alt-h 'commandline -r brs_sourcefile; commandline -f execute'"), "vi's insert mode too: {out}");
     assert!(!out.contains("helper-left"), "{out}");
@@ -483,50 +573,6 @@ fn brs_sourcefile_shows_the_file_of_the_shell_it_runs_in() {
         .output()
         .expect("bash");
     assert_eq!(last_line(&bash.stdout), format!("# source file: {}", home.dir.join(".bashrs/sourcefile.sh").display()));
-}
-
-/// The stale-config nag speaks exactly while an archived config waits to be merged.
-#[test]
-fn the_stale_config_nag_speaks_only_while_an_archive_waits() {
-    let home = Home::new("stale");
-    let quiet = home.fish(true, "source $sourcefile; echo status:$status");
-    assert_eq!(&*Captured::new(&quiet.stderr), "");
-    assert_eq!(&*Captured::new(&quiet.stdout), "status:0\n", "a clean start ends the source in success");
-    std::fs::write(home.dir.join(".bashrs/configrs.toml.20260101.old"), "").unwrap();
-    let nagged = home.fish(true, "source $sourcefile");
-    let nag = Captured::new(&nagged.stderr);
-    assert!(nag.contains("an archived config (~/.bashrs/configrs*.old) awaits merging"), "{nag}");
-}
-
-/// Alt+L binds the first LISTED desktop that runs — table order, not the order the processes
-/// started in. `pgrep` is stubbed to answer as the real one does (a `PID NAME` line each), so no
-/// case needs a desktop actually running.
-#[test]
-fn alt_l_binds_the_first_listed_desktop_that_runs() {
-    let home = Home::new("altl");
-    let bound = |running: &str, session: &str| {
-        home.interactive(&format!(
-            "function pgrep; for name in (string split -n ' ' -- '{running}'); echo \"1 $name\"; end; end
-             set -gx XDG_SESSION_TYPE {session}; source $sourcefile; bind alt-l 2>/dev/null
-             set -q desktops; and echo left-behind"
-        ))
-    };
-    let cases = [
-        ("openbox i3", "x11", Some("i3-msg restart"), "table order, not process order"),
-        ("gnome-shell sway", "wayland", Some("swaymsg reload"), "GNOME's X11-only row falls through"),
-        ("kwin_wayland plasmashell", "wayland", Some("systemctl --user restart plasma-plasmashell.service"), "Plasma on Wayland"),
-        ("", "x11", None, "nothing listed running"),
-    ];
-    for (running, session, expected, why) in cases {
-        let out = bound(running, session);
-        // What is bound, not how fish quotes it when listing (it re-quotes in its own style).
-        let binding = out.lines().find(|line| line.starts_with("bind alt-l "));
-        match expected {
-            Some(command) => assert!(binding.is_some_and(|line| line.contains(command)), "{why}: {out}"),
-            None => assert!(binding.is_none(), "{why}: nothing bound: {out}"),
-        }
-        assert!(!out.contains("left-behind"), "{why}: the chain's list must not outlive the source: {out}");
-    }
 }
 
 /// The prompt clock, with the first prompt stood in for by its event: the clock goes in front of the

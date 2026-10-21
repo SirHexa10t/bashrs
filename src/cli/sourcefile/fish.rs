@@ -1,7 +1,7 @@
 //! The fish sourcefile's own syntax: everything [`super::wrappers`] lays out, written as fish — and
 //! laid out as bash's file is, so the two read alike: one function per line, each section a table.
-//! Where bash puts a description in a trailing comment, fish carries it as the function's `-d`,
-//! which fish shows beside the name when completing commands.
+//! Where bash puts a description in a trailing comment, fish sets it in the same place, with a
+//! trailing `functions -d` — which fish shows beside the name when completing commands.
 
 use std::collections::BTreeMap;
 
@@ -9,7 +9,7 @@ use super::{substitute, Section, Wrapper, BIN, ORIGINAL};
 use crate::conf::keybinds::{self, Chord};
 use crate::conf::RELOAD_EXIT_CODE;
 use crate::support::align::align_columns;
-use crate::support::shell_dialect::{fish_function, fish_original, Shell, FISH_DESCRIPTION};
+use crate::support::shell_dialect::{fish_function, fish_original, printf_line, Shell, FISH_COLUMNS};
 
 /// The file around `body`: the header, then bash's three early returns in fish's terms — before
 /// anything is defined, cheapest first.
@@ -29,13 +29,74 @@ pub(super) fn file(body: &str) -> String {
     out += "\nstatus is-interactive; or return 0  # interactive shells only — non-interactive contexts must inherit nothing\n";
     out += "if set -q _BASHRS_BARE; set -e _BASHRS_BARE; return 0; end  # shell_bare: skip bashrs for THIS shell, flag consumed (any new shell arms again)\n";
     out += &format!("test -f {BIN}; or return 0\n");
+    out += &clear_completion_links(&super::defined_functions(body));
     out += body;
     out
 }
 
+/// The completion links of aliases named like one of `names`, cleared before the file defines its
+/// functions. A fish alias is a function, which the file's own of the name replaces — fish's last
+/// definition wins — but its link to the completions of what it wrapped (`--wraps`) outlives the
+/// replacing: after `alias g=git`, bashrs's `g` would offer git's completions. `complete` with no
+/// arguments lists the completions registered so far — at conf.d time, what earlier definitions
+/// registered — so the links are found there: by a plain search for any, and only where there are
+/// some by a regex of the names, which fish compiles at each use (~0.07 ms). Whole block, fish
+/// 4.0.2 and 4.9.3: ~0.06 ms with no link registered, ~0.13 with some, ~0.3 with ten to clear.
+///
+/// Each is cleared by erasing its command's completions, which belonged to the replaced command
+/// anyway — not by erasing the link by its target, which fish does for every command wrapping
+/// that target: `alias g=git` cleared so would take git's completions from the user's own
+/// `alias gti=git`. Fish 4.0 keeps the link through that erase, so there the completions stay
+/// mixed, as they were before; 4.9 clears it.
+///
+/// Everything else keeps fish's own precedence. A function defined before the file is replaced
+/// without a record, as any redefinition is; an abbreviation, which expands as it is typed, wins
+/// wherever it is defined, and `shell_def` shows it first, with the `\NAME` that gets past it.
+/// Rejected: setting those aside as bash's file sets its aliases aside — each earlier function
+/// recorded, and each abbreviation erased and recorded, for `shell_def` to show. It cost ~0.4 ms
+/// (fish 4.0.2) and ~0.3 ms (4.9.3) with nothing to set aside — 1.1 and 0.7 ms while it still
+/// loaded fish's own functions to tell them apart, `diff.fish` running a `diff` — and it erased
+/// abbreviations that take over no command (`--command`- and `--regex`-scoped ones).
+fn clear_completion_links(names: &[&str]) -> String {
+    let names: Vec<String> = names.iter().map(|name| regex::escape(name)).collect();
+    let pattern = Shell::Fish.quote(&format!("^complete ({}) --wraps ", names.join("|")));
+    format!(
+        "\n# completion links of aliases named like the functions defined below (`alias g=git` has `g` complete as git), \
+         cleared so that bashrs's commands complete as themselves\n\
+         set -l __bashrs_links (complete | string match -e -- ' --wraps ')\n\
+         set -q __bashrs_links[1]; and set __bashrs_links (string match -rg -- {pattern} $__bashrs_links)\n\
+         for __bashrs_name in $__bashrs_links\n    \
+         complete -c $__bashrs_name --erase  # by its name: erased by its target, a link is gone from every command that has it\n\
+         end\n"
+    )
+}
+
+/// The greeting, `text`, and — while an entry of `~/.bashrs` matches `archives` — the stale-config
+/// `warning` on stderr: written in, printed by fish itself, in a terminal's first shell only — the
+/// one leading its session, told from fish's own `/proc/$fish_pid/stat` without starting a process,
+/// as bash's file tells it (`bash::greeting`, which says why the field is cut out exactly).
+/// Unreadable, the file greets. The archives are matched by `set`, which a glob matching nothing
+/// leaves empty — the one place it does: anywhere else, it fails its command.
+pub(super) fn greeting(text: &str, warning: &str, archives: &str) -> String {
+    format!(
+        "set -l __bashrs_stat\n\
+         test -r /proc/$fish_pid/stat; and read -l __bashrs_stat < /proc/$fish_pid/stat\n\
+         if test -z \"$__bashrs_stat\"; or test (string replace -r -- '^.*\\) \\S+ \\S+ \\S+ (\\S+) .*$' '$1' $__bashrs_stat) = $fish_pid\n    \
+         {}\n    \
+         set -l __bashrs_old $HOME/.bashrs/{archives}\n    \
+         set -q __bashrs_old[1]; and {} >&2\n\
+         end\n",
+        printf_line(text, Shell::Fish),
+        printf_line(warning, Shell::Fish)
+    )
+}
+
 /// One category's functions as a table: a wrapper for every name a command answers to, then the
-/// pure-shell commands — each an override's original kept first where it calls one.
+/// pure-shell commands. Ahead of the table, each override that calls its original keeps it — a
+/// statement, not a function, so no row: it holds a `;` too, and as a row its first statement
+/// would set the width of the section's name column.
 pub(super) fn definitions(section: &Section) -> String {
+    let mut originals = String::new();
     let mut lines: Vec<String> = Vec::new();
     for wrapper in &section.wrappers {
         lines.extend(wrapper.names.iter().map(|name| wrapper_function(wrapper, name)));
@@ -43,11 +104,13 @@ pub(super) fn definitions(section: &Section) -> String {
     for (name, body, comment) in &section.bodies {
         let description = Some(*comment).filter(|comment| !comment.is_empty());
         if body.fish().contains(ORIGINAL) {
-            lines.push(save_original(name));
+            originals += &save_original(name);
+            originals.push('\n');
         }
         lines.push(fish_function(name, description, &[substitute(body.fish(), Shell::Fish, name)]));
     }
-    align_columns(lines, &[FISH_DESCRIPTION]).into_iter().map(|line| line + "\n").collect()
+    let table: String = align_columns(lines, &FISH_COLUMNS).into_iter().map(|line| line + "\n").collect();
+    originals + &table
 }
 
 /// The function for one of `wrapper`'s names: the binary call, behind its probe and ahead of its
@@ -83,8 +146,8 @@ fn save_original(name: &str) -> String {
 }
 
 /// The keybinds: each of [`keybinds::bindings`] through [`keybinds::fish_bind`], commented with its
-/// chord as a keyboard labels it and what it runs, then the ALT+L desktop restart — all of them
-/// bound by [`keybinds::fish_bind_helper`], which goes again once they are.
+/// chord as a keyboard labels it and what it runs — bound by [`keybinds::fish_bind_helper`], which
+/// goes again once they are.
 pub(super) fn keybinds(abouts: &BTreeMap<String, String>) -> String {
     let binds: Vec<String> = keybinds::bindings()
         .iter()
@@ -98,7 +161,6 @@ pub(super) fn keybinds(abouts: &BTreeMap<String, String>) -> String {
         out += &line;
         out.push('\n');
     }
-    out += &keybinds::desktop_restart(Shell::Fish);
     out += &format!("functions -e {}\n", keybinds::FISH_BIND);
     out
 }
@@ -138,7 +200,7 @@ pub(super) fn completion(sections: &[Section], stainless: &[(String, String)]) -
          end\n\
          {}\n\
          for name in {}\n    \
-         complete -c $name -n {COMPLETING_FLAG} -a \"({BIN_ESCAPED} complete-flags --shell fish $name)\"\n\
+         complete -c $name -n {COMPLETING_FLAG} -a \"({BIN_ESCAPED} complete-flags $name)\"\n\
          end\n\
          {}",
         fish_function(COMPLETING_FLAG, Some("Whether the word being completed is a flag"), &["string match -q -- '-*' (commandline -ct)"]),
