@@ -81,13 +81,14 @@ pub fn sync(pins: &[(String, String)], problems: &mut Problems) -> bool {
         })
         .unzip();
 
-    // A utility the system provides, still bundled from an earlier compile — made while the
-    // system lacked it, or while the setting said to bundle anyway — would shadow the system's
-    // copy, since `resolve` and the PATH shim both prefer a bundle. So it goes, its shim with it.
-    // A language's bundle is never removed this way: the python environment holds the user's own
-    // packages.
+    // A tool the settings leave to the system, while an earlier compile's bundle of it is still
+    // there — made while the system lacked it, or while a setting said to bundle anyway — would
+    // shadow the system's copy, since `resolve` and the PATH shim both prefer a bundle. The user
+    // chose the system's, so the bundle goes, its shim with it. The python environment is the one
+    // exception: it holds the user's own packages. And a tool the system lacks keeps its bundle
+    // whatever the settings say — it is the only copy there is.
     for ((tool, planned), on_system) in TOOLS.iter().zip(&plan).zip(&on_system) {
-        if planned.is_none() && *on_system && matches!(tool.group, Group::Utility) {
+        if planned.is_none() && *on_system && !matches!(tool.acquire, Acquire::UvVenv { .. }) {
             remove_leftover_bundle(tool, &root().join(tool.dir), problems);
         }
     }

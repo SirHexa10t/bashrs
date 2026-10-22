@@ -386,7 +386,7 @@ mod commands {
     #[trailing_newline]
     pub fn local(args: LocalArgs) {
         // `support` may not ask where `~/.bashrs` is; this layer may, so it says so once.
-        oui::install_cache_path(crate::conf::user_data_dir().join("oui.tsv"));
+        oui::install_cache_path(crate::conf::user_appdata_dir().join("oui.tsv"));
         if args.refresh_vendors {
             match oui::refresh() {
                 Ok(count) => println!("{}", approved(&format!("manufacturer registry: {count} entries"))),

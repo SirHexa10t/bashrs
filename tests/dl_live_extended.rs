@@ -50,7 +50,7 @@ fn youtube_store_or_skip(test: &str) -> Option<String> {
     let site = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default()
-        .join(".bashrs/user-data/browser_cookies/youtube");
+        .join(".bashrs/user-appdata/browser_cookies/youtube");
     let browser = std::fs::read_to_string(site.join("browser.spec")).ok();
     let store = site.join("store");
     match browser {

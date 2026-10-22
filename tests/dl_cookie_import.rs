@@ -148,7 +148,7 @@ impl Rig {
 
     /// The per-site store dir bashrs writes under this rig's HOME.
     fn site_dir(&self, key: &str) -> PathBuf {
-        self.home.join(".bashrs/user-data/browser_cookies").join(key)
+        self.home.join(".bashrs/user-appdata/browser_cookies").join(key)
     }
 
     /// Every yt-dlp invocation the run made, one argv per line.
@@ -395,7 +395,7 @@ fn an_unresolvable_import_target_is_rejected_before_touching_anything() {
     assert!(!out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("isn't a site I can target"), "{}", text(&out));
     assert!(
-        !rig.home.join(".bashrs/user-data").exists(),
+        !rig.home.join(".bashrs/user-appdata").exists(),
         "a rejected target must not create store state"
     );
 }

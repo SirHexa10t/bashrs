@@ -32,7 +32,8 @@ enum Wired {
     Added,
 }
 
-/// SIDE EFFECTS — the whole install: guard and create `~/.bashrs`, copy the running binary in,
+/// SIDE EFFECTS — the whole install: guard and create `~/.bashrs`, bring its user directories
+/// to their current names (`migrate_user_dirs`), copy the running binary in,
 /// write the generated sourcefiles (`bash` to `~/.bashrs/sourcefile.sh`, `fish` to
 /// `~/.bashrs/sourcefile.fish`), make bashrs's completions win for the names in `fish_completed`
 /// that fish completes too (`shadow_fish_completions`), then wire `.bashrc`, `.zshrc` and fish's
@@ -45,6 +46,12 @@ pub fn install_shell(bash: &str, fish: &str, fish_completed: &[String]) {
     };
     if let Err(msg) = ensure_home(&home) {
         die(msg);
+    }
+    for line in migrate_user_dirs(&home) {
+        match line {
+            Ok(moved) => println!("{moved}"),
+            Err(warning) => eprintln!("WARNING: {warning}"),
+        }
     }
     if let Err(msg) = ensure_profile_store(&home) {
         die(msg);
@@ -188,16 +195,71 @@ fn ensure_home(home: &Path) -> Result<(), String> {
     std::fs::create_dir_all(home).map_err(|err| format!("could not create {}: {err}", home.display()))
 }
 
-/// Create the binds-profile store, `<home>/user-data/sequencer` (the `<home>` form of
-/// [`super::user_data_dir`], kept parameterised like everything here so tests install into a
+/// Create the binds-profile store, `<home>/user-custom/sequencer` (the `<home>` form of
+/// [`super::user_custom_dir`], kept parameterised like everything here so tests install into a
 /// temp home). Nothing else creates it — profiles are hand-written — and it must exist before
 /// the first one does: it's what makes the store discoverable, and what a bare `autokey_apply`
-/// passes. The other user-data dirs are NOT made here; their owners build them on first write
-/// (`dl`'s cookie store, the oui cache).
+/// passes. The `user-appdata` dirs are NOT made here; their owners build them on first write
+/// (`dl`'s cookie store, the vendor list).
 fn ensure_profile_store(home: &Path) -> Result<(), String> {
-    let store = home.join("user-data").join("sequencer");
+    let store = home.join("user-custom").join("sequencer");
     std::fs::create_dir_all(&store)
         .map_err(|err| format!("could not create {}: {err}", store.display()))
+}
+
+/// The user directories' earlier names under `<home>`, each with the name it has now, in the
+/// order the moves must happen: `user-data` held the apps' data and the user's own writing
+/// alike, so it became `user-appdata` as a whole — and then the binds-profile store, the
+/// user's own, moved on to `user-custom`. A later rename is one more row.
+const USER_DIR_MOVES: &[(&str, &str)] = &[("user-data", "user-appdata"), ("user-appdata/sequencer", "user-custom/sequencer")];
+
+/// Bring the user directories under `home` to their current names ([`USER_DIR_MOVES`]) — once:
+/// a move happens while the old name exists and the new one doesn't. A rename, so a symlinked
+/// directory moves as the link it is, its target untouched. An empty directory on either side
+/// is no obstacle — nothing to merge — so it is simply removed; but when both hold something,
+/// nothing is merged behind the user's back: that is a warning naming both. Never fatal — the
+/// install goes on either way. `Ok` lines say what moved; `Err` lines are the warnings.
+fn migrate_user_dirs(home: &Path) -> Vec<Result<String, String>> {
+    let mut said = Vec::new();
+    for (old, new) in USER_DIR_MOVES {
+        let (from, to) = (home.join(old), home.join(new));
+        if from.symlink_metadata().is_err() {
+            continue; // nothing under the old name: moved already, or never there
+        }
+        if to.symlink_metadata().is_ok() {
+            if is_empty_dir(&from) {
+                let _ = std::fs::remove_dir(&from);
+                continue;
+            }
+            if !is_empty_dir(&to) || std::fs::remove_dir(&to).is_err() {
+                said.push(Err(format!(
+                    "both {} and {} exist — merge the first into the second by hand, then delete it",
+                    from.display(),
+                    to.display()
+                )));
+                continue;
+            }
+        }
+        let moved = to.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::rename(&from, &to));
+        said.push(match moved {
+            Ok(()) => Ok(format!("Moved {} to {}", from.display(), to.display())),
+            Err(err) => Err(format!(
+                "could not move {} to {}: {err} — move it by hand: mv {} {}",
+                from.display(),
+                to.display(),
+                from.display(),
+                to.display()
+            )),
+        });
+    }
+    said
+}
+
+/// Whether `path` is a real directory with nothing in it — never a symlink, whose target is not
+/// this install's to judge, let alone remove.
+fn is_empty_dir(path: &Path) -> bool {
+    path.symlink_metadata().is_ok_and(|meta| meta.is_dir())
+        && std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
 /// Install the running executable as `<home>/bashrs` — the self-copy that IS the installation
@@ -573,9 +635,95 @@ mod tests {
     fn installing_creates_the_profile_store() {
         let home = scratch("profilestore");
         assert_eq!(ensure_profile_store(&home), Ok(()));
-        assert!(home.join("user-data/sequencer").is_dir());
+        assert!(home.join("user-custom/sequencer").is_dir());
         // Idempotent, like the rest of the install: a second run changes nothing.
         assert_eq!(ensure_profile_store(&home), Ok(()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn read(path: PathBuf) -> String {
+        std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    }
+
+    /// An install over the old layout moves it once: `user-data` becomes `user-appdata` whole —
+    /// the cookies, the vendor list, and whatever else the user kept there — and the profile
+    /// store moves on to `user-custom`. The next install finds nothing left to move.
+    #[test]
+    fn the_old_user_data_moves_to_appdata_and_its_profiles_to_custom_once() {
+        let home = scratch("migrate");
+        std::fs::create_dir_all(home.join("user-data/browser_cookies/youtube")).unwrap();
+        std::fs::create_dir_all(home.join("user-data/sequencer/sub")).unwrap();
+        std::fs::write(home.join("user-data/oui.tsv"), "vendors").unwrap();
+        std::fs::write(home.join("user-data/owned-games.txt"), "Portal 2").unwrap();
+        std::fs::write(home.join("user-data/sequencer/sub/binds.toml"), "[binds]").unwrap();
+
+        let said = migrate_user_dirs(&home);
+        assert!(said.len() == 2 && said.iter().all(Result::is_ok), "{said:?}");
+        assert!(home.join("user-data").symlink_metadata().is_err(), "the old name is gone");
+        assert_eq!(read(home.join("user-appdata/oui.tsv")), "vendors");
+        assert_eq!(read(home.join("user-appdata/owned-games.txt")), "Portal 2", "the user's own additions move too");
+        assert!(home.join("user-appdata/browser_cookies/youtube").is_dir());
+        assert!(home.join("user-appdata/sequencer").symlink_metadata().is_err(), "the profiles moved on");
+        assert_eq!(read(home.join("user-custom/sequencer/sub/binds.toml")), "[binds]");
+        assert!(migrate_user_dirs(&home).is_empty(), "once moved, nothing more to do");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A symlinked `user-data` — onto another disk, or into a dotfiles checkout — moves as the
+    /// link: the link takes the new name, and what it points at stays where it is.
+    #[test]
+    fn a_symlinked_user_data_moves_as_the_link() {
+        let base = scratch("migrate_link");
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("browser_cookies")).unwrap();
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join("user-data")).unwrap();
+
+        let said = migrate_user_dirs(&home);
+        assert!(said.iter().all(Result::is_ok), "{said:?}");
+        assert_eq!(std::fs::read_link(home.join("user-appdata")).unwrap(), elsewhere, "the link, renamed");
+        assert!(elsewhere.join("browser_cookies").is_dir(), "its target untouched");
+
+        // A link is never "empty", even to an empty directory: with the new name in use, it is
+        // a warning, and the link stays as it is.
+        let empty = base.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::os::unix::fs::symlink(&empty, home.join("user-data")).unwrap();
+        let said = migrate_user_dirs(&home);
+        assert!(said.len() == 1 && said[0].is_err(), "{said:?}");
+        assert_eq!(std::fs::read_link(home.join("user-data")).unwrap(), empty, "the link stays");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Both names holding something is never merged automatically: a warning names both, and
+    /// neither moves. An empty directory on either side is no obstacle — nothing to merge — be
+    /// it the empty store an install made before the move, or an old name left empty.
+    #[test]
+    fn two_names_in_use_are_left_to_the_user_and_an_empty_one_is_no_obstacle() {
+        let home = scratch("migrate_both");
+        std::fs::create_dir_all(home.join("user-data")).unwrap();
+        std::fs::write(home.join("user-data/old.txt"), "old").unwrap();
+        std::fs::create_dir_all(home.join("user-appdata")).unwrap();
+        std::fs::write(home.join("user-appdata/new.txt"), "new").unwrap();
+        let said = migrate_user_dirs(&home);
+        let warnings: Vec<&String> = said.iter().filter_map(|line| line.as_ref().err()).collect();
+        assert!(said.len() == 1 && warnings.len() == 1, "{said:?}");
+        assert!(warnings[0].contains("user-data") && warnings[0].contains("user-appdata") && warnings[0].contains("by hand"), "{said:?}");
+        assert_eq!(read(home.join("user-data/old.txt")), "old", "nothing moved");
+        assert_eq!(read(home.join("user-appdata/new.txt")), "new");
+
+        let home = scratch("migrate_empty");
+        std::fs::create_dir_all(home.join("user-appdata/sequencer")).unwrap();
+        std::fs::write(home.join("user-appdata/sequencer/a.toml"), "a").unwrap();
+        std::fs::create_dir_all(home.join("user-custom/sequencer")).unwrap();
+        let said = migrate_user_dirs(&home);
+        assert!(said.len() == 1 && said.iter().all(Result::is_ok), "{said:?}");
+        assert_eq!(read(home.join("user-custom/sequencer/a.toml")), "a", "moved into the empty store's place");
+        std::fs::create_dir_all(home.join("user-appdata/sequencer")).unwrap();
+        assert!(migrate_user_dirs(&home).is_empty(), "an empty old name is just removed, quietly");
+        assert!(home.join("user-appdata/sequencer").symlink_metadata().is_err());
+        assert_eq!(read(home.join("user-custom/sequencer/a.toml")), "a");
         let _ = std::fs::remove_dir_all(&home);
     }
 

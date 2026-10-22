@@ -234,7 +234,7 @@ mod commands {
     #[shell_body(both = "cd -- {PROJECT_ROOT}")]
     pub fn cd() {}
 
-    /// `cd` to ~/.bashrs — the installation: binary, sourcefile, config, tools, user-data
+    /// `cd` to ~/.bashrs — the installation: binary, sourcefile, config, tools, user-appdata, user-custom
     #[shell_body(both = r#"cd -- "$HOME/.bashrs""#)]
     pub fn conf_cd() {}
 

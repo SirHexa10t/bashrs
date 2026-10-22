@@ -40,10 +40,18 @@ pub(crate) fn bashrs_home() -> PathBuf {
     home().join(".bashrs")
 }
 
-/// `~/.bashrs/user-data` — persistent state bashrs accumulates on the user's behalf, as opposed
-/// to the binary/config/tooling it installs. Currently the imported browser cookies for `dl`.
-pub(crate) fn user_data_dir() -> PathBuf {
-    bashrs_home().join("user-data")
+/// `~/.bashrs/user-appdata` — what the apps keep for the user: state bashrs accumulates on the
+/// user's behalf (the browser cookies imported for `dl`, the vendor list `net_local` downloads),
+/// as opposed to the binary, config and tooling it installs, and to what the user writes
+/// ([`user_custom_dir`]).
+pub(crate) fn user_appdata_dir() -> PathBuf {
+    bashrs_home().join("user-appdata")
+}
+
+/// `~/.bashrs/user-custom` — what the user writes and comes back to: the sequencer's binds
+/// profiles, so far — as opposed to what the apps choose to keep for them ([`user_appdata_dir`]).
+pub(crate) fn user_custom_dir() -> PathBuf {
+    bashrs_home().join("user-custom")
 }
 
 /// `~/.bashrs/sourcefile.sh` — the generated shell file. Derived here so its writer
@@ -111,7 +119,8 @@ mod tests {
         assert_eq!(super::sourcefile(), home.join("sourcefile.sh"));
         assert_eq!(super::fish_sourcefile(), home.join("sourcefile.fish"));
         assert_eq!(super::fish_completions_dir(), home.join("fish_completions"));
-        assert_eq!(super::user_data_dir(), home.join("user-data"));
+        assert_eq!(super::user_appdata_dir(), home.join("user-appdata"));
+        assert_eq!(super::user_custom_dir(), home.join("user-custom"));
         assert_eq!(super::clones_dir(), home.join("stainless_comfy"));
     }
 

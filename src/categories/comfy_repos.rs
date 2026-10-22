@@ -122,7 +122,7 @@ mod commands {
         _sequencer(sequencer::Command::Doctor(args));
     }
 
-    /// `~/.bashrs/user-data/sequencer` — the profile store: where this shell keeps binds
+    /// `~/.bashrs/user-custom/sequencer` — the profile store: where this shell keeps binds
     /// profiles. Deliberately nothing more than a well-known directory — sequencer takes real
     /// paths only, no command resolves bare names against this behind the user's back, and TAB
     /// completion doesn't offer its contents (they aren't in the PWD; the full-path listing is
@@ -130,7 +130,7 @@ mod commands {
     /// that listing walks; the same division as [`_cookie_store_dir`] — where bashrs keeps its
     /// data is bashrs's own business. `install-shell` creates it.
     fn _profile_store_dir() -> PathBuf {
-        crate::conf::user_data_dir().join("sequencer")
+        crate::conf::user_custom_dir().join("sequencer")
     }
 
     /// Check binds files for problems without applying them: nothing is activated, no profile
@@ -154,7 +154,7 @@ mod commands {
 
     /// Apply binds profiles: remap keys and run sequences until stopped. Each FILE is linked into
     /// the active set (naming a directory takes every `.toml` directly inside it, in name order);
-    /// naming nothing applies the profile store, ~/.bashrs/user-data/sequencer. The first
+    /// naming nothing applies the profile store, ~/.bashrs/user-custom/sequencer. The first
     /// invocation becomes the manager and later ones add to it (sequencer profile-apply)
     #[unprefixed]
     pub fn autokey_apply(mut args: sequencer::ProfileApplyArgs) {
@@ -168,7 +168,7 @@ mod commands {
         _sequencer(sequencer::Command::ProfileApply(args));
     }
 
-    /// List the profile store (~/.bashrs/user-data/sequencer): every binds profile in it,
+    /// List the profile store (~/.bashrs/user-custom/sequencer): every binds profile in it,
     /// RECURSIVELY, and every directory — `autokey_apply` expands a directory non-recursively
     /// on purpose, so each directory is its own applyable unit and earns its own line (a
     /// trailing `/`). Full paths, made to be copied straight onto an `autokey_apply` line:
@@ -316,13 +316,13 @@ mod commands {
 
     // --- dl ------------------------------------------------------------------
 
-    /// `~/.bashrs/user-data/browser_cookies` — the base holding one subdir per imported site.
+    /// `~/.bashrs/user-appdata/browser_cookies` — the base holding one subdir per imported site.
     /// `dl` pins this: the store's *shape* and every operation on it belong to `vidl`, but where
     /// bashrs keeps its data is bashrs's own business. So `vidl`'s two-value
     /// `--cookies-extract-for-domain <TARGET> <OUTPUT-DIR>` is narrowed here to the target alone
     /// (`crate::cli::NARROWED_ARGS`) and this supplies the rest.
     fn _cookie_store_dir() -> PathBuf {
-        crate::conf::user_data_dir().join("browser_cookies")
+        crate::conf::user_appdata_dir().join("browser_cookies")
     }
 
     /// The bundled copy of `name`, when bashrs actually bundles it. `tools::resolve` answers with
@@ -398,12 +398,13 @@ mod commands {
     mod autokey_tests {
         use super::*;
 
-        /// The Rust half of the store-location pin; the shell half (the completer's
-        /// `$HOME/.bashrs/user-data/sequencer` glob) is pinned in `cli::sourcefile`'s tests.
-        /// Either moving without the other turns exactly one of the two red.
+        /// The reader's half of the store-location pin — the profiles are the user's own writing,
+        /// so the store sits in `user-custom`; the creator's half (`install-shell` making
+        /// `<home>/user-custom/sequencer`) is pinned in `conf::install`'s tests. Either moving
+        /// without the other turns exactly one of the two red.
         #[test]
-        fn the_profile_store_sits_in_user_data() {
-            assert_eq!(_profile_store_dir(), crate::conf::user_data_dir().join("sequencer"));
+        fn the_profile_store_sits_in_user_custom() {
+            assert_eq!(_profile_store_dir(), crate::conf::user_custom_dir().join("sequencer"));
         }
         /// A scratch store for one test, gone afterwards.
         fn scratch(tag: &str) -> PathBuf {

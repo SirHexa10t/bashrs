@@ -8,14 +8,16 @@
 # Bundle the programming languages (python, plus uv, its toolchain manager) under ~/.bashrs/tools
 # even when the system provides them. bashrs commands and companion repos run on these
 # environments, so the project controlling their versions is the reliable default.
-# false: bundle only what the system lacks.
+# false: bundle only what the system lacks — and remove an earlier bundle of uv once the system
+# has its own (the python environment stays: it holds your packages).
 always_bundle_languages = true
 # Bundle the utility programs (ffmpeg, yt-dlp, deno) even when the system provides them.
 # false: bundle only what the system lacks — and remove an earlier bundle of one it now has,
 # so the system's own is used.
 always_bundle_utilities = true
 # Install optional extras — tools bashrs never calls itself, but can set up for you instead of a
-# manual install. Off by default (opt-in); when on, each is bundled only if the system lacks it.
+# manual install. Off by default (opt-in); when on, each is bundled only if the system lacks it,
+# and an earlier bundle of one the system has is removed.
 # Currently: git-lfs (Git large-file support) — after it installs, run `git lfs install` once to
 # activate Git's LFS filters for your checkouts.
 install_extras = false

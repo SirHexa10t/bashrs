@@ -413,12 +413,13 @@ fn offline_provisioning_hands_its_problems_to_the_file_compile_sh_prints_last() 
 }
 
 #[test]
-fn a_utility_is_looked_up_until_the_system_has_its_own_and_then_its_bundle_goes() {
-    // `always_bundle_utilities = false` (and `always_bundle_languages` too), with an earlier
-    // compile's ffmpeg bundle still in place, shims and all. While its shim is the only ffmpeg on
-    // PATH, that is no system copy: the bundle stays and is looked up, as from any shell. Once the
-    // system has its own (a stand-in), no lookup is made for it, and the bundle goes — while a
-    // language's bundle, which holds the user's packages, is never removed for the same reason.
+fn a_tool_is_looked_up_until_the_system_has_its_own_and_then_its_bundle_goes() {
+    // Every `always_bundle_*` setting off, with an earlier compile's bundles still in place, shims
+    // and all. While its shim is the only ffmpeg on PATH, that is no system copy: the bundle stays
+    // and is looked up, as from any shell. Once the system has its own (a stand-in), no lookup is
+    // made for it, and the bundle goes; so does uv's, a language's, once the system has uv. Two
+    // bundles stay whatever the settings say: the python environment, which holds the user's
+    // packages, and git-lfs, an extra the system lacks — the only copy there is.
     use std::os::unix::fs::PermissionsExt;
     let home = std::env::temp_dir().join(format!("bashrs_system_has_it_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
@@ -430,7 +431,7 @@ fn a_utility_is_looked_up_until_the_system_has_its_own_and_then_its_bundle_goes(
         .replace("always_bundle_languages = true", "always_bundle_languages = false");
     assert_eq!(config.matches("= false").count(), template.matches("= false").count() + 2, "both settings still exist to turn off");
     let os_bin = home.join("os/bin");
-    for dir in [tools.join("ffmpeg/bin"), tools.join("python/bin"), tools.join("bin"), os_bin.clone()] {
+    for dir in ["ffmpeg/bin", "python/bin", "uv", "git-lfs", "bin"].map(|dir| tools.join(dir)).into_iter().chain([os_bin.clone()]) {
         std::fs::create_dir_all(dir).unwrap();
     }
     std::fs::write(home.join(".bashrs/configrs.toml"), config).unwrap();
@@ -438,24 +439,30 @@ fn a_utility_is_looked_up_until_the_system_has_its_own_and_then_its_bundle_goes(
     for (program, body) in [
         (tools.join("ffmpeg/bin/ffmpeg"), "#!/bin/sh\n"),
         (tools.join("ffmpeg/bin/ffprobe"), "#!/bin/sh\n"),
+        (tools.join("uv/uv"), "#!/bin/sh\n"),
+        (tools.join("uv/uvx"), "#!/bin/sh\n"),
+        (tools.join("git-lfs/git-lfs"), "#!/bin/sh\n"),
         (tools.join("python/bin/python3"), "#!/bin/sh\necho 'Python 3.14.6'\n"),
         (os_bin.join("python3"), "#!/bin/sh\necho 'Python 3.14.6'\n"),
     ] {
         std::fs::write(&program, body).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    for name in ["ffmpeg", "ffprobe"] {
-        std::os::unix::fs::symlink(Path::new("../ffmpeg/bin").join(name), tools.join("bin").join(name)).unwrap();
+    for (name, bundled) in
+        [("ffmpeg", "ffmpeg/bin/ffmpeg"), ("ffprobe", "ffmpeg/bin/ffprobe"), ("uv", "uv/uv"), ("uvx", "uv/uvx"), ("git-lfs", "git-lfs/git-lfs")]
+    {
+        std::os::unix::fs::symlink(Path::new("..").join(bundled), tools.join("bin").join(name)).unwrap();
     }
     std::fs::write(
         tools.join("ffmpeg/.source_url"),
         "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-linux64-gpl-9.0.tar.xz",
     )
     .unwrap();
-    // The inherited PATH minus every directory with an ffmpeg of its own — a real system copy, or
-    // the real ~/.bashrs's shim — so the only one left is this home's bundle, or the stand-in.
+    // The inherited PATH minus every directory with an ffmpeg or a git-lfs of its own — a real
+    // system copy, or the real ~/.bashrs's shim — so the only ones left are this home's bundles,
+    // or the stand-ins.
     let inherited: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .filter(|dir| !dir.join("ffmpeg").exists())
+        .filter(|dir| !dir.join("ffmpeg").exists() && !dir.join("git-lfs").exists())
         .collect();
     let path_with = |first: &[PathBuf]| std::env::join_paths(first.iter().chain(&inherited)).unwrap();
     let looked_up = |said: &str| said.lines().any(|line| line.contains("recorded ffmpeg pin") || line.contains("newer ffmpeg build"));
@@ -464,17 +471,49 @@ fn a_utility_is_looked_up_until_the_system_has_its_own_and_then_its_bundle_goes(
     assert!(ok && looked_up(&said), "the shim is the bundle, not the system's — so it is kept current: {said}");
     assert!(tools.join("ffmpeg/bin/ffmpeg").exists(), "and kept: {said}");
 
-    std::fs::write(os_bin.join("ffmpeg"), "#!/bin/sh\n").unwrap();
-    std::fs::set_permissions(os_bin.join("ffmpeg"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    for program in ["ffmpeg", "uv"] {
+        std::fs::write(os_bin.join(program), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(os_bin.join(program), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let (ok, said) = install_stainless_offline(&home, &path_with(&[tools.join("bin"), os_bin.clone()]), &[]);
     assert!(ok, "{said}");
     let os_ffmpeg = os_bin.join("ffmpeg");
     assert!(said.contains(&format!("tools: ffmpeg is already on this system ({}) — not bundling", os_ffmpeg.display())), "{said}");
     assert!(!looked_up(&said), "no lookup for what the system has: {said}");
-    assert!(tools.join("ffmpeg").symlink_metadata().is_err(), "the old bundle is gone: {said}");
-    assert!(tools.join("bin/ffmpeg").symlink_metadata().is_err(), "and its shim with it");
-    assert!(os_ffmpeg.exists(), "the system's own is never touched");
-    assert!(tools.join("python/bin/python3").exists(), "a language's bundle is never removed this way: {said}");
+    for (bundle, shim) in [("ffmpeg", "ffmpeg"), ("uv", "uv"), ("uv", "uvx")] {
+        assert!(tools.join(bundle).symlink_metadata().is_err(), "the old {bundle} bundle is gone: {said}");
+        assert!(tools.join("bin").join(shim).symlink_metadata().is_err(), "and its {shim} shim with it");
+    }
+    assert!(os_ffmpeg.exists() && os_bin.join("uv").exists(), "the system's own are never touched");
+    assert!(tools.join("python/bin/python3").exists(), "the python environment stays — the user's packages: {said}");
+    assert!(tools.join("git-lfs/git-lfs").exists(), "the system lacks git-lfs, so its bundle stays: {said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn the_install_moves_the_old_user_data_to_the_new_homes() {
+    // The real install-shell, over the layout from before the split, in a private HOME with no rc
+    // files to wire and fish never run: what the apps keep ends up in user-appdata, the user's
+    // binds profiles in user-custom, and the install says what it moved.
+    let home = std::env::temp_dir().join(format!("bashrs_user_dirs_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let old = home.join(".bashrs/user-data");
+    std::fs::create_dir_all(old.join("sequencer")).unwrap();
+    std::fs::create_dir_all(old.join("browser_cookies/youtube")).unwrap();
+    std::fs::write(old.join("sequencer/binds.toml"), "[binds]").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+        .arg("install-shell")
+        .env("HOME", &home)
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .expect("run bashrs");
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{said}");
+    let bashrs = home.join(".bashrs");
+    assert!(bashrs.join("user-appdata/browser_cookies/youtube").is_dir(), "{said}");
+    assert_eq!(std::fs::read_to_string(bashrs.join("user-custom/sequencer/binds.toml")).unwrap(), "[binds]", "{said}");
+    assert!(old.symlink_metadata().is_err(), "the old name is gone: {said}");
+    assert!(said.contains("Moved ") && said.contains("user-custom/sequencer"), "it says so: {said}");
     let _ = std::fs::remove_dir_all(&home);
 }
 

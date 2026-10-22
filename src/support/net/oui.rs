@@ -19,7 +19,7 @@
 //!
 //! 1. **A system database**, where the distribution ships one — nmap, wireshark and `hwdata` all
 //!    carry the registry, and reading theirs costs nothing and stays current with their updates.
-//! 2. **Our own cache**, `~/.bashrs/user-data/oui.tsv`, written by [`refresh`].
+//! 2. **Our own cache**, `~/.bashrs/user-appdata/oui.tsv`, written by [`refresh`].
 //!
 //! All of them are read into one map on first use and never again.
 

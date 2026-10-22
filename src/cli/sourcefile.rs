@@ -808,7 +808,7 @@ mod tests {
         let script = wrappers(Shell::Bash);
         assert!(!script.contains("_bashrs_autokey_complete"), "the store completer was removed");
         assert!(
-            !script.contains("user-data/sequencer/\"*.toml"),
+            !script.contains("user-custom/sequencer/\"*.toml"),
             "nothing in the sourcefile should glob the profile store"
         );
     }
