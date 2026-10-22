@@ -5,6 +5,7 @@
 //! so the run / report / capture logic lives in one place.
 
 use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 /// Run `program` with `args`, inheriting stdio. Returns whether it succeeded,
@@ -204,15 +205,27 @@ where
 
 /// Whether `program` is an executable found in any `PATH` directory — a dependency-free
 /// `command -v` (checks the executable bit, not mere presence). Backs the package-manager
-/// detection and the bundled-tools skip ([`crate::tools`]).
+/// detection and the network probes' tool checks.
 pub(crate) fn on_path(program: &str) -> bool {
+    !path_hits(program).is_empty()
+}
+
+/// Every executable named `program` in the `PATH` directories, in `PATH` order — [`on_path`]'s
+/// answer kept whole, for a caller that must tell the copies apart: the bundled-tools skip
+/// ([`crate::tools`]), which looks past bashrs's own.
+pub(crate) fn path_hits(program: &str) -> Vec<PathBuf> {
+    std::env::var_os("PATH").map(|paths| hits_in(&paths, program)).unwrap_or_default()
+}
+
+/// [`path_hits`] over the given `PATH` value.
+fn hits_in(paths: &OsStr, program: &str) -> Vec<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| {
-            std::fs::metadata(dir.join(program))
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    std::env::split_paths(paths)
+        .map(|dir| dir.join(program))
+        .filter(|candidate| {
+            std::fs::metadata(candidate).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         })
-    })
+        .collect()
 }
 
 #[cfg(test)]
@@ -284,5 +297,27 @@ mod tests {
     fn on_path_finds_a_ubiquitous_binary_and_rejects_a_bogus_one() {
         assert!(on_path("sh"), "expected to find `sh` on PATH");
         assert!(!on_path("bashrs_no_such_program_xyz"));
+    }
+
+    /// Every executable copy, in `PATH` order — a file without the executable bit, a directory of
+    /// the name, and a missing one are no copies.
+    #[test]
+    fn every_executable_copy_on_path_is_found_in_path_order() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("bashrs_path_hits_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for dir in ["first", "plain", "dir", "second", "empty"] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        for (dir, mode) in [("first", 0o755), ("plain", 0o644), ("second", 0o700)] {
+            let file = base.join(dir).join("tool");
+            std::fs::write(&file, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        std::fs::create_dir_all(base.join("dir/tool")).unwrap();
+        let paths = std::env::join_paths(["second", "plain", "dir", "empty", "first"].map(|dir| base.join(dir))).unwrap();
+        assert_eq!(hits_in(&paths, "tool"), [base.join("second/tool"), base.join("first/tool")]);
+        assert!(hits_in(&paths, "absent").is_empty());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

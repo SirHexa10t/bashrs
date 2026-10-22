@@ -296,7 +296,7 @@ mod commands {
     /// Build the project in DIR (default `.`); `-d` debug (fastest compile), `-r` release
     /// (fastest runtime, the default), `-t` tiny (smallest binary)
     pub fn compile(args: CompileArgs) {
-        let dir = Path::new(&args.dir);
+        let dir = Path::new(&args.project.dir);
         let Some(tc) = _detect(dir) else { return };
         let step = if args.tiny {
             tc.tiny
@@ -394,7 +394,7 @@ mod commands {
     /// counts only with no ASCII letter touching it (`TODO:`, `# todo`, `todo!(…)` — not
     /// `todos`, `MyTODO`); `--match-any-todo` drops that and takes the substring anywhere
     pub fn todo(args: TodoArgs) {
-        let dir = Path::new(&args.dir);
+        let dir = Path::new(&args.project.dir);
         if !dir.is_dir() {
             eprintln!("pro_todo: no such directory: {}", dir.display());
             std::process::exit(1);
@@ -472,9 +472,8 @@ mod commands {
     /// What `pro_todo` takes: the directory, and the one looseness switch.
     #[derive(Args)]
     pub struct TodoArgs {
-        /// Project directory to search
-        #[arg(default_value = ".")]
-        dir: String,
+        #[command(flatten)]
+        project: DirArgs,
         /// Match `todo` anywhere, letters around it included (`todos`, `MyTODO`, `todoooo`);
         /// the default requires no ASCII letter on either side
         #[arg(long)]
@@ -484,6 +483,7 @@ mod commands {
     /// The directory to act in (default: current directory).
     #[derive(Args)]
     pub struct DirArgs {
+        /// Project directory
         #[arg(default_value = ".")]
         dir: String,
     }
@@ -492,8 +492,8 @@ mod commands {
     /// `--debug`, which wins over `--release`.
     #[derive(Args)]
     pub struct CompileArgs {
-        #[arg(default_value = ".")]
-        dir: String,
+        #[command(flatten)]
+        project: DirArgs,
         /// Debug build: fastest to compile.
         #[arg(short, long)]
         debug: bool,
@@ -897,6 +897,39 @@ mod commands {
         fn cmake_tests_build_first_but_cargo_does_not() {
             assert!(_detect_with(|m| m == "CMakeLists.txt").unwrap().test_needs_build);
             assert!(!_detect_with(|m| m == "Cargo.toml").unwrap().test_needs_build); // cargo test builds itself
+        }
+
+        /// The command line as clap sees it: every command acting on a project directory takes it
+        /// the same way — one documented, optional positional, `.` when left out ([`DirArgs`]) —
+        /// with `pro_compile`'s modes and `pro_todo`'s switch on top.
+        #[test]
+        fn the_project_directory_is_one_optional_positional_defaulting_to_here() {
+            #[derive(clap::Parser)]
+            struct Dir {
+                #[command(flatten)]
+                project: DirArgs,
+            }
+            #[derive(clap::Parser)]
+            struct Compile {
+                #[command(flatten)]
+                compile: CompileArgs,
+            }
+            #[derive(clap::Parser)]
+            struct Todo {
+                #[command(flatten)]
+                todo: TodoArgs,
+            }
+            use clap::{CommandFactory, Parser};
+            let argv = |name, args: &[&'static str]| std::iter::once(name).chain(args.to_vec());
+
+            assert!(Dir::command().get_arguments().all(|arg| arg.get_help().is_some()), "DIR is documented");
+            assert_eq!(Dir::try_parse_from(argv("pro_test", &[])).expect("no dir").project.dir, ".");
+            let compile = Compile::try_parse_from(argv("pro_compile", &["proj", "-t"])).expect("dir and mode").compile;
+            assert!(compile.project.dir == "proj" && compile.tiny && !compile.debug);
+            assert_eq!(Compile::try_parse_from(argv("pro_compile", &["-d"])).expect("mode only").compile.project.dir, ".");
+            let todo = Todo::try_parse_from(argv("pro_todo", &["--match-any-todo", "proj"])).expect("switch and dir").todo;
+            assert!(todo.project.dir == "proj" && todo.match_any_todo);
+            assert_eq!(Todo::try_parse_from(argv("pro_todo", &[])).expect("no dir").todo.project.dir, ".");
         }
 
         #[test]

@@ -9,12 +9,12 @@ mod commands {
     use clap::Args;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
-    use crate::categories::media::_run_writing;
+    use crate::categories::media::{_run_writing, OverwriteArgs};
     // --- media_convert (+ quality / compact profiles) ---------------------------
 
     /// Convert a media file to another format
     pub fn convert(args: ConvertArgs) {
-        let ConvertArgs { input, output, overwrite, bitrate, remux } = args;
+        let ConvertArgs { base: ConvertBase { input, output, overwrite }, bitrate, remux } = args;
         let output = _convert_output(&input, &output);
         let mut tuning: Vec<&str> = Vec::new();
         if remux {
@@ -23,18 +23,26 @@ mod commands {
         if let Some(bitrate) = bitrate.as_deref() {
             tuning.extend(["-b:v", bitrate]);
         }
-        _run_convert("media_convert", &input, &output, overwrite, &tuning);
+        _run_convert("media_convert", &input, &output, overwrite.yes, &tuning);
     }
 
+    /// What every `media_convert*` command accepts — the file in, the file out, and `-y` — each
+    /// adding its own tuning on top: `--bitrate`/`--remux` for `media_convert` itself, `--h264`
+    /// for the profiled two.
     #[derive(Args)]
-    pub struct ConvertArgs {
+    pub struct ConvertBase {
         /// Input file
         pub input: PathBuf,
         /// Output path — or just a format (`mp4`, `.ogg`, …), converting beside the input
         pub output: PathBuf,
-        /// Overwrite output file if it exists
-        #[arg(short = 'y', long)]
-        pub overwrite: bool,
+        #[command(flatten)]
+        pub overwrite: OverwriteArgs,
+    }
+
+    #[derive(Args)]
+    pub struct ConvertArgs {
+        #[command(flatten)]
+        pub base: ConvertBase,
         /// Cap the video bitrate (e.g. 1M, 500k) instead of ffmpeg's quality-based defaults
         #[arg(short, long)]
         pub bitrate: Option<String>,
@@ -48,7 +56,7 @@ mod commands {
     /// losslessly when the target container already fits them, else encoding at
     /// visually-lossless settings (H.265 video) with generous audio
     pub fn convert_quality(args: ProfiledConvertArgs) {
-        let ProfiledConvertArgs { input, output, overwrite, h264 } = args;
+        let ProfiledConvertArgs { base: ConvertBase { input, output, overwrite }, h264 } = args;
         let output = _convert_output(&input, &output);
         let tuning: &[&str] = if _remuxable(&input, &output, h264) {
             eprintln!(
@@ -59,29 +67,24 @@ mod commands {
         } else {
             _profile_flags(&output, Profile::Quality, h264)
         };
-        _run_convert("media_convert_quality", &input, &output, overwrite, tuning);
+        _run_convert("media_convert_quality", &input, &output, overwrite.yes, tuning);
     }
 
     /// Convert a media file to another format squeezing the visuals down hard (H.265 video);
     /// audio (if any) stays on its encoder defaults
     pub fn convert_compact(args: ProfiledConvertArgs) {
-        let ProfiledConvertArgs { input, output, overwrite, h264 } = args;
+        let ProfiledConvertArgs { base: ConvertBase { input, output, overwrite }, h264 } = args;
         let output = _convert_output(&input, &output);
         let tuning = _profile_flags(&output, Profile::Compact, h264);
-        _run_convert("media_convert_compact", &input, &output, overwrite, tuning);
+        _run_convert("media_convert_compact", &input, &output, overwrite.yes, tuning);
     }
 
     /// The arguments shared by both profiled conversions — no `--bitrate` or `--remux` here: the
     /// profile owns the quality decision, and a remux never re-encodes to begin with.
     #[derive(Args)]
     pub struct ProfiledConvertArgs {
-        /// Input file
-        pub input: PathBuf,
-        /// Output path — or just a format (`mp4`, `.ogg`, …), converting beside the input
-        pub output: PathBuf,
-        /// Overwrite output file if it exists
-        #[arg(short = 'y', long)]
-        pub overwrite: bool,
+        #[command(flatten)]
+        pub base: ConvertBase,
         /// Encode video as H.264 instead of the default H.265 — bigger files, but plays
         /// everywhere (only affects the mp4/mov/m4v/mkv family)
         #[arg(long)]
@@ -262,7 +265,7 @@ mod commands {
 
     /// The conversion runner: build the argv, hand off to the shared writing tail.
     fn _run_convert(command: &str, input: &Path, output: &Path, overwrite: bool, tuning: &[&str]) {
-        _run_writing(command, input, output, _convert_argv(input, output, overwrite, tuning));
+        _run_writing(command, input, output, overwrite, _convert_argv(input, output, overwrite, tuning));
     }
     /// Resolve the output argument: a bare format token (`mp4`, `.ogg` — nothing but a name,
     /// dotless once the leading dot is stripped) becomes the input's path with that extension;
@@ -325,8 +328,8 @@ mod commands {
             }
         };
         let output = output.unwrap_or_else(|| _trimmed_output(&input));
-        let argv = _trim_argv(&input, &output, &cut, overwrite, copy);
-        _run_writing("media_trim", &input, &output, argv);
+        let argv = _trim_argv(&input, &output, &cut, overwrite.yes, copy);
+        _run_writing("media_trim", &input, &output, overwrite.yes, argv);
     }
 
     #[derive(Args)]
@@ -346,9 +349,8 @@ mod commands {
         /// Output file (defaults to `<input>_trimmed.<ext>`, beside the input)
         #[arg(long)]
         pub output: Option<PathBuf>,
-        /// Overwrite output file if it exists
-        #[arg(short = 'y', long)]
-        pub overwrite: bool,
+        #[command(flatten)]
+        pub overwrite: OverwriteArgs,
         /// Copy the streams instead of re-encoding: instant and lossless, but the cut snaps to
         /// the nearest keyframe — possibly seconds off on sparse-keyframe video
         #[arg(long)]
@@ -599,6 +601,41 @@ mod commands {
             assert!(_profile_flags(Path::new("noext"), Profile::Compact, false).is_empty());
         }
 
+        /// The command line as clap sees it: every conversion takes the same input, output and `-y`
+        /// ([`ConvertBase`]) and adds its own tuning on top — `--bitrate` or `--remux` (never both)
+        /// for `media_convert`, `--h264` for the profiled two, whose profile owns the rest.
+        #[test]
+        fn conversions_share_one_base_and_each_adds_its_own_tuning() {
+            #[derive(clap::Parser)]
+            struct Plain {
+                #[command(flatten)]
+                convert: ConvertArgs,
+            }
+            #[derive(clap::Parser)]
+            struct Profiled {
+                #[command(flatten)]
+                convert: ProfiledConvertArgs,
+            }
+            use clap::{error::ErrorKind, Parser};
+            let plain = |argv: &[&str]| Plain::try_parse_from(std::iter::once("media_convert").chain(argv.iter().copied()));
+            let profiled =
+                |argv: &[&str]| Profiled::try_parse_from(std::iter::once("media_convert_quality").chain(argv.iter().copied()));
+
+            let capped = plain(&["in.mov", "mp4", "-y", "-b", "1M"]).expect("capped").convert;
+            assert_eq!(capped.base.input, PathBuf::from("in.mov"));
+            assert_eq!(capped.base.output, PathBuf::from("mp4"));
+            assert!(capped.base.overwrite.yes && !capped.remux && capped.bitrate.as_deref() == Some("1M"));
+            let both = plain(&["in.mov", "mp4", "--remux", "-b", "1M"]).err().map(|err| err.kind());
+            assert_eq!(both, Some(ErrorKind::ArgumentConflict), "a remux re-encodes nothing to cap");
+
+            let h264 = profiled(&["in.mov", "out.mp4", "--h264"]).expect("h264").convert;
+            assert!(h264.h264 && !h264.base.overwrite.yes);
+            for tuning in [&["--bitrate", "1M"][..], &["--remux"]] {
+                let refused = profiled(&[&["in.mov", "out.mp4"][..], tuning].concat()).err().map(|err| err.kind());
+                assert_eq!(refused, Some(ErrorKind::UnknownArgument), "{tuning:?} is the profile's call");
+            }
+        }
+
         fn cut(seek: Option<&str>, keep: Option<&str>) -> Cut {
             Cut { seek: seek.map(str::to_string), keep: keep.map(str::to_string) }
         }
@@ -695,7 +732,7 @@ mod commands {
 
             let two = parse(&["in.mp4", "0:05", "0:30", "-y", "--copy"]).expect("two points").trim;
             assert_eq!(two.points, ["0:05", "0:30"]);
-            assert!(two.overwrite && two.copy && two.start.is_none() && two.end.is_none());
+            assert!(two.overwrite.yes && two.copy && two.start.is_none() && two.end.is_none());
             let named = parse(&["in.mp4", "--end", "0:30", "--output", "cut.mp4"]).expect("named end").trim;
             assert!(named.points.is_empty() && named.end.as_deref() == Some("0:30"));
             assert_eq!(named.output, Some(PathBuf::from("cut.mp4")));

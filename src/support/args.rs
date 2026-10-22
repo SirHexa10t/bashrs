@@ -1,6 +1,7 @@
 //! Argument structs shared across command categories.
 
 use clap::Args;
+use ignore::{DirEntry, WalkBuilder};
 use std::path::PathBuf;
 
 /// An empty argument set, for commands that take no arguments.
@@ -81,6 +82,34 @@ pub fn is_skipped(path: &std::path::Path, skips: &[String]) -> bool {
                     .all(|(part, want)| *want == "*" || part == want)
             })
     })
+}
+
+/// The walk every command taking [`SkipArgs`] makes — `gg`'s and `detect_ai_textual_fingerprint`'s:
+/// over `roots`, searching *everything* — hidden and ignored files included (matching the old
+/// `find`/`grep -r`), unlike ripgrep's gitignore-aware default — but what `skips` names.
+pub fn walk(roots: &[PathBuf], skips: &[String]) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(&roots[0]);
+    for root in &roots[1..] {
+        builder.add(root);
+    }
+    builder.standard_filters(false);
+    if !skips.is_empty() {
+        // Pruned here rather than filtered per-result: `filter_entry` stops the walk descending
+        // at all, so a skipped `target/` is never even enumerated. The walk root itself is
+        // exempt — naming a directory is the decision to search it. So the skips are matched
+        // against each entry's path below its root: against the whole path, a root named like a
+        // skip had every entry in it skipped, its own name leading each one's path.
+        let skips = skips.to_vec();
+        builder.filter_entry(move |entry| !is_skipped(&below_root(entry), &skips));
+    }
+    builder
+}
+
+/// `entry`'s path from the root it was found under — the last of its components, as many as it
+/// lies deep.
+fn below_root(entry: &DirEntry) -> PathBuf {
+    let parts: Vec<_> = entry.path().components().collect();
+    parts[parts.len().saturating_sub(entry.depth())..].iter().collect()
 }
 
 /// Everything the `g` family accepts EXCEPT the context knob — the numbered variants (`g2`,
@@ -183,6 +212,34 @@ pub struct EchoArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A walk prunes what `skips` names below each root, and searches a root that is itself named
+    /// like a skip — naming a directory is the decision to search it — though a skip further down
+    /// still applies there.
+    #[test]
+    fn a_walk_skips_below_its_roots_and_searches_a_root_named_like_a_skip() {
+        let root = std::env::temp_dir().join(format!("bashrs_walk_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("target/sub")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("target/sub/a.txt"), "").unwrap();
+        std::fs::write(root.join("src/b.txt"), "").unwrap();
+        let files = |at: &str, skips: &[&str]| -> Vec<String> {
+            let skips: Vec<String> = skips.iter().map(|skip| (*skip).to_string()).collect();
+            let mut found: Vec<String> = walk(&[root.join(at)], &skips)
+                .build()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+                .map(|entry| entry.path().strip_prefix(&root).unwrap().display().to_string())
+                .collect();
+            found.sort();
+            found
+        };
+        assert_eq!(files("", &["target"]), ["src/b.txt"], "a skip prunes what it names");
+        assert_eq!(files("target", &["target"]), ["target/sub/a.txt"], "a root named like a skip is searched");
+        assert!(files("target", &["sub"]).is_empty(), "a skip below the named root still applies");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// The reason skips match components and not substrings: `target/bebuggers` starts with
     /// `target/` and contains `debug` — a substring rule skips it, and the user loses a

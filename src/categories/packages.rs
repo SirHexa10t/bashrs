@@ -31,7 +31,7 @@ mod commands {
         update_toolchains(NoArgs {});
         // The bundled side last: tools, yt-dlp's python helpers, companion repos — recorded in
         // Carstay.toml with the usual revert notice, exactly as COMPILE.sh provisions them.
-        crate::drivers::install_stainless(false);
+        crate::drivers::install_stainless(false, None);
     }
 
     /// List installed packages, grouped under their package manager

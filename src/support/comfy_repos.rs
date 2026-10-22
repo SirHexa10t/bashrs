@@ -1,12 +1,22 @@
 //! Shared support for the commands backed by my other repos ([`crate::categories::comfy_repos`]) —
 //! the pieces those commands need that something *else* needs too, so neither side owns them.
 //!
-//! Right now that's the `table_fancy` preset: the fancy table shape, defined once and used both by
-//! the command itself and by [`crate::support::doc_render`], which renders the embedded templates'
-//! markdown tables in that same shape. Helpers for the other wrapped tools (`table`, `backup_*`)
-//! belong here too as they appear.
+//! Right now that's `table_formatter`'s presets: the `table_fancy` shape, defined once and used both
+//! by the command itself and by [`crate::support::doc_render`], which renders the embedded
+//! templates' markdown tables in that same shape; and the plain listing shape every listing prints
+//! in. Helpers for the other wrapped tools (`table`, `backup_*`) belong here too as they appear.
 
 use table_formatter::{FormatOptions, RowSpacing};
+
+/// The listing shape — `table --remove-trailing-spaces --reasonable-spacing` — that `lll`, `LLL`,
+/// `fs_usage` and the network tables print in: the library's two-space columns, a run of two
+/// spaces or a tab dividing the input's cells (rows built tab-delimited), two spaces joining the
+/// output's. A very wide cell sets no width for the other rows, as in the sourcefile's alignment
+/// (`support::align`): the last column — a long name — pads no row, and a cell far wider than the
+/// rest of its column takes its row out of the alignment instead of padding everyone to it.
+pub(crate) fn listing_table_options() -> FormatOptions {
+    FormatOptions { trim_trailing: true, reasonable_spacing: true, ..Default::default() }
+}
 
 /// The `table_fancy` shape at the live terminal width — `table -j " | " --split-lines
 /// --space-rows '-' --emit-frame`: columns pipe-joined inside a border, wide rows wrapped to fit,
@@ -35,6 +45,20 @@ pub(crate) fn table_fancy_options_at(width: usize) -> FormatOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The listing shape is the library's default with the two flags it stands for, and nothing
+    /// else — so a listing and a bare `table` differ only by these.
+    #[test]
+    fn the_listing_preset_is_the_default_shape_trimmed_and_reasonably_spaced() {
+        let opts = listing_table_options();
+        assert!(opts.trim_trailing, "--remove-trailing-spaces");
+        assert!(opts.reasonable_spacing, "--reasonable-spacing");
+        let default = FormatOptions::default();
+        assert_eq!(opts.divide_by, default.divide_by, "the default divider");
+        assert_eq!(opts.join_with, default.join_with, "the default join");
+        assert_eq!(opts.join_with, "  ", "two-space columns");
+        assert_eq!(opts.sort, default.sort);
+    }
 
     #[test]
     fn the_preset_is_the_pipe_joined_framed_split_ruled_shape() {

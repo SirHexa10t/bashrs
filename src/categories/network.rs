@@ -21,6 +21,7 @@
 
 #[bashrs_macros::category(command = NetworkCommand, prefix = "net_")]
 mod commands {
+    use crate::support::comfy_repos;
     use crate::support::doc_style::{self, _header, approved, notice, problematic};
     use crate::support::theme::{Basic, Weight};
     use crate::support::exec;
@@ -139,7 +140,7 @@ mod commands {
         lines.extend(targets.iter().zip(&measured).map(|(target, latency)| {
             format!("{}\t{}\t{}\t{}", target.provider, target.endpoint, target.host, _latency_cell(*latency))
         }));
-        for line in table_formatter::format_table(&lines, &_sonar_table()).unwrap_or(lines) {
+        for line in table_formatter::format_table(&lines, &comfy_repos::listing_table_options()).unwrap_or(lines) {
             println!("{line}");
         }
         measured
@@ -598,7 +599,7 @@ mod commands {
                 _ports_cell(device),
             ));
         }
-        for line in table_formatter::format_table(&lines, &_sonar_table()).unwrap_or(lines) {
+        for line in table_formatter::format_table(&lines, &comfy_repos::listing_table_options()).unwrap_or(lines) {
             println!("{line}");
         }
         println!("{}", approved(&format!("{} device(s)", devices.len())));
@@ -895,7 +896,7 @@ mod commands {
                 device.rssi.map_or_else(|| "—".to_string(), |dbm| format!("{dbm} dBm")),
             ));
         }
-        for line in table_formatter::format_table(&lines, &_sonar_table()).unwrap_or(lines) {
+        for line in table_formatter::format_table(&lines, &comfy_repos::listing_table_options()).unwrap_or(lines) {
             println!("{line}");
         }
         println!("{}", approved(&format!("{} device(s)", devices.len())));
@@ -958,11 +959,6 @@ mod commands {
             assert!(parse(&["--no-bluetooth"]).no_bluetooth, "and skippable when only IP matters");
             assert_eq!(parse(&["--bluetooth-scan", "0"]).bluetooth_scan, 0, "0 lists without scanning");
         }
-    }
-
-    /// Two-space columns, trailing padding trimmed — the same shape the other tables here use.
-    fn _sonar_table() -> table_formatter::FormatOptions {
-        table_formatter::FormatOptions { trim_trailing: true, ..Default::default() }
     }
 
     /// Probe every target with at most `workers` handshakes in flight, preserving input order.

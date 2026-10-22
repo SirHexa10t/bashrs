@@ -11,7 +11,8 @@
 # false: bundle only what the system lacks.
 always_bundle_languages = true
 # Bundle the utility programs (ffmpeg, yt-dlp, deno) even when the system provides them.
-# false: bundle only what the system lacks.
+# false: bundle only what the system lacks — and remove an earlier bundle of one it now has,
+# so the system's own is used.
 always_bundle_utilities = true
 # Install optional extras — tools bashrs never calls itself, but can set up for you instead of a
 # manual install. Off by default (opt-in); when on, each is bundled only if the system lacks it.

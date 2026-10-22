@@ -1,8 +1,9 @@
 //! End-to-end tests of assorted non-search commands, driving the real binary.
 
 
+use std::ffi::OsStr;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 /// Run the real `bashrs` with `args` and extra environment overrides.
@@ -13,6 +14,11 @@ fn bashrs(args: &[&str], envs: &[(&str, &str)]) -> Output {
         cmd.env(key, value);
     }
     cmd.output().expect("run bashrs")
+}
+
+/// Run the real `bashrs` with `args` from `cwd`.
+fn bashrs_in(cwd: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_bashrs")).args(args).current_dir(cwd).output().expect("run bashrs")
 }
 
 #[test]
@@ -176,6 +182,85 @@ fn media_commands_propagate_failure_as_a_nonzero_exit() {
     assert!(!metadata.status.success(), "an unreadable file must exit non-zero");
 }
 
+/// Every media command that writes a file, as `(command, its arguments, the file they write)`,
+/// each run from one directory of synthesized inputs — with `-y` appended, or without.
+const MEDIA_WRITERS: &[(&str, &[&str], &str)] = &[
+    ("media_convert", &["tone.wav", "convert.wav"], "convert.wav"),
+    ("media_convert_quality", &["tone.wav", "quality.flac"], "quality.flac"),
+    ("media_convert_compact", &["tone.wav", "compact.flac"], "compact.flac"),
+    ("media_trim", &["tone.wav", "0.2", "--output", "trim.wav"], "trim.wav"),
+    ("media_remove_vocals", &["tone.wav", "devocal.wav"], "devocal.wav"),
+    ("media_hmerge_imgs", &["--output", "hmerge.png", "red.png", "blue.png"], "hmerge.png"),
+    ("media_vmerge_imgs", &["--output", "vmerge.png", "red.png", "blue.png"], "vmerge.png"),
+];
+
+#[test]
+fn every_command_offering_overwrite_has_a_media_writers_row() {
+    // The CLI's own definition says which commands take `-y`, so none can be added without the
+    // test below exercising it — and no row outlives its command.
+    use clap::CommandFactory;
+    let offering: std::collections::BTreeSet<String> = bashrs::cli::Cli::command()
+        .get_subcommands()
+        .filter(|command| command.get_arguments().any(|arg| arg.get_long() == Some("overwrite")))
+        .map(|command| command.get_name().to_string())
+        .collect();
+    let rows = MEDIA_WRITERS.iter().map(|(command, ..)| command.to_string()).collect();
+    assert_eq!(offering, rows);
+}
+
+#[test]
+fn media_commands_leave_an_existing_output_alone_unless_told_to_overwrite() {
+    // Each MEDIA_WRITERS row runs twice against a stale output: refused and untouched without
+    // `-y`, replaced with it. Needs a real ffmpeg/ffprobe, looked up on PATH — where a bashrs
+    // shell puts the bundled copy first (`~/.bashrs/tools/bin`), the one the commands run.
+    let works = ["ffmpeg", "ffprobe"]
+        .iter()
+        .all(|tool| Command::new(tool).arg("-version").output().is_ok_and(|out| out.status.success()));
+    if !works {
+        eprintln!("SKIPPED media overwrite: no ffmpeg/ffprobe on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("bashrs_media_overwrite_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (source, shape, file) in [
+        ("sine=d=1", &["-ac", "2"][..], "tone.wav"), // stereo, as vocal removal requires
+        ("color=c=red:s=8x8", &["-frames:v", "1", "-update", "1"], "red.png"),
+        ("color=c=blue:s=8x8", &["-frames:v", "1", "-update", "1"], "blue.png"),
+    ] {
+        let made = Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", source])
+            .args(shape)
+            .arg(file)
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(made, "could not synthesize {file}");
+    }
+    let run = |command: &str, args: &[&str], overwrite: bool| {
+        Command::new(env!("CARGO_BIN_EXE_bashrs"))
+            .arg(command)
+            .args(args)
+            .args(overwrite.then_some("-y"))
+            .current_dir(&dir)
+            .output()
+            .expect("run bashrs")
+    };
+
+    for &(command, args, output) in MEDIA_WRITERS {
+        let output = dir.join(output);
+        std::fs::write(&output, "stale").unwrap();
+        let refused = run(command, args, false);
+        assert!(!refused.status.success(), "{command} without -y must refuse");
+        assert_eq!(std::fs::read(&output).unwrap(), b"stale", "{command} without -y must leave the file alone");
+        let replaced = run(command, args, true);
+        assert!(replaced.status.success(), "{command} -y: {}", String::from_utf8_lossy(&replaced.stderr));
+        assert!(std::fs::read(&output).unwrap() != b"stale", "{command} -y must replace the file");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn pro_run_forwards_every_arg_to_the_program_except_its_own_help() {
     // A minimal crate whose program echoes its argv and cwd — whatever pro_run forwards must
@@ -303,6 +388,193 @@ fn pro_test_survives_a_relative_dir_across_its_two_steps() {
 }
 
 #[test]
+fn offline_provisioning_hands_its_problems_to_the_file_compile_sh_prints_last() {
+    // COMPILE.sh's contract with install-stainless, run for real with nowhere to connect to.
+    let home = std::env::temp_dir().join(format!("bashrs_offline_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let problems = home.join("problems");
+    std::fs::write(&problems, "").unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let (ok, said) = install_stainless_offline(&home, &path, &[OsStr::new("--problems-file"), problems.as_os_str()]);
+
+    let written = std::fs::read_to_string(&problems).unwrap();
+    assert!(ok, "offline is no failure of the compile: {said}");
+    assert!(written.contains("Provisioning problems"), "{written}");
+    assert!(
+        written.lines().any(|line| line.contains("uv") && line.contains("could not reach GitHub")),
+        "a tool lookup, with its reason: {written}"
+    );
+    assert!(written.contains("tools: could not create the python environment"), "{written}");
+    assert!(written.lines().any(|line| line.contains("stainless/") && line.contains("git failed")), "{written}");
+    // Each problem was also printed where it happened; the summary itself went to the file.
+    assert!(!said.contains("Provisioning problems"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_utility_is_looked_up_until_the_system_has_its_own_and_then_its_bundle_goes() {
+    // `always_bundle_utilities = false` (and `always_bundle_languages` too), with an earlier
+    // compile's ffmpeg bundle still in place, shims and all. While its shim is the only ffmpeg on
+    // PATH, that is no system copy: the bundle stays and is looked up, as from any shell. Once the
+    // system has its own (a stand-in), no lookup is made for it, and the bundle goes — while a
+    // language's bundle, which holds the user's packages, is never removed for the same reason.
+    use std::os::unix::fs::PermissionsExt;
+    let home = std::env::temp_dir().join(format!("bashrs_system_has_it_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let tools = home.join(".bashrs/tools");
+    let template =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/conf/templates/configrs.toml")).unwrap();
+    let config = template
+        .replace("always_bundle_utilities = true", "always_bundle_utilities = false")
+        .replace("always_bundle_languages = true", "always_bundle_languages = false");
+    assert_eq!(config.matches("= false").count(), template.matches("= false").count() + 2, "both settings still exist to turn off");
+    let os_bin = home.join("os/bin");
+    for dir in [tools.join("ffmpeg/bin"), tools.join("python/bin"), tools.join("bin"), os_bin.clone()] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(home.join(".bashrs/configrs.toml"), config).unwrap();
+    std::fs::write(tools.join("python/pyvenv.cfg"), "home = /somewhere\n").unwrap();
+    for (program, body) in [
+        (tools.join("ffmpeg/bin/ffmpeg"), "#!/bin/sh\n"),
+        (tools.join("ffmpeg/bin/ffprobe"), "#!/bin/sh\n"),
+        (tools.join("python/bin/python3"), "#!/bin/sh\necho 'Python 3.14.6'\n"),
+        (os_bin.join("python3"), "#!/bin/sh\necho 'Python 3.14.6'\n"),
+    ] {
+        std::fs::write(&program, body).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    for name in ["ffmpeg", "ffprobe"] {
+        std::os::unix::fs::symlink(Path::new("../ffmpeg/bin").join(name), tools.join("bin").join(name)).unwrap();
+    }
+    std::fs::write(
+        tools.join("ffmpeg/.source_url"),
+        "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-linux64-gpl-9.0.tar.xz",
+    )
+    .unwrap();
+    // The inherited PATH minus every directory with an ffmpeg of its own — a real system copy, or
+    // the real ~/.bashrs's shim — so the only one left is this home's bundle, or the stand-in.
+    let inherited: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .filter(|dir| !dir.join("ffmpeg").exists())
+        .collect();
+    let path_with = |first: &[PathBuf]| std::env::join_paths(first.iter().chain(&inherited)).unwrap();
+    let looked_up = |said: &str| said.lines().any(|line| line.contains("recorded ffmpeg pin") || line.contains("newer ffmpeg build"));
+
+    let (ok, said) = install_stainless_offline(&home, &path_with(&[os_bin.clone(), tools.join("bin")]), &[]);
+    assert!(ok && looked_up(&said), "the shim is the bundle, not the system's — so it is kept current: {said}");
+    assert!(tools.join("ffmpeg/bin/ffmpeg").exists(), "and kept: {said}");
+
+    std::fs::write(os_bin.join("ffmpeg"), "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(os_bin.join("ffmpeg"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (ok, said) = install_stainless_offline(&home, &path_with(&[tools.join("bin"), os_bin.clone()]), &[]);
+    assert!(ok, "{said}");
+    let os_ffmpeg = os_bin.join("ffmpeg");
+    assert!(said.contains(&format!("tools: ffmpeg is already on this system ({}) — not bundling", os_ffmpeg.display())), "{said}");
+    assert!(!looked_up(&said), "no lookup for what the system has: {said}");
+    assert!(tools.join("ffmpeg").symlink_metadata().is_err(), "the old bundle is gone: {said}");
+    assert!(tools.join("bin/ffmpeg").symlink_metadata().is_err(), "and its shim with it");
+    assert!(os_ffmpeg.exists(), "the system's own is never touched");
+    assert!(tools.join("python/bin/python3").exists(), "a language's bundle is never removed this way: {said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `install-stainless --use-stable-carstay`, run for real in the private `home` with `path` as its
+/// `PATH` and nowhere to connect to: every proxy variable aimed at a closed port, and nothing
+/// routing around it — NO_PROXY goes, and so does the system git config, which could name a proxy
+/// of its own. Stable mode is the one that never rewrites the project's Carstay.toml; were it ever
+/// to, the file is put back before the assertion says so. Returns whether the run succeeded, and
+/// everything it printed.
+fn install_stainless_offline(home: &Path, path: &OsStr, extra: &[&OsStr]) -> (bool, String) {
+    let carstay = Path::new(env!("CARGO_MANIFEST_DIR")).join("Carstay.toml");
+    let recorded = std::fs::read(&carstay).ok();
+    let dead = "http://127.0.0.1:9";
+    let out = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+        .args(["install-stainless", "--use-stable-carstay"])
+        .args(extra)
+        .env("HOME", home)
+        .env("PATH", path)
+        .envs(["https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY", "ALL_PROXY"].map(|var| (var, dead)))
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("UV_HTTP_RETRIES", "0") // uv's retries would stretch one refused download into seconds
+        .output()
+        .expect("run bashrs");
+    let now = std::fs::read(&carstay).ok();
+    if let (Some(bytes), true) = (&recorded, now != recorded) {
+        let _ = std::fs::write(&carstay, bytes);
+    }
+    assert_eq!(now, recorded, "the project's Carstay.toml must be left exactly as it was");
+    (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+}
+
+/// A fresh project directory with an empty sibling to run from: whatever a `pro_*` command then
+/// finds can only have come from the project named on its command line. Returns
+/// `(parent, project, elsewhere)`; the test removes `parent` when it is done.
+fn project_beside_an_empty_dir(test: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let parent = std::env::temp_dir().join(format!("bashrs_{test}_{}", std::process::id()));
+    let (project, elsewhere) = (parent.join("proj"), parent.join("elsewhere"));
+    let _ = std::fs::remove_dir_all(&parent);
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    (parent, project, elsewhere)
+}
+
+#[test]
+fn pro_todo_reads_the_project_it_is_given_not_the_directory_it_runs_in() {
+    let (parent, project, elsewhere) = project_beside_an_empty_dir("pro_todo");
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::write(project.join("TODO.md"), "buy milk\n").unwrap();
+    std::fs::write(project.join("src/main.rs"), "// TODO: wire it up\n").unwrap();
+    let out = bashrs_in(&elsewhere, &["pro_todo", project.to_str().unwrap()]);
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(shown.contains("buy milk"), "the project's TODO file, printed whole: {shown}");
+    assert!(shown.contains("wire it up"), "the project's TODO mention: {shown}");
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+#[test]
+fn pro_readme_shows_the_project_it_is_given_not_the_directory_it_runs_in() {
+    let (parent, project, elsewhere) = project_beside_an_empty_dir("pro_readme");
+    std::fs::write(project.join("README.md"), "# proj\nDoes one thing well.\n").unwrap();
+    let out = bashrs_in(&elsewhere, &["pro_readme", project.to_str().unwrap()]);
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(shown.contains("Does one thing well."), "the project's README: {shown}");
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+#[test]
+fn pro_compile_builds_the_project_it_is_given_not_the_directory_it_runs_in() {
+    // Make leaves a mark without any compiler: the recipe touches a file, which only a build
+    // run in the named project can put there.
+    if !Command::new("make").arg("--version").output().is_ok_and(|o| o.status.success()) {
+        eprintln!("SKIPPED pro_compile project dir: no make on this machine");
+        return;
+    }
+    let (parent, project, elsewhere) = project_beside_an_empty_dir("pro_compile");
+    std::fs::write(project.join("Makefile"), "all:\n\ttouch built\n").unwrap();
+    let out = bashrs_in(&elsewhere, &["pro_compile", project.to_str().unwrap()]);
+    let all =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(project.join("built").exists(), "the build ran in the named project: {all}");
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+#[test]
+fn pro_update_packages_acts_on_the_project_it_is_given_not_the_directory_it_runs_in() {
+    // A Makefile project's update step is a note, not a package manager, so nothing is run or
+    // installed — and its toolchain is detected only if the named directory is the one read.
+    let (parent, project, elsewhere) = project_beside_an_empty_dir("pro_update_packages");
+    std::fs::write(project.join("Makefile"), "all:\n").unwrap();
+    let out = bashrs_in(&elsewhere, &["pro_update_packages", project.to_str().unwrap()]);
+    let all =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(all.contains("Detected C/C++ (Make)"), "the named project's toolchain: {all}");
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+#[test]
 fn diff_prints_gits_own_diff_of_two_files_and_exits_as_git_does() {
     let dir = std::env::temp_dir().join(format!("bashrs_diff_e2e_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -402,6 +674,22 @@ fn diff_compares_two_directories_one_level_deep_unless_recursive() {
     let same = bashrs(&["diff", "-r", &path(&old), &path(&old)], &[]);
     assert_eq!((same.status.code(), same.stdout.as_slice()), (Some(0), &b""[..]), "a match is silent");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `lll` and the `cd` listing read a device as the real `ls` writes it: `/dev/null`, character
+/// device 1, 3 on every Linux — its numbers its size, then its date, then its name. (Taken for
+/// one word, the size once pushed the date into the name's place.) In a `/dev` whose minors vary
+/// in width, `ls` pads between the numbers too, which must not split them either.
+#[test]
+fn lll_and_the_cd_listing_read_a_device_as_ls_writes_it() {
+    let plain = |out: &Output| console::strip_ansi_codes(&String::from_utf8_lossy(&out.stdout)).into_owned();
+    let listing = plain(&bashrs(&["lll", "/dev"], &[]));
+    let row = listing.lines().find(|row| row.ends_with("  null")).unwrap_or_else(|| panic!("no `null` row:\n{listing}"));
+    let cells: Vec<&str> = row.split("  ").map(str::trim).filter(|cell| !cell.is_empty()).collect();
+    let date = |cell: &str| cell.len() == 19 && cell.as_bytes()[4] == b'-' && cell.as_bytes()[10] == b'_';
+    assert!(cells[5] == "1, 3" && date(cells[6]) && cells[7] == "null", "size, date, name: {row}");
+    let landing = Command::new(env!("CARGO_BIN_EXE_bashrs")).arg("cd-listing").current_dir("/dev").output().expect("cd-listing");
+    assert!(plain(&landing).lines().any(|name| name == "null"), "{}", plain(&landing));
 }
 
 /// Compile-time guard that the fixture path stays valid if this file grows path-dependent tests.

@@ -10,6 +10,7 @@
 //! prepends it to `PS1`, while fish draws its prompt with a function, which bashrs wraps — see
 //! `prompt_clock` — and zsh keeps its own prompt.
 
+use crate::support::align::align_columns;
 use crate::support::shell_dialect::{bash_or_zsh, fish_original, Shell};
 
 /// One `export`: the variable, its shell-quoted value (quotes and all, since single vs.
@@ -66,10 +67,10 @@ pub fn settings(shell: Shell) -> String {
     }
 }
 
-/// [`EXPORTS`] as `export` lines, aligning the trailing `#` comments with the shared
-/// [`table_formatter`] helper. A 3-space code→comment delimiter plus a split threshold of 3 let it
-/// align these without splitting a value like `HISTTIMEFORMAT="%F_%T  "` on its interior double
-/// space (the default threshold of 2 would).
+/// [`EXPORTS`] as `export` lines, their trailing `#` comments aligned as every hand-shaped block of
+/// the generated shell is ([`align_columns`]), which divides a line only before the token it is
+/// handed — a value's own spaces, `HISTTIMEFORMAT`'s double one, stay text. A value must therefore
+/// hold no `# ` of its own, which a test holds every row to.
 fn bash_exports() -> String {
     let lines: Vec<String> = EXPORTS
         .iter()
@@ -77,24 +78,15 @@ fn bash_exports() -> String {
             if e.comment.is_empty() {
                 format!("export {}={}", e.var, e.value)
             } else {
-                format!("export {}={}   # {}", e.var, e.value, e.comment)
+                format!("export {}={} {COMMENT}{}", e.var, e.value, e.comment)
             }
         })
         .collect();
-    // divide_by "   " (3 spaces) splits code from its `# comment` on the 3-space gap — the old
-    // threshold:3 — while join_with keeps the default 2-space output gap. Fallback unreachable:
-    // sort is off and the delimiters are valid.
-    let opts = table_formatter::FormatOptions {
-        divide_by: "   ".to_string(),
-        trim_trailing: true,
-        ..Default::default()
-    };
-    table_formatter::format_table(&lines, &opts)
-        .unwrap_or(lines)
-        .iter()
-        .map(|line| format!("{line}\n"))
-        .collect()
+    align_columns(lines, &[COMMENT]).into_iter().map(|line| line + "\n").collect()
 }
+
+/// What opens an export's trailing comment — the column [`bash_exports`] aligns.
+const COMMENT: &str = "# ";
 
 /// The [`InFish::Same`] rows as `set -gx` lines, their comments trailing as bash's do, and each
 /// [`InFish::BashOnly`] row as the comment saying what fish does instead.
@@ -170,6 +162,14 @@ mod tests {
         let columns: Vec<usize> = bash_exports().lines().filter_map(|line| line.find("  # ")).collect();
         assert!(columns.len() >= 2, "expected several commented exports");
         assert!(columns.windows(2).all(|w| w[0] == w[1]), "comment columns not aligned: {columns:?}");
+    }
+
+    /// The alignment divides a line at its first `# `, so a value holding one would be cut there.
+    #[test]
+    fn no_value_holds_the_comment_s_opener() {
+        for export in EXPORTS {
+            assert!(!export.value.contains(COMMENT), "{}'s value would split at its own `{COMMENT}`", export.var);
+        }
     }
 
     #[test]

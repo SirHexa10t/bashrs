@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
+use crate::support::problems::Problems;
 use crate::support::shell_dialect::{bash_function, fish_function, Shell, FISH_COLUMNS};
 
 /// One of your own non-Rust repos (a future external kind would be a sibling struct in this table).
@@ -140,12 +141,12 @@ fn exe_dir_shell(comfy: &Comfy) -> String {
 /// [`aliases`]. A `pins` entry (a Carstay.toml revision, in `--use-stable-carstay` mode) puts that clone AT
 /// the recorded commit — fetched explicitly and hard-reset, which discards nothing of the user's:
 /// these clones are read-only mirrors.
-pub fn sync(pins: &[(String, String)]) {
+pub fn sync(pins: &[(String, String)], problems: &mut Problems) {
     // Git phase, parallel: each repo is its own directory and its own remote, so the clones
     // and fetches don't contend — the wall clock is the slowest repo instead of the sum.
     // Every line a repo says is prefixed `stainless/<name>:`, so attribution never depends
     // on where a line landed in the output.
-    let reports: Vec<Vec<String>> = std::thread::scope(|scope| {
+    let reports: Vec<Vec<Line>> = std::thread::scope(|scope| {
         let handles: Vec<_> = STAINLESS
             .iter()
             .map(|comfy| (repo_name(comfy.repo), scope.spawn(move || sync_repo(comfy, pins))))
@@ -155,12 +156,15 @@ pub fn sync(pins: &[(String, String)]) {
             .map(|(name, handle)| {
                 handle
                     .join()
-                    .unwrap_or_else(|_| vec![format!("stainless/{name}: sync thread panicked")])
+                    .unwrap_or_else(|_| vec![Line::Problem(format!("stainless/{name}: sync thread panicked"))])
             })
             .collect()
     });
-    for line in reports.iter().flatten() {
-        eprintln!("{line}");
+    for line in reports.into_iter().flatten() {
+        match line {
+            Line::Note(note) => eprintln!("{note}"),
+            Line::Problem(problem) => problems.report(problem),
+        }
     }
     // Python phase: ONE `uv pip install` for every repo's packages together. They all land in
     // the same bundled environment, so per-repo calls paid uv's startup, resolve, and
@@ -176,8 +180,16 @@ pub fn sync(pins: &[(String, String)]) {
             .collect()
     };
     if !super::python::install(&packages) {
-        eprintln!("stainless: some companion python packages may be missing (uv's output above names them)");
+        problems.report("stainless: some companion python packages may be missing (uv's output above names them)");
     }
+}
+
+/// One thing a repo's sync has to say: progress, or a problem — told apart so the problems can
+/// be repeated at the end of the compile, while both still print in order with the repo's other
+/// lines.
+enum Line {
+    Note(String),
+    Problem(String),
 }
 
 /// One repo's git work — clone, or pin, or fast-forward — with everything worth saying
@@ -187,7 +199,7 @@ pub fn sync(pins: &[(String, String)]) {
 /// A pin short-circuits on a purely local HEAD comparison: the wanted revision is already
 /// known, so matching it means there is no reason to touch the network at all. The unpinned
 /// path has no such shortcut on purpose — see the note above its pull.
-fn sync_repo(comfy: &Comfy, pins: &[(String, String)]) -> Vec<String> {
+fn sync_repo(comfy: &Comfy, pins: &[(String, String)]) -> Vec<Line> {
     let mut log = Vec::new();
     let dir = clone_dir(comfy);
     let name = repo_name(comfy.repo);
@@ -202,14 +214,14 @@ fn sync_repo(comfy: &Comfy, pins: &[(String, String)]) -> Vec<String> {
             &tag,
             &mut log,
         ) {
-            log.push(format!("{tag}: cloned"));
+            log.push(Line::Note(format!("{tag}: cloned")));
         }
     }
     let pin = pins.iter().find(|(pinned, _)| pinned == name).map(|(_, rev)| rev.as_str());
     match pin {
         Some(rev) if dir.exists() => {
             if local_head(&dir).as_deref() == Some(rev) {
-                log.push(format!("{tag}: already at the recorded revision {rev}"));
+                log.push(Line::Note(format!("{tag}: already at the recorded revision {rev}")));
                 return log;
             }
             // GitHub serves unadvertised commits by SHA, so a shallow fetch of the exact
@@ -223,7 +235,7 @@ fn sync_repo(comfy: &Comfy, pins: &[(String, String)]) -> Vec<String> {
                 &tag,
                 &mut log,
             ) {
-                log.push(format!("{tag}: pinned to the recorded revision {rev}"));
+                log.push(Line::Note(format!("{tag}: pinned to the recorded revision {rev}")));
             }
         }
         None if existed => {
@@ -246,12 +258,12 @@ fn sync_repo(comfy: &Comfy, pins: &[(String, String)]) -> Vec<String> {
                 .args(["-c", "protocol.version=0", "pull", "--ff-only"])
                 .output();
             if matches!(&pulled, Ok(out) if out.status.success()) {
-                log.push(format!("{tag}: fast-forwarded"));
+                log.push(Line::Note(format!("{tag}: fast-forwarded")));
             } else {
-                log.push(format!(
+                log.push(Line::Problem(format!(
                     "{tag}: could not fast-forward (upstream history rewritten?) — delete {} and re-run COMPILE.sh to re-clone it fresh",
                     dir.display()
-                ));
+                )));
             }
         }
         _ => {} // fresh clone with no pin — already at the tip
@@ -272,14 +284,14 @@ fn local_head(dir: &std::path::Path) -> Option<String> {
 /// interleaved progress is unreadable), logging a warning — never failing the compile — when
 /// it doesn't succeed. Reports the verdict for steps that chain (a pinned reset only makes
 /// sense after its fetch).
-fn git(cmd: &mut Command, tag: &str, log: &mut Vec<String>) -> bool {
+fn git(cmd: &mut Command, tag: &str, log: &mut Vec<Line>) -> bool {
     let out = cmd.output();
     let ok = matches!(&out, Ok(out) if out.status.success());
     if !ok {
-        log.push(format!("{tag}: git failed; the alias may be stale or point at a missing path"));
+        log.push(Line::Problem(format!("{tag}: git failed; the alias may be stale or point at a missing path")));
         if let Ok(out) = out {
             if let Some(last) = String::from_utf8_lossy(&out.stderr).lines().last() {
-                log.push(format!("{tag}:   {last}"));
+                log.push(Line::Problem(format!("{tag}:   {last}")));
             }
         }
     }
@@ -790,7 +802,7 @@ mod tests {
 
 #[cfg(test)]
 mod sync_tests {
-    use super::local_head;
+    use super::{git, local_head, Line};
 
     /// The pinned-revision shortcut skips every network call when this agrees with the recorded
     /// revision, so it has to name the commit that is actually checked out — and say nothing at
@@ -839,5 +851,26 @@ mod sync_tests {
 
         assert_eq!(local_head(&root.join("never-cloned")), None, "no clone, no answer");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A failed git step is a problem — its summary line and git's own last word both — so the
+    /// end of the compile repeats it; a step that worked adds nothing to the log.
+    #[test]
+    fn a_failed_git_step_is_logged_as_a_problem_and_a_clean_one_says_nothing() {
+        let mut log = Vec::new();
+        assert!(git(std::process::Command::new("git").arg("--version"), "stainless/x", &mut log));
+        assert!(log.is_empty(), "a clean step is silent");
+
+        assert!(!git(std::process::Command::new("git").args(["-C", "/no/such/clone", "status"]), "stainless/x", &mut log));
+        let problems: Vec<&str> = log
+            .iter()
+            .map(|line| match line {
+                Line::Problem(problem) => problem.as_str(),
+                Line::Note(note) => panic!("a failure logged as a note: {note}"),
+            })
+            .collect();
+        assert_eq!(problems[0], "stainless/x: git failed; the alias may be stale or point at a missing path");
+        assert!(problems[1].starts_with("stainless/x:   ") && problems[1].contains("/no/such/clone"), "{problems:?}");
+        assert_eq!(problems.len(), 2);
     }
 }

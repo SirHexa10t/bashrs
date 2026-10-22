@@ -23,9 +23,10 @@ use std::sync::Mutex;
 use grep::matcher::Matcher;
 use grep::regex::RegexMatcher;
 use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
-use ignore::{DirEntry, WalkBuilder, WalkState};
+use ignore::{DirEntry, WalkState};
 use termcolor::{Buffer, BufferWriter, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
+use crate::support::args::walk;
 use crate::support::doc_style::_header;
 use crate::support::shell;
 use crate::support::streamgrep;
@@ -342,7 +343,7 @@ impl<'a> GgSink<'a> {
             buffer,
             path: path.to_string_lossy().into_owned().into_bytes(),
             path_color: spec(Color::Magenta, None),
-            line_color: spec(Color::Yellow, None),
+            line_color: spec(named(streamgrep::LINE_NUMBER_FG), None),
             match_color: match_spec(),
         }
     }
@@ -400,10 +401,15 @@ fn spec(fg: Color, bg: Option<Color>) -> ColorSpec {
     spec
 }
 
-/// The black-on-red match style, shared by the filename listing and the content sink (and mirrored
-/// by `g`'s printer colours in [`streamgrep`]).
+/// The black-on-red match style, shared by the filename listing and the content sink — the colours
+/// `g`'s printer paints a match in too ([`streamgrep::MATCH_FG`]).
 fn match_spec() -> ColorSpec {
-    spec(Color::Black, Some(Color::Red))
+    spec(named(streamgrep::MATCH_FG), Some(named(streamgrep::MATCH_BG)))
+}
+
+/// A colour by its name, as [`streamgrep`]'s shared colours are given.
+fn named(colour: &str) -> Color {
+    colour.parse().expect("the shared hit colours are named as termcolor names colours")
 }
 
 /// Every match span of `matcher` in `bytes`, as `(start, end)` byte offsets — the shared span
@@ -631,26 +637,6 @@ fn flush(buffer: &Buffer, ctx: &Ctx) {
     }
 }
 
-/// A walker configured to search *everything* — hidden and ignored files included (matching the
-/// old `find`/`grep -r`), unlike ripgrep's gitignore-aware default.
-fn walk(roots: &[PathBuf], skips: &[String]) -> WalkBuilder {
-    let mut builder = WalkBuilder::new(&roots[0]);
-    for root in &roots[1..] {
-        builder.add(root);
-    }
-    builder.standard_filters(false);
-    if !skips.is_empty() {
-        // Pruned here rather than filtered per-result: `filter_entry` stops the walk descending
-        // at all, so a skipped `target/` is never even enumerated. The walk root itself is
-        // exempt — naming a directory is the decision to search it.
-        let skips = skips.to_vec();
-        builder.filter_entry(move |entry| {
-            entry.depth() == 0 || !crate::support::args::is_skipped(entry.path(), &skips)
-        });
-    }
-    builder
-}
-
 /// Record a walk error's path if it was a permission denial (a directory we couldn't descend).
 fn record_walk_denied(err: &ignore::Error, denied: &Mutex<BTreeSet<PathBuf>>) {
     let is_permission = err.io_error().is_some_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
@@ -694,6 +680,23 @@ mod tests {
             let sink = GgSink::new(&matcher, buf, Path::new("f"));
             searcher.search_slice(&matcher, text, sink).unwrap();
         })
+    }
+
+    /// A numbered `gg` hit is painted as a numbered `g` hit — the same colours for the line number
+    /// and the match ([`streamgrep::MATCH_FG`] and its siblings), down to the escapes: `gg`'s line
+    /// is `g`'s, behind its path.
+    #[test]
+    fn a_numbered_gg_hit_is_painted_as_a_numbered_g_hit() {
+        let (text, terms) = (b"above\na match here\n", ["match".to_string()]);
+        let mut g = Buffer::ansi();
+        streamgrep::filter_into(&terms, text, &streamgrep::Options { line_number: true, ..Default::default() }, &mut g);
+        let matcher = streamgrep::build_matcher(&terms, false).unwrap();
+        let mut gg = Buffer::ansi();
+        build_searcher(true, 0).search_slice(&matcher, text, GgSink::new(&matcher, &mut gg, Path::new("f"))).unwrap();
+        let (g, gg) = (String::from_utf8_lossy(g.as_slice()), String::from_utf8_lossy(gg.as_slice()));
+        let behind_path = &gg[gg.find(':').expect("gg's path ends at its first `:`") + 1..];
+        assert_eq!(behind_path, g, "gg: {gg:?}");
+        assert!(g.contains('\x1b'), "both painted: {g:?}");
     }
 
     #[test]

@@ -98,6 +98,18 @@ fn gg_finds_names_contents_hidden_and_nested_but_skips_binaries() {
     assert!(text.contains("matching filenames:") && text.contains("matching file contents:"), "{text}");
 }
 
+/// `--skip-pattern` prunes what it names below the searched directory — and naming that very
+/// directory searches it: the skips are matched below the root, not against the root's own name.
+#[test]
+fn gg_skips_below_the_named_directory_but_searches_it_when_named() {
+    let tree = Tree::build("skips");
+    let from_above = stdout(&bashrs(&["gg", "match", "--skip-pattern", "sub", "-d", tree.path()], None, None));
+    assert!(!from_above.contains("nested.log") && from_above.contains("data.txt"), "only the skipped directory is left out: {from_above}");
+    let named = tree.root.join("sub");
+    let out = bashrs(&["gg", "match", "--skip-pattern", "sub", "-d", named.to_str().unwrap()], None, None);
+    assert!(stdout(&out).contains("nested.log:1:nested match"), "naming it searches it: {}", stdout(&out));
+}
+
 #[test]
 fn gg_ors_multiple_expressions_together() {
     let tree = Tree::build("or");

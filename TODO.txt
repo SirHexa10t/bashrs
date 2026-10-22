@@ -223,7 +223,3 @@ Make sure that things work with Wayland too
     autokey surely broke
 
 Add user-actions/ alongside user-data/ in .bashrs ; move-in the autokey scripts, and add the mounting scripts
-
-Make project autogenerate a .fish file too (pointers for the autogeneration are in the chat with the other AI) and source it in the ~/.config/<something>.fish file
-
-lll / LLL requires the table flag that doesn't force very long lines on all entries if 1st and 2nd place have a huge difference in size

@@ -33,8 +33,12 @@ struct Tool {
     /// `None` for the tools that need nothing beyond their binary. Fired only on a fetch (see
     /// [`fetch::sync`]), so it does not repeat on later compiles: git-lfs registers Git's global
     /// LFS filters here, the step its binary alone doesn't do.
-    post_install: Option<fn(&std::path::Path)>,
+    post_install: Option<PostInstall>,
 }
+
+/// A [`Tool`]'s one-time step after a fresh fetch, given the bundle's directory — or, as `Err`,
+/// the problem to report.
+type PostInstall = fn(&std::path::Path) -> Result<(), String>;
 
 /// The configuration groups of [`Tool`]s.
 ///
@@ -52,19 +56,22 @@ enum Group {
     Extra,
 }
 
+/// A release lookup: the download URL of the asset to bundle — or, as `Err`, why there is none
+/// (offline, no such release, nothing for this machine, GitHub's hourly limit spent).
+type Resolve = fn(Option<&str>) -> Result<String, fetch::LookupError>;
+
 /// How a tool's bundle comes to exist (and updates). The URL functions take an optional
 /// version pin (a Carstay.toml value, in `--use-stable-carstay` mode) — `None` means the latest release.
 enum Acquire {
     /// Download a static archive (URL discovered per release, root folder stripped on unpack);
-    /// re-fetched when the published URL changes, tracked by a `.source_url` marker. Tools whose
-    /// download URL alone can't name an exact build (ffmpeg's rolling `latest` tag) also carry a
-    /// `dated_tag` resolver — its result is stored beside the bundle and lands in Carstay.toml,
-    /// so `--use-stable-carstay` can restore the exact build, not just the channel.
-    Archive { url: fn(Option<&str>) -> Option<String>, dated_tag: Option<fn() -> Option<String>> },
+    /// re-fetched when the published URL changes, tracked by a `.source_url` marker. Every URL
+    /// names its exact build — ffmpeg's included, which comes from a dated month-end release —
+    /// so the marker alone tells Carstay.toml which build to record.
+    Archive(Resolve),
     /// A single released binary — same URL-discovery and `.source_url` freshness contract as
     /// [`Acquire::Archive`], but the download *is* the program (written to the tool's first
     /// `bins` path, made executable).
-    Binary(fn(Option<&str>) -> Option<String>),
+    Binary(Resolve),
     /// A `uv venv` at the tool's dir — a stable `bin/python3` over an interpreter uv installs
     /// into [`interpreters_dir`]; kept current via `uv python upgrade`.
     UvVenv { python: &'static str },
@@ -75,8 +82,9 @@ const TOOLS: &[Tool] = &[
     Tool {
         dir: "ffmpeg",
         bins: &[("ffmpeg", "bin/ffmpeg"), ("ffprobe", "bin/ffprobe")],
-        // BtbN's rolling `latest` URL can't name an exact build — the dated autobuild tag can.
-        acquire: Acquire::Archive { url: fetch::ffmpeg_url, dated_tag: Some(fetch::ffmpeg_dated_tag) },
+        // From BtbN's newest month-end release, whose URL names the exact build — and which BtbN
+        // keeps for years, where its dailies go after about two weeks.
+        acquire: Acquire::Archive(fetch::ffmpeg_url),
         group: Group::Utility,
         post_install: None,
     },
@@ -92,7 +100,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         dir: "uv",
         bins: &[("uv", "uv"), ("uvx", "uvx")],
-        acquire: Acquire::Archive { url: fetch::uv_url, dated_tag: None },
+        acquire: Acquire::Archive(fetch::uv_url),
         group: Group::Language,
         post_install: None,
     },
@@ -109,7 +117,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         dir: "deno",
         bins: &[("deno", "deno")],
-        acquire: Acquire::Archive { url: fetch::deno_url, dated_tag: None },
+        acquire: Acquire::Archive(fetch::deno_url),
         group: Group::Utility,
         post_install: None,
     },
@@ -123,7 +131,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         dir: "git-lfs",
         bins: &[("git-lfs", "git-lfs")],
-        acquire: Acquire::Archive { url: fetch::gitlfs_url, dated_tag: None },
+        acquire: Acquire::Archive(fetch::gitlfs_url),
         group: Group::Extra,
         post_install: Some(fetch::activate_git_lfs),
     },

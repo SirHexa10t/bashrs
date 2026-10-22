@@ -10,6 +10,7 @@ mod commands {
     use clap::Args;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
+    use crate::categories::media::OverwriteArgs;
 
     // --- media_remove_vocals ----------------------------------------------------
 
@@ -50,9 +51,8 @@ mod commands {
         /// Print the vocal-frequency reference for choosing --from/--to, then exit
         #[arg(long)]
         pub range_help: bool,
-        /// Overwrite output file if it exists
-        #[arg(short = 'y', long)]
-        pub overwrite: bool,
+        #[command(flatten)]
+        pub overwrite: OverwriteArgs,
     }
 
     /// The vocal-removal graph for a cancellation band of `from`..`to` Hz. Vocals sit dead-center
@@ -116,12 +116,7 @@ mod commands {
         if &output == input {
             return Err("the output is the input itself — pick another name".to_string());
         }
-        if !args.overwrite && output.exists() {
-            return Err(format!(
-                "'{}' already exists — pass -y/--overwrite to replace it",
-                output.display()
-            ));
-        }
+        super::_refuse_existing(&output, args.overwrite.yes)?;
         match _audio_channels(input)? {
             2 => {}
             1 => {
@@ -206,7 +201,7 @@ mod commands {
                 from: 120,
                 to: None,
                 range_help: false,
-                overwrite: false,
+                overwrite: OverwriteArgs { yes: false },
             }
         }
 
@@ -330,7 +325,7 @@ mod commands {
                 from,
                 to,
                 range_help: false,
-                overwrite: true,
+                overwrite: OverwriteArgs { yes: true },
             };
             _remove_vocals(&args).expect("de-vocal run works")
         }
@@ -400,7 +395,7 @@ mod commands {
                     from,
                     to,
                     range_help: false,
-                    overwrite: true,
+                    overwrite: OverwriteArgs { yes: true },
                 };
                 _remove_vocals(&args).expect("de-vocal run works")
             };
@@ -472,7 +467,7 @@ mod commands {
                 from: 120,
                 to: None,
                 range_help: false,
-                overwrite: true,
+                overwrite: OverwriteArgs { yes: true },
             };
             assert!(
                 _remove_vocals(&args).unwrap_err().contains("stereo"),

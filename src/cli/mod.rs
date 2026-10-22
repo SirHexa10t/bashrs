@@ -115,6 +115,10 @@ pub enum Command {
         /// Provision the versions recorded in Carstay.toml instead of the latest releases
         #[arg(long)]
         use_stable_carstay: bool,
+        /// Write the closing summary of what could not be provisioned here, instead of printing
+        /// it — COMPILE.sh prints the file after install-shell, as the compile's last word
+        #[arg(long, value_name = "FILE")]
+        problems_file: Option<std::path::PathBuf>,
     },
     /// Print what the `cd` override lists where it lands — `ls -AF`'s listing, its names spelled
     /// for the shell it runs in (the generated `cd` calls it).
@@ -162,8 +166,8 @@ impl Command {
                 let (fish, fish_completed) = sourcefile::generated(Shell::Fish);
                 crate::conf::install::install_shell(&sourcefile::wrappers(Shell::Bash), &fish, &fish_completed)
             }
-            Command::InstallStainless { use_stable_carstay } => {
-                crate::drivers::install_stainless(use_stable_carstay)
+            Command::InstallStainless { use_stable_carstay, problems_file } => {
+                crate::drivers::install_stainless(use_stable_carstay, problems_file.as_deref())
             }
             Command::CdListing => std::process::exit(crate::categories::filesystem::_landing_listing()),
             Command::CompleteFlags { command } => println!("{}", sourcefile::complete_flags(&command, Shell::caller())),

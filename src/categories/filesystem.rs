@@ -8,10 +8,12 @@
 
 #[bashrs_macros::category(command = FilesystemCommand, prefix = "fs_")]
 mod commands {
+    use std::borrow::Cow;
     use std::collections::{HashMap, HashSet};
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
 
+    use crate::support::comfy_repos;
     use crate::support::doc_style::{self, _header};
     use crate::support::exec;
     use crate::support::shell_dialect::Shell;
@@ -201,7 +203,7 @@ mod commands {
                 |s| [_human_size(s.bytes), s.files.to_string(), s.inodes.to_string()],
             );
             let kept: Vec<&str> =
-                entry.meta.iter().enumerate().filter(|(i, _)| *i != SIZE_COL).map(|(_, f)| *f).collect();
+                entry.meta.iter().enumerate().filter(|(i, _)| *i != SIZE_COL).map(|(_, f)| f.as_ref()).collect();
             let row = format!(
                 "{}\t{}\t{}",
                 figures.join("\t"),
@@ -214,13 +216,7 @@ mod commands {
         let lines: Vec<String> = std::iter::once(_header(&_lll_header().join("\t")))
             .chain(rows.into_iter().map(|(_, _, row)| row))
             .collect();
-        let gap = " ".repeat(TABLE_SEPARATOR);
-        let opts = table_formatter::FormatOptions {
-            divide_by: gap.clone(),
-            join_with: gap,
-            ..Default::default()
-        };
-        table_formatter::format_table(&lines, &opts).unwrap_or(lines)
+        _listing_table(lines)
     }
 
     /// The `ls` flags that define an `lll` listing: long, all, mtime-sorted (reversed), block +
@@ -242,9 +238,6 @@ mod commands {
     /// Column labels, matched to `LS_FLAGS` (the 7 metadata columns, then the name).
     const HEADER: &[&str] =
         &["Blocks", "Permissions", "Hard-Links", "Owner", "Group", "Size", "Date_Modified", "Filename"];
-    /// Column spacing for these listings — a run of this many spaces both divides the input
-    /// columns and separates the output ones (matches `table_formatter`'s default).
-    const TABLE_SEPARATOR: usize = 2;
 
     // ——— Formatting (pure) ————————————————————————————————————————————————
 
@@ -260,17 +253,14 @@ mod commands {
                 _records(ls_output).map(|record| _row(record, targets, shell)),
             )
             .collect();
+        _listing_table(rows)
+    }
+
+    /// `lll`'s rows aligned into its table — and `LLL`'s, which are `lll`'s with their usage
+    /// figures in front: the one layout both listings share.
+    fn _listing_table(rows: Vec<String>) -> Vec<String> {
         // The fallback is unreachable: only `sort` can error, and it's off.
-        // divide_by / join_with are delimiter strings now, not counts: a run of TABLE_SEPARATOR
-        // spaces both splits the input (`\s{2,}|\t+` — our rows are tab-delimited) and spaces the
-        // output. Fallback stays unreachable: sort is off and the delimiter is valid.
-        let gap = " ".repeat(TABLE_SEPARATOR);
-        let opts = table_formatter::FormatOptions {
-            divide_by: gap.clone(),
-            join_with: gap,
-            ..Default::default()
-        };
-        table_formatter::format_table(&rows, &opts).unwrap_or(rows)
+        table_formatter::format_table(&rows, &comfy_repos::listing_table_options()).unwrap_or(rows)
     }
 
     /// One listing row: the [`META_COLS`] leading metadata fields tab-delimited, then the name as
@@ -294,14 +284,30 @@ mod commands {
     /// A record's [`META_COLS`] metadata fields and the exact name remainder. Split only on
     /// spaces, and only for the metadata: `ls` pads those columns with spaces, so a tab belonging
     /// to the name is never taken for a delimiter, and the name is handed back whole.
-    fn _split_record(record: &str) -> (Vec<&str>, &str) {
+    ///
+    /// A device's size is two words, its numbers — `major, minor`, the minor right-aligned to the
+    /// listing's widest — which are one field here, spelled with one space: no cell of these tables
+    /// may hold a run of spaces, which divides their columns. Taken for one word, the minor stood
+    /// in the date's place, and the date at the head of the name. Decided by the mode, and by the
+    /// comma `ls` writes after the major, so a device given any other size never swallows its date.
+    fn _split_record(record: &str) -> (Vec<Cow<'_, str>>, &str) {
         let mut rest = record;
-        let mut meta: Vec<&str> = Vec::with_capacity(META_COLS);
+        let mut meta: Vec<Cow<'_, str>> = Vec::with_capacity(META_COLS);
         for _ in 0..META_COLS {
             rest = rest.trim_start_matches(' ');
             let Some(end) = rest.find(' ') else { break };
-            meta.push(&rest[..end]);
+            let field = &rest[..end];
             rest = &rest[end..];
+            let device = meta.get(1).is_some_and(|mode| mode.starts_with(['b', 'c']));
+            if meta.len() == SIZE_COL && device && field.ends_with(',') {
+                let after = rest.trim_start_matches(' ');
+                if let Some(end) = after.find(' ') {
+                    meta.push(Cow::Owned(format!("{field} {}", &after[..end])));
+                    rest = &after[end..];
+                    continue;
+                }
+            }
+            meta.push(Cow::Borrowed(field));
         }
         (meta, rest.trim_start_matches(' '))
     }
@@ -310,7 +316,7 @@ mod commands {
     /// metadata fields, and the name exactly as `ls` printed it — colour codes and all — with the
     /// type marker `-F` put after it split off; for a symlink, its target likewise.
     struct _Entry<'a> {
-        meta: Vec<&'a str>,
+        meta: Vec<Cow<'a, str>>,
         /// The name, without its marker.
         name: &'a str,
         /// What `-F` put after the name: one of [`TYPE_MARKERS`], or nothing.
@@ -338,7 +344,7 @@ mod commands {
             if meta.is_empty() || rest.is_empty() {
                 return None;
             }
-            let mode = meta.get(1).copied().unwrap_or_default();
+            let mode = meta.get(1).map_or("", |mode| mode.as_ref());
             let (named, target) = match rest.split_once(" -> ").filter(|_| mode.starts_with('l')) {
                 Some((link, target)) => (link, Some(_after_colour(target))),
                 None => (rest, None),
@@ -351,8 +357,8 @@ mod commands {
         }
 
         /// The mode column, `drwxr-xr-x` and the like.
-        fn mode(&self) -> &'a str {
-            self.meta.get(1).copied().unwrap_or_default()
+        fn mode(&self) -> &str {
+            self.meta.get(1).map_or("", |mode| mode.as_ref())
         }
 
         /// The name as it is on disk: colour gone, marker off — `LLL`'s join key, which `--zero`
@@ -691,8 +697,7 @@ mod commands {
         }
         // Default delimiters (2-space split/join) — the old separator:2/threshold:2. Fallback
         // unreachable: sort is off and the defaults are valid.
-        let opts = table_formatter::FormatOptions { trim_trailing: true, ..Default::default() };
-        for line in table_formatter::format_table(&lines, &opts).unwrap_or(lines) {
+        for line in table_formatter::format_table(&lines, &comfy_repos::listing_table_options()).unwrap_or(lines) {
             println!("{line}");
         }
     }
@@ -859,6 +864,12 @@ mod commands {
             format!("4 {mode} 1 user group 1.2K 2024-01-01_12:00:00 {name}")
         }
 
+        /// A device's record, as `ls` writes one: its size the two numbers, `numbers` — `major,
+        /// minor`, with whatever spaces `ls` aligns the minor by.
+        fn device(mode: &str, numbers: &str, name: &str) -> String {
+            format!("0 {mode} 1 root disk {numbers} 2024-01-01_12:00:00 {name}")
+        }
+
         fn one_target(name: &str, target: &str) -> HashMap<String, String> {
             HashMap::from([(name.to_string(), target.to_string())])
         }
@@ -990,6 +1001,13 @@ mod commands {
             let plain = |cells: Vec<String>| -> Vec<String> { cells.iter().map(|cell| console::strip_ansi_codes(cell).into_owned()).collect() };
             assert_eq!(plain(_landing_cells(&listing, Shell::Bash)), ["docs/", "latest@", "run*", r"$'it\'s.txt'", "'x *'"]);
             assert_eq!(plain(_landing_cells(&listing, Shell::Fish)), ["docs/", "latest@", "run*", r"'it\'s.txt'", "'x *'"]);
+        }
+
+        /// A device lists by its name — its date left with the rest of its metadata.
+        #[test]
+        fn a_device_lands_in_the_listing_by_its_name() {
+            let listing = format!("{}\0", device("crw-rw-rw-", "1,   3", "null"));
+            assert_eq!(_landing_cells(&listing, Shell::Bash), ["null"]);
         }
 
         /// The columns are GNU's — checked against `ls -C` itself, for the same names in the same
@@ -1152,6 +1170,53 @@ mod commands {
             assert!(out[2].contains("a link -> real target.txt"), "an actual link: {}", out[2]);
         }
 
+        /// A device's size is its two numbers, `major, minor` — with `ls`'s own alignment between
+        /// them — read as one field, spelled with one space: taken for one word, the minor stood
+        /// in the date's place, and the date at the head of the name. A device given a one-word
+        /// size keeps its date too.
+        #[test]
+        fn a_device_s_two_numbers_are_its_one_size() {
+            for (record, size) in [
+                (device("crw-rw-rw-", "1, 3", "null"), "1, 3"),
+                (device("brw-rw----", "259,   0", "nvme0n1"), "259, 0"),
+                (device("crw-------", "0", "odd"), "0"),
+            ] {
+                let entry = _Entry::parse(&record).expect("a listing row");
+                assert_eq!(entry.meta[SIZE_COL], size, "{record}");
+                assert_eq!(entry.meta[SIZE_COL + 1], "2024-01-01_12:00:00", "{record}");
+                assert_eq!(entry.key(), record.rsplit(' ').next().unwrap(), "{record}");
+            }
+        }
+
+        /// …and so `lll` shows it: the numbers in the size column, the date in its own, the name
+        /// in the last — read back from the table, column by column.
+        #[test]
+        fn a_device_row_keeps_its_date_and_name_in_their_columns() {
+            let listing =
+                format!("total 0\0{}\0{}\0", device("crw-rw-rw-", "1,   3", "null"), device("crw-rw-rw-", "1, 128", "wide"));
+            let out = _format_listing(&listing, &HashMap::new(), Shell::Bash);
+            for (row, size, name) in [(&out[1], "1, 3", "null"), (&out[2], "1, 128", "wide")] {
+                let cells: Vec<&str> = row.split("  ").map(str::trim).filter(|cell| !cell.is_empty()).collect();
+                assert_eq!(cells[SIZE_COL..], [size, "2024-01-01_12:00:00", name], "{row}");
+            }
+        }
+
+        /// One very wide cell sets no width for the other rows, as in the sourcefile's alignment:
+        /// a long name — the last column — pads no row, and an owner far wider than the rest of its
+        /// column takes its own row out of the alignment. Every other row reads exactly as it would
+        /// without it, and none ends in padding.
+        #[test]
+        fn a_very_wide_cell_sets_no_width_for_the_other_rows() {
+            let plain = format!("total 0\0{}\0{}\0", row("a.txt"), row("b.txt"));
+            let base = _format_listing(&plain, &HashMap::new(), Shell::Bash);
+            let wide_owner = format!("4 -rw-r--r-- 1 {} group 1.2K 2024-01-01_12:00:00 c.txt", "o".repeat(80));
+            for outlier in [row(&"n".repeat(200)), wide_owner] {
+                let out = _format_listing(&format!("{plain}{outlier}\0"), &HashMap::new(), Shell::Bash);
+                assert_eq!(out[..base.len()], base[..], "the other rows, beside {outlier:.24}…");
+                assert!(out.iter().all(|row| !row.ends_with(' ')), "no row padded on the right: {out:#?}");
+            }
+        }
+
         // ——— LLL: the joined listing ——————————————————————————————————————
 
         fn stats(bytes: u64, files: u64, inodes: u64) -> Stats {
@@ -1211,6 +1276,30 @@ mod commands {
             assert_eq!(names, ["full.bin", "empty.txt", ".", ".."], "{out:#?}");
             assert!(out[3].trim_start().starts_with('-'), "an unmeasured entry reports no figures: {}", out[3]);
             assert!(out[2].trim_start().starts_with("0B"), "an empty file reports a real zero: {}", out[2]);
+        }
+
+        /// As in `lll`'s table, one very wide cell sets no width for the other rows: a long name
+        /// pads none, and an owner far wider than the rest takes its own row out of the alignment.
+        /// (Each outlier measures smallest, so it sorts after the rows it is compared against.)
+        #[test]
+        fn lll_too_lets_no_very_wide_cell_set_the_others_width() {
+            let measured = [("a.bin", stats(4096, 1, 1)), ("b.bin", stats(2048, 1, 1))];
+            let base = joined(&[row("a.bin"), row("b.bin")], &measured);
+            let long = "n".repeat(200);
+            let wide_owner = format!("4 -rw-r--r-- 1 {} group 1.2K 2024-01-01_12:00:00 c.bin", "o".repeat(80));
+            for (outlier, name) in [(row(&long), long.as_str()), (wide_owner, "c.bin")] {
+                let out = joined(&[row("a.bin"), row("b.bin"), outlier], &[measured[0], measured[1], (name, stats(1, 1, 1))]);
+                assert_eq!(out[..base.len()], base[..], "the other rows, beside {name:.24}…");
+                assert!(out.iter().all(|row| !row.ends_with(' ')), "no row padded on the right: {out:#?}");
+            }
+        }
+
+        /// `LLL` joins a device on its name, and its numbers go with `lll`'s size column.
+        #[test]
+        fn lll_joins_a_device_on_its_name() {
+            let out = joined(&[device("crw-rw-rw-", "1,   3", "null")], &[("null", stats(0, 1, 1))]);
+            assert!(out[1].ends_with("  null") && out[1].contains("2024-01-01_12:00:00"), "{}", out[1]);
+            assert!(!out[1].contains("1, 3"), "the numbers went with lll's size column: {}", out[1]);
         }
 
         #[test]

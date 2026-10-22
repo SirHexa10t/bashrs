@@ -39,7 +39,7 @@ pub(crate) fn filter(patterns: &[String], text: &[u8], opts: &Options) {
 
 /// The body of [`filter`], parameterised over the output sink so tests can capture it into an
 /// in-memory buffer (production passes [`stdout`]).
-fn filter_into<W: WriteColor>(patterns: &[String], text: &[u8], opts: &Options, wtr: W) {
+pub(crate) fn filter_into<W: WriteColor>(patterns: &[String], text: &[u8], opts: &Options, wtr: W) {
     let matcher = match build_matcher(patterns, opts.regex) {
         Ok(matcher) => matcher,
         Err(err) => return eprintln!("g: could not build matcher: {err}"),
@@ -85,15 +85,26 @@ fn stdout() -> StandardStream {
 /// dark terminal). termcolor has no reverse style, and its default foreground is the terminal's
 /// text colour (not black), so we set both background and foreground explicitly.
 ///
-/// Line numbers are yellow, the colour [`crate::support::treegrep`] already gives them, so a
-/// numbered `g` hit and a numbered `gg` hit read identically.
+/// Line numbers are yellow. The colours are [`MATCH_FG`], [`MATCH_BG`] and [`LINE_NUMBER_FG`],
+/// which [`crate::support::treegrep`] paints `gg`'s hits in too, so a numbered `g` hit and a
+/// numbered `gg` hit read identically.
 fn color_specs() -> ColorSpecs {
-    let specs: Vec<UserColorSpec> = ["match:bg:red", "match:fg:black", "line:fg:yellow"]
-        .iter()
-        .map(|spec| spec.parse().expect("built-in colour spec is valid"))
-        .collect();
+    let specs: Vec<UserColorSpec> =
+        [format!("match:bg:{MATCH_BG}"), format!("match:fg:{MATCH_FG}"), format!("line:fg:{LINE_NUMBER_FG}")]
+            .iter()
+            .map(|spec| spec.parse().expect("built-in colour spec is valid"))
+            .collect();
     ColorSpecs::new(&specs)
 }
+
+/// The colours a hit is painted in — by `g`/`hg`'s printer here ([`color_specs`]) and by `gg`'s own
+/// sink alike: the match black on red, its line number yellow. Named as both `grep`'s colour specs
+/// and `termcolor` read a colour.
+pub(crate) const MATCH_FG: &str = "black";
+/// See [`MATCH_FG`].
+pub(crate) const MATCH_BG: &str = "red";
+/// See [`MATCH_FG`].
+pub(crate) const LINE_NUMBER_FG: &str = "yellow";
 
 /// Compile `expressions` into one case-insensitive alternation — literal (escaped) by default, or
 /// each treated as a regular expression when `regex` is set (`-E`), isolated as `(?:…)` so the

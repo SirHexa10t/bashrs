@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::support::exec;
+use crate::support::problems::Problems;
 
 /// The bundled interpreter, when present (`None`: not bundled on this machine).
 pub(crate) fn interpreter() -> Option<PathBuf> {
@@ -117,12 +118,12 @@ fn missing_env() -> bool {
 /// (403s/429s without it), `mutagen` powers thumbnail/tag embedding into audio formats
 /// (ffmpeg covers the video containers), and `pycryptodomex` decrypts the AES-protected
 /// streams some sites serve (vidl now expects it). A no-op for whatever is already importable,
-/// or when yt-dlp isn't even bundled.
+/// or when yt-dlp isn't even bundled; an install that fails goes to `problems`.
 ///
 /// Pairs are `(import name, package name)` because they differ: `pycryptodomex` installs under
 /// that name but is imported as `Cryptodome` — probing the package name would report it missing
 /// on every run and reinstall it forever.
-pub fn ensure_ytdlp_deps() {
+pub fn ensure_ytdlp_deps(problems: &mut Problems) {
     if crate::tools::resolve("yt-dlp") == "yt-dlp" {
         return;
     }
@@ -139,7 +140,12 @@ pub fn ensure_ytdlp_deps() {
         .collect();
     if !missing.is_empty() {
         eprintln!("tools: installing yt-dlp's python helpers: {}", missing.join(", "));
-        let _ = install(&missing);
+        if !install(&missing) {
+            problems.report(format!(
+                "tools: could not install yt-dlp's python helpers ({}) — the output above says why",
+                missing.join(", ")
+            ));
+        }
     }
 }
 

@@ -3,9 +3,10 @@
 //!
 //! One product per module, each its own `#[category]` block and clap enum, all flattened under the
 //! single `media` group by [`crate::cli`]: [`transcode`] (convert + trim), [`metadata`] (report),
-//! [`audio_fx`] (vocal removal), [`images`] (canvas merges). They share nothing but the two
-//! file-writing helpers below — so a new product is a new module here, and a new command joins the
-//! module it belongs to without touching the others.
+//! [`audio_fx`] (vocal removal), [`images`] (canvas merges). They share nothing but the
+//! file-writing helpers below, and the [`OverwriteArgs`] flag every file-writing command takes —
+//! so a new product is a new module here, and a new command joins the module it belongs to
+//! without touching the others.
 
 pub mod audio_fx;
 pub mod images;
@@ -15,6 +16,15 @@ pub mod transcode;
 use crate::tools;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+
+/// The flag every media command writing a file takes, flattened into its arguments as `overwrite`
+/// — so a command reads it as `overwrite.yes`.
+#[derive(clap::Args)]
+pub struct OverwriteArgs {
+    /// Overwrite output file if it exists
+    #[arg(short = 'y', long = "overwrite")]
+    pub yes: bool,
+}
 
 /// Run the bundled ffmpeg and pass its exit code back.
 ///
@@ -50,9 +60,15 @@ fn _run_ffmpeg(argv: Vec<OsString>) -> i32 {
 /// The tail every ffmpeg-writing command shares: refuse writing onto the input itself, run,
 /// and pass ffmpeg's exit code through — it keeps ignorable warnings out of its status (a
 /// warned-but-clean run exits 0), so its code is the honest signal for chaining scripts.
-fn _run_writing(command: &str, input: &Path, output: &Path, argv: Vec<OsString>) {
+/// Without `-y` it refuses an existing output too, before ffmpeg runs: the one failure
+/// ffmpeg's code hides ([`_refuse_existing`]).
+fn _run_writing(command: &str, input: &Path, output: &Path, overwrite: bool, argv: Vec<OsString>) {
     if output == input {
         eprintln!("{command}: the output is the input itself ({})", input.display());
+        std::process::exit(1);
+    }
+    if let Err(why) = _refuse_existing(output, overwrite) {
+        eprintln!("{command}: {why}");
         std::process::exit(1);
     }
     let code = _run_ffmpeg(argv);
@@ -60,6 +76,17 @@ fn _run_writing(command: &str, input: &Path, output: &Path, argv: Vec<OsString>)
         std::process::exit(code);
     }
     _report_saved(output.to_owned());
+}
+
+/// Refuse to write onto an existing `output` unless `-y` was given — checked here, because
+/// ffmpeg's own refusal can't stand in for it: ffmpeg says "already exists. Exiting." and exits
+/// 0 (n9.0, and with `-n` too), which a caller can only read as success, reporting a file it
+/// never wrote as saved.
+fn _refuse_existing(output: &Path, overwrite: bool) -> Result<(), String> {
+    if !overwrite && output.exists() {
+        return Err(format!("'{}' already exists — pass -y/--overwrite to replace it", output.display()));
+    }
+    Ok(())
 }
 
 /// Report a just-written output file by its canonical path.
@@ -72,4 +99,43 @@ fn _report_saved(path: PathBuf) {
 #[cfg(test)]
 pub(crate) fn strs(argv: &[OsString]) -> Vec<String> {
     argv.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `-y` and `--overwrite` are one flag, off unless given — the spelling every file-writing
+    /// media command answers to, since each flattens this one.
+    #[test]
+    fn overwrite_is_off_unless_asked_for_in_either_spelling() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            overwrite: OverwriteArgs,
+        }
+        use clap::Parser;
+        let yes = |argv: &[&str]| {
+            Cli::try_parse_from(std::iter::once("media").chain(argv.iter().copied())).expect("parses").overwrite.yes
+        };
+        assert!(!yes(&[]), "off unless given");
+        assert!(yes(&["-y"]) && yes(&["--overwrite"]));
+    }
+
+    /// Without `-y` an existing output is refused, naming the file and the way out; with `-y`,
+    /// or with nothing there yet, the write goes ahead.
+    #[test]
+    fn an_existing_output_is_refused_unless_overwrite_is_given() {
+        let dir = std::env::temp_dir().join(format!("bashrs_refuse_existing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let taken = dir.join("taken.mp4");
+        std::fs::write(&taken, b"x").unwrap();
+
+        let refusal = _refuse_existing(&taken, false).unwrap_err();
+        assert!(refusal.contains(&taken.display().to_string()) && refusal.contains("-y/--overwrite"), "{refusal}");
+        assert_eq!(_refuse_existing(&taken, true), Ok(()));
+        assert_eq!(_refuse_existing(&dir.join("free.mp4"), false), Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

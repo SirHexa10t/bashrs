@@ -158,14 +158,21 @@ fi
 # under ~/.bashrs/stainless_comfy so install-shell can alias them and read their --help live,
 # keeps the self-contained tools (ffmpeg, python, …) under ~/.bashrs/tools on their latest
 # published builds, and records the provisioned versions in Carstay.toml. Best-effort: a failure
-# (offline, …) must not abort the compile.
+# (offline, …) must not abort the compile — but each one is collected into $PROBLEMS as well, and
+# printed again as the compile's last output (step 4), where it is read instead of scrolled past.
 #
 # With --use-stable-carstay, the versions RECORDED in Carstay.toml are provisioned instead of
 # the latest releases — the recover-a-broken-upstream path, --use-stable-cargo's twin.
-"$BIN" install-stainless ${SYNC_ARGS[@]+"${SYNC_ARGS[@]}"} || echo "WARNING: install-stainless failed; companion aliases may be stale or missing." >&2
+PROBLEMS=$(mktemp)
+trap 'rm -f -- "$PROBLEMS"' EXIT
+"$BIN" install-stainless --problems-file "$PROBLEMS" ${SYNC_ARGS[@]+"${SYNC_ARGS[@]}"} || echo "WARNING: install-stainless failed; companion aliases may be stale or missing." >&2
 
 # --- 3. Install the binary + shell integration --------------------------------
 # The binary installs ITSELF under ~/.bashrs (guarding the dir, unlink-then-copy so a running
 # old copy survives), writes the sourcefile, and wires each existing rc file to source it
 # (idempotent-by-marker) — one tested implementation, src/conf/install.rs.
 "$BIN" install-shell
+
+# --- 4. What provisioning could not do, last ----------------------------------
+# Written by install-stainless as it went — nothing at all on a clean run, so nothing is printed.
+if [ -s "$PROBLEMS" ]; then cat -- "$PROBLEMS" >&2; fi

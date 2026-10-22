@@ -3,13 +3,16 @@
 //! revisions ([`super::stainless::clone_revisions`]) — into a VCS-tracked file at the project
 //! root. It is `Cargo.lock`'s job for the dependencies Cargo can't see: commit it when things
 //! work, and when an upstream release breaks something, `git log Carstay.toml` names the
-//! last-known-good set. (Restoring TO a recorded version is future work; this is the record.)
+//! last-known-good set — which `--use-stable-carstay` restores: [`recorded`] reads the file back,
+//! and the syncs provision those versions instead of the latest releases.
 //!
 //! Lives in `drivers` because it spans two provisioning domains — `tools` (a layer below, so it
 //! can't own the composition) and the sibling [`super::stainless`] — and the `install-stainless`
 //! command that triggers it stays a thin sequence of calls.
 
 use std::path::Path;
+
+use crate::support::problems::Problems;
 
 /// The manifest's filename — one const to change if the name ever sails elsewhere.
 const FILENAME: &str = "Carstay.toml";
@@ -65,7 +68,7 @@ pub fn stability_revert_notice() {
 /// SIDE EFFECTS — `install-stainless` runs this after every sync: gather all sections and
 /// (re)write the manifest in one move. Skipped when the content is unchanged, so an untouched
 /// sync keeps the file's mtime and stays quiet in VCS.
-pub fn record() {
+pub fn record(problems: &mut Problems) {
     let content = render(&crate::tools::versions(), &super::stainless::clone_revisions());
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(FILENAME);
     if std::fs::read_to_string(&path).is_ok_and(|old| old == content) {
@@ -73,7 +76,7 @@ pub fn record() {
     }
     match std::fs::write(&path, &content) {
         Ok(()) => println!("carstay: recorded the provisioned versions in {FILENAME}"),
-        Err(err) => eprintln!("carstay: could not write {}: {err}", path.display()),
+        Err(err) => problems.report(format!("carstay: could not write {}: {err}", path.display())),
     }
 }
 
@@ -87,9 +90,9 @@ fn render(tools: &[(&str, Option<String>)], repos: &[(&str, Option<String>)]) ->
          # alongside code: when an upstream release breaks something, `git log Carstay.toml`\n\
          # names the last-known-good versions — and `./COMPILE.sh --use-stable-carstay` provisions THESE\n\
          # recorded versions instead of the latest releases (the file becomes the input then,\n\
-         # and is not rewritten). Values are release tags (ffmpeg: its release channel —\n\
-         # same-channel rebuilds share one id); repos record their clone's commit; \"system\"\n\
-         # means the machine provides the tool itself, so nothing was bundled.\n",
+         # and is not rewritten). Values are release tags (ffmpeg: its release channel @ the\n\
+         # month-end build it came from); repos record their clone's commit; \"system\" means\n\
+         # the machine provides the tool itself, so nothing was bundled.\n",
     );
     let mut section = |name: &str, rows: &[(&str, Option<String>)]| {
         out.push_str(&format!("\n[{name}]\n"));

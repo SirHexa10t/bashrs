@@ -8,14 +8,14 @@ mod commands {
     use clap::{Args, ValueEnum};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
-    use crate::categories::media::_report_saved;
+    use crate::categories::media::{_report_saved, OverwriteArgs};
     // --- media_hmerge_imgs ----------------------------------------------------
 
     /// Merge images side by side onto one canvas — as tall as the tallest input, as wide as all
     /// inputs combined; nothing is scaled, and `--align` places each image vertically
     pub fn hmerge_imgs(args: HmergeImgsArgs) {
         let HmergeImgsArgs { output, overwrite, align, inputs } = args;
-        _merge_imgs(Axis::Horizontal, align.offset_expr(), output, overwrite, inputs);
+        _merge_imgs(Axis::Horizontal, align.offset_expr(), output, overwrite.yes, inputs);
     }
 
     #[derive(Args)]
@@ -23,9 +23,8 @@ mod commands {
         /// Output file (defaults to auto-generated name)
         #[arg(long)]
         pub output: Option<PathBuf>,
-        /// Overwrite output file if it exists
-        #[arg(short = 'y', long)]
-        pub overwrite: bool,
+        #[command(flatten)]
+        pub overwrite: OverwriteArgs,
         /// Where each image sits vertically on the canvas (which is as tall as the tallest input).
         #[arg(long, value_enum, default_value_t = VerticalAlign::Middle)]
         pub align: VerticalAlign,
@@ -59,7 +58,7 @@ mod commands {
     /// inputs combined; nothing is scaled, and `--align` places each image horizontally
     pub fn vmerge_imgs(args: VmergeImgsArgs) {
         let VmergeImgsArgs { output, overwrite, align, inputs } = args;
-        _merge_imgs(Axis::Vertical, align.offset_expr(), output, overwrite, inputs);
+        _merge_imgs(Axis::Vertical, align.offset_expr(), output, overwrite.yes, inputs);
     }
 
     #[derive(Args)]
@@ -67,9 +66,8 @@ mod commands {
         /// Output file (defaults to auto-generated name)
         #[arg(long)]
         pub output: Option<PathBuf>,
-        /// Overwrite output file if it exists
-        #[arg(short = 'y', long)]
-        pub overwrite: bool,
+        #[command(flatten)]
+        pub overwrite: OverwriteArgs,
         /// Where each image sits horizontally on the canvas (which is as wide as the widest input).
         #[arg(long, value_enum, default_value_t = HorizontalAlign::Center)]
         pub align: HorizontalAlign,
@@ -165,6 +163,10 @@ mod commands {
         // input's `pad` sees only its own dimensions), so it's probed up front via ffprobe.
         let Some(canvas) = _max_dimension(axis, &inputs) else { std::process::exit(1) };
         let output = output.unwrap_or_else(|| _default_merge_output(axis, &inputs));
+        if let Err(why) = super::_refuse_existing(&output, overwrite) {
+            eprintln!("{}: {why}", axis.command());
+            std::process::exit(1);
+        }
         let code = super::_run_ffmpeg(_merge_argv(axis, &inputs, &output, overwrite, offset, canvas));
         if code != 0 {
             std::process::exit(code);

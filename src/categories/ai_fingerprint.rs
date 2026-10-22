@@ -42,7 +42,6 @@ mod commands {
     use ai_detection::{hidden, metadata, tells};
     use crate::support::doc_style::{approved, notice, problematic};
     use clap::Args;
-    use ignore::WalkBuilder;
     use std::io::{self, BufWriter, Write};
     use std::path::{Path, PathBuf};
 
@@ -309,8 +308,9 @@ mod commands {
         pub max_file_size: u64,
     }
 
-    /// The paths to scan: the file itself, or every file under a directory — unfiltered
-    /// (`standard_filters(false)`, like `gg`), skipping only what the command line stated.
+    /// The paths to scan: the file itself, or every file under a directory — unfiltered, by the
+    /// walk `gg` makes too ([`crate::support::args::walk`]), skipping only what the command line
+    /// stated.
     ///
     /// Gitignore-based filtering was tried and removed: it skipped by rules written elsewhere
     /// (a parent repo's `.gitignore` hid whole projects), and the walk root was exempt while
@@ -320,13 +320,11 @@ mod commands {
         if target.is_file() {
             return vec![target.to_path_buf()];
         }
-        WalkBuilder::new(target)
-            .standard_filters(false)
+        crate::support::args::walk(&[target.to_path_buf()], skips)
             .build()
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
             .map(ignore::DirEntry::into_path)
-            .filter(|path| !crate::support::args::is_skipped(path, skips))
             .collect()
     }
 
@@ -519,6 +517,20 @@ mod commands {
             // Naming a file IS the decision: skip rules apply to a walk, not to a named path.
             assert_eq!(_files(&hidden, &[".hidden".to_string()]), vec![hidden.clone()]);
             assert!(_files(&dir, &[]).contains(&hidden), "a default walk finds it");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// …and so is a named directory, whole, when a skip names it — the skips apply below the
+        /// path the command was given — while from above, the skip leaves it out.
+        #[test]
+        fn a_named_directory_is_scanned_even_when_a_skip_names_it() {
+            let dir = std::env::temp_dir().join(format!("bashrs_wm_named_{}", std::process::id()));
+            let build = dir.join("target").join("sub");
+            std::fs::create_dir_all(&build).unwrap();
+            std::fs::write(build.join("a.md"), "x\u{200B}y").unwrap();
+            let skip = ["target".to_string()];
+            assert_eq!(_files(&dir.join("target"), &skip), vec![build.join("a.md")], "named, it is scanned");
+            assert!(_files(&dir, &skip).is_empty(), "from above, the skip leaves it out");
             let _ = std::fs::remove_dir_all(&dir);
         }
 
