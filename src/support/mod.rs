@@ -4,7 +4,8 @@
 //! unified diffs ([`diff_highlight`]) and the GNU-style comparison of two directories
 //! ([`dir_diff`]), an external-process runner
 //! ([`exec`]), shared support for the wrapped-repo commands ([`comfy_repos`]), text-input
-//! resolution ([`input`]), the network-probing engines ([`net`]), an in-process stream grep
+//! resolution ([`input`]), the network-probing engines ([`net`]), the terminal's opacity, stepped
+//! by the terminal or the window manager ([`opacity`]), an in-process stream grep
 //! ([`streamgrep`]), a
 //! recursive tree grep ([`treegrep`] — its `--delve` binary decoders are a private child), output
 //! capture and the stdout colour policy ([`shell`]), the shells the sourcefile is written for and
@@ -24,6 +25,7 @@ pub mod doc_style;
 pub mod exec;
 pub mod input;
 pub mod net;
+pub mod opacity;
 // The software-world resource lists moved to their own extractable crate; re-exported here so
 // every `crate::support::…` call site keeps reading naturally.
 pub use software_inventory::{package_management, prog_langs};

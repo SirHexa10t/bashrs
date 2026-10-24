@@ -31,6 +31,7 @@ use crate::categories::filesystem::FilesystemCommand;
 use crate::categories::git::GitCommand;
 use crate::categories::lookup::LookupCommand;
 use crate::categories::media::audio_fx::MediaAudioFxCommand;
+use crate::categories::media::correction::MediaCorrectionCommand;
 use crate::categories::media::images::MediaImagesCommand;
 use crate::categories::media::metadata::MediaMetadataCommand;
 use crate::categories::media::transcode::MediaTranscodeCommand;
@@ -40,6 +41,7 @@ use crate::categories::processes::ProcessesCommand;
 use crate::categories::project::ProjectCommand;
 use crate::categories::python::PythonCommand;
 use crate::categories::shell::ShellCommand;
+use crate::categories::terminal::TerminalCommand;
 use crate::categories::styles::StyleCommand;
 use crate::conf::{config_file, environment, greeting};
 use crate::drivers::stainless;
@@ -89,7 +91,8 @@ const CATEGORIES: &[(&str, &[Surface])] = &[
     ("download", &[surface!(DownloadCommand)]),
     ("exposed_helpers", &[surface!(ExposedHelpersCommand)]),
     ("media", &[surface!(MediaTranscodeCommand), surface!(MediaMetadataCommand),
-                surface!(MediaAudioFxCommand), surface!(MediaImagesCommand)]),
+                surface!(MediaAudioFxCommand), surface!(MediaImagesCommand),
+                surface!(MediaCorrectionCommand)]),
     ("network", &[surface!(NetworkCommand)]),
     ("packages", &[surface!(PackagesCommand)]),
     ("processes", &[surface!(ProcessesCommand)]),
@@ -98,6 +101,7 @@ const CATEGORIES: &[(&str, &[Surface])] = &[
     // `shell_new`/`shell_bare` are `#[shell_body]` (they `exec` the calling shell);
     // `sudo_bashrs` and `print_args` are ordinary commands with generated wrappers.
     ("shell", &[surface!(ShellCommand)]),
+    ("terminal", &[surface!(TerminalCommand)]),
     // One `lookup` group. The generated `g`/`gg` families come first so the hand-written
     // commands can follow what they are built on: `GG` is `gg --delve` and `GGG` is `GG`
     // plus more, which only reads that way listed after `gg`. Within that last enum `hg`
@@ -568,8 +572,13 @@ mod tests {
             script.contains("[ -n \"$_BASHRS_BARE\" ] && { unset _BASHRS_BARE ; return 0; }"),
             "the flag-consuming bare guard must sit at the sourcefile's top"
         );
-        assert!(script.contains(r#"bind '"\en": "shell_new\n"'"#), "ALT+N keybind missing");
-        assert!(script.contains(r#"bind '"\e\C-n": "shell_bare\n"'"#), "CTRL+ALT+N keybind missing");
+        // A key typing its command types it on a line of its own: the line being typed set aside
+        // first, and given back after (`bash_binds_each_key_the_way_it_runs`).
+        let typed = |key: &str, func: &str| {
+            format!("bind '\"{key}\": \"{}{func}\\n{}\"'", bash::LINE_SET_ASIDE, bash::LINE_GIVEN_BACK)
+        };
+        assert!(script.contains(&typed(r"\en", "shell_new")), "ALT+N keybind missing");
+        assert!(script.contains(&typed(r"\e\C-n", "shell_bare")), "CTRL+ALT+N keybind missing");
         // Every bind carries a comment naming the chord as a keyboard labels it, plus what it
         // runs — sourced from the bound command's own description, so it cannot drift.
         assert!(script.contains("# Alt+N: Start a fresh shell session"), "bind comment missing");
@@ -582,15 +591,41 @@ mod tests {
             .filter_map(|line| line.find("  # "))
             .collect();
         assert_eq!(comment_columns.len(), 1, "bind comments are not aligned: {comment_columns:?}");
-        assert!(script.contains(r#"bind '"\eh": "brs_sourcefile\n"'"#), "ALT+H keybind missing");
-        assert!(script.contains(r#"bind '"\ew": "brs_configure\n"'"#), "ALT+W keybind missing");
-        assert!(script.contains(r#"bind '"\eq": "brs_compile\n"'"#), "ALT+Q keybind missing");
-        assert!(script.contains(r#"bind '"\el": "proc_restart_desktop\n"'"#), "ALT+L keybind missing");
+        assert!(script.contains(&typed(r"\eh", "brs_sourcefile")), "ALT+H keybind missing");
+        assert!(script.contains(&typed(r"\ew", "brs_configure")), "ALT+W keybind missing");
+        assert!(script.contains(&typed(r"\eq", "brs_compile")), "ALT+Q keybind missing");
+        assert!(script.contains(&typed(r"\el", "proc_restart_desktop")), "ALT+L keybind missing");
         assert!(script.contains("if [ -n \"$BASH_VERSION\" ]; then"), "keybinds should be bash-guarded");
     }
 
+    /// Bash binds each key the way it runs: a key typing its command as readline's macro, the
+    /// command and Enter between the two keys setting the line being typed aside and giving it back,
+    /// each bound to its helper — one run in place through `bind -x`, which leaves the line as it was.
+    #[test]
+    fn bash_binds_each_key_the_way_it_runs() {
+        let script = wrappers(Shell::Bash);
+        let has = |bind: &str| script.lines().any(|line| line.trim_start().starts_with(bind));
+        for (key, func, run) in keybinds::bindings() {
+            let bind = match run {
+                keybinds::Run::AsTyped => {
+                    format!("bind '\"{key}\": \"{}{func}\\n{}\"'", bash::LINE_SET_ASIDE, bash::LINE_GIVEN_BACK)
+                }
+                keybinds::Run::InPlace => format!("bind -x '\"{key}\": {func}'"),
+            };
+            assert!(has(&bind), "no `{bind}` in:\n{script}");
+        }
+        for (key, helper) in [(bash::LINE_SET_ASIDE, "__bashrs_line_save"), (bash::LINE_GIVEN_BACK, "__bashrs_line_restore")] {
+            let bound = format!("function {helper} {{");
+            let line = script.lines().map(str::trim_start).find(|line| line.starts_with(&bound));
+            let line = line.unwrap_or_else(|| panic!("no {helper} in:\n{script}"));
+            assert!(line.ends_with(&format!("; bind -x '\"{key}\": {helper}'")), "{helper} on its key: {line}");
+        }
+    }
+
     /// Zsh sources this file too, and binds the very keys bash does: the same table, through zsh's
-    /// `bindkey -s`, behind zsh's guard — their comments in the column bash's use.
+    /// `bindkey` — each key to a widget, one per command, defined ahead of the keys: pushing the
+    /// line being typed aside and accepting the command for a key typing it, showing what it printed
+    /// for one run in place — behind zsh's guard, their comments in the column bash's use.
     #[test]
     fn zsh_binds_the_keys_bash_binds() {
         let script = wrappers(Shell::Bash);
@@ -598,16 +633,36 @@ mod tests {
             script.lines().skip_while(|line| *line != "# keybinds").skip(1).take_while(|line| !line.is_empty()).collect();
         let zsh: Vec<&str> = block
             .iter()
-            .copied()
+            .map(|line| line.trim_start())
             .skip_while(|line| *line != "elif [ -n \"$ZSH_VERSION\" ]; then")
             .skip(1)
             .take_while(|line| *line != "fi")
-            .filter(|line| !line.trim_start().starts_with('#'))
+            .filter(|line| !line.starts_with('#'))
             .collect();
-        assert_eq!(zsh.len(), keybinds::bindings().len(), "one zsh line per binding: {block:#?}");
-        for (line, (key, func)) in zsh.iter().zip(keybinds::bindings()) {
-            assert!(line.trim_start().starts_with(&format!("bindkey -s '{key}' '{func}\\n'")), "{line}");
+        let first_key = zsh.iter().position(|line| line.starts_with("bindkey ")).expect("zsh binds keys");
+        let (widgets, keys) = zsh.split_at(first_key);
+        assert_eq!(keys.len(), keybinds::bindings().len(), "one bindkey line per binding: {block:#?}");
+        for (line, (key, func, _)) in keys.iter().zip(keybinds::bindings()) {
+            let bind = format!("bindkey '{key}' __bashrs_key_{func}");
+            assert!(line.starts_with(&bind), "{line}");
         }
+        let mut commands: Vec<(&str, keybinds::Run)> = Vec::new();
+        for (_, func, run) in keybinds::bindings() {
+            if !commands.iter().any(|(seen, _)| seen == func) {
+                commands.push((func, *run));
+            }
+        }
+        let defined: Vec<String> = commands
+            .iter()
+            .map(|(func, run)| {
+                let body = match run {
+                    keybinds::Run::AsTyped => format!("zle push-line; BUFFER={func}; zle accept-line"),
+                    keybinds::Run::InPlace => format!("zle -M -- \"$({func} 2>&1)\""),
+                };
+                format!("function __bashrs_key_{func} {{ {body}; }}; zle -N __bashrs_key_{func}")
+            })
+            .collect();
+        assert_eq!(widgets, defined, "a widget per command, once however many keys run it");
         let binds = block.iter().filter(|line| line.trim_start().starts_with("bind"));
         let columns: std::collections::BTreeSet<usize> = binds.filter_map(|line| line.find("  # ")).collect();
         assert_eq!(columns.len(), 1, "both shells' comments share one column: {block:#?}");
@@ -621,7 +676,7 @@ mod tests {
     #[test]
     fn every_keybind_targets_a_function_the_sourcefile_defines() {
         let script = wrappers(Shell::Bash);
-        for (key, bound) in keybinds::bindings() {
+        for (key, bound, _) in keybinds::bindings() {
             // A bind may carry arguments; only the command itself has to resolve.
             let command = bound.split_once(' ').map_or(*bound, |(name, _)| name);
             let definition = format!("function {command} {{");

@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{leading_shell, lines, shell, Captured, Home};
+use common::{is_command, leading_shell, lines, shell, Captured, Home};
 use std::process::{Command, Output};
 
 /// The first `lines` of a `# `-headed section of the real generated sourcefile.
@@ -183,13 +183,13 @@ fn an_alias_of_a_command_s_name_hijacks_nothing() {
 /// aside: typing the name runs bashrs's command, and the alias's expansion is kept, which
 /// `shell_def` shows with the line that brings it back. An unrelated alias stays, and one defined
 /// after the file wins again — the last definition does, of either kind. Exhaustive, and read
-/// from bash itself: every name the file gives bash is aliased first.
+/// from bash itself: every command's name the file gives bash ([`is_command`]) is aliased first.
 #[test]
 fn aliases_of_the_commands_names_are_set_aside() {
     let home = Home::new("bash_set_aside");
     let defined = bash_rc(&home, "", "declare -F");
     let names: Vec<&str> =
-        defined.lines().filter_map(|line| line.strip_prefix("declare -f ")).filter(|name| !name.starts_with("_bashrs_")).collect();
+        defined.lines().filter_map(|line| line.strip_prefix("declare -f ")).filter(|name| is_command(name)).collect();
     assert!(names.len() > 100, "bash defined too little to check: {names:?}");
     let aliases: String = names.iter().map(|name| format!("alias -- {name}=false\n")).collect();
     let checks = format!(
@@ -368,4 +368,45 @@ fn the_path_prepend_is_idempotent_across_resources() {
          printf '%s' \":$PATH:\" | grep -oF \":$HOME/.bashrs/tools/bin:\" | wc -l"
     );
     assert_eq!(bash(&script).trim(), "1");
+}
+
+/// A key typing its command types it on a line of its own: its macro sets the line being typed
+/// aside, types the command and Enter, and gives the line back — readline runs the rest of a macro
+/// on into the next prompt — through two helpers bound to keys only the macros press. Read from
+/// the real bash: each such key's macro as `bind -s` lists it, the helpers' keys as `bind -X` does,
+/// and the helpers themselves run as readline runs them, on a line with a cursor in it — one a
+/// shell would expand, given the chance.
+#[test]
+fn a_key_typing_its_command_sets_the_line_aside_and_gives_it_back() {
+    use bashrs::conf::keybinds::{bindings, Run};
+    let home = Home::new("typed_keys");
+    let listed = bash_rc(&home, "", "bind -X; echo ---; bind -s");
+    let (helpers, macros) = listed.split_once("---\n").expect("both listings");
+    let key_of = |helper: &str| -> String {
+        let bound = helpers.lines().find_map(|line| line.strip_prefix('"')?.strip_suffix(&format!("\": \"{helper}\"")));
+        bound.unwrap_or_else(|| panic!("no key runs {helper}: {helpers}")).to_string()
+    };
+    let (set_aside, given_back) = (key_of("__bashrs_line_save"), key_of("__bashrs_line_restore"));
+    let typing: Vec<(&str, &str)> =
+        bindings().iter().filter(|(_, _, run)| *run == Run::AsTyped).map(|(key, command, _)| (*key, *command)).collect();
+    assert!(typing.len() >= 6, "too few keys type their command to check: {typing:?}");
+    for (key, command) in typing {
+        let typed = format!("\"{key}\": \"{set_aside}{command}\\C-j{given_back}\"");
+        assert!(macros.lines().any(|line| line == typed), "{key} must type `{command}` on a line of its own: {macros}");
+    }
+
+    let line = r#"echo "$HOME" *  \ x"#;
+    let run = bash_rc(
+        &home,
+        "",
+        &format!(
+            "READLINE_LINE='{line}' READLINE_POINT=7\n\
+             __bashrs_line_save; printf 'aside:<%s>%s\\n' \"$READLINE_LINE\" \"$READLINE_POINT\"\n\
+             READLINE_LINE=brs_compile READLINE_POINT=11\n\
+             __bashrs_line_restore; printf 'back:<%s>%s\\n' \"$READLINE_LINE\" \"$READLINE_POINT\"\n\
+             declare -p __bashrs_line __bashrs_point >/dev/null 2>&1 || echo nothing-left"
+        ),
+    );
+    let back = format!("back:<{line}>7");
+    assert_eq!(lines(&run), ["aside:<>0", back.as_str(), "nothing-left"], "the line, exactly, and its cursor");
 }

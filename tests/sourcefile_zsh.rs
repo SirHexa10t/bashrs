@@ -13,7 +13,7 @@
 
 mod common;
 
-use common::{leading_shell, lines, shell, Captured, Home};
+use common::{is_command, leading_shell, lines, shell, Captured, Home};
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
@@ -127,7 +127,8 @@ fn interactive_sourcing_writes_nothing_to_stderr() {
 }
 
 /// Whatever bash defines from the file, zsh does too — read from the two real shells, not from a
-/// list. Only bash's completion helpers are bash's alone: the completion block is.
+/// list. Only bash's machinery is bash's alone ([`is_command`]): its completion block, and the line
+/// helpers its keys press, which zsh's own stack of lines makes no need of.
 #[test]
 fn every_function_bash_gets_zsh_gets_too() {
     let home = Home::new("zsh_parity");
@@ -135,7 +136,7 @@ fn every_function_bash_gets_zsh_gets_too() {
     let zsh = home.interactive("source $sourcefile; print -rl -- ${(k)functions}");
     let zsh: std::collections::BTreeSet<&str> = zsh.lines().collect();
     let bash: Vec<&str> =
-        bash.lines().filter_map(|line| line.strip_prefix("declare -f ")).filter(|name| !name.starts_with("_bashrs_")).collect();
+        bash.lines().filter_map(|line| line.strip_prefix("declare -f ")).filter(|name| is_command(name)).collect();
     assert!(bash.len() > 100, "bash defined too little to compare: {bash:?}");
     let missing: Vec<&&str> = bash.iter().filter(|name| !zsh.contains(**name)).collect();
     assert!(missing.is_empty(), "defined in bash but not in zsh: {missing:?}");
@@ -334,27 +335,80 @@ fn the_warning_comes_while_an_archived_config_waits() {
     assert!(Captured::new(&off.stdout).plain().ends_with("still-off\n"), "and globbing is off again: {}", Captured::new(&off.stdout));
 }
 
-/// Zsh binds the keys bash binds, each to the same command — read from the two real shells: each
-/// key bash's `bind -s` lists is looked up in zsh's line editor in that same spelling.
+/// Zsh types each command bash types, on a line of its own as bash does — read from the two real
+/// shells: each of bash's macros (`bind -s`) types its command and Enter between the keys its two
+/// line helpers are bound to (`bind -X`), and the widget zsh's line editor binds that key to — looked
+/// up in the same spelling — pushes the line being typed onto zsh's stack of lines, which gives it
+/// back at the next prompt, then accepts that same command in its place (`zle` stood in for here,
+/// as zsh runs it only inside its line editor).
 #[test]
-fn zsh_binds_every_key_bash_binds() {
+fn zsh_types_each_command_bash_types_on_a_line_of_its_own() {
     let home = Home::new("zsh_keys");
+    let helpers = home.bash("bind -X");
+    let key_of = |helper: &str| -> String {
+        let bound = helpers.lines().find_map(|line| line.strip_prefix('"')?.strip_suffix(&format!("\": \"{helper}\"")));
+        bound.unwrap_or_else(|| panic!("no key runs {helper}: {helpers}")).to_string()
+    };
+    let (set_aside, given_back) = (key_of("__bashrs_line_save"), key_of("__bashrs_line_restore"));
     let bash = home.bash("bind -s");
     let macros: Vec<(&str, &str)> = bash
         .lines()
         .filter_map(|line| {
-            let (key, command) = line.strip_prefix('"')?.split_once("\": \"")?;
-            Some((key, command.strip_suffix("\\C-j\"")?))
+            let (key, typed) = line.strip_prefix('"')?.split_once("\": \"")?;
+            Some((key, typed.strip_prefix(set_aside.as_str())?.strip_suffix(&format!("\\C-j{given_back}\""))?))
         })
         .collect();
-    assert!(macros.len() >= 6, "bash bound too little to compare: {bash}");
-    let lookups: String = macros.iter().map(|(key, _)| format!("bindkey -- '{key}'\n")).collect();
-    let zsh = home.interactive(&format!("source $sourcefile\n{lookups}"));
-    let zsh = lines(&zsh);
-    assert_eq!(zsh.len(), macros.len(), "one answer per key: {zsh:?}");
-    for ((key, command), bound) in macros.iter().zip(zsh) {
-        assert!(bound.ends_with(&format!(" \"{command}^J\"")), "{key} runs `{command}` in bash, but in zsh: {bound}");
-    }
+    assert_eq!(macros.len(), lines(&bash).len(), "every macro sets the line aside and gives it back: {bash}");
+    assert!(macros.len() >= 6, "bash typed too little to compare: {bash}");
+    let presses: String = macros
+        .iter()
+        .map(|(key, _)| {
+            format!(
+                "bound=$(bindkey -- '{key}'); widget=${{bound##* }}\n\
+                 builtin zle -l -- $widget || print -r -- \"$widget is no widget\"\n\
+                 BUFFER='half typed'; $widget\n"
+            )
+        })
+        .collect();
+    let zsh = home.interactive(&format!("source $sourcefile\nfunction zle {{ print -r -- \"zle $* <$BUFFER>\"; }}\n{presses}"));
+    let typed: String =
+        macros.iter().map(|(_, command)| format!("zle push-line <half typed>\nzle accept-line <{command}>\n")).collect();
+    assert_eq!(&*zsh, typed, "each key pushes the line aside, then accepts bash's command for it: {zsh}");
+}
+
+/// Zsh runs in place the keys bash runs in place — read from the two real shells: each key bash's
+/// `bind -X` lists is bound in zsh's line editor to a widget, which shows what bash's command for
+/// that key printed, its errors with it, under the line (`zle -M` — stood in for here, as zsh runs
+/// it only inside its line editor).
+#[test]
+fn zsh_runs_in_place_every_key_bash_runs_in_place() {
+    let home = Home::new("zsh_in_place");
+    let bash = home.bash("bind -X");
+    // The line helpers the typing keys press are bash's machinery, no key of anyone's: zsh has
+    // its stack of lines instead (`zsh_types_each_command_bash_types_on_a_line_of_its_own`).
+    let commands: Vec<(&str, &str)> = bash
+        .lines()
+        .filter_map(|line| {
+            let (key, command) = line.strip_prefix('"')?.split_once("\": \"")?;
+            Some((key, command.strip_suffix('"')?))
+        })
+        .filter(|(_, command)| is_command(command))
+        .collect();
+    assert!(commands.len() >= 3, "bash runs too little in place to compare: {bash}");
+    // Per key: the widget it is bound to — a widget indeed — run, its command standing in for itself.
+    let runs: String = commands
+        .iter()
+        .map(|(key, command)| {
+            format!(
+                "bound=$(bindkey -- '{key}'); widget=${{bound##* }}\n\
+                 builtin zle -l -- $widget || print -r -- \"$widget is no widget\"\n\
+                 function {command} {{ print -r -- ran-{command}; print -r -- its-error >&2; }}; $widget\n"
+            )
+        })
+        .collect();
+    let zsh = home.interactive(&format!("source $sourcefile\nfunction zle {{ print -r -- \"zle $*\"; }}\n{runs}"));
+    let shown: String = commands.iter().map(|(_, command)| format!("zle -M -- ran-{command}\nits-error\n")).collect();
+    assert_eq!(&*zsh, shown, "each key shows what its command printed: {zsh}");
 }
 
 /// `hg` reads zsh's whole history — not only the last 16 commands its `history` lists by default —

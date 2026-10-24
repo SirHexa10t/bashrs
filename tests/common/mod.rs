@@ -75,6 +75,15 @@ pub fn lines(text: &str) -> Vec<&str> {
     text.lines().collect()
 }
 
+/// Whether `name`, a function a sourcefile defines, is one of bashrs's commands rather than the
+/// machinery one shell's blocks keep for themselves — named apart for it: bash's completion
+/// function (`_bashrs_complete`), the line helpers its keys press, zsh's key widgets, fish's
+/// helpers (`__bashrs_…`). Which shells have a command is the surface's contract; machinery is each
+/// shell's own business.
+pub fn is_command(name: &str) -> bool {
+    !name.starts_with("_bashrs_") && !name.starts_with("__bashrs_")
+}
+
 /// `program` as a `Command` for a shell under test: in a session of its own, led by an `sh` above
 /// it, with the variables a bashrs-armed session exports removed, and the tools directory such a
 /// session puts on `PATH`. Arguments added to it are `program`'s.

@@ -147,13 +147,14 @@ fn save_original(name: &str) -> String {
 
 /// The keybinds: each of [`keybinds::bindings`] through [`keybinds::fish_bind`], commented with its
 /// chord as a keyboard labels it and what it runs — bound by [`keybinds::fish_bind_helper`], which
-/// goes again once they are.
+/// goes again once they are, and run as typed through [`keybinds::fish_as_typed_helper`], which
+/// stays for them.
 pub(super) fn keybinds(abouts: &BTreeMap<String, String>) -> String {
     let binds: Vec<String> = keybinds::bindings()
         .iter()
-        .map(|(key, func)| {
+        .map(|(key, func, run)| {
             let what = abouts.get(*func).map_or(*func, String::as_str);
-            format!("{} # {}: {what}", keybinds::fish_bind(key, func), Chord::parse(key).label())
+            format!("{} # {}: {what}", keybinds::fish_bind(key, func, *run), Chord::parse(key).label())
         })
         .collect();
     let mut out = format!("\n# keybinds\n{}", keybinds::fish_bind_helper());
@@ -162,6 +163,7 @@ pub(super) fn keybinds(abouts: &BTreeMap<String, String>) -> String {
         out.push('\n');
     }
     out += &format!("functions -e {}\n", keybinds::FISH_BIND);
+    out += &keybinds::fish_as_typed_helper(keybinds::bindings());
     out
 }
 

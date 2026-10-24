@@ -13,7 +13,7 @@
 
 mod common;
 
-use common::{generated, leading_shell, lines, shell, Captured, Home};
+use common::{generated, is_command, leading_shell, lines, shell, Captured, Home};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -94,8 +94,12 @@ fn every_section_aligns_its_bodies_into_a_column() {
     let multi_line: Vec<&str> = file.lines().filter(|line| line.starts_with("function ") && !line.contains("; end")).collect();
     assert_eq!(
         multi_line,
-        ["function __bashrs_prompt_clock --on-event fish_prompt", "function __bashrs_bind -a key cmd"],
-        "every command is a one-line function; only the two pieces of machinery are blocks"
+        [
+            "function __bashrs_prompt_clock --on-event fish_prompt",
+            "function __bashrs_bind -a key cmd how",
+            "function __bashrs_as_typed -a cmd",
+        ],
+        "every command is a one-line function; only the three pieces of machinery are blocks"
     );
 }
 
@@ -166,7 +170,8 @@ fn the_file_bails_early_when_the_binary_is_missing() {
 }
 
 /// Whatever bash's file defines, fish's does too — read from the two real shells, not from a list.
-/// Only bash's own completion helpers have no fish counterpart: fish completes declaratively.
+/// Only bash's machinery has no fish counterpart ([`is_command`]): its completion helpers — fish
+/// completes declaratively — and the line helpers its keys press, which fish's keys do without.
 #[test]
 fn every_function_bash_gets_fish_gets_too() {
     let home = Home::new("parity");
@@ -183,7 +188,7 @@ fn every_function_bash_gets_fish_gets_too() {
     let bash_names: Vec<&str> = bash
         .lines()
         .filter_map(|line| line.strip_prefix("declare -f "))
-        .filter(|name| !name.starts_with("_bashrs_"))
+        .filter(|name| is_command(name))
         .collect();
     assert!(bash_names.len() > 100, "bash defined too little to compare: {bash_names:?}");
     let missing: Vec<&&str> = bash_names.iter().filter(|name| !fish_new.contains(**name) && !before.lines().any(|old| old == **name)).collect();
@@ -545,17 +550,85 @@ fn pure_shell_commands_keep_fishs_own_completion() {
     assert!(out.contains("only_dir_here/"), "{out}");
 }
 
-/// Each key runs its command as if typed — in the default mode and in vi's insert mode — and the
-/// helper that bound them is gone once they are.
+/// Each key runs its command as if typed, through the function kept for that — in the default mode
+/// and in vi's insert mode — and the helper that bound them is gone once they are.
 #[test]
 fn the_keybinds_run_their_commands_as_if_typed() {
     let home = Home::new("binds");
-    let out = home.interactive("source $sourcefile; bind alt-q; bind ctrl-alt-n; bind alt-l; bind -M insert alt-h; functions -q __bashrs_bind; and echo helper-left");
-    assert!(out.contains("bind alt-q 'commandline -r brs_compile; commandline -f execute'"), "{out}");
-    assert!(out.contains("bind alt-l 'commandline -r proc_restart_desktop; commandline -f execute'"), "bound whatever desktop runs: {out}");
-    assert!(out.contains("bind ctrl-alt-n 'commandline -r shell_bare; commandline -f execute'"), "{out}");
-    assert!(out.contains("bind -M insert alt-h 'commandline -r brs_sourcefile; commandline -f execute'"), "vi's insert mode too: {out}");
+    let out = home.interactive(
+        "source $sourcefile; bind alt-q; bind ctrl-alt-n; bind alt-l; bind -M insert alt-h; \
+         functions -q __bashrs_bind; and echo helper-left; functions -q __bashrs_as_typed; and echo typing-kept",
+    );
+    assert!(out.contains("bind alt-q '__bashrs_as_typed brs_compile'"), "{out}");
+    assert!(out.contains("bind alt-l '__bashrs_as_typed proc_restart_desktop'"), "bound whatever desktop runs: {out}");
+    assert!(out.contains("bind ctrl-alt-n '__bashrs_as_typed shell_bare'"), "{out}");
+    assert!(out.contains("bind -M insert alt-h '__bashrs_as_typed brs_sourcefile'"), "vi's insert mode too: {out}");
     assert!(!out.contains("helper-left"), "{out}");
+    assert!(out.contains("typing-kept"), "the keys call it when pressed: {out}");
+}
+
+/// A key typing its command types it on a line of its own: the line being typed — text and cursor
+/// — is set aside, the command takes its place and executes, and the next prompt gives the line
+/// back, its handler gone once it has, nothing left behind — an empty line too, given back as one.
+/// `commandline` is stood in for, as fish runs it only inside its line editor: it hands over the
+/// line it is given, and says what it is told. The handler is run by hand: emitting the prompt's
+/// event would run fish's own handlers too.
+#[test]
+fn a_key_typing_its_command_sets_the_line_aside_and_gives_it_back() {
+    let home = Home::new("typed_line");
+    let out = home.interactive(
+        "source $sourcefile
+function commandline
+    switch \"$argv\"
+        case ''
+            echo $line
+        case -C
+            echo $point
+        case '*'
+            echo commandline $argv
+    end
+end
+set line 'ls -l'; set point 3
+__bashrs_as_typed brs_compile
+functions __bashrs_line_restore | string match -q -- '*--on-event fish_prompt*'; and echo restore-at-next-prompt
+__bashrs_line_restore
+functions -q __bashrs_line_restore; or echo restore-gone
+set -q __bashrs_line; or set -q __bashrs_point; or echo nothing-left
+set line ''; set point 0
+__bashrs_as_typed brs_compile
+__bashrs_line_restore",
+    );
+    assert_eq!(
+        lines(&out),
+        [
+            "commandline -r -- brs_compile",
+            "commandline -f execute",
+            "restore-at-next-prompt",
+            "commandline -r -- ls -l",
+            "commandline -C -- 3",
+            "restore-gone",
+            "nothing-left",
+            "commandline -r -- brs_compile",
+            "commandline -f execute",
+            "commandline -r -- ",
+            "commandline -C -- 0",
+        ],
+        "{out}"
+    );
+}
+
+/// The opacity keys run their commands in place, through `__fish_echo` — fish's own, which this fish
+/// has — in the default mode and in vi's insert mode, Alt+- by fish's name for its key.
+#[test]
+fn the_opacity_keys_run_their_commands_in_place() {
+    let home = Home::new("binds_in_place");
+    let out = home.interactive(
+        "source $sourcefile; bind alt-=; bind alt-+; bind -M insert alt-minus; functions -q __fish_echo; and echo fish-echo-found",
+    );
+    assert!(out.contains("bind alt-= '__fish_echo term_opacity_up'"), "{out}");
+    assert!(out.contains("bind alt-+ '__fish_echo term_opacity_up'"), "{out}");
+    assert!(out.contains("bind -M insert alt-minus '__fish_echo term_opacity_down'"), "vi's insert mode too: {out}");
+    assert!(out.contains("fish-echo-found"), "the keys print through this fish's own helper: {out}");
 }
 
 /// Alt+H's command shows each shell its own file: fish's in fish, bash's in bash — told by the shell

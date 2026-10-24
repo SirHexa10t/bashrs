@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use super::{substitute, Section, BIN};
-use crate::conf::keybinds::{self, Chord};
+use crate::conf::keybinds::{self, Chord, Run};
 use crate::conf::RELOAD_EXIT_CODE;
 use crate::support::align::align_columns;
 use crate::support::shell_dialect::{bash_function, bash_or_zsh, printf_line, Shell, ShellText, SET_ASIDE_RECORD};
@@ -160,12 +160,15 @@ fn text(text: ShellText, name: &str) -> String {
 }
 
 /// The keybinds, each shell's behind its own guard: bash binds through readline's `bind`, zsh
-/// through its line editor's `bindkey -s`, which reads a key in readline's spelling as bash does —
-/// so the table is written once, and in either shell a key types its command and Enter. Each is
-/// commented with its chord as a keyboard labels it and what it runs, looked up in `abouts` by the
-/// bound command's name.
+/// through its line editor's `bindkey`, which reads a key in readline's spelling as bash does —
+/// so the table is written once, and in either shell a key types its command and Enter on a line
+/// of its own, the line being typed set aside till the next prompt (`bind`'s macro between the
+/// [`bash_line_helpers`], a zsh widget around its `push-line`), or runs it in place (`bind -x`, a
+/// zsh widget showing what it printed) — zsh's widgets all [`zsh_widgets`].
+/// Each is commented with its chord as a keyboard labels it and what it runs, looked up in
+/// `abouts` by the bound command's name.
 ///
-/// Zsh's emacs keymap binds five of these keys itself, which bashrs's bindings replace — noted in
+/// Zsh's emacs keymap binds six of these keys itself, which bashrs's bindings replace — noted in
 /// its block, as fish's own are in fish's file.
 pub(super) fn keybinds(abouts: &BTreeMap<String, String>) -> String {
     let bindings = keybinds::bindings();
@@ -175,16 +178,89 @@ pub(super) fn keybinds(abouts: &BTreeMap<String, String>) -> String {
     };
     // Same column-alignment as the category blocks: two-plus spaces before `#` is the
     // table split point, and the bind text itself only ever holds single spaces.
-    let bash = bindings.iter().map(|(key, func)| format!("bind '\"{key}\": \"{func}\\n\"' {}", comment(key, func)));
-    let zsh = bindings.iter().map(|(key, func)| format!("bindkey -s '{key}' '{func}\\n' {}", comment(key, func)));
+    let bash = bindings.iter().map(|(key, func, run)| {
+        let bind = match run {
+            Run::AsTyped => format!("bind '\"{key}\": \"{LINE_SET_ASIDE}{func}\\n{LINE_GIVEN_BACK}\"'"),
+            Run::InPlace => format!("bind -x '\"{key}\": {func}'"),
+        };
+        format!("{bind} {}", comment(key, func))
+    });
+    let zsh = bindings.iter().map(|(key, func, _)| format!("bindkey '{key}' {} {}", zsh_widget(func), comment(key, func)));
     // One table for both shells' lines, so the comments share a column across the two blocks.
     let mut lines = align_columns(bash.chain(zsh).collect(), &["# "]);
     if lines.is_empty() {
         return String::new();
     }
     let zsh = lines.split_off(bindings.len());
-    let zsh = format!("{ZSH_KEYS_REPLACED}\n{}", zsh.join("\n"));
-    format!("\n# keybinds\n{}", bash_or_zsh(&lines.join("\n"), &zsh))
+    let bash = format!("{}{}", bash_line_helpers(bindings), lines.join("\n"));
+    let zsh = format!("{ZSH_KEYS_REPLACED}\n{}{}", zsh_widgets(bindings), zsh.join("\n"));
+    format!("\n# keybinds\n{}", bash_or_zsh(&bash, &zsh))
+}
+
+/// The readline keys a bash key typing its command presses first and last: the [`bash_line_helpers`]
+/// setting the line being typed aside, and giving it back. Keys nobody presses — under Ctrl+X, where
+/// readline binds nothing to Ctrl+_.
+pub(super) const LINE_SET_ASIDE: &str = r"\C-x\C-_s";
+pub(super) const LINE_GIVEN_BACK: &str = r"\C-x\C-_r";
+
+/// For bash's keys typing a command, which bash has no stack of lines for, as zsh has: a helper
+/// setting the line being typed aside — text and cursor — for the command to be typed on a line of
+/// its own, and one giving it back, each bound with `bind -x` to a key only the macros press
+/// ([`LINE_SET_ASIDE`], [`LINE_GIVEN_BACK`]). Readline runs the rest of a macro on into the next
+/// prompt, past the Enter executing the command, so the line comes back there — the command's
+/// Ctrl+C notwithstanding. Nothing where no key types its command.
+fn bash_line_helpers(bindings: &[(&str, &str, Run)]) -> String {
+    if !bindings.iter().any(|(_, _, run)| *run == Run::AsTyped) {
+        return String::new();
+    }
+    let set_aside = bash_function(
+        "__bashrs_line_save",
+        "__bashrs_line=$READLINE_LINE __bashrs_point=$READLINE_POINT; READLINE_LINE= READLINE_POINT=0",
+    );
+    let given_back = bash_function(
+        "__bashrs_line_restore",
+        "READLINE_LINE=$__bashrs_line READLINE_POINT=$__bashrs_point; unset __bashrs_line __bashrs_point",
+    );
+    format!(
+        "# the keys typing a command set the line being typed aside, and give it back at the next prompt\n\
+         {set_aside}; bind -x '\"{LINE_SET_ASIDE}\": __bashrs_line_save'\n\
+         {given_back}; bind -x '\"{LINE_GIVEN_BACK}\": __bashrs_line_restore'\n"
+    )
+}
+
+/// The zsh widget a key is bound to, named after the command it runs.
+fn zsh_widget(command: &str) -> String {
+    format!("__bashrs_key_{command}")
+}
+
+/// The widgets the keys are bound to, one per command however many keys run it, each defined ahead
+/// of the keys, as a function registered as a widget (`zle -N`). A key typing its command pushes
+/// the line being typed onto zsh's stack of lines (`push-line`), which gives it back at the next
+/// prompt, and accepts the command in its place; one run in place shows what its command printed
+/// under the line being typed (`zle -M`), which stays as it was. Nothing where no key is bound.
+fn zsh_widgets(bindings: &[(&str, &str, Run)]) -> String {
+    let mut commands: Vec<(&str, Run)> = Vec::new();
+    for (_, command, run) in bindings {
+        if !commands.iter().any(|(seen, _)| seen == command) {
+            commands.push((command, *run));
+        }
+    }
+    if commands.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "# a widget per command: typing it on a line of its own, the line being typed set aside (zsh's push-line) till the next prompt, \
+         or showing what it printed under the line being typed, which stays as it was\n",
+    );
+    for (command, run) in commands {
+        let widget = zsh_widget(command);
+        let body = match run {
+            Run::AsTyped => format!("zle push-line; BUFFER={command}; zle accept-line"),
+            Run::InPlace => format!("zle -M -- \"$({command} 2>&1)\""),
+        };
+        out += &format!("{}; zle -N {widget}\n", bash_function(&widget, &body));
+    }
+    out
 }
 
 /// The greeting, `text`, and — while an entry of `~/.bashrs` matches `archives` — the stale-config
@@ -246,7 +322,8 @@ const GREET: &str = "__bashrs_greet";
 /// The keys of zsh's own that the bindings replace: its emacs keymap's defaults for them, as zsh
 /// 5.9's `bindkey` lists them (its vi insert keymap binds none of them).
 const ZSH_KEYS_REPLACED: &str = "# these replace zsh's own emacs-mode Alt+N (history-search-forward), Alt+H (run-help), \
-                                 Alt+W (copy-region-as-kill), Alt+Q (push-line) and Alt+L (down-case-word)";
+                                 Alt+W (copy-region-as-kill), Alt+Q (push-line), Alt+L (down-case-word) and \
+                                 Alt+- (neg-argument)";
 
 /// Flag completion: on TAB after a `-`, ask the binary which flags the command being completed
 /// accepts (`complete-flags`, always in sync with the real CLI); any other word falls back to

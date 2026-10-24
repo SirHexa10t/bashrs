@@ -1,9 +1,9 @@
-//! What's on the screen: the X11 window list, each with its title and owning process.
+//! What's on the screen: the X11 window list, each with its title and owning process — and the
+//! few things done to a window from outside: asking it to close, stepping its opacity.
 //!
 //! In-process over `x11rb` — already in the dependency tree for sequencer's X11 backends — rather
 //! than shelling to `wmctrl`/`xdotool`, which may not be installed and whose output would need
-//! parsing back apart. This module only *enumerates*; who wants which window is the caller's
-//! question.
+//! parsing back apart. Who wants which window is the caller's question.
 //!
 //! The usual X11 caveats apply and are reported rather than papered over: it needs a display (on
 //! Wayland only XWayland windows are visible) and a window manager that maintains
@@ -164,6 +164,71 @@ pub(crate) fn still_open(ids: &[u32]) -> Vec<u32> {
     }
 }
 
+/// Move the focused window's opacity to `next(now)` — the caller's stepping rule, handed the
+/// opacity it has now — and say where it ended up. EWMH's `_NET_WM_WINDOW_OPACITY` carries it:
+/// what X11 compositors (picom, xfwm4, Mutter, KWin) draw a window's opacity from; a window
+/// without the property is opaque.
+///
+/// The FOCUSED window: the terminal the command was typed into, as every window-level opacity
+/// control acts on (`_NET_ACTIVE_WINDOW`, the client window itself, which is where compositors
+/// read the property). And only under a compositor — one owns the `_NET_WM_CM_S<screen>`
+/// selection — since without one the property changes nothing on screen: that is an error, not
+/// a silent success.
+pub(crate) fn step_opacity(next: impl FnOnce(f64) -> f64) -> Result<f64, String> {
+    use x11rb::protocol::xproto::PropMode;
+    use x11rb::wrapper::ConnectionExt as _;
+    let (conn, screen) = x11rb::connect(None).map_err(|_| "no X11 display".to_string())?;
+    let root = conn.setup().roots[screen].root;
+    let atom = |name: &str| -> Result<u32, String> {
+        conn.intern_atom(false, name.as_bytes())
+            .map_err(|err| format!("X connection failed: {err}"))?
+            .reply()
+            .map(|reply| reply.atom)
+            .map_err(|err| format!("X connection failed: {err}"))
+    };
+    let compositor = conn
+        .get_selection_owner(atom(&format!("_NET_WM_CM_S{screen}"))?)
+        .map_err(|err| format!("X connection failed: {err}"))?
+        .reply()
+        .map_err(|err| format!("X connection failed: {err}"))?
+        .owner;
+    if compositor == x11rb::NONE {
+        return Err("no compositor is running, so a window's opacity would not show".into());
+    }
+    let window = _window_property(&conn, root, atom("_NET_ACTIVE_WINDOW")?)
+        .filter(|&window| window != x11rb::NONE)
+        .ok_or("the window manager names no focused window (_NET_ACTIVE_WINDOW)")?;
+    let opacity = atom("_NET_WM_WINDOW_OPACITY")?;
+    let next = next(_cardinal(&conn, window, opacity).map_or(1.0, opacity_of));
+    conn.change_property32(PropMode::REPLACE, window, opacity, AtomEnum::CARDINAL, &[cardinal_of(next)])
+        .map_err(|err| format!("could not set the window's opacity: {err}"))?
+        .check()
+        .map_err(|err| format!("the window's opacity was refused: {err}"))?;
+    conn.flush().map_err(|err| format!("could not set the window's opacity: {err}"))?;
+    Ok(next)
+}
+
+/// `_NET_WM_WINDOW_OPACITY` as a fraction: the property spans all of `u32`, 0 clear and
+/// `u32::MAX` opaque.
+fn opacity_of(cardinal: u32) -> f64 {
+    f64::from(cardinal) / f64::from(u32::MAX)
+}
+
+/// [`opacity_of`]'s inverse, for a fraction in `0..=1`.
+fn cardinal_of(opacity: f64) -> u32 {
+    (opacity.clamp(0.0, 1.0) * f64::from(u32::MAX)).round() as u32
+}
+
+/// A window's single WINDOW-typed property (`_NET_ACTIVE_WINDOW` on the root), if it has one.
+fn _window_property(conn: &impl Connection, window: u32, property: u32) -> Option<u32> {
+    conn.get_property(false, window, property, AtomEnum::WINDOW, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?
+        .value32()?
+        .next()
+}
+
 /// A window's single CARDINAL property, if it has one.
 fn _cardinal(conn: &impl Connection, window: u32, property: u32) -> Option<u32> {
     conn.get_property(false, window, property, AtomEnum::CARDINAL, 0, 1)
@@ -180,4 +245,24 @@ fn _text(conn: &impl Connection, window: u32, property: u32, kind: u32) -> Optio
     let reply = conn.get_property(false, window, property, kind, 0, u32::MAX).ok()?.reply().ok()?;
     (reply.format == 8 && !reply.value.is_empty())
         .then(|| String::from_utf8_lossy(&reply.value).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The property's scale end to end: its two extremes are opaque and clear, a fraction comes
+    /// back within the property's resolution, and out of range is clamped rather than wrapped.
+    #[test]
+    fn window_opacity_spans_the_whole_cardinal_range() {
+        assert_eq!(cardinal_of(1.0), u32::MAX);
+        assert_eq!(cardinal_of(0.0), 0);
+        assert_eq!(opacity_of(u32::MAX), 1.0);
+        assert_eq!(opacity_of(0), 0.0);
+        for opacity in [0.05, 0.5, 0.85] {
+            assert!((opacity_of(cardinal_of(opacity)) - opacity).abs() < 1e-9, "{opacity}");
+        }
+        assert_eq!(cardinal_of(1.5), u32::MAX);
+        assert_eq!(cardinal_of(-0.5), 0);
+    }
 }

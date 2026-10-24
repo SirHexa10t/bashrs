@@ -14,7 +14,7 @@
 /// The column boundary [`align_columns`] writes before each token: a character that never occurs
 /// in shell text, spaced as `table_formatter` wants a divider with a visible core. Only it divides;
 /// any run of spaces in a line is that line's own text.
-const DIVIDER: &str = " \u{1f} ";
+pub(crate) const DIVIDER: &str = " \u{1f} ";
 
 /// Align `lines` into a table at each of `columns`: every line's FIRST occurrence of each token
 /// starts a column, and the block is aligned as one table, two spaces between columns. Rows

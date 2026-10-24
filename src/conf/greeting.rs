@@ -35,8 +35,8 @@ pub(crate) fn warning() -> String {
 fn key_for(command: &str) -> String {
     keybinds::bindings()
         .iter()
-        .find(|(_, bound)| *bound == command)
-        .map_or_else(|| command.to_string(), |(sequence, _)| Chord::parse(sequence).label().to_uppercase())
+        .find(|(_, bound, _)| *bound == command)
+        .map_or_else(|| command.to_string(), |(sequence, _, _)| Chord::parse(sequence).label().to_uppercase())
 }
 
 #[cfg(test)]

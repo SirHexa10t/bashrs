@@ -3,14 +3,17 @@
 //!
 //! One product per module, each its own `#[category]` block and clap enum, all flattened under the
 //! single `media` group by [`crate::cli`]: [`transcode`] (convert + trim), [`metadata`] (report),
-//! [`audio_fx`] (vocal removal), [`images`] (canvas merges). They share nothing but the
-//! file-writing helpers below, and the [`OverwriteArgs`] flag every file-writing command takes —
-//! so a new product is a new module here, and a new command joins the module it belongs to
-//! without touching the others.
+//! [`audio_fx`] (vocal removal), [`images`] (canvas merges), [`correction`] (in-place repairs).
+//! They share nothing but the file-writing helpers below, the [`OverwriteArgs`] flag every
+//! file-writing command takes, and — for the two that rewrite a file's streams, the trim and the
+//! correction — `streams`, the stream probe and Matroska's cover rules. So a new product is a new
+//! module here, and a new command joins the module it belongs to without touching the others.
 
 pub mod audio_fx;
+pub mod correction;
 pub mod images;
 pub mod metadata;
+mod streams;
 pub mod transcode;
 
 use crate::tools;
@@ -44,11 +47,13 @@ pub struct OverwriteArgs {
 fn _run_ffmpeg(argv: Vec<OsString>) -> i32 {
     let mut full: Vec<OsString> = vec!["-nostdin".into()];
     full.extend(argv);
-    match std::process::Command::new(tools::resolve("ffmpeg"))
-        .stdin(std::process::Stdio::null())
-        .args(full)
-        .status()
-    {
+    let mut ffmpeg = std::process::Command::new(tools::resolve("ffmpeg"));
+    // SVT-AV1 writes its banner and configuration to stderr whatever ffmpeg's `-v` says — twenty
+    // lines on every AV1 encode. 2 keeps its warnings and errors; a level set by hand stands.
+    if std::env::var_os("SVT_LOG").is_none() {
+        ffmpeg.env("SVT_LOG", "2");
+    }
+    match ffmpeg.stdin(std::process::Stdio::null()).args(full).status() {
         Ok(status) => status.code().unwrap_or(1),
         Err(err) => {
             eprintln!("could not run ffmpeg: {err}");
@@ -63,15 +68,25 @@ fn _run_ffmpeg(argv: Vec<OsString>) -> i32 {
 /// Without `-y` it refuses an existing output too, before ffmpeg runs: the one failure
 /// ffmpeg's code hides ([`_refuse_existing`]).
 fn _run_writing(command: &str, input: &Path, output: &Path, overwrite: bool, argv: Vec<OsString>) {
-    if output == input {
-        eprintln!("{command}: the output is the input itself ({})", input.display());
-        std::process::exit(1);
-    }
-    if let Err(why) = _refuse_existing(output, overwrite) {
-        eprintln!("{command}: {why}");
+    _run_writing_then(command, input, output, overwrite, argv, || {});
+}
+
+/// [`_run_writing`], running `tidy` once the writing is over, whichever way it ended — refused,
+/// failed, or saved. What a command made for ffmpeg to read (the trim's extracted covers) must not
+/// outlive the run, and every end but saving leaves the process on the spot.
+fn _run_writing_then(command: &str, input: &Path, output: &Path, overwrite: bool, argv: Vec<OsString>, tidy: impl FnOnce()) {
+    let refusal = if output == input {
+        Some(format!("{command}: the output is the input itself ({})", input.display()))
+    } else {
+        _refuse_existing(output, overwrite).err().map(|why| format!("{command}: {why}"))
+    };
+    if let Some(refusal) = refusal {
+        tidy();
+        eprintln!("{refusal}");
         std::process::exit(1);
     }
     let code = _run_ffmpeg(argv);
+    tidy();
     if code != 0 {
         std::process::exit(code);
     }

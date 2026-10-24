@@ -4,6 +4,9 @@
 //! making the readability verdicts deterministic. The heart of it is the feature's privacy
 //! contract: ONLY the target site's rows ever reach bashrs's disk.
 //!
+//! `dl_fix` meets vidl at the same seam — vidl's `repair`, handed bashrs's pinned tools and its
+//! cookie store — so its wiring is proven here too, on the same rig.
+//!
 //! The child's world is HERMETIC: its PATH holds only the rig's bin dir — the stub as `yt-dlp`,
 //! a HOME-independent `python3`, and `bash` for the stub's shebang. Anything less deterministic
 //! leaks the running machine in: real browsers on PATH flip `any_browser_installed`'s message,
@@ -154,6 +157,15 @@ impl Rig {
     /// Every yt-dlp invocation the run made, one argv per line.
     fn calls(&self) -> String {
         fs::read_to_string(self.stub.join("calls.log")).unwrap_or_default()
+    }
+
+    /// Make the stub bashrs's pinned yt-dlp — `~/.bashrs/tools/yt-dlp/bin/yt-dlp`, where a
+    /// bundle is looked for — and the only one: it leaves PATH, so a run that reaches it was
+    /// handed it.
+    fn pin_ytdlp(&self) {
+        let bundle = self.home.join(".bashrs/tools/yt-dlp/bin");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::rename(self.bin().join("yt-dlp"), bundle.join("yt-dlp")).unwrap();
     }
 
     /// Seed a ready-made store for `site`, skipping the import flow. Its contents are never read
@@ -519,3 +531,59 @@ fn no_cookies_conflicts_with_every_way_of_supplying_them() {
     }
 }
 
+
+/// What bashrs hands vidl for a repair: the yt-dlp it pins, proven by being the only one there
+/// is, and the cookie store it keeps, proven by its spec on the call that asks YouTube about the
+/// video. What the repair then makes of the answer is vidl's, and tested there; here the stand-in
+/// gives none, and the hermetic PATH no ffprobe, so the video stays unread and the run fails.
+#[test]
+fn dl_fix_asks_youtube_with_the_pinned_yt_dlp_and_the_imported_store() {
+    let rig = Rig::new("fix_seam", None);
+    rig.pin_ytdlp();
+    rig.seed_store("youtube");
+    fs::write(rig.into.join("A Talk__abcdefghijk.mkv"), "not really a video").unwrap();
+    let into = rig.into.display().to_string();
+    let out = rig.run("ok", &["dl_fix", &into, "--check"], None);
+    let all = text(&out);
+    assert_eq!(out.status.code(), Some(1), "a video left unread fails the run: {all}");
+    assert!(all.contains("repair --check:") && all.contains("nothing was changed"), "--check reaches the repair: {all}");
+    let calls = rig.calls();
+    let asked = calls.lines().find(|line| line.contains("watch?v=abcdefghijk")).expect("YouTube was asked about the video");
+    assert!(
+        asked.contains("--cookies-from-browser") && asked.contains("browser_cookies/youtube/store"),
+        "the imported store must be used: {asked}"
+    );
+}
+
+/// `dl`'s half of the handoff `dl_fix` shares: with the stub made the only yt-dlp there is, a
+/// download still reaches it.
+#[test]
+fn dl_downloads_with_the_pinned_yt_dlp() {
+    let rig = Rig::new("pinned_dl", None);
+    rig.pin_ytdlp();
+    let into = rig.into.display().to_string();
+    let out = rig.run("ok", &["dl", YT_VIDEO, "--into", &into], None);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(rig.calls().contains(YT_VIDEO), "the pinned copy ran:\n{}", rig.calls());
+}
+
+/// `dl_fix` takes a repair's options and `dl` a download's — no `dl repair` beside `dl_fix`, which
+/// completion could not reach anyway. A folder that isn't there is refused before YouTube is
+/// asked anything, with the exit code vidl gives it.
+#[test]
+fn dl_fix_takes_a_repairs_options_and_refuses_a_missing_folder() {
+    let rig = Rig::new("fix_args", None);
+    // The empty scratch folder is named, so a run that wrongly went ahead completes nothing —
+    // never the directory the tests happen to run in.
+    let into = rig.into.display().to_string();
+    let audio = rig.run("ok", &["dl_fix", "--audio", &into], None);
+    assert!(text(&audio).contains("unexpected argument '--audio'"), "a download's option: {}", text(&audio));
+    let help = text(&rig.run("ok", &["dl", "--help"], None));
+    assert!(help.contains("Usage:") && !help.contains("Commands:"), "`dl` holds no commands: {help}");
+
+    let gone = rig.root.join("no_such_folder").display().to_string();
+    let missing = rig.run("ok", &["dl_fix", &gone], None);
+    assert_eq!(missing.status.code(), Some(2), "{}", text(&missing));
+    assert!(text(&missing).contains("there is no folder at"), "{}", text(&missing));
+    assert!(rig.calls().is_empty(), "nothing was asked of YouTube:\n{}", rig.calls());
+}

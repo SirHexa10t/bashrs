@@ -17,6 +17,7 @@ use crate::categories::filesystem::FilesystemCommand;
 use crate::categories::git::GitCommand;
 use crate::categories::lookup::LookupCommand;
 use crate::categories::media::audio_fx::MediaAudioFxCommand;
+use crate::categories::media::correction::MediaCorrectionCommand;
 use crate::categories::media::images::MediaImagesCommand;
 use crate::categories::media::metadata::MediaMetadataCommand;
 use crate::categories::media::transcode::MediaTranscodeCommand;
@@ -26,6 +27,7 @@ use crate::categories::processes::ProcessesCommand;
 use crate::categories::project::ProjectCommand;
 use crate::categories::python::PythonCommand;
 use crate::categories::shell::ShellCommand;
+use crate::categories::terminal::TerminalCommand;
 use crate::categories::styles::StyleCommand;
 use crate::support::shell_dialect::Shell;
 
@@ -66,6 +68,8 @@ pub enum Command {
     #[command(flatten)]
     MediaImages(MediaImagesCommand),
     #[command(flatten)]
+    MediaCorrection(MediaCorrectionCommand),
+    #[command(flatten)]
     ComfyRepos(ComfyReposCommand),
     #[command(flatten)]
     AiFingerprint(AiFingerprintCommand),
@@ -81,6 +85,8 @@ pub enum Command {
     Python(PythonCommand),
     #[command(flatten)]
     Shell(ShellCommand),
+    #[command(flatten)]
+    Terminal(TerminalCommand),
     // Three enums, one logical `lookup` category. The generated families lead so the
     // hand-written commands can follow what they build on (`GG` is `gg --delve`) — the same
     // order `sourcefile::category_commands` groups them in, so help and wrappers agree.
@@ -148,6 +154,7 @@ impl Command {
             Command::MediaMetadata(cmd) => cmd.run(),
             Command::MediaAudioFx(cmd) => cmd.run(),
             Command::MediaImages(cmd) => cmd.run(),
+            Command::MediaCorrection(cmd) => cmd.run(),
             Command::ComfyRepos(cmd) => cmd.run(),
             Command::AiFingerprint(cmd) => cmd.run(),
             Command::Network(cmd) => cmd.run(),
@@ -156,6 +163,7 @@ impl Command {
             Command::Project(cmd) => cmd.run(),
             Command::Python(cmd) => cmd.run(),
             Command::Shell(cmd) => cmd.run(),
+            Command::Terminal(cmd) => cmd.run(),
             Command::Lookup(cmd) => cmd.run(),
             Command::Grep(cmd) => cmd.run(),
             Command::Treegrep(cmd) => cmd.run(),
@@ -451,6 +459,7 @@ mod tests {
             command_names::<MediaMetadataCommand>(),
             command_names::<MediaAudioFxCommand>(),
             command_names::<MediaImagesCommand>(),
+            command_names::<MediaCorrectionCommand>(),
         ] {
             assert_prefixed(&names, "media_", &[]);
         }
@@ -485,17 +494,17 @@ mod tests {
     #[test]
     fn comfy_commands_follow_naming_standard() {
         // External tools keep their own upstream name (`table`, plus its pinned-preset sibling
-        // `table_fancy`), the verb they have always had here (`dl`, over the `vidl` crate), or a
-        // task-named family — all unprefixed by design (`backup_*` flattens filesync's
-        // subcommands into directly-completable commands, and `autokey_*` does the same for
-        // sequencer's profile and key-naming subcommands).
+        // `table_fancy`), the verb they have always had here (`dl` and its `dl_fix`, over the
+        // `vidl` crate), or a task-named family — all unprefixed by design (`backup_*` flattens
+        // filesync's subcommands into directly-completable commands, and `autokey_*` does the same
+        // for sequencer's profile and key-naming subcommands).
         assert_prefixed(
             &command_names::<ComfyReposCommand>(),
             "comfy_",
             &[
                 "table", "table_fancy",
                 "backup_diff", "backup_sync", "backup_find_bitrot",
-                "dl",
+                "dl", "dl_fix",
                 "clicker", "clicker_benchmark",
                 "autokey_doctor", "autokey_check", "autokey_reformat", "autokey_apply", "autokey_unapply", "autokey_detect", "autokey_list_bashrs_profiles",
             ],
@@ -509,6 +518,7 @@ mod tests {
         // is the deliberate exception: named for what it grants — sudo, but a BASHRS shell,
         // sourcefile re-armed — rather than for the category it sits in.
         assert_prefixed(&command_names::<ShellCommand>(), "shell_", &["sudo_bashrs"]);
+        assert_prefixed(&command_names::<TerminalCommand>(), "term_", &[]);
     }
 
     #[test]

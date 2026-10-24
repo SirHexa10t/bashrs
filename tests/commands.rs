@@ -182,6 +182,509 @@ fn media_commands_propagate_failure_as_a_nonzero_exit() {
     assert!(!metadata.status.success(), "an unreadable file must exit non-zero");
 }
 
+/// Whether a real ffmpeg and ffprobe answer on PATH — where a bashrs shell puts the bundled copies
+/// first (`~/.bashrs/tools/bin`), the ones the commands run. Without them the media tests have
+/// nothing to drive, and say so as they skip.
+fn media_tools_work(test: &str) -> bool {
+    let works = ["ffmpeg", "ffprobe"]
+        .iter()
+        .all(|tool| Command::new(tool).arg("-version").output().is_ok_and(|out| out.status.success()));
+    if !works {
+        eprintln!("SKIPPED {test}: no ffmpeg/ffprobe on PATH");
+    }
+    works
+}
+
+/// `args` run through the real ffmpeg in `dir`, quietly; panics on failure, naming `what` it made.
+fn ffmpeg_makes(dir: &Path, what: &str, args: &[&str]) {
+    let made = Command::new("ffmpeg")
+        .args(["-v", "error", "-y"])
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    assert!(made, "could not synthesize {what}");
+}
+
+/// `args` run through the real ffprobe on `file`, quietly: what it printed.
+fn ffprobe(file: &Path, args: &[&str]) -> String {
+    let out = Command::new("ffprobe").args(["-v", "error"]).args(args).arg(file).output().expect("ffprobe");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// What ffprobe reads of `file`: its container's duration, and each subtitle track's cues as
+/// `(start, end)`, in seconds.
+fn duration_and_cues(file: &Path) -> (f64, Vec<Vec<(f64, f64)>>) {
+    let duration = ffprobe(file, &["-show_entries", "format=duration", "-of", "csv=p=0"]).trim().parse().expect("a duration");
+    let tracks = ffprobe(file, &["-select_streams", "s", "-show_entries", "stream=index", "-of", "csv=p=0"]).lines().count();
+    let cues = (0..tracks)
+        .map(|track| {
+            ffprobe(file, &["-select_streams", &format!("s:{track}"), "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0"])
+                .lines()
+                .filter_map(|line| {
+                    let (start, length) = line.trim_end_matches(',').split_once(',')?;
+                    let start: f64 = start.parse().ok()?;
+                    Some((start, start + length.parse::<f64>().ok()?))
+                })
+                .collect()
+        })
+        .collect();
+    (duration, cues)
+}
+
+/// A cut fits the subtitle cues to itself at both ends, on every subtitle track: one on screen at
+/// the start opens the cut from its first moment instead of being lost, one running past the end
+/// stops there — and the file lasts as long as its picture, not as long as the overhanging cue.
+/// Every way of giving the cut, re-encoded and copied.
+#[test]
+fn media_trim_fits_the_subtitle_cues_to_both_ends_of_the_cut() {
+    if !media_tools_work("media_trim subtitle fitting") {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("bashrs_trim_cues_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Cues across 10 s and 20 s, and one between: the cut points every case below uses.
+    std::fs::write(
+        dir.join("cues.srt"),
+        "1\n00:00:05,000 --> 00:00:12,000\nacross ten\n\n2\n00:00:14,000 --> 00:00:16,000\nbetween\n\n3\n00:00:18,000 --> 00:00:28,000\nacross twenty\n",
+    )
+    .unwrap();
+    let source = ["-f", "lavfi", "-i", "testsrc2=d=30:s=160x120:r=25", "-f", "lavfi", "-i", "sine=d=30", "-i", "cues.srt"];
+    let tracks = ["-map", "0", "-map", "1", "-map", "2", "-map", "2", "-metadata:s:s:0", "language=eng", "-metadata:s:s:1", "language=por"];
+    ffmpeg_makes(&dir, "clip.mkv", &[&source[..], &tracks, &["-g", "25", "clip.mkv"]].concat());
+    let trim = |args: &[&str], output: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+            .args(["media_trim", "clip.mkv"])
+            .args(args)
+            .args(["--output", output])
+            .current_dir(&dir)
+            .output()
+            .expect("run bashrs");
+        assert!(out.status.success(), "media_trim {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        duration_and_cues(&dir.join(output))
+    };
+    let near = |got: f64, want: f64, slack: f64| (got - want).abs() <= slack;
+
+    // A copy starts at the keyframe before the cut, its pre-roll shifting everything along — cues
+    // included, so the cut's own start is where the cue across it now begins. The copy's last
+    // packets may also run a frame or two past the end, as copied video and audio do.
+    for (copy, overrun) in [(&[][..], 0.05), (&["--copy"][..], 0.5)] {
+        let (length, tracks) = trim(&[&["10", "20"], copy].concat(), &format!("both{}.mkv", copy.len()));
+        assert_eq!(tracks.len(), 2, "{copy:?}: both subtitle tracks kept: {tracks:?}");
+        for cues in &tracks {
+            let (first, last) = (cues[0], cues[cues.len() - 1]);
+            let start = first.0;
+            if copy.is_empty() {
+                assert!(start <= 0.05, "re-encoded, the cut starts the file: {cues:?}");
+            }
+            assert!(near(first.1 - start, 2.0, 0.05), "{copy:?}: the cue across 10 s opens the cut, its last 2 s left: {cues:?}");
+            assert!(near(last.1 - start, 10.0, 0.05), "{copy:?}: the cue across 20 s ends with the cut: {cues:?}");
+            assert!(length - start <= 10.0 + overrun, "{copy:?}: 10→20 lasts {length} from {start}, not ~10: {cues:?}");
+        }
+    }
+    let (length, tracks) = trim(&["20"], "start.mkv");
+    assert!(near(length, 10.0, 0.05), "20→end lasts {length}: {tracks:?}");
+    for cues in &tracks {
+        assert_eq!(cues.len(), 1, "only the cue across 20 s: {cues:?}");
+        assert!(near(cues[0].0, 0.0, 0.05) && near(cues[0].1, 8.0, 0.05), "{cues:?}");
+    }
+    let (length, tracks) = trim(&["--end", "15"], "end.mkv");
+    assert!(near(length, 15.0, 0.05), "0→15 lasts {length}: {tracks:?}");
+    for cues in &tracks {
+        assert!(near(cues[cues.len() - 1].1, 15.0, 0.05), "the cue across 15 s ends with the cut: {cues:?}");
+    }
+    // Into a container that holds no subtitles, the cut goes ffmpeg's own way — the sound alone.
+    let (length, tracks) = trim(&["10", "20"], "sound.mp3");
+    assert!(near(length, 10.0, 0.1) && tracks.is_empty(), "10→20 as sound: {length} {tracks:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A trim keeps every stream of a file in its own codec — the picture re-encoded as what it was,
+/// at about the rate the source spent on the stretch kept; the sound, the subtitle tracks and the
+/// attachment copied — not in the container's default codecs, and not at their default quality.
+/// A `--copy` keeps the same streams.
+#[test]
+fn media_trim_keeps_every_stream_in_its_own_codec_at_its_own_rate() {
+    if !media_tools_work("media_trim in kind") {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("bashrs_trim_kind_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("cues.srt"), "1\n00:00:01,000 --> 00:00:19,000\nall along\n").unwrap();
+    std::fs::write(dir.join("font.ttf"), "not really a font").unwrap();
+    // None of these is Matroska's default: it would re-encode them as h264, vorbis and ass. And
+    // the picture's rate is far from mpeg4's own default (about a third of it, here), so a re-encode
+    // that missed the source's rate would show.
+    ffmpeg_makes(&dir, "clip.mkv", &[
+        "-f", "lavfi", "-i", "testsrc2=d=20:s=640x480:r=25", "-f", "lavfi", "-i", "sine=d=20", "-i", "cues.srt",
+        "-map", "0", "-map", "1", "-map", "2", "-map", "2",
+        "-c:v", "mpeg4", "-b:v", "1500k", "-c:a", "ac3", "-c:s", "srt",
+        "-attach", "font.ttf", "-metadata:s:t", "mimetype=application/x-truetype-font", "clip.mkv",
+    ]);
+    let streams = |file: &str| ffprobe(&dir.join(file), &["-show_entries", "stream=codec_type,codec_name", "-of", "csv=p=0"]);
+    let video_rate = |file: &str, from: f64, until: f64| {
+        let packets = ffprobe(&dir.join(file), &["-select_streams", "v:0", "-show_entries", "packet=pts_time,size", "-of", "csv=p=0"]);
+        let bytes: f64 = packets
+            .lines()
+            .filter_map(|line| line.split_once(','))
+            .filter_map(|(pts, size)| Some((pts.parse::<f64>().ok()?, size.parse::<f64>().ok()?)))
+            .filter(|(pts, _)| (from..until).contains(pts))
+            .map(|(_, size)| size)
+            .sum();
+        bytes * 8.0 / (until - from)
+    };
+    let source = streams("clip.mkv");
+    assert_eq!(source.lines().count(), 5, "five streams to keep: {source}");
+    for (args, output) in [(&["5", "15"][..], "kind.mkv"), (&["5", "15", "--copy"], "copy.mkv")] {
+        let out = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+            .args(["media_trim", "clip.mkv"])
+            .args(args)
+            .args(["--output", output])
+            .current_dir(&dir)
+            .output()
+            .expect("run bashrs");
+        assert!(out.status.success(), "media_trim {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(streams(output), source, "{args:?}: every stream, each in its own codec");
+    }
+    let (kept, spent) = (video_rate("kind.mkv", 0.0, 10.0), video_rate("clip.mkv", 5.0, 15.0));
+    assert!((kept / spent - 1.0).abs() < 0.25, "the picture at the source's rate: {kept:.0} for {spent:.0} bit/s");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A trim keeps a thumbnail a thumbnail: a Matroska cover comes out attached again, under its own
+/// name and type — not the plain video track a remux makes of it, which players list as one more
+/// video and thumbnailers ignore — beside the other attachments; a cover an earlier remux demoted
+/// so comes out a cover again; an mp4's cover art stays cover art. Re-encoded, copied, or cut at
+/// the end only — and the covers taken out for it are gone afterwards, whether the trim saved or
+/// was refused.
+#[test]
+fn media_trim_keeps_a_thumbnail_a_thumbnail() {
+    if !media_tools_work("media_trim thumbnail") {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("bashrs_trim_thumb_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("font.ttf"), "not really a font").unwrap();
+    ffmpeg_makes(&dir, "cover.jpg", &["-f", "lavfi", "-i", "color=c=red:s=64x64", "-frames:v", "1", "-update", "1", "cover.jpg"]);
+    let clip = ["-f", "lavfi", "-i", "testsrc2=d=10:s=160x120:r=25", "-f", "lavfi", "-i", "sine=d=10"];
+    ffmpeg_makes(&dir, "covered.mkv", &[&clip[..], &[
+        "-attach", "cover.jpg", "-metadata:s:t:0", "mimetype=image/jpeg", "-metadata:s:t:0", "filename=cover.jpg",
+        "-attach", "font.ttf", "-metadata:s:t:1", "mimetype=application/x-truetype-font", "-metadata:s:t:1", "filename=font.ttf",
+        "covered.mkv",
+    ]].concat());
+    // What a `-map 0 -c copy` remux does to a Matroska cover: a plain one-frame video track.
+    ffmpeg_makes(&dir, "demoted.mkv", &["-i", "covered.mkv", "-map", "0", "-c", "copy", "demoted.mkv"]);
+    ffmpeg_makes(&dir, "covered.mp4", &[&clip[..], &["-i", "cover.jpg", "-map", "0", "-map", "1", "-map", "2", "-c:v:1", "copy", "-disposition:v:1", "attached_pic", "covered.mp4"]].concat());
+    // Each stream as `kind,cover[,filename,mimetype]`.
+    let streams = |file: &str| -> Vec<String> {
+        ffprobe(&dir.join(file), &["-show_entries", "stream=codec_type:stream_disposition=attached_pic:stream_tags=filename,mimetype", "-of", "csv=p=0"])
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    assert!(streams("demoted.mkv").contains(&"video,0,cover.jpg,image/jpeg".to_string()), "the remux demoted the cover: {:?}", streams("demoted.mkv"));
+    let trim = |input: &str, args: &[&str], output: &str, overwrite: bool| {
+        let child = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+            .args(["media_trim", input])
+            .args(args)
+            .args(["--output", output])
+            .args(overwrite.then_some("-y"))
+            .current_dir(&dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run bashrs");
+        let covers = std::env::temp_dir().join(format!("bashrs_trim_covers_{}", child.id()));
+        let out = child.wait_with_output().expect("bashrs ran");
+        assert!(!covers.exists(), "{input} {args:?}: the covers taken out are left behind in {}", covers.display());
+        out
+    };
+    for (input, args, output) in [
+        ("covered.mkv", &["2", "8"][..], "cut.mkv"),
+        ("covered.mkv", &["2", "8", "--copy"], "copied.mkv"),
+        ("covered.mkv", &["--end", "6"], "ended.mkv"),
+        ("demoted.mkv", &["2", "8"], "repaired.mkv"),
+    ] {
+        let out = trim(input, args, output, true);
+        assert!(out.status.success(), "{input} {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        let kept = streams(output);
+        assert_eq!(kept.iter().filter(|stream| stream.starts_with("video,0")).count(), 1, "{input} {args:?}: one picture, no cover as a track: {kept:?}");
+        assert!(kept.contains(&"video,1,cover.jpg,image/jpeg".to_string()), "{input} {args:?}: the cover, attached: {kept:?}");
+        assert!(kept.contains(&"attachment,0,font.ttf,application/x-truetype-font".to_string()), "{input} {args:?}: the font beside it: {kept:?}");
+    }
+    let out = trim("covered.mp4", &["2", "8"], "cut.mp4", true);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(streams("cut.mp4").iter().filter(|stream| stream.starts_with("video,1")).count(), 1, "the mp4's cover art: {:?}", streams("cut.mp4"));
+    // Refused — the output is there, and no -y — the covers taken out go all the same.
+    let refused = trim("covered.mkv", &["2", "8"], "cut.mkv", false);
+    assert!(!refused.status.success(), "an existing output without -y is refused");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The correction makes a picture riding as a video track the file's thumbnail, in place: a cover
+/// a remux demoted is restored; a copy of a thumbnail the file already has is removed; a different
+/// picture is kept as a second one, the thumbnail shown staying the one it was; an mp4's picture
+/// track is marked as cover art. A file with nothing to correct is left as it is, and said so; one
+/// whose container holds no thumbnail, or that is no media at all, fails — untouched. The
+/// corrected files keep their permissions, and nothing is left beside them.
+#[test]
+fn media_correction_makes_a_picture_track_the_thumbnail() {
+    if !media_tools_work("media_correction") {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("bashrs_correction_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    ffmpeg_makes(&dir, "cover.jpg", &["-f", "lavfi", "-i", "color=c=red:s=64x64", "-frames:v", "1", "-update", "1", "cover.jpg"]);
+    ffmpeg_makes(&dir, "other.jpg", &["-f", "lavfi", "-i", "color=c=green:s=64x64", "-frames:v", "1", "-update", "1", "other.jpg"]);
+    let clip = ["-f", "lavfi", "-i", "testsrc2=d=4:s=160x120:r=25", "-f", "lavfi", "-i", "sine=d=4"];
+    let attach = |picture: &'static str| ["-attach", picture, "-metadata:s:t:0", "mimetype=image/jpeg", "-metadata:s:t:0", "filename=cover.jpg"];
+    ffmpeg_makes(&dir, "proper.mkv", &[&clip[..], &attach("cover.jpg"), &["proper.mkv"]].concat());
+    ffmpeg_makes(&dir, "plain.mkv", &[&clip[..], &["plain.mkv"]].concat());
+    // What a `-map 0 -c copy` remux does to a cover — and what a fetch beside it then adds.
+    ffmpeg_makes(&dir, "demoted.mkv", &["-i", "proper.mkv", "-map", "0", "-c", "copy", "demoted.mkv"]);
+    ffmpeg_makes(&dir, "same.mkv", &[&["-i", "demoted.mkv", "-map", "0", "-c", "copy"][..], &attach("cover.jpg"), &["same.mkv"]].concat());
+    ffmpeg_makes(&dir, "different.mkv", &[&["-i", "demoted.mkv", "-map", "0", "-c", "copy"][..], &attach("other.jpg"), &["different.mkv"]].concat());
+    ffmpeg_makes(&dir, "track.mp4", &[&clip[..], &["-i", "cover.jpg", "-map", "0", "-map", "1", "-map", "2", "-c:v:1", "copy", "track.mp4"]].concat());
+    let picture = &clip[..4]; // the moving picture alone, no sound
+    ffmpeg_makes(&dir, "track.avi", &[picture, &["-i", "cover.jpg", "-map", "0", "-map", "1", "-c:v:0", "mpeg4", "-c:v:1", "copy", "track.avi"]].concat());
+    std::fs::write(dir.join("notes.txt"), "no media at all").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.join("demoted.mkv"), std::fs::Permissions::from_mode(0o640)).unwrap();
+    let rows = |file: &str| -> Vec<String> {
+        ffprobe(&dir.join(file), &["-show_entries", "stream=codec_type:stream_disposition=attached_pic:stream_tags=filename,mimetype", "-of", "csv=p=0"])
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    let before: Vec<(&str, Vec<String>, Vec<u8>)> = ["proper.mkv", "plain.mkv", "track.avi", "notes.txt"]
+        .into_iter()
+        .map(|file| (file, rows(file), std::fs::read(dir.join(file)).unwrap()))
+        .collect();
+
+    let files = ["demoted.mkv", "same.mkv", "different.mkv", "track.mp4", "proper.mkv", "plain.mkv", "track.avi", "notes.txt"];
+    let child = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+        .arg("media_correction")
+        .args(files)
+        .current_dir(&dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run bashrs");
+    let covers = std::env::temp_dir().join(format!("bashrs_correction_covers_{}", child.id()));
+    let out = child.wait_with_output().expect("bashrs ran");
+    assert!(!covers.exists(), "the pictures taken out are left behind in {}", covers.display());
+    let said = String::from_utf8_lossy(&out.stdout);
+    let complained = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "two files could not be corrected: {said}{complained}");
+    for line in [
+        "demoted.mkv: its picture track is its thumbnail now (cover.jpg)",
+        "same.mkv: a copy of its thumbnail riding as a track removed",
+        "different.mkv: its picture track is its thumbnail now (cover-2.jpg)",
+        "track.mp4: its picture track is its thumbnail now (cover.jpg)",
+        "proper.mkv: nothing to correct — its thumbnail is in place",
+        "plain.mkv: nothing to correct",
+    ] {
+        assert!(said.lines().any(|said| said == line), "{line:?} in: {said}");
+    }
+    assert!(complained.contains("track.avi: a picture rides in it as a video track, but a .avi holds no thumbnail"), "{complained}");
+    assert!(complained.contains("notes.txt: ffprobe could not read it"), "{complained}");
+
+    let cover = "video,1,cover.jpg,image/jpeg".to_string();
+    let plain = |file: &str| rows(file).iter().filter(|row| row.starts_with("video,0")).count();
+    for file in ["demoted.mkv", "same.mkv"] {
+        assert_eq!((plain(file), rows(file).iter().filter(|row| **row == cover).count()), (1, 1), "{file}: one picture, one cover: {:?}", rows(file));
+    }
+    let different = rows("different.mkv");
+    assert!(different.contains(&cover) && different.contains(&"video,1,cover-2.jpg,image/jpeg".to_string()), "{different:?}");
+    assert_eq!(plain("different.mkv"), 1, "{different:?}");
+    let shown = ffprobe(&dir.join("different.mkv"), &["-select_streams", "v", "-show_entries", "stream=index:stream_tags=filename", "-of", "csv=p=0"]);
+    let first_cover = shown.lines().find(|row| row.ends_with(",cover.jpg")).and_then(|row| row.split(',').next()).expect("a cover.jpg");
+    let kept = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(dir.join("different.mkv")).args(["-map", &format!("0:{first_cover}"), "-c", "copy", "-f", "image2pipe", "-"]).output().unwrap().stdout;
+    assert_eq!(kept, std::fs::read(dir.join("other.jpg")).unwrap(), "the thumbnail shown is the one the file had");
+    assert_eq!(rows("track.mp4").iter().filter(|row| row.starts_with("video,1")).count(), 1, "{:?}", rows("track.mp4"));
+    for (file, rows_before, bytes) in &before {
+        assert_eq!(&rows(file), rows_before, "{file} unchanged");
+        assert_eq!(&std::fs::read(dir.join(file)).unwrap(), bytes, "{file} untouched");
+    }
+    let mode = std::fs::metadata(dir.join("demoted.mkv")).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o640, "the corrected file keeps its permissions");
+    let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect();
+    left.sort();
+    assert_eq!(left, ["cover.jpg", "demoted.mkv", "different.mkv", "notes.txt", "other.jpg", "plain.mkv", "proper.mkv", "same.mkv", "track.avi", "track.mp4"], "nothing beside them");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A rewrite that did not do what the correction planned is never put in the original's place: here
+/// an ffmpeg stand-in whose rewrite only copies the file, the picture still a track. The original
+/// is left as it was, the failure said, and nothing is left beside it.
+#[test]
+fn media_correction_puts_no_unchecked_rewrite_in_place() {
+    if !media_tools_work("media_correction check") {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("bashrs_correction_check_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    std::fs::create_dir_all(dir.join("home")).unwrap();
+    ffmpeg_makes(&dir, "cover.jpg", &["-f", "lavfi", "-i", "color=c=red:s=64x64", "-frames:v", "1", "-update", "1", "cover.jpg"]);
+    ffmpeg_makes(&dir, "proper.mkv", &[
+        "-f", "lavfi", "-i", "testsrc2=d=2:s=160x120:r=25",
+        "-attach", "cover.jpg", "-metadata:s:t:0", "mimetype=image/jpeg", "-metadata:s:t:0", "filename=cover.jpg", "proper.mkv",
+    ]);
+    ffmpeg_makes(&dir, "demoted.mkv", &["-i", "proper.mkv", "-map", "0", "-c", "copy", "demoted.mkv"]);
+    let real = Command::new("sh").args(["-c", "command -v ffmpeg"]).output().expect("sh");
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    let stand_in = dir.join("bin/ffmpeg");
+    std::fs::write(
+        &stand_in,
+        format!(
+            "#!/bin/sh\nfor last in \"$@\"; do :; done\ncase \"$last\" in\n  *.correcting.*)\n    while [ \"$#\" -gt 0 ] && [ \"$1\" != \"-i\" ]; do shift; done\n    cp \"$2\" \"$last\"; exit 0 ;;\nesac\nexec '{real}' \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let before = std::fs::read(dir.join("demoted.mkv")).unwrap();
+    let path = format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap_or_default());
+    // A HOME of its own: no bundled ffmpeg there to outrank the stand-in on PATH.
+    let out = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+        .args(["media_correction", "demoted.mkv"])
+        .env("PATH", &path)
+        .env("HOME", dir.join("home"))
+        .current_dir(&dir)
+        .output()
+        .expect("run bashrs");
+    let complained = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{complained}");
+    assert!(complained.contains("demoted.mkv: the corrected file did not check out — left as it was"), "{complained}");
+    assert_eq!(std::fs::read(dir.join("demoted.mkv")).unwrap(), before, "the original is left as it was");
+    assert!(!dir.join("demoted.correcting.mkv").exists(), "the unchecked rewrite is not left beside it");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An AV1 trim says nothing of SVT-AV1's own: its banner and configuration, which it prints
+/// whatever ffmpeg's `-v` says, are kept off the terminal. Only where the ffmpeg on PATH has it.
+#[test]
+fn media_trim_keeps_svt_av1_quiet() {
+    if !media_tools_work("media_trim quiet AV1") {
+        return;
+    }
+    let encoders = Command::new("ffmpeg").args(["-hide_banner", "-encoders"]).output().expect("ffmpeg");
+    if !String::from_utf8_lossy(&encoders.stdout).contains("libsvtav1") {
+        eprintln!("SKIPPED media_trim quiet AV1: this ffmpeg has no libsvtav1");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("bashrs_trim_svt_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let made = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=d=3:s=160x120:r=25", "-c:v", "libsvtav1", "clip.mkv"])
+        .env("SVT_LOG", "1")
+        .current_dir(&dir)
+        .status()
+        .is_ok_and(|status| status.success());
+    assert!(made, "could not synthesize clip.mkv");
+    let out = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+        .args(["media_trim", "clip.mkv", "1", "2", "--output", "cut.mkv"])
+        .env_remove("SVT_LOG")
+        .current_dir(&dir)
+        .output()
+        .expect("run bashrs");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(!said.contains("Svt[info]"), "SVT-AV1's banner reached the terminal: {said}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The quality conversion copies what already fits the target container, and says so — but with
+/// `--h264`, a picture not already H.264 is re-encoded, however well it would fit.
+#[test]
+fn media_convert_quality_copies_only_what_already_fits() {
+    if !media_tools_work("media_convert_quality remux") {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("bashrs_quality_remux_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = ["-f", "lavfi", "-i", "testsrc2=d=1:s=160x120:r=25", "-f", "lavfi", "-i", "sine=d=1", "-c:a", "aac"];
+    ffmpeg_makes(&dir, "h264.mp4", &[&source[..], &["-c:v", "libx264", "h264.mp4"]].concat());
+    ffmpeg_makes(&dir, "mpeg4.mp4", &[&source[..], &["-c:v", "mpeg4", "mpeg4.mp4"]].concat());
+    let convert = |input: &str, output: &str, h264: bool| {
+        let out = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+            .args(["media_convert_quality", input, output])
+            .args(h264.then_some("--h264"))
+            .current_dir(&dir)
+            .output()
+            .expect("run bashrs");
+        assert!(out.status.success(), "{input} → {output}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stderr).contains("copying them bit-identically")
+    };
+    assert!(convert("h264.mp4", "h264.mov", true), "h264 and aac fit a .mov as they are");
+    assert!(convert("mpeg4.mp4", "mpeg4.mov", false), "so do mpeg4 and aac");
+    assert!(!convert("mpeg4.mp4", "mpeg4_h264.mov", true), "but --h264 re-encodes a picture that isn't h264");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Several files print side by side: the facts they share level with each other — the file names
+/// first, a shared tag on one line — and a tag only one file has below them, in its own column;
+/// every gap one ` | `, at the same column on every line. A fifth file is a usage error.
+#[test]
+fn media_metadata_lines_up_what_several_files_share() {
+    if !media_tools_work("media_metadata comparison") {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("bashrs_metadata_cmp_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    ffmpeg_makes(&dir, "first.mka", &["-f", "lavfi", "-i", "sine=d=1", "-metadata", "title=First", "-metadata", "comment=only here", "first.mka"]);
+    ffmpeg_makes(&dir, "second.mka", &["-f", "lavfi", "-i", "sine=d=2", "-metadata", "title=Second", "second.mka"]);
+    let out = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+        .args(["media_metadata", "first.mka", "second.mka"])
+        .env("COLUMNS", "300")
+        .current_dir(&dir)
+        .output()
+        .expect("run bashrs");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let shown = console::strip_ansi_codes(&String::from_utf8_lossy(&out.stdout)).into_owned();
+    let lines: Vec<&str> = shown.lines().collect();
+    // Content first, whatever the padding: each line as its cells — split at the bar, which no
+    // value here holds, as a row whose last cell is empty ends on a bare ` |`.
+    let cells: Vec<Vec<&str>> = lines.iter().map(|line| line.split('|').map(str::trim).collect()).collect();
+    assert_eq!(cells[0], ["file: first.mka", "file: second.mka"], "{shown}");
+    let title = cells.iter().position(|row| row == &["title: First", "title: Second"]).unwrap_or_else(|| panic!("titles paired: {shown}"));
+    let comment = cells.iter().position(|row| row == &["comment: only here", ""]).unwrap_or_else(|| panic!("the lone comment: {shown}"));
+    assert!(comment > title, "the lone tag after the shared ones: {shown}");
+    // Then the layout: one gap per line, in one column.
+    let gaps: std::collections::BTreeSet<Option<usize>> = lines.iter().map(|line| line.find(" |")).collect();
+    assert_eq!(gaps.len(), 1, "every ` | ` in one column: {shown}");
+    assert!(lines.iter().all(|line| line.matches(" | ").count() + usize::from(line.ends_with(" |")) == 1), "{shown}");
+
+    // One file is the plain report, never a table: not wrapped even where the terminal is
+    // narrower than its lines.
+    let one = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+        .args(["media_metadata", "first.mka"])
+        .env("COLUMNS", "20")
+        .current_dir(&dir)
+        .output()
+        .expect("run bashrs");
+    let alone = console::strip_ansi_codes(&String::from_utf8_lossy(&one.stdout)).into_owned();
+    assert!(alone.starts_with("file: first.mka\n") && alone.contains("\ntitle: First\n"), "one file, the plain report: {alone}");
+    assert!(alone.contains("\ncontainer: matroska,webm\n"), "a line wider than the terminal, whole: {alone}");
+    assert!(!alone.contains(" |"), "and no columns: {alone}");
+
+    let five = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+        .args(["media_metadata", "a", "b", "c", "d", "e"])
+        .output()
+        .expect("run bashrs");
+    assert_eq!(five.status.code(), Some(2), "a fifth file is a usage error, before ffprobe runs");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Every media command that writes a file, as `(command, its arguments, the file they write)`,
 /// each run from one directory of synthesized inputs — with `-y` appended, or without.
 const MEDIA_WRITERS: &[(&str, &[&str], &str)] = &[
@@ -211,13 +714,8 @@ fn every_command_offering_overwrite_has_a_media_writers_row() {
 #[test]
 fn media_commands_leave_an_existing_output_alone_unless_told_to_overwrite() {
     // Each MEDIA_WRITERS row runs twice against a stale output: refused and untouched without
-    // `-y`, replaced with it. Needs a real ffmpeg/ffprobe, looked up on PATH — where a bashrs
-    // shell puts the bundled copy first (`~/.bashrs/tools/bin`), the one the commands run.
-    let works = ["ffmpeg", "ffprobe"]
-        .iter()
-        .all(|tool| Command::new(tool).arg("-version").output().is_ok_and(|out| out.status.success()));
-    if !works {
-        eprintln!("SKIPPED media overwrite: no ffmpeg/ffprobe on PATH");
+    // `-y`, replaced with it.
+    if !media_tools_work("media overwrite") {
         return;
     }
     let dir = std::env::temp_dir().join(format!("bashrs_media_overwrite_{}", std::process::id()));
@@ -729,6 +1227,143 @@ fn lll_and_the_cd_listing_read_a_device_as_ls_writes_it() {
     assert!(cells[5] == "1, 3" && date(cells[6]) && cells[7] == "null", "size, date, name: {row}");
     let landing = Command::new(env!("CARGO_BIN_EXE_bashrs")).arg("cd-listing").current_dir("/dev").output().expect("cd-listing");
     assert!(plain(&landing).lines().any(|name| name == "null"), "{}", plain(&landing));
+}
+
+/// `bashrs <args>` as the opacity commands see a desktop: of the variables they read, only `vars`
+/// are set, and `fakes` — `(name, script)` stand-ins for the terminals' and window managers' own
+/// tools, each logging the words it was run with before answering as its script says — come first
+/// on PATH. Returns the run, and the log: one line per call, the tool's name and its words.
+fn opacity_run(tag: &str, args: &[&str], vars: &[(&str, &str)], fakes: &[(&str, &str)]) -> (Output, String) {
+    use std::os::unix::fs::PermissionsExt;
+    const READ: &[&str] = &[
+        "KITTY_WINDOW_ID", "ALACRITTY_WINDOW_ID", "ALACRITTY_SOCKET", "XDG_CURRENT_DESKTOP", "SWAYSOCK",
+        "HYPRLAND_INSTANCE_SIGNATURE", "XDG_SESSION_TYPE", "DISPLAY", "WAYLAND_DISPLAY", "TMUX", "STY", "ZELLIJ",
+        "HERDR_PANE_ID",
+    ];
+    let dir = std::env::temp_dir().join(format!("bashrs_opacity_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, script) in fakes {
+        let tool = dir.join(name);
+        std::fs::write(&tool, format!("#!/bin/sh\nprintf '%s\\n' \"${{0##*/}} $*\" >> \"$CALLS\"\n{script}\n")).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let calls = dir.join("calls");
+    let path = std::env::join_paths(std::iter::once(dir.clone()).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())))
+        .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bashrs"));
+    command.args(args).env("PATH", path).env("CALLS", &calls);
+    for var in READ {
+        command.env_remove(var);
+    }
+    let out = command.envs(vars.iter().copied()).output().expect("run bashrs");
+    let log = std::fs::read_to_string(&calls).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    (out, log)
+}
+
+/// kitty, as its remote control answers: `ls --self` with the OS window's opacity, and
+/// `set-background-opacity` either taking or refusing — in kitty's own words.
+const KITTY_AT: &str = r#"case "$2" in ls) echo '[{"id": 1, "background_opacity": 0.8, "tabs": []}]' ;; esac"#;
+const KITTY_REFUSING: &str = r#"case "$2" in
+  ls) echo '[{"id": 1, "background_opacity": 0.8, "tabs": []}]' ;;
+  set-background-opacity) echo "Error: You must turn on the dynamic_background_opacity option in kitty.conf" >&2; exit 1 ;;
+esac"#;
+
+#[test]
+fn the_opacity_steps_in_kittys_background_when_run_directly_in_it() {
+    let (out, log) = opacity_run("kitty", &["term_opacity_up"], &[("KITTY_WINDOW_ID", "7")], &[("kitten", KITTY_AT)]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "kitty: background opacity 85%\n");
+    assert_eq!(log, "kitten @ ls --self\nkitten @ set-background-opacity --match id:7 0.85\n", "read back, then set this window's");
+}
+
+#[test]
+fn a_refusing_terminal_hands_the_step_to_the_window_manager_and_says_why() {
+    let (out, log) = opacity_run(
+        "refused",
+        &["term_opacity_up"],
+        &[("KITTY_WINDOW_ID", "7"), ("XDG_CURRENT_DESKTOP", "KDE")],
+        &[("kitten", KITTY_REFUSING), ("busctl", "")],
+    );
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "KWin: window opacity +5%\n");
+    assert!(said.contains("kitty couldn't — You must turn on the dynamic_background_opacity option in kitty.conf"), "{said}");
+    assert!(log.ends_with(
+        "busctl --user call org.kde.kglobalaccel /component/kwin org.kde.kglobalaccel.Component invokeShortcut s Increase Opacity\n"
+    ), "{log}");
+}
+
+#[test]
+fn inside_a_multiplexer_the_window_manager_steps_and_the_terminal_is_left_alone() {
+    let (out, log) = opacity_run(
+        "tmux",
+        &["term_opacity_down"],
+        &[("KITTY_WINDOW_ID", "7"), ("TMUX", "/tmp/tmux-1000/default,1,0"), ("XDG_CURRENT_DESKTOP", "KDE")],
+        &[("kitten", KITTY_AT), ("busctl", "")],
+    );
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "KWin: window opacity -5%\n");
+    assert!(!log.contains("kitten"), "kitty's possibly stale window is never addressed: {log}");
+    assert!(said.contains("inside tmux, kitty's own controls are out of reach"), "{said}");
+}
+
+#[test]
+fn alacritty_steps_its_window_from_the_opacity_it_reads_back() {
+    let alacritty = r#"case "$2" in get-config) echo '{"window": {"opacity": 0.9, "decorations": "Full"}}' ;; esac"#;
+    let (out, log) = opacity_run("alacritty", &["term_opacity_down"], &[("ALACRITTY_WINDOW_ID", "3")], &[("alacritty", alacritty)]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Alacritty: background opacity 85%\n");
+    assert_eq!(log, "alacritty msg get-config\nalacritty msg config window.opacity=0.85\n");
+}
+
+#[test]
+fn the_window_managers_step_the_focused_window_in_their_own_terms() {
+    let (out, log) = opacity_run("sway", &["term_opacity_down"], &[("SWAYSOCK", "/run/user/1000/sway-ipc.sock")], &[("swaymsg", "")]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "sway: window opacity -5%\n", "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(log, "swaymsg opacity minus 0.05\n");
+
+    let hyprctl = r#"case "$1" in getprop) echo 0.95 ;; dispatch) echo ok ;; esac"#;
+    let (out, log) = opacity_run("hyprland", &["term_opacity_up", "10"], &[("HYPRLAND_INSTANCE_SIGNATURE", "v0.56")], &[("hyprctl", hyprctl)]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Hyprland: window opacity 100%\n", "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(log, "hyprctl getprop activewindow opacity\nhyprctl dispatch setprop activewindow opacity 1.00\n", "never past opaque");
+
+    let (out, log) = opacity_run("kwin", &["term_opacity_down", "20"], &[("XDG_CURRENT_DESKTOP", "KDE")], &[("busctl", "")]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "KWin: window opacity -20%\n", "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(log.matches("invokeShortcut s Decrease Opacity").count(), 4, "four of KWin's 5% presses: {log}");
+
+    // Hyprland can say no while exiting 0: only its `ok` counts as done.
+    let refusing = r#"case "$1" in getprop) echo 0.9 ;; dispatch) echo "Invalid dispatcher" ;; esac"#;
+    let (out, _) = opacity_run("hyprland_no", &["term_opacity_up"], &[("HYPRLAND_INSTANCE_SIGNATURE", "v0.56")], &[("hyprctl", refusing)]);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && said.contains("Hyprland: Hyprland answered: Invalid dispatcher"), "{said}");
+}
+
+/// The floors differ by what fades: a background may go fully clear, as the text still shows; a
+/// whole window stops at 5%, where KWin's own opacity actions stop, being all but lost below it.
+#[test]
+fn a_background_may_clear_completely_but_a_window_stops_at_five_percent() {
+    let nearly_clear = r#"case "$2" in ls) echo '[{"id": 1, "background_opacity": 0.03, "tabs": []}]' ;; esac"#;
+    let (out, log) = opacity_run("floor_kitty", &["term_opacity_down"], &[("KITTY_WINDOW_ID", "7")], &[("kitten", nearly_clear)]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "kitty: background opacity 0%\n", "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(log.ends_with("set-background-opacity --match id:7 0.00\n"), "{log}");
+
+    let faint = r#"case "$1" in getprop) echo 0.07 ;; dispatch) echo ok ;; esac"#;
+    let (out, log) = opacity_run("floor_hyprland", &["term_opacity_down"], &[("HYPRLAND_INSTANCE_SIGNATURE", "v0.56")], &[("hyprctl", faint)]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Hyprland: window opacity 5%\n", "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(log.ends_with("setprop activewindow opacity 0.05\n"), "{log}");
+}
+
+#[test]
+fn where_nothing_can_change_the_opacity_it_fails_and_names_what_could() {
+    let (out, log) = opacity_run("nothing", &["term_opacity_up"], &[], &[]);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{said}");
+    assert!(said.contains("nothing here can change the terminal's opacity"), "{said}");
+    assert!(said.contains("kitty, Alacritty") && said.contains("KWin, sway, Hyprland"), "{said}");
+    assert!(log.is_empty(), "no tool was even tried: {log}");
 }
 
 /// Compile-time guard that the fixture path stays valid if this file grows path-dependent tests.

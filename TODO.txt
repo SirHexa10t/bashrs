@@ -222,4 +222,3 @@ Add `terminal` category, and add functionality for changing transparency if it's
 Make sure that things work with Wayland too
     autokey surely broke
 
-Add user-actions/ alongside user-data/ in .bashrs ; move-in the autokey scripts, and add the mounting scripts

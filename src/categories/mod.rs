@@ -23,3 +23,4 @@ pub mod project;
 pub mod python;
 pub mod shell;
 pub mod styles;
+pub mod terminal;

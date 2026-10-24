@@ -1,13 +1,13 @@
 //! Commands backed by my other repos, imported as dependencies. Each is exposed under the
 //! external tool's own name (`table`), a task-named family wrapping its subcommands (`backup_*`
-//! over filesync), or the verb it has always had here (`dl`, over the `vidl` crate) — all
-//! `#[unprefixed]`, and each reuses the upstream argument structs where it can, so the args are
-//! defined once, upstream.
+//! over filesync), or the verb it has always had here (`dl`, over the `vidl` crate, with `dl_fix`
+//! over its `repair`) — all `#[unprefixed]`, and each reuses the upstream argument structs where
+//! it can, so the args are defined once, upstream.
 //!
-//! `dl` carries a little more of its own weight than the others: injecting bashrs's pinned tool
-//! paths, pinning where imported cookies are kept, and the supported-sites page stay on this side
-//! of the boundary. Acquiring the cookies themselves does not — that moved into `vidl`, which owns
-//! the store it reads.
+//! `dl` and `dl_fix` carry a little more of their own weight than the others: injecting bashrs's
+//! pinned tool paths, pinning where imported cookies are kept, and `dl`'s supported-sites page
+//! stay on this side of the boundary. Acquiring the cookies themselves does not — that moved into
+//! `vidl`, which owns the store it reads.
 
 #[bashrs_macros::category(command = ComfyReposCommand, prefix = "comfy_")]
 mod commands {
@@ -333,6 +333,19 @@ mod commands {
         (resolved != *name).then(|| PathBuf::from(resolved))
     }
 
+    /// Hand vidl the copies bashrs bundles and version-pins. Without this it would find whatever
+    /// is on PATH — which is the right default for a standalone user, and exactly what the
+    /// pinning exists to avoid here. The python matters twice over: it runs the cookie filter's
+    /// sqlite work, so an extract never depends on a system interpreter.
+    fn _install_vidl_tools() {
+        vidl::tools::install(vidl::tools::Tools {
+            ytdlp: _bundled("yt-dlp").map(PathBuf::into_os_string),
+            python: _bundled("python3").map(PathBuf::into_os_string),
+            ffmpeg_dir: _bundled("ffmpeg").and_then(|bin| bin.parent().map(Path::to_path_buf)),
+            js_runtime: _bundled("deno"),
+        });
+    }
+
     /// Download a video with the bundled yt-dlp. A YouTube URL (`youtube.com`, `youtu.be`, …)
     /// takes the full path — per-video subtitle selection, the playlist unplayable-report,
     /// channel tabs sorted into folders; any other site yt-dlp supports takes a generic path —
@@ -351,16 +364,7 @@ mod commands {
             eprintln!("dl: a URL is required (or -t, -c, or --cookies-extract-for-domain)");
             std::process::exit(2);
         }
-        // Hand vidl the copies bashrs bundles and version-pins. Without this it would find
-        // whatever is on PATH — which is the right default for a standalone user, and exactly
-        // what the pinning exists to avoid here. The python matters twice over: it runs the
-        // cookie filter's sqlite work, so an extract never depends on a system interpreter.
-        vidl::tools::install(vidl::tools::Tools {
-            ytdlp: _bundled("yt-dlp").map(PathBuf::into_os_string),
-            python: _bundled("python3").map(PathBuf::into_os_string),
-            ffmpeg_dir: _bundled("ffmpeg").and_then(|bin| bin.parent().map(Path::to_path_buf)),
-            js_runtime: _bundled("deno"),
-        });
+        _install_vidl_tools();
         // Imported cookies live under bashrs's data dir, not vidl's per-user default — the one
         // download option bashrs decides for itself. Set unconditionally, not just on an import: a
         // store is READ on every run, and a root known only while importing would be found once
@@ -392,6 +396,24 @@ mod commands {
     /// `table_fancy`-style to fit the terminal.
     fn _compatibility_help() -> String {
         doc_render::render_doc(COMPATIBILITY)
+    }
+
+    /// Add to the YouTube videos downloaded here (or under DIR), collection folders included, the
+    /// data each lacks — its thumbnail, subtitle tracks and their auto-generated marks, metadata
+    /// tags and chapters, as a download of it would hold them now. Videos are matched by the id in
+    /// their file names; nothing is downloaded again, and nothing a file holds is replaced.
+    /// `--check` only says what each lacks (vidl repair)
+    #[unprefixed]
+    pub fn dl_fix(args: vidl::RepairArgs) {
+        _install_vidl_tools();
+        // What a repair shares with a download is left at a download's defaults, but for where
+        // the imported cookies are kept — bashrs's data dir, as for `dl`, so a store imported
+        // there is the one a repair asks YouTube with.
+        let shared = vidl::Args { cookie_root: Some(_cookie_store_dir()), ..Default::default() };
+        let code = vidl::run_repair(shared, args);
+        if code != 0 {
+            std::process::exit(code);
+        }
     }
 
     #[cfg(test)]

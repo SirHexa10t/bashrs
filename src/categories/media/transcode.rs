@@ -9,7 +9,8 @@ mod commands {
     use clap::Args;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
-    use crate::categories::media::{_run_writing, OverwriteArgs};
+    use crate::categories::media::streams::{_attach_argv, _attaches_covers, _cover, _streams, _take_out, Cover, Stream};
+    use crate::categories::media::{_run_writing, _run_writing_then, OverwriteArgs};
     // --- media_convert (+ quality / compact profiles) ---------------------------
 
     /// Convert a media file to another format
@@ -232,10 +233,13 @@ mod commands {
             .map(|knobs| knobs.accepts)
             .unwrap_or_default();
         !accepts.is_empty()
-            && _stream_codecs(input, false).is_some_and(|codecs| _all_accepted(&codecs, accepts))
-            && (!h264_only
-                || _stream_codecs(input, true)
-                    .is_some_and(|video| video.iter().all(|codec| codec == "h264")))
+            && _streams(input).is_some_and(|streams| {
+                let codecs: Vec<String> =
+                    streams.iter().filter(|stream| !stream.codec.is_empty()).map(|stream| stream.codec.clone()).collect();
+                _all_accepted(&codecs, accepts)
+                    && (!h264_only
+                        || streams.iter().filter(|stream| stream.kind == "video").all(|stream| stream.codec == "h264"))
+            })
     }
 
     /// Whether `codecs` all sit within `accepts` (`"*"` = a codec-agnostic container, e.g. mkv).
@@ -245,22 +249,6 @@ mod commands {
             && codecs
                 .iter()
                 .all(|codec| accepts.contains(&"*") || accepts.contains(&codec.as_str()))
-    }
-
-    /// The codec names of `input`'s streams (all of them, or just the video ones), via ffprobe —
-    /// `None` when unprobeable (callers treat that as "don't stream-copy", never as an error).
-    fn _stream_codecs(input: &Path, only_video: bool) -> Option<Vec<String>> {
-        let mut argv: Vec<OsString> = ["-v", "error", "-show_entries", "stream=codec_name"]
-            .into_iter()
-            .map(OsString::from)
-            .collect();
-        if only_video {
-            argv.extend(["-select_streams", "v"].map(OsString::from));
-        }
-        argv.extend(["-of", "csv=p=0"].map(OsString::from));
-        argv.push(input.as_os_str().to_owned());
-        let out = capture_stdout(tools::resolve("ffprobe"), argv)?;
-        Some(out.split_whitespace().map(str::to_owned).collect())
     }
 
     /// The conversion runner: build the argv, hand off to the shared writing tail.
@@ -315,8 +303,8 @@ mod commands {
     // --- media_trim -------------------------------------------------------------
 
     /// Keep one stretch of a video/audio file: from a start, up to an end, or between the two —
-    /// frame-accurate (re-encoding on the output container's defaults), or instant and lossless
-    /// with `--copy` at keyframe precision
+    /// frame-accurate (re-encoding the video in its own codec, at its own bit rate), or instant
+    /// and lossless with `--copy` at keyframe precision
     pub fn trim(args: TrimArgs) {
         let TrimArgs { input, points, start, end, output, overwrite, copy } = args;
         let cut = match _resolve_cut(&points, start.as_deref(), end.as_deref()) {
@@ -328,8 +316,20 @@ mod commands {
             }
         };
         let output = output.unwrap_or_else(|| _trimmed_output(&input));
-        let argv = _trim_argv(&input, &output, &cut, overwrite.yes, copy);
-        _run_writing("media_trim", &input, &output, overwrite.yes, argv);
+        // Where covers are taken out to, for a container that attaches them again: the system's
+        // temporary directory rather than beside either file, as the input's may be read-only.
+        let covers = _attaches_covers(&output)
+            .then(|| std::env::temp_dir().join(format!("bashrs_trim_covers_{}", std::process::id())));
+        let mut layout = _trim_layout(&input, &output, &cut, copy, covers.as_deref());
+        if let Some(kept) = &mut layout {
+            _extract_covers(&input, kept);
+        }
+        let argv = _trim_argv(&input, &output, &cut, overwrite.yes, copy, layout.as_deref());
+        _run_writing_then("media_trim", &input, &output, overwrite.yes, argv, || {
+            if let Some(dir) = &covers {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        });
     }
 
     #[derive(Args)]
@@ -358,13 +358,14 @@ mod commands {
     }
 
     /// The stretch to keep, as ffmpeg will be told it: where to seek to (`-ss`, the start as
-    /// typed) and how much to keep from there (`-t`).
+    /// typed) and how much to keep from there (`-t`, in seconds).
     ///
     /// `-t` rather than `-to`, and the difference matters. With `-ss` before `-i` ffmpeg restarts
     /// the output's clock at the seek point, so `-to` there counts from the START — `-ss 0:05 -to
     /// 0:30` keeps thirty seconds, not twenty-five. `-t` with the difference says what was meant
-    /// on every ffmpeg version; with no start there is no seek, and the end as typed IS the
-    /// length.
+    /// on every ffmpeg version; with no start there is no seek, and the end IS the length. Either
+    /// way it is written in seconds, the unit the subtitle fitting ([`_subtitle_fitting`])
+    /// reckons in.
     #[derive(Debug, PartialEq, Eq)]
     struct Cut {
         seek: Option<String>,
@@ -426,7 +427,7 @@ mod commands {
                 ));
             }
             (Some(from), Some(to)) => Some(_ffmpeg_seconds(to - from)),
-            (None, Some(_)) => end.map(str::to_string),
+            (None, Some(to)) => Some(_ffmpeg_seconds(to)),
             (_, None) => None,
         };
         Ok(Cut { seek: start.map(str::to_string), keep })
@@ -462,16 +463,207 @@ mod commands {
         text.trim_end_matches('0').trim_end_matches('.').to_string()
     }
 
+    /// One stream a trim keeps: where it comes from — the seeked input (`0`), or the unseeked
+    /// reread (`1`) the subtitles of a cut with a start come from, see [`_trim_argv`] — and how it
+    /// is written.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Kept {
+        input: usize,
+        stream: Stream,
+        how: How,
+    }
+
+    /// An encoder's own options, as `(option, value)` pairs — each written `-{option}:{stream}
+    /// {value}`, for the one output stream it encodes.
+    type EncoderSettings = &'static [(&'static str, &'static str)];
+
+    /// How a kept stream is written.
+    #[derive(Debug, PartialEq, Eq)]
+    enum How {
+        /// Bit for bit.
+        Copy,
+        /// Re-encoded in its own codec ([`IN_KIND`]), spending `rate` bits per second — the
+        /// source's own over the cut, where it could be read; else at the encoder's default.
+        InKind { encoder: &'static str, settings: EncoderSettings, rate: Option<u64> },
+        /// Re-encoded to the sample in its own lossless codec, which loses nothing.
+        Lossless,
+        /// Re-encoded on the container's default encoder, no in-kind one being known for it.
+        Default,
+        /// A cover picture taken out of the input beforehand ([`_extract_covers`]) and attached to
+        /// the output again — not mapped, which would make a video track of it (the Matroska
+        /// rule, `streams::_attaches_covers`).
+        Reattach(Cover),
+    }
+
+    /// The encoder writing each video codec back in kind as a trim re-encodes it, and the settings
+    /// that keep it quick — each tried on 30 s of a 1080p24 AV1 video at that stretch's own rate,
+    /// 609 kbit/s. SVT-AV1 at preset 8 ran a little faster than x264 at its default and landed on
+    /// 599 kbit/s; preset 10 halved the time but undershot, to 469, and SVT warns of artifacts
+    /// there. libvpx-vp9 (good, cpu-used 4, row threads) and x265 (medium) took about three times
+    /// as long, at 702 and 633; x264's one-pass rate control overshot, to 858. A codec missing
+    /// here is re-encoded on the container's default instead.
+    const IN_KIND: &[(&str, &str, EncoderSettings)] = &[
+        ("av1", "libsvtav1", &[("preset", "8")]),
+        ("vp9", "libvpx-vp9", &[("deadline", "good"), ("cpu-used", "4"), ("row-mt", "1")]),
+        ("hevc", "libx265", &[("preset", "medium"), ("x265-params", "log-level=error")]),
+        ("h264", "libx264", &[]),
+        ("vp8", "libvpx", &[]),
+        ("mpeg4", "mpeg4", &[]),
+    ];
+
+    /// Whether an audio codec is lossless: re-encoding it costs nothing, and the cut then falls
+    /// on the very sample asked for.
+    fn _lossless_audio(codec: &str) -> bool {
+        codec.starts_with("pcm_") || ["flac", "alac", "wavpack", "tta"].contains(&codec)
+    }
+
+    /// What the trim keeps of `input`, stream by stream ([`_keep_plan`]), the video's rates read
+    /// from the source ([`_kept_bit_rate`]), its covers to be taken out to `covers` where the
+    /// output attaches them — or `None`, leaving the choice to ffmpeg, where the output is another
+    /// container than the input's, which may not hold all it does (changing containers is
+    /// `media_convert`'s job), or where ffprobe cannot read `input`. Says so where a video goes on
+    /// the container's default, or at its encoder's default quality.
+    fn _trim_layout(input: &Path, output: &Path, cut: &Cut, copy: bool, covers: Option<&Path>) -> Option<Vec<Kept>> {
+        if _ext(input) != _ext(output) {
+            return None;
+        }
+        let plan = _keep_plan(&_streams(input)?, copy, cut.seek.is_some(), covers, |stream| _kept_bit_rate(input, stream, cut));
+        for kept in &plan {
+            match kept.how {
+                How::Default => eprintln!(
+                    "media_trim: no encoder known to write {} back in kind — the container's default re-encodes it",
+                    kept.stream.codec
+                ),
+                How::InKind { rate: None, .. } => eprintln!(
+                    "media_trim: {}'s bit rate could not be read off the source — re-encoding at its encoder's default quality",
+                    kept.stream.codec
+                ),
+                _ => {}
+            }
+        }
+        Some(plan)
+    }
+
+    /// Take each cover the plan attaches again out of `input`, to the file it names. One that will
+    /// not come out stays a mapped stream instead, demoted to a plain video track but kept, and is
+    /// said so.
+    fn _extract_covers(input: &Path, plan: &mut [Kept]) {
+        for kept in plan.iter_mut() {
+            let How::Reattach(cover) = &kept.how else { continue };
+            if !_take_out(input, kept.stream.index, cover) {
+                eprintln!(
+                    "media_trim: the cover {} would not come out to be attached again — kept as a plain video track",
+                    cover.filename
+                );
+                kept.how = How::Copy;
+            }
+        }
+    }
+
+    /// What a trim keeps of `streams`, in their order: every picture, sound, subtitle and
+    /// attachment — and none of the data tracks (an mp4's chapter and timecode tracks, which its
+    /// chapters and metadata remake, or nothing can remux). Where `covers` names a directory, the
+    /// output attaches its covers (the Matroska rule): each is taken out there, to be attached
+    /// again — in an image type Matroska keeps as a cover, else copied as it came.
+    /// `copy` copies the rest. Otherwise the video is re-encoded in kind, at the rate `rate` reads
+    /// for its stream; lossless sound is re-encoded, to the sample; lossy sound, cover pictures,
+    /// subtitles and attachments are copied — subtitles from the reread when the cut has a start
+    /// (`seek`).
+    fn _keep_plan(
+        streams: &[Stream],
+        copy: bool,
+        seek: bool,
+        covers: Option<&Path>,
+        rate: impl Fn(usize) -> Option<u64>,
+    ) -> Vec<Kept> {
+        streams
+            .iter()
+            .filter_map(|stream| {
+                let how = if let Some(cover) = covers.filter(|_| stream.cover).and_then(|dir| _cover(stream, dir)) {
+                    How::Reattach(cover)
+                } else {
+                    match stream.kind.as_str() {
+                        "video" | "audio" | "subtitle" | "attachment" if copy => How::Copy,
+                        "video" if !stream.cover => match IN_KIND.iter().find(|(codec, ..)| *codec == stream.codec) {
+                            Some(&(_, encoder, settings)) => How::InKind { encoder, settings, rate: rate(stream.index) },
+                            None => How::Default,
+                        },
+                        "audio" if _lossless_audio(&stream.codec) => How::Lossless,
+                        "video" | "audio" | "subtitle" | "attachment" => How::Copy,
+                        _ => return None,
+                    }
+                };
+                let input = usize::from(seek && stream.kind == "subtitle");
+                Some(Kept { input, stream: stream.clone(), how })
+            })
+            .collect()
+    }
+
+    /// The rate the source spends on stream `stream` over the cut, in bits per second — its
+    /// packets' bytes in the kept stretch, read without decoding, so the cut weighs what that
+    /// stretch did in the source. `None` where ffprobe reads no packets there.
+    fn _kept_bit_rate(input: &Path, stream: usize, cut: &Cut) -> Option<u64> {
+        let from = cut.seek.as_deref().and_then(_seconds).unwrap_or(0.0);
+        let keep = cut.keep.as_deref().and_then(|keep| keep.parse::<f64>().ok());
+        let interval = match keep {
+            Some(keep) => format!("{from}%+{keep}"),
+            None => format!("{from}%"),
+        };
+        let stream = stream.to_string();
+        let mut argv: Vec<OsString> = [
+            "-v", "error", "-select_streams", &stream, "-read_intervals", &interval,
+            "-show_entries", "packet=pts_time,duration_time,size", "-of", "csv=p=0",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        argv.push(input.as_os_str().to_owned());
+        _bit_rate_of(&capture_stdout(tools::resolve("ffprobe"), argv)?, from, keep)
+    }
+
+    /// The bit rate of the packets ffprobe lists in `csv` (`pts_time,duration_time,size` rows)
+    /// that start within `from` and `from + keep` — every one from `from` on, without a `keep`:
+    /// the reading starts at the keyframe before `from`, whose packets are no part of the cut.
+    fn _bit_rate_of(csv: &str, from: f64, keep: Option<f64>) -> Option<u64> {
+        let until = keep.map_or(f64::INFINITY, |keep| from + keep);
+        let (mut bytes, mut first, mut last) = (0u64, f64::INFINITY, f64::NEG_INFINITY);
+        for row in csv.lines() {
+            let mut fields = row.split(',');
+            let (Some(pts), Some(duration), Some(size)) = (fields.next(), fields.next(), fields.next()) else { continue };
+            let (Ok(pts), Ok(size)) = (pts.parse::<f64>(), size.parse::<u64>()) else { continue };
+            if pts < from || pts >= until {
+                continue;
+            }
+            bytes += size;
+            first = first.min(pts);
+            last = last.max(pts + duration.parse::<f64>().unwrap_or(0.0));
+        }
+        let span = last - first;
+        (bytes > 0 && span > 0.0).then(|| (bytes as f64 * 8.0 / span).round() as u64)
+    }
+
     /// ffmpeg argv for the trim. `-ss` sits *before* `-i`: ffmpeg then seeks instead of decoding
     /// through the skipped part — and when re-encoding it is still frame-accurate, decoding
     /// forward from the preceding keyframe and discarding up to the requested point. `-t` is an
     /// output option and sits after the input, like `-c copy`.
+    ///
+    /// With a `layout` ([`_trim_layout`]), each kept stream is mapped and written as it says. A
+    /// cut with a start then reads the input a second time, unseeked and shifted back by the
+    /// start, for the subtitles: the seek lands past the cue still on screen there — it began
+    /// earlier — which the reread still has. A re-encode drops what the copied sound carries from
+    /// before the start (the seek's keyframe lead-in, which the re-encoded picture does not
+    /// have); a `--copy` keeps it, as its picture keeps the lead-in. A cover the output attaches
+    /// again ([`How::Reattach`]) is attached after the mapped streams, under the name and type it
+    /// carried. Without a layout ffmpeg picks the streams, and default encoders, itself. Wherever a cut can leave a subtitle cue
+    /// overhanging it — at an end, or a start read again — the cues are fitted to it
+    /// ([`_subtitle_fitting`]).
     fn _trim_argv(
         input: &Path,
         output: &Path,
         cut: &Cut,
         overwrite: bool,
         copy: bool,
+        layout: Option<&[Kept]>,
     ) -> Vec<OsString> {
         let mut argv: Vec<OsString> = Vec::new();
         if overwrite {
@@ -482,14 +674,73 @@ mod commands {
         }
         argv.push("-i".into());
         argv.push(input.as_os_str().to_owned());
-        if copy {
-            argv.extend(["-c", "copy"].map(OsString::from));
+        let reread = layout.is_some_and(|kept| kept.iter().any(|kept| kept.input == 1));
+        if let (true, Some(seek)) = (reread, &cut.seek) {
+            argv.extend(["-itsoffset".into(), format!("-{seek}").into(), "-i".into(), input.as_os_str().to_owned()]);
+        }
+        match layout {
+            Some(kept) => {
+                let mapped: Vec<&Kept> = kept.iter().filter(|kept| !matches!(kept.how, How::Reattach(_))).collect();
+                for (at, kept) in mapped.iter().enumerate() {
+                    argv.extend(["-map".to_string(), format!("{}:{}", kept.input, kept.stream.index)].map(OsString::from));
+                    argv.extend(_written_as(at, kept).into_iter().map(OsString::from));
+                }
+                let covers: Vec<&Cover> =
+                    kept.iter().filter_map(|kept| if let How::Reattach(cover) = &kept.how { Some(cover) } else { None }).collect();
+                let attachments = mapped.iter().filter(|kept| kept.stream.kind == "attachment").count();
+                argv.extend(_attach_argv(&covers, attachments));
+            }
+            None if copy => argv.extend(["-c", "copy"].map(OsString::from)),
+            None => {}
         }
         if let Some(keep) = &cut.keep {
             argv.extend(["-t", keep].map(OsString::from));
         }
+        if layout.is_some() && !copy && cut.seek.is_some() {
+            argv.extend(["-bsf:a", r"noise=drop='lt(pts\,0)'"].map(OsString::from));
+        }
+        if reread || cut.keep.is_some() {
+            argv.push("-bsf:s".into());
+            argv.push(_subtitle_fitting(cut.keep.as_deref()).into());
+        }
         argv.push(output.as_os_str().to_owned());
         argv
+    }
+
+    /// The options writing `kept` as output stream `at`, as its [`How`] says.
+    fn _written_as(at: usize, kept: &Kept) -> Vec<String> {
+        match &kept.how {
+            How::Copy => vec![format!("-c:{at}"), "copy".to_string()],
+            How::InKind { encoder, settings, rate } => {
+                let mut options = vec![format!("-c:{at}"), encoder.to_string()];
+                for (option, value) in *settings {
+                    options.extend([format!("-{option}:{at}"), value.to_string()]);
+                }
+                if let Some(rate) = rate {
+                    options.extend([format!("-b:{at}"), rate.to_string()]);
+                }
+                options
+            }
+            How::Lossless => vec![format!("-c:{at}"), kept.stream.codec.clone()],
+            How::Default | How::Reattach(_) => Vec::new(),
+        }
+    }
+
+    /// The bitstream filters fitting the subtitle cues to the cut, `keep` seconds long if it ends.
+    ///
+    /// A cue straddling a cut point is kept whole by ffmpeg — and a Matroska file lasts as long as
+    /// the last thing in it ends, so one overhanging the end runs the player's timeline past the
+    /// picture, into black (YouTube's rolling auto-captions last until the next one starts:
+    /// almost any cut lands inside one). The filters run on the cues' own clock, the cut's start
+    /// at 0: `noise` drops those that ended before it (only a reread delivers any), and `setts`
+    /// moves an earlier start up to 0 and an end beyond `keep` back to it, the duration following
+    /// suit.
+    fn _subtitle_fitting(keep: Option<&str>) -> String {
+        let end = match keep {
+            Some(keep) => format!(r"min(PTS+DURATION\,{keep}/TB)"),
+            None => "PTS+DURATION".to_string(),
+        };
+        format!(r"noise=drop='lte(pts+duration\,0)',setts=pts='max(PTS\,0)':dts='max(DTS\,0)':duration='{end}-max(PTS\,0)'")
     }
 
     /// The default trim output: the input's name with a `_trimmed` mark, in the same directory.
@@ -505,6 +756,7 @@ mod commands {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::categories::media::streams::_parse_streams;
         use crate::categories::media::strs;
 
         #[test]
@@ -657,7 +909,7 @@ mod commands {
         /// its own is only sayable as `--end`.
         #[test]
         fn named_points_claim_their_role_and_bare_ones_fill_what_is_left() {
-            assert_eq!(resolve(&[], None, Some("0:30")), Ok(cut(None, Some("0:30"))), "end alone");
+            assert_eq!(resolve(&[], None, Some("0:30")), Ok(cut(None, Some("30"))), "end alone, as the length in seconds");
             assert_eq!(resolve(&[], Some("0:05"), None), Ok(cut(Some("0:05"), None)), "start alone, named");
             assert_eq!(resolve(&[], Some("0:05"), Some("0:30")), Ok(cut(Some("0:05"), Some("25"))));
             assert_eq!(resolve(&["0:05"], None, Some("0:30")), Ok(cut(Some("0:05"), Some("25"))), "the bare one is the start");
@@ -705,15 +957,177 @@ mod commands {
         }
 
         /// `-ss` seeks before the input; `-t` limits the output after it. With `-ss` before `-i`,
-        /// `-to` would count from the seek point, which is why `-t` carries the difference.
+        /// `-to` would count from the seek point, which is why `-t` carries the difference. Left
+        /// to ffmpeg's own stream choice — no layout — a cut with an end fits the subtitle cues to
+        /// it, and a start alone leaves them as ffmpeg shifted them.
         #[test]
         fn trim_argv_seeks_before_the_input_and_limits_after_it() {
-            let argv = |cut, overwrite, copy| strs(&_trim_argv(Path::new("in.mp4"), Path::new("out.mp4"), &cut, overwrite, copy));
+            let argv = |cut, overwrite, copy| strs(&_trim_argv(Path::new("in.mp4"), Path::new("out.mp4"), &cut, overwrite, copy, None));
+            let fitting = |keep| _subtitle_fitting(Some(keep));
             assert_eq!(argv(cut(Some("1.2"), None), false, false), ["-ss", "1.2", "-i", "in.mp4", "out.mp4"]);
-            assert_eq!(argv(cut(None, Some("0:30")), false, false), ["-i", "in.mp4", "-t", "0:30", "out.mp4"]);
+            assert_eq!(argv(cut(None, Some("30")), false, false), ["-i", "in.mp4", "-t", "30", "-bsf:s", &fitting("30"), "out.mp4"]);
             assert_eq!(
                 argv(cut(Some("0:05"), Some("25")), true, true),
-                ["-y", "-ss", "0:05", "-i", "in.mp4", "-c", "copy", "-t", "25", "out.mp4"]
+                ["-y", "-ss", "0:05", "-i", "in.mp4", "-c", "copy", "-t", "25", "-bsf:s", &fitting("25"), "out.mp4"]
+            );
+        }
+
+        /// A YouTube download's streams, as ffprobe lists them in JSON: an AV1 picture, Opus sound,
+        /// two subtitle tracks, a cover picture (attached as `cover.jpg`), a font, and a data track.
+        const DOWNLOAD: &str = r#"{"streams": [
+            {"index": 0, "codec_name": "av1", "codec_type": "video", "disposition": {"attached_pic": 0}},
+            {"index": 1, "codec_name": "opus", "codec_type": "audio", "disposition": {"attached_pic": 0}},
+            {"index": 2, "codec_name": "webvtt", "codec_type": "subtitle", "disposition": {"attached_pic": 0}},
+            {"index": 3, "codec_name": "webvtt", "codec_type": "subtitle", "disposition": {"attached_pic": 0}},
+            {"index": 4, "codec_name": "mjpeg", "codec_type": "video", "disposition": {"attached_pic": 1},
+             "tags": {"filename": "cover.jpg", "mimetype": "image/jpeg"}},
+            {"index": 5, "codec_type": "attachment", "disposition": {"attached_pic": 0},
+             "tags": {"filename": "font.ttf", "mimetype": "application/x-truetype-font"}},
+            {"index": 6, "codec_name": "bin_data", "codec_type": "data", "disposition": {"attached_pic": 0}}
+        ]}"#;
+
+        fn stream(index: usize, kind: &str, codec: &str, cover: bool) -> Stream {
+            Stream { index, kind: kind.to_string(), codec: codec.to_string(), attached: cover, cover, filename: None, mimetype: None }
+        }
+
+        fn kept(input: usize, stream: Stream, how: How) -> Kept {
+            Kept { input, stream, how }
+        }
+
+        /// Re-encoding with a start: the picture in kind at its measured rate, the sound, both
+        /// subtitle tracks (from the reread), the cover and the font copied — the data track left
+        /// out. `--copy` copies the same streams, the subtitles still from the reread. Into a
+        /// container that attaches covers, the cover is taken out to be attached again instead.
+        #[test]
+        fn a_trim_keeps_every_stream_but_data_each_written_its_way() {
+            let streams = _parse_streams(DOWNLOAD).unwrap();
+            let svt = How::InKind { encoder: "libsvtav1", settings: &[("preset", "8")], rate: Some(576_097) };
+            let plan = _keep_plan(&streams, false, true, None, |index| (index == 0).then_some(576_097));
+            let ways: Vec<(usize, usize, &How)> = plan.iter().map(|kept| (kept.input, kept.stream.index, &kept.how)).collect();
+            assert_eq!(ways, [(0, 0, &svt), (0, 1, &How::Copy), (1, 2, &How::Copy), (1, 3, &How::Copy), (0, 4, &How::Copy), (0, 5, &How::Copy)]);
+            assert!(plan.iter().zip(&streams).all(|(kept, stream)| kept.stream == *stream), "each with its stream as probed");
+            let copied = _keep_plan(&streams, true, false, None, |_| unreachable!("a copy measures nothing"));
+            assert!(copied.iter().all(|kept| kept.how == How::Copy && kept.input == 0), "{copied:?}");
+            assert_eq!(copied.len(), 6, "the data track still left out: {copied:?}");
+
+            let covers = Path::new("/tmp/covers");
+            let reattached = How::Reattach(Cover {
+                file: covers.join("cover-4.jpg"),
+                filename: "cover.jpg".to_string(),
+                mimetype: "image/jpeg".to_string(),
+            });
+            for copy in [false, true] {
+                let plan = _keep_plan(&streams, copy, false, Some(covers), |_| Some(576_097));
+                assert_eq!(plan[4].how, reattached, "copy: {copy}");
+                assert_eq!(plan[5].how, How::Copy, "a font is mapped, as it ever was: {plan:?}");
+            }
+            // An mjpeg picture that is no cover is video, not a picture to attach.
+            let motion = _keep_plan(&[stream(0, "video", "mjpeg", false)], false, false, Some(covers), |_| None);
+            assert_eq!(motion[0].how, How::Default, "{motion:?}");
+        }
+
+        /// A cover that will not come out — here, from an input that is not there — is kept as a
+        /// mapped stream instead of being lost.
+        #[test]
+        fn a_cover_that_will_not_come_out_is_kept_mapped() {
+            let dir = std::env::temp_dir().join(format!("bashrs_cover_fallback_{}", std::process::id()));
+            let mut plan = [kept(0, stream(4, "video", "mjpeg", true), How::Reattach(Cover {
+                file: dir.join("cover-4.jpg"),
+                filename: "cover.jpg".to_string(),
+                mimetype: "image/jpeg".to_string(),
+            }))];
+            _extract_covers(Path::new("/no/such/input.mkv"), &mut plan);
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(plan[0].how, How::Copy);
+        }
+
+        /// Lossless sound is re-encoded, to the sample; a video codec with no in-kind encoder goes
+        /// on the container's default; a rate that cannot be read leaves the encoder's own.
+        #[test]
+        fn lossless_sound_and_unknown_video_codecs_have_their_own_way() {
+            let streams = [stream(0, "video", "prores", false), stream(1, "video", "h264", false), stream(2, "audio", "flac", false), stream(3, "audio", "pcm_s24le", false)];
+            let ways: Vec<How> = _keep_plan(&streams, false, false, None, |_| None).into_iter().map(|kept| kept.how).collect();
+            assert_eq!(ways, [How::Default, How::InKind { encoder: "libx264", settings: &[], rate: None }, How::Lossless, How::Lossless]);
+            for codec in ["opus", "aac", "mp3", "vorbis", "ac3"] {
+                assert!(!_lossless_audio(codec), "{codec} is lossy, so copied");
+            }
+        }
+
+        /// The rate counts only packets starting within the cut — not the lead-in from the
+        /// keyframe before it, nor what follows it — over the time they span.
+        #[test]
+        fn the_rate_is_the_cuts_own_packets_over_their_span() {
+            let csv = "29.0,1.0,999999\n30.0,1.0,1000\n31.0,1.0,1000\n32.0,N/A,500\n40.0,1.0,999999\nbroken\n";
+            // 2500 bytes from 30.0 to 32.0 (a duration ffprobe has no value for counts as none).
+            assert_eq!(_bit_rate_of(csv, 30.0, Some(10.0)), Some(10_000));
+            // 1 002 499 bytes from 30.0 to 41.0: everything from the start on.
+            assert_eq!(_bit_rate_of(csv, 30.0, None), Some(729_090), "to the end");
+            assert_eq!(_bit_rate_of("", 0.0, None), None, "no packets, no rate");
+        }
+
+        /// Every kept stream is mapped, and written as its plan says — by its index among the
+        /// output's mapped streams; a cover attached again is attached after them all, its tags on
+        /// the attachment it becomes (after the mapped ones); a re-encode with a start drops the
+        /// copied sound's lead-in, a start reads the input again for the subtitles, and the cues
+        /// are fitted to the cut.
+        #[test]
+        fn a_layout_maps_each_stream_and_writes_it_its_way() {
+            let layout = [
+                kept(0, stream(0, "video", "av1", false), How::InKind { encoder: "libsvtav1", settings: &[("preset", "8")], rate: Some(576_097) }),
+                kept(0, stream(1, "audio", "opus", false), How::Copy),
+                kept(1, stream(2, "subtitle", "webvtt", false), How::Copy),
+                kept(0, stream(3, "audio", "flac", false), How::Lossless),
+                kept(0, stream(4, "video", "prores", false), How::Default),
+                kept(0, stream(5, "video", "mjpeg", true), How::Reattach(Cover {
+                    file: PathBuf::from("/tmp/covers/cover-5.jpg"),
+                    filename: "cover.jpg".to_string(),
+                    mimetype: "image/jpeg".to_string(),
+                })),
+                kept(0, stream(6, "attachment", "ttf", false), How::Copy),
+            ];
+            let argv = |cut, copy| strs(&_trim_argv(Path::new("in.mkv"), Path::new("out.mkv"), &cut, false, copy, Some(&layout)));
+            assert_eq!(
+                argv(cut(Some("0:30"), Some("10")), false),
+                [
+                    "-ss", "0:30", "-i", "in.mkv",
+                    "-itsoffset", "-0:30", "-i", "in.mkv",
+                    "-map", "0:0", "-c:0", "libsvtav1", "-preset:0", "8", "-b:0", "576097",
+                    "-map", "0:1", "-c:1", "copy",
+                    "-map", "1:2", "-c:2", "copy",
+                    "-map", "0:3", "-c:3", "flac",
+                    "-map", "0:4",
+                    "-map", "0:6", "-c:5", "copy",
+                    "-attach", "/tmp/covers/cover-5.jpg", "-metadata:s:t:1", "mimetype=image/jpeg", "-metadata:s:t:1", "filename=cover.jpg",
+                    "-t", "10", "-bsf:a", r"noise=drop='lt(pts\,0)'", "-bsf:s", &_subtitle_fitting(Some("10")), "out.mkv",
+                ]
+            );
+            // As the plan lays them out: a copy, from a start; a re-encode, with no start at all.
+            let streams = _parse_streams(DOWNLOAD).unwrap();
+            let planned = |cut: Cut, copy| {
+                let layout = _keep_plan(&streams, copy, cut.seek.is_some(), None, |_| Some(576_097));
+                strs(&_trim_argv(Path::new("in.mkv"), Path::new("out.mkv"), &cut, false, copy, Some(&layout)))
+            };
+            let copied = planned(cut(Some("30"), None), true);
+            assert!(copied.contains(&"-itsoffset".to_string()), "a copy rereads the subtitles too: {copied:?}");
+            assert!(!copied.contains(&"-bsf:a".to_string()), "a copy keeps the sound's lead-in, as its picture's: {copied:?}");
+            assert_eq!(copied[copied.len() - 3..], ["-bsf:s", &_subtitle_fitting(None), "out.mkv"], "{copied:?}");
+            let no_start = planned(cut(None, Some("10")), false);
+            assert!(!no_start.contains(&"-itsoffset".to_string()) && !no_start.contains(&"-bsf:a".to_string()), "{no_start:?}");
+            assert!(no_start.contains(&"0:2".to_string()) && !no_start.contains(&"1:2".to_string()), "subtitles from the one input: {no_start:?}");
+        }
+
+        /// The fitting is ffmpeg's own filter syntax — commas inside an expression escaped, as
+        /// a bare one would end the filter there — and it ends the cues at the cut only when the
+        /// cut has an end.
+        #[test]
+        fn subtitle_fitting_drops_what_ended_before_the_start_and_clamps_both_ends() {
+            assert_eq!(
+                _subtitle_fitting(Some("142.5")),
+                r"noise=drop='lte(pts+duration\,0)',setts=pts='max(PTS\,0)':dts='max(DTS\,0)':duration='min(PTS+DURATION\,142.5/TB)-max(PTS\,0)'"
+            );
+            assert_eq!(
+                _subtitle_fitting(None),
+                r"noise=drop='lte(pts+duration\,0)',setts=pts='max(PTS\,0)':dts='max(DTS\,0)':duration='PTS+DURATION-max(PTS\,0)'"
             );
         }
 

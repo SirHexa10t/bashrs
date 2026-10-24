@@ -918,11 +918,17 @@ mod tests {
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(dir.join("pyvenv.cfg"), "home = /somewhere/interpreters/bin\n").unwrap();
         match python {
+            // Put in place by a child process, so this one never holds it open for writing: a
+            // test thread starting a process meanwhile hands its child a copy of every open
+            // descriptor, kept until that child's own exec, and running a file still open for
+            // writing fails with "Text file busy" (ETXTBSY). Run right after being written, the
+            // stub did — about once in two hundred parallel runs of the suite. The staged copy is
+            // never run, so writing it here is safe.
             Some(script) => {
-                use std::os::unix::fs::PermissionsExt;
-                let bin = dir.join("bin/python3");
-                std::fs::write(&bin, script).unwrap();
-                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let staged = dir.join("python3.staged");
+                std::fs::write(&staged, script).unwrap();
+                let placed = Command::new("install").args(["-m", "755"]).arg(&staged).arg(dir.join("bin/python3")).status();
+                assert!(placed.is_ok_and(|status| status.success()), "could not place the stub interpreter");
             }
             // The moved-disk casualty: a symlink whose absolute target no longer exists.
             None => std::os::unix::fs::symlink("/no/such/interpreter/python3", dir.join("bin/python3")).unwrap(),

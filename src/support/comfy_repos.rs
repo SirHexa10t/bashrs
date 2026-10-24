@@ -3,10 +3,13 @@
 //!
 //! Right now that's `table_formatter`'s presets: the `table_fancy` shape, defined once and used both
 //! by the command itself and by [`crate::support::doc_render`], which renders the embedded
-//! templates' markdown tables in that same shape; and the plain listing shape every listing prints
-//! in. Helpers for the other wrapped tools (`table`, `backup_*`) belong here too as they appear.
+//! templates' markdown tables in that same shape; the plain listing shape every listing prints
+//! in; and the comparison shape `media_metadata` lines several files up in. Helpers for the other
+//! wrapped tools (`table`, `backup_*`) belong here too as they appear.
 
 use table_formatter::{FormatOptions, RowSpacing};
+
+use crate::support::align::DIVIDER;
 
 /// The listing shape — `table --remove-trailing-spaces --reasonable-spacing` — that `lll`, `LLL`,
 /// `fs_usage` and the network tables print in: the library's two-space columns, a run of two
@@ -16,6 +19,40 @@ use table_formatter::{FormatOptions, RowSpacing};
 /// rest of its column takes its row out of the alignment instead of padding everyone to it.
 pub(crate) fn listing_table_options() -> FormatOptions {
     FormatOptions { trim_trailing: true, reasonable_spacing: true, ..Default::default() }
+}
+
+/// The comparison shape at the live terminal width — `table -d " \x1f " -j " | "
+/// --avoid-trimming-cells --remove-trailing-spaces --split-lines --space-rows none`: one column per
+/// compared thing, pipe-joined, wrapped to fit the window only where it would not.
+///
+/// The rows arrive framed by [`DIVIDER`] — before the first cell and after the last, as well as
+/// between — and the cells are kept exactly as given: a padding cell stays empty instead of
+/// getting the library's `-` filler, and an indented continuation keeps its indent, in the first
+/// column too, which only the frame bounds. No rule between records: every row is one, and a rule
+/// under each would double the table's height as soon as one row wrapped.
+pub(crate) fn comparison_table_options() -> FormatOptions {
+    comparison_table_options_at(table_formatter::terminal_width())
+}
+
+/// The comparison shape at an explicit width, as [`table_fancy_options_at`] is for its shape.
+pub(crate) fn comparison_table_options_at(width: usize) -> FormatOptions {
+    FormatOptions {
+        divide_by: DIVIDER.to_string(),    // -d " \x1f ", which the rows are framed in
+        join_with: " | ".to_string(),      // -j " | "
+        avoid_trimming_cells: true,        // --avoid-trimming-cells
+        trim_trailing: true,               // --remove-trailing-spaces
+        split_until_width: Some(width),    // --split-lines, already resolved to a width
+        space_rows: RowSpacing::Off,       // --space-rows none
+        ..Default::default()
+    }
+}
+
+/// `cells` as one row of a comparison table: framed by [`DIVIDER`] on both sides and divided by it
+/// within — the shape [`comparison_table_options`] reads. A divider inside a cell becomes a space,
+/// so no text can split a cell in two.
+pub(crate) fn comparison_row(cells: &[String]) -> String {
+    let cells: Vec<String> = cells.iter().map(|cell| cell.replace('\u{1f}', " ")).collect();
+    format!("{}{}{}", DIVIDER.trim_start(), cells.join(DIVIDER), DIVIDER.trim_end())
 }
 
 /// The `table_fancy` shape at the live terminal width — `table -j " | " --split-lines
@@ -83,6 +120,32 @@ mod tests {
             table_fancy_options().split_until_width,
             Some(table_formatter::terminal_width())
         );
+    }
+
+    /// The comparison preset is the flags it stands for and nothing else, its width the library's
+    /// own terminal width when probed.
+    #[test]
+    fn the_comparison_preset_is_pipe_joined_exact_trimmed_and_split_unruled() {
+        let opts = comparison_table_options_at(120);
+        assert_eq!(opts.divide_by, DIVIDER, "-d, the divider the rows are framed in");
+        assert_eq!(opts.join_with, " | ", "-j \" | \"");
+        assert!(opts.avoid_trimming_cells && opts.exact_cells(), "--avoid-trimming-cells, in effect");
+        assert!(opts.trim_trailing, "--remove-trailing-spaces");
+        assert_eq!(opts.split_until_width, Some(120), "--split-lines, at the given width");
+        assert!(matches!(opts.space_rows, RowSpacing::Off), "--space-rows none");
+        let default = FormatOptions::default();
+        assert_eq!((opts.sort, opts.header, opts.emit_frame), (default.sort, default.header, default.emit_frame));
+        assert_eq!(comparison_table_options().split_until_width, Some(table_formatter::terminal_width()));
+    }
+
+    /// A row is its cells framed by the divider on both sides; a divider inside a cell becomes a
+    /// space rather than a cell boundary.
+    #[test]
+    fn a_comparison_row_is_framed_and_no_cell_can_split_it() {
+        let cells = ["a".to_string(), String::new(), "b\u{1f}c".to_string()];
+        assert_eq!(comparison_row(&cells), "\u{1f} a \u{1f}  \u{1f} b c \u{1f}");
+        let laid = table_formatter::format_table(&[comparison_row(&cells)], &comparison_table_options_at(80)).unwrap();
+        assert_eq!(laid, ["a |  | b c"], "three cells, the empty one kept empty");
     }
 
     #[test]
