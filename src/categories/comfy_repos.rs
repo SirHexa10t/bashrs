@@ -1,8 +1,9 @@
 //! Commands backed by my other repos, imported as dependencies. Each is exposed under the
 //! external tool's own name (`table`), a task-named family wrapping its subcommands (`backup_*`
 //! over filesync), or the verb it has always had here (`dl`, over the `vidl` crate, with `dl_fix`
-//! over its `repair`) — all `#[unprefixed]`, and each reuses the upstream argument structs where
-//! it can, so the args are defined once, upstream.
+//! over its `repair`) — each named outright with `#[name]`, being an alias of a repo rather than
+//! a command of a bashrs category (whose prefix `#[unprefixed]` drops), and each reusing the
+//! upstream argument structs where it can, so the args are defined once, upstream.
 //!
 //! `dl` and `dl_fix` carry a little more of their own weight than the others: injecting bashrs's
 //! pinned tool paths, pinning where imported cookies are kept, and `dl`'s supported-sites page
@@ -20,7 +21,7 @@ mod commands {
 
     /// Align whitespace-delimited columns into a neat table — or paste an HTML <table>
     /// (a saved wiki/docs page) and it's translated into one (table_formatter)
-    #[unprefixed]
+    #[name("table")]
     pub fn table(args: table_formatter::Args) {
         if let Err(err) = table_formatter::run_with(args) {
             eprintln!("table: {err}");
@@ -30,7 +31,7 @@ mod commands {
     /// `table` in its framed, terminal-width form: `-j " | " --split-lines --space-rows '-'
     /// --emit-frame` — pipe-joined columns in a border, records ruled apart, wide rows wrapped to
     /// fit the window (table_formatter)
-    #[unprefixed]
+    #[name("table_fancy")]
     pub fn table_fancy(args: TableFancyArgs) {
         if let Err(err) = _table_fancy(&args.input) {
             eprintln!("table_fancy: {err}");
@@ -64,20 +65,20 @@ mod commands {
     }
 
     /// Report what a backup sync would do (new / changed / moved / deleted); changes nothing (filesync diff)
-    #[unprefixed]
+    #[name("backup_diff")]
     pub fn backup_diff(args: filesync::cli::DiffArgs) {
         _filesync(filesync::Command::Diff(args));
     }
 
     /// Make DEST mirror SOURCE: copy new/changed, rename moves, delete extras; resumable (filesync sync)
-    #[unprefixed]
+    #[name("backup_sync")]
     pub fn backup_sync(args: filesync::cli::SyncArgs) {
         _filesync(filesync::Command::Sync(args));
     }
 
     /// Verify a mirror by content: `backup_diff` comparing every file's bytes (blake3), so silent
     /// corruption can't hide behind a matching size+mtime (filesync diff --eager-checksum)
-    #[unprefixed]
+    #[name("backup_find_bitrot")]
     pub fn backup_find_bitrot(mut args: filesync::cli::DiffArgs) {
         // Force the content comparison; a plain bool, so a caller passing it anyway is a no-op
         // (hidden from this command's help/completion — see `cli::HIDDEN_PINNED`).
@@ -89,7 +90,7 @@ mod commands {
     /// rate, wherever the mouse already is; F8 quits. Works on X11, Wayland and the console
     /// alike; on X11 it needs no privileges at all. If device access is needed and missing,
     /// the error walks you through the fix (sequencer clicker)
-    #[unprefixed]
+    #[name("clicker")]
     #[alias("autoclick")]
     pub fn clicker(args: sequencer::ClickerArgs) {
         _sequencer(sequencer::Command::Clicker(args));
@@ -99,7 +100,7 @@ mod commands {
     /// (or flat out, with no `--cps`) while reading its own virtual device back, printing the
     /// live rate as it goes. The gap between written and delivered is the honest ceiling —
     /// a rate counted from the sending loop alone would never show it (sequencer bench)
-    #[unprefixed]
+    #[name("clicker_benchmark")]
     pub fn clicker_benchmark(args: sequencer::BenchArgs) {
         _sequencer(sequencer::Command::Bench(args));
     }
@@ -117,7 +118,7 @@ mod commands {
     /// /dev/uinput writable, /dev/input readable — and print the exact commands to fix whatever
     /// is missing. One check for the whole family: `clicker` and the `autokey_*` profile
     /// commands open the same devices. Exit 0 means ready (sequencer doctor)
-    #[unprefixed]
+    #[name("autokey_doctor")]
     pub fn autokey_doctor(args: sequencer::DoctorArgs) {
         _sequencer(sequencer::Command::Doctor(args));
     }
@@ -136,7 +137,7 @@ mod commands {
     /// Check binds files for problems without applying them: nothing is activated, no profile
     /// state is touched, and the files are left exactly as they are. `autokey_reformat` is the
     /// same check with tidying turned on (sequencer profile-check)
-    #[unprefixed]
+    #[name("autokey_check")]
     pub fn autokey_check(args: sequencer::ProfileCheckArgs) {
         _sequencer(sequencer::Command::ProfileCheck(args));
     }
@@ -144,7 +145,7 @@ mod commands {
     /// `autokey_check` that also rewrites: every file that parses is tidied in place with all its
     /// comments kept, and one that doesn't is reported and left alone. Still activates nothing —
     /// the rewrite is the only thing it changes (sequencer profile-check --format)
-    #[unprefixed]
+    #[name("autokey_reformat")]
     pub fn autokey_reformat(mut args: sequencer::ProfileCheckArgs) {
         // Always tidy what parses: a plain bool, so a caller passing it anyway is a no-op
         // (hidden from this command's help/completion — see `cli::HIDDEN_PINNED`).
@@ -156,7 +157,7 @@ mod commands {
     /// the active set (naming a directory takes every `.toml` directly inside it, in name order);
     /// naming nothing applies the profile store, ~/.bashrs/user-custom/sequencer. The first
     /// invocation becomes the manager and later ones add to it (sequencer profile-apply)
-    #[unprefixed]
+    #[name("autokey_apply")]
     pub fn autokey_apply(mut args: sequencer::ProfileApplyArgs) {
         // Upstream requires at least one FILE; this shell relaxes that (`cli::OPTIONAL_ARGS`)
         // and answers the bare invocation itself: the whole store, as an ordinary directory
@@ -176,7 +177,7 @@ mod commands {
     /// Applied entries are marked, plus anything applied from outside the store, with the
     /// path it came from. `_bashrs_` because the store is this shell's: sequencer applies
     /// whatever files it is given and has no drawer of its own
-    #[unprefixed]
+    #[name("autokey_list_bashrs_profiles")]
     pub fn autokey_list_bashrs_profiles(_args: NoArgs) {
         for line in _profile_listing(&_profile_store_dir(), &sequencer::applied_profiles()) {
             println!("{line}");
@@ -263,7 +264,7 @@ mod commands {
 
     /// Remove profiles from the active set by name (`gaming` or `gaming.toml`); naming none opens
     /// an interactive picker listing what is currently applied (sequencer profile-unapply)
-    #[unprefixed]
+    #[name("autokey_unapply")]
     pub fn autokey_unapply(args: sequencer::ProfileUnapplyArgs) {
         _sequencer(sequencer::Command::ProfileUnapply(args));
     }
@@ -272,7 +273,7 @@ mod commands {
     /// binds profile expects. Reads the input devices, so it is exact; `-n` reads the terminal
     /// instead, needing no privileges but seeing only keys that type something
     /// (sequencer detect-key)
-    #[unprefixed]
+    #[name("autokey_detect")]
     pub fn autokey_detect(args: sequencer::DetectKeyArgs) {
         _sequencer(sequencer::Command::DetectKey(args));
     }
@@ -360,7 +361,7 @@ mod commands {
             print!("{}", _compatibility_help());
             return;
         }
-        if vidl.url.is_none() && !vidl.taglist && vidl.cookies_extract_for_domain.is_none() {
+        if vidl.url.is_none() && !vidl.taglist && vidl.global.cookies_extract_for_domain.is_none() {
             eprintln!("dl: a URL is required (or -t, -c, or --cookies-extract-for-domain)");
             std::process::exit(2);
         }
@@ -369,7 +370,7 @@ mod commands {
         // download option bashrs decides for itself. Set unconditionally, not just on an import: a
         // store is READ on every run, and a root known only while importing would be found once
         // and then lost.
-        vidl.cookie_root = Some(_cookie_store_dir());
+        vidl.global.cookie_root = Some(_cookie_store_dir());
         let code = vidl::run(vidl);
         if code != 0 {
             std::process::exit(code);
@@ -398,19 +399,19 @@ mod commands {
         doc_render::render_doc(COMPATIBILITY)
     }
 
-    /// Add to the YouTube videos downloaded here (or under DIR), collection folders included, the
-    /// data each lacks — its thumbnail, subtitle tracks and their auto-generated marks, metadata
-    /// tags and chapters, as a download of it would hold them now. Videos are matched by the id in
-    /// their file names; nothing is downloaded again, and nothing a file holds is replaced.
-    /// `--check` only says what each lacks (vidl repair)
-    #[unprefixed]
-    pub fn dl_fix(args: vidl::RepairArgs) {
+    /// Add to the YouTube videos downloaded here (or under PATH), collection folders included — or
+    /// to the one video file PATH names — the data each lacks: its thumbnail, subtitle tracks and
+    /// their auto-generated marks, metadata tags and chapters, as a download of it would hold them
+    /// now. A video is known by the id in its file name, or else by the page its metadata names;
+    /// nothing is downloaded again, and nothing a file holds is replaced. `--check` only says what
+    /// each lacks (vidl repair)
+    #[name("dl_fix")]
+    pub fn dl_fix(mut args: vidl::RepairArgs) {
         _install_vidl_tools();
-        // What a repair shares with a download is left at a download's defaults, but for where
-        // the imported cookies are kept — bashrs's data dir, as for `dl`, so a store imported
-        // there is the one a repair asks YouTube with.
-        let shared = vidl::Args { cookie_root: Some(_cookie_store_dir()), ..Default::default() };
-        let code = vidl::run_repair(shared, args);
+        // As for `dl`: imported cookies live under bashrs's data dir, so a store imported there is
+        // the one a repair asks YouTube with.
+        args.global.cookie_root = Some(_cookie_store_dir());
+        let code = vidl::run_repair(args);
         if code != 0 {
             std::process::exit(code);
         }

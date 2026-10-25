@@ -183,11 +183,10 @@ impl Command {
     }
 }
 
-/// Arguments a command settles for itself, hidden from its help and completion. Mostly flags it
-/// forces on, where passing one is a harmless no-op (it's already on); `dl`'s `--cookie-dir` is
-/// the one that carries a value, and `dl` overwrites it, because where bashrs keeps its data is
-/// not the caller's to move. Keyed by clap name and arg ID (the field name). The `g<N>`/`gg<N>` variants aren't listed: they REMOVE their pinned `-C` outright by
-/// taking the `*Base` argument structs (see [`crate::support::args`]).
+/// Arguments a command settles for itself, hidden from its help and completion: flags it forces
+/// on, where passing one is a harmless no-op (it's already on). Keyed by clap name and arg ID (the
+/// field name). The `g<N>`/`gg<N>` variants aren't listed: they REMOVE their pinned `-C` outright
+/// by taking the `*Base` argument structs (see [`crate::support::args`]).
 const HIDDEN_PINNED: &[(&str, &[&str])] = &[
     ("GG", &["delve", "lean"]),
     ("GGG", &["delve", "save", "regex", "lean"]),
@@ -199,13 +198,16 @@ const HIDDEN_PINNED: &[(&str, &[&str])] = &[
 /// bashrs supplies the rest itself. Keyed by clap name, arg ID, the number of values to expose,
 /// and the value names to show for them.
 ///
-/// One entry today. `vidl` spells it `--cookies-extract-for-domain <TARGET> <OUTPUT-DIR>`, which is
-/// right for a tool with no data directory of its own; bashrs has one, and where it keeps imported
-/// cookies is not the caller's to move. So `dl` takes the target alone and fills the directory in
-/// (see [`crate::categories::comfy_repos::dl`]) — narrowed rather than hidden, because the target
-/// half is still very much the caller's to give.
-const NARROWED_ARGS: &[(&str, &str, usize, &[&str])] =
-    &[("dl", "cookies_extract_for_domain", 1, &["TARGET"])];
+/// One argument today, on both commands that take it. `vidl` spells it
+/// `--cookies-extract-for-domain <TARGET> <OUTPUT-DIR>`, which is right for a tool with no data
+/// directory of its own; bashrs has one, and where it keeps imported cookies is not the caller's to
+/// move. So `dl` and `dl_fix` take the target alone and fill the directory in (see
+/// [`crate::categories::comfy_repos::dl`]) — narrowed rather than hidden, because the target half
+/// is still very much the caller's to give.
+const NARROWED_ARGS: &[(&str, &str, usize, &[&str])] = &[
+    ("dl", "cookies_extract_for_domain", 1, &["TARGET"]),
+    ("dl_fix", "cookies_extract_for_domain", 1, &["TARGET"]),
+];
 
 /// Upstream-required arguments this shell relaxes, as `(command, argument)`. The wrapper
 /// supplies a default when nothing is passed — `autokey_apply` with no FILE applies the whole

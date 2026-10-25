@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# TEST.sh — run ALL of bashrs's tests, including the live ones `cargo test` skips.
+# TEST.sh — run bashrs's tests by category, each reported on its own line.
 #
-# Five categories, cheapest first:
-#   1. offline        unit + integration (stubbed yt-dlp, fixture cookie DBs) — hermetic, fast
+# Four categories, cheapest first:
+#   1. offline        unit + integration (a stubbed yt-dlp among them) — hermetic, fast
 #   2. macros         the proc-macro crate's own tests: the attribute contracts the compiler
 #                     enforces, e.g. that every hand-written shell fragment names both bash and
 #                     fish. Plain `cargo test` builds the macros but never runs their tests.
@@ -15,13 +15,10 @@
 #                     history, its prompt left alone), aliases of the commands' names, and the
 #                     contracts bash's file keeps. These also run in offline; REQUIRED, as
 #                     fish's are — a machine without zsh fails this category by name.
-#   5. live-extended  one test: that the cookie store `dl --cookie-import` writes is readable by
-#                     the genuine yt-dlp loader. It skips-with-notice unless a store has been
-#                     imported, and sends no network requests — it only reads a real session.
 #
-# Downloading lives in the `vidl` crate, and its live download tests moved there with it; run
-# vidl's own TEST.sh for those. The live category here can still fail for environmental reasons,
-# so both run regardless and the summary shows what passed where.
+# Downloading lives in the `vidl` crate, and its tests moved there with it — the cookie import, and
+# the live ones down to the imported store's read-back through the genuine yt-dlp; run vidl's own
+# TEST.sh for those. Every category here runs regardless, and the summary shows what passed where.
 set -uo pipefail
 
 command -v cargo >/dev/null 2>&1 || { printf 'ERROR: cargo not found in PATH.\n' >&2; exit 1; }
@@ -72,7 +69,6 @@ run_category "offline"       cargo test --no-fail-fast -- --nocapture
 run_category "macros"        cargo test --no-fail-fast -p bashrs-macros -- --nocapture
 run_category "fish"          fish_checks
 run_category "zsh"           zsh_checks
-run_category "live-extended" cargo test --test dl_live_extended -- --ignored --test-threads=1 --nocapture
 
 echo
 echo "=== summary ==="
@@ -81,9 +77,4 @@ for name in "${ORDER[@]}"; do
     printf '  %-14s %s\n' "$name" "${RESULT[$name]}"
     [ "${RESULT[$name]}" = "FAIL" ] && failed=1
 done
-if ! ls "$HOME/.bashrs/user-data/browser_cookies/youtube/browser.spec" >/dev/null 2>&1; then
-    echo
-    echo "note: no youtube cookie store is imported, so the cookie-gated test self-skipped"
-    echo "      (SKIPPED line above) — run \`dl --cookie-import youtube\` for full coverage."
-fi
 exit "$failed"

@@ -217,8 +217,6 @@ Add `midi` category module. Maybe should be its own thing like the arterminal pr
 
 Separate filesync's dedup into a "filededup" project (was this the name I thought of?) which would use filesync as a dependency
 
-Add `terminal` category, and add functionality for changing transparency if it's supported on the terminal (prints error if the terminal doesn't support it)
-
 Make sure that things work with Wayland too
     autokey surely broke
 
