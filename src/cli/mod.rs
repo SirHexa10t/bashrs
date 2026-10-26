@@ -211,9 +211,10 @@ const NARROWED_ARGS: &[(&str, &str, usize, &[&str])] = &[
 
 /// Upstream-required arguments this shell relaxes, as `(command, argument)`. The wrapper
 /// supplies a default when nothing is passed — `autokey_apply` with no FILE applies the whole
-/// profile store — so keeping upstream's `required` would reject exactly the invocation the
-/// wrapper exists to serve, before its code ever ran.
-const OPTIONAL_ARGS: &[(&str, &str)] = &[("autokey_apply", "files")];
+/// profile store, `symlink_devs` with no CONFIG the one config in its store — so keeping
+/// upstream's `required` would reject exactly the invocation the wrapper exists to serve, before
+/// its code ever ran.
+const OPTIONAL_ARGS: &[(&str, &str)] = &[("autokey_apply", "files"), ("symlink_devs", "config")];
 
 /// Apply the upstream-argument adjustments: hide each [`HIDDEN_PINNED`] flag on its command,
 /// narrow each [`NARROWED_ARGS`] one to the values this shell exposes, and relax each
@@ -419,6 +420,42 @@ mod tests {
         );
     }
 
+    /// `symlink_devs` with nothing at all must parse as well — it answers the bare invocation with
+    /// its store's one config ([`OPTIONAL_ARGS`]); naming one still works, and upstream's own
+    /// checks of the rest still apply.
+    #[test]
+    fn a_bare_symlink_devs_parses() {
+        let try_parse = |argv: &[&str]| adjust_pinned(Cli::command()).try_get_matches_from(argv.to_vec());
+        assert!(try_parse(&["bashrs", "symlink_devs"]).is_ok(), "the bare invocation must parse");
+        assert!(try_parse(&["bashrs", "symlink_devs", "home.toml", "--dry-run"]).is_ok());
+        assert!(try_parse(&["bashrs", "symlink_devs", "--root", "relative"]).is_err());
+    }
+
+    /// Help that names a place in `~/.bashrs` names one that is there: every `~/.bashrs/…` path
+    /// in a command's help, or an argument's, is a [`crate::conf::Place`] — so renaming a place
+    /// turns this red until the help naming it follows.
+    #[test]
+    fn the_places_help_names_in_bashrs_home_are_real() {
+        let home = crate::conf::bashrs_home_shown();
+        let places: Vec<String> = crate::conf::Place::ALL.iter().map(|place| place.shown()).collect();
+        let tree = adjust_pinned(Cli::command());
+        let mut named = 0;
+        for sub in tree.get_subcommands() {
+            let arguments = sub.get_arguments().flat_map(|arg| [arg.get_help(), arg.get_long_help()]);
+            let texts = [sub.get_about(), sub.get_long_about()].into_iter().chain(arguments).flatten();
+            for text in texts.map(ToString::to_string) {
+                for (at, _) in text.match_indices(&format!("{home}/")) {
+                    let path: String =
+                        text[at..].chars().take_while(|c| !c.is_whitespace() && !",;:)`'\"".contains(*c)).collect();
+                    let path = path.trim_end_matches(['.', '/']);
+                    assert!(places.iter().any(|place| place == path), "`{}` names {path}, no place in {home}", sub.get_name());
+                    named += 1;
+                }
+            }
+        }
+        assert!(named > 0, "no help names a place, so this checks nothing");
+    }
+
     /// Only the clap-backed commands appear here — `#[shell_body]` ones (`brs_cd`,
     /// `brs_conf_cd`) never enter the clap graph, and are asserted where the shell functions
     /// are emitted, in `sourcefile`'s tests.
@@ -497,9 +534,10 @@ mod tests {
     fn comfy_commands_follow_naming_standard() {
         // External tools keep their own upstream name (`table`, plus its pinned-preset sibling
         // `table_fancy`), the verb they have always had here (`dl` and its `dl_fix`, over the
-        // `vidl` crate), or a task-named family — all unprefixed by design (`backup_*` flattens
-        // filesync's subcommands into directly-completable commands, and `autokey_*` does the same
-        // for sequencer's profile and key-naming subcommands).
+        // `vidl` crate), a task name (`symlink_devs`, over devmounts' `apply`: symlinks to the
+        // devices, wherever mounted), or a task-named family — all unprefixed by design
+        // (`backup_*` flattens filesync's subcommands into directly-completable commands, and
+        // `autokey_*` does the same for sequencer's profile and key-naming subcommands).
         assert_prefixed(
             &command_names::<ComfyReposCommand>(),
             "comfy_",
@@ -507,6 +545,7 @@ mod tests {
                 "table", "table_fancy",
                 "backup_diff", "backup_sync", "backup_find_bitrot",
                 "dl", "dl_fix",
+                "symlink_devs",
                 "clicker", "clicker_benchmark",
                 "autokey_doctor", "autokey_check", "autokey_reformat", "autokey_apply", "autokey_unapply", "autokey_detect", "autokey_list_bashrs_profiles",
             ],

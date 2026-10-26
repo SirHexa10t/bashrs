@@ -1,4 +1,4 @@
-//! Non-Rust ("stainless" — Rust-resistant) companion repos, cloned under `~/.bashrs/stainless_comfy`
+//! Non-Rust ("stainless" — Rust-resistant) companion repos, cloned under [`Place::Clones`]
 //! and exposed as plain shell aliases in the sourcefiles (bash's and fish's). Data-driven, like [`crate::conf::keybinds`]: a
 //! `const` table plus functions that turn it into shell lines — no macro, no clap command.
 //!
@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
+use crate::conf::Place;
 use crate::support::problems::Problems;
 use crate::support::shell_dialect::{bash_function, fish_function, Shell, FISH_COLUMNS};
 
@@ -90,25 +91,24 @@ const STAINLESS: &[Comfy] = &[Comfy {
     ],
 }];
 
-/// Clone root as the *generated shell* spells it — the sanctioned `$HOME`-relative literal, kept
-/// for the alias lines the shell expands at use time (the Rust-side spelling of this same
-/// directory is [`crate::conf::clones_dir`]). Named the "comfy" area (the dir you picked) even
-/// though the module is the general stainless one.
-const CLONE_BASE: &str = ".bashrs/stainless_comfy";
-
 /// `https://…/contAInerized(.git)(/)` → `contAInerized`.
 fn repo_name(repo: &str) -> &str {
     repo.trim_end_matches('/').rsplit('/').next().unwrap_or(repo).trim_end_matches(".git")
 }
 
 fn clone_dir(comfy: &Comfy) -> PathBuf {
-    crate::conf::clones_dir().join(repo_name(comfy.repo))
+    Place::Clones.path().join(repo_name(comfy.repo))
+}
+
+/// [`clone_dir`] as the aliases spell it, [`Place::Clones`] in the shell's terms.
+fn clone_dir_shell(comfy: &Comfy) -> String {
+    format!("{}/{}", Place::Clones.in_shell(), repo_name(comfy.repo))
 }
 
 /// A clone-relative path, `$HOME`-relative and shell-ready (the shell expands `$HOME`) — the form
 /// used verbatim in aliases and in the `--help` probe.
 fn clone_path_shell(comfy: &Comfy, rel: &str) -> String {
-    format!("$HOME/{CLONE_BASE}/{}/{}", repo_name(comfy.repo), rel)
+    format!("{}/{rel}", clone_dir_shell(comfy))
 }
 
 /// The `$HOME`-relative executable path — the main alias's target (and the `--help` probe's).
@@ -128,7 +128,7 @@ fn exe_dir(comfy: &Comfy) -> PathBuf {
 
 /// [`exe_dir`] as the aliases spell it: `$HOME`-relative, for the shell to expand.
 fn exe_dir_shell(comfy: &Comfy) -> String {
-    let root = format!("$HOME/{CLONE_BASE}/{}", repo_name(comfy.repo));
+    let root = clone_dir_shell(comfy);
     match Path::new(comfy.exe).parent().and_then(Path::to_str).filter(|dir| !dir.is_empty()) {
         Some(dir) => format!("{root}/{dir}"),
         None => root,

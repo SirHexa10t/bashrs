@@ -1,9 +1,10 @@
 //! Commands backed by my other repos, imported as dependencies. Each is exposed under the
 //! external tool's own name (`table`), a task-named family wrapping its subcommands (`backup_*`
-//! over filesync), or the verb it has always had here (`dl`, over the `vidl` crate, with `dl_fix`
-//! over its `repair`) — each named outright with `#[name]`, being an alias of a repo rather than
-//! a command of a bashrs category (whose prefix `#[unprefixed]` drops), and each reusing the
-//! upstream argument structs where it can, so the args are defined once, upstream.
+//! over filesync), a task name of its own (`symlink_devs`, over devmounts' `apply`), or the verb
+//! it has always had here (`dl`, over the `vidl` crate, with `dl_fix` over its `repair`) — each
+//! named outright with `#[name]`, being an alias of a repo rather than a command of a bashrs
+//! category (whose prefix `#[unprefixed]` drops), and each reusing the upstream argument structs
+//! where it can, so the args are defined once, upstream.
 //!
 //! `dl` and `dl_fix` carry a little more of their own weight than the others: injecting bashrs's
 //! pinned tool paths, pinning where imported cookies are kept, and `dl`'s supported-sites page
@@ -12,6 +13,7 @@
 
 #[bashrs_macros::category(command = ComfyReposCommand, prefix = "comfy_")]
 mod commands {
+    use crate::conf::Place;
     use crate::support::args::NoArgs;
     use crate::support::comfy_repos::table_fancy_options;
     use crate::support::doc_render;
@@ -123,7 +125,7 @@ mod commands {
         _sequencer(sequencer::Command::Doctor(args));
     }
 
-    /// `~/.bashrs/user-custom/sequencer` — the profile store: where this shell keeps binds
+    /// The profile store ([`Place::SequencerProfiles`]): where this shell keeps binds
     /// profiles. Deliberately nothing more than a well-known directory — sequencer takes real
     /// paths only, no command resolves bare names against this behind the user's back, and TAB
     /// completion doesn't offer its contents (they aren't in the PWD; the full-path listing is
@@ -131,7 +133,7 @@ mod commands {
     /// that listing walks; the same division as [`_cookie_store_dir`] — where bashrs keeps its
     /// data is bashrs's own business. `install-shell` creates it.
     fn _profile_store_dir() -> PathBuf {
-        crate::conf::user_custom_dir().join("sequencer")
+        Place::SequencerProfiles.path()
     }
 
     /// Check binds files for problems without applying them: nothing is activated, no profile
@@ -317,33 +319,27 @@ mod commands {
 
     // --- dl ------------------------------------------------------------------
 
-    /// `~/.bashrs/user-appdata/browser_cookies` — the base holding one subdir per imported site.
+    /// [`Place::BrowserCookies`] — the base holding one subdir per imported site.
     /// `dl` pins this: the store's *shape* and every operation on it belong to `vidl`, but where
     /// bashrs keeps its data is bashrs's own business. So `vidl`'s two-value
     /// `--cookies-extract-for-domain <TARGET> <OUTPUT-DIR>` is narrowed here to the target alone
     /// (`crate::cli::NARROWED_ARGS`) and this supplies the rest.
     fn _cookie_store_dir() -> PathBuf {
-        crate::conf::user_appdata_dir().join("browser_cookies")
-    }
-
-    /// The bundled copy of `name`, when bashrs actually bundles it. `tools::resolve` answers with
-    /// the bare name when there's no bundle, which is the signal to let the tool be found on PATH
-    /// instead — so `None` here means "no pinned copy; use the normal lookup".
-    fn _bundled(name: &str) -> Option<PathBuf> {
-        let resolved = crate::tools::resolve(name);
-        (resolved != *name).then(|| PathBuf::from(resolved))
+        Place::BrowserCookies.path()
     }
 
     /// Hand vidl the copies bashrs bundles and version-pins. Without this it would find whatever
     /// is on PATH — which is the right default for a standalone user, and exactly what the
-    /// pinning exists to avoid here. The python matters twice over: it runs the cookie filter's
-    /// sqlite work, so an extract never depends on a system interpreter.
+    /// pinning exists to avoid here (a tool with no bundled copy is left to that normal lookup).
+    /// The python matters twice over: it runs the cookie filter's sqlite work, so an extract
+    /// never depends on a system interpreter.
     fn _install_vidl_tools() {
+        use crate::tools::bundled;
         vidl::tools::install(vidl::tools::Tools {
-            ytdlp: _bundled("yt-dlp").map(PathBuf::into_os_string),
-            python: _bundled("python3").map(PathBuf::into_os_string),
-            ffmpeg_dir: _bundled("ffmpeg").and_then(|bin| bin.parent().map(Path::to_path_buf)),
-            js_runtime: _bundled("deno"),
+            ytdlp: bundled("yt-dlp").map(PathBuf::into_os_string),
+            python: bundled("python3").map(PathBuf::into_os_string),
+            ffmpeg_dir: bundled("ffmpeg").and_then(|bin| bin.parent().map(Path::to_path_buf)),
+            js_runtime: bundled("deno"),
         });
     }
 
@@ -417,18 +413,93 @@ mod commands {
         }
     }
 
+    // --- symlink_devs --------------------------------------------------------
+
+    /// Link each device a config lists into place wherever the OS has mounted it, mounting what
+    /// isn't: every device gets a root link that follows it, and short links into it go
+    /// through that, so a device that moves or is swapped only has its root link re-pointed. With
+    /// no CONFIG, the one config in ~/.bashrs/user-custom/devmounts is used (devmounts apply)
+    #[name("symlink_devs")]
+    pub fn symlink_devs(mut args: devmounts::cli::RunArgs) {
+        // Upstream requires a CONFIG; this shell relaxes that (`cli::OPTIONAL_ARGS`) and answers the
+        // bare invocation with the store's one config. With none to give, devmounts says the
+        // CONFIG is missing, in its own words, and the note after adds how to go without one.
+        let found = args.config.is_none().then(|| _devmounts_store_config(&Place::DevmountsConfigs.path()));
+        if let Some(StoreConfig::One(config)) = &found {
+            args.config = Some(config.clone());
+        }
+        let code = devmounts::cli::Command::Apply(args).run();
+        if let Some(note) = found.and_then(|found| _store_note(&found, code)) {
+            eprintln!("{note}");
+        }
+        if code != 0 {
+            std::process::exit(code.into());
+        }
+    }
+
+    /// What the devmounts store ([`Place::DevmountsConfigs`]) holds for a bare `symlink_devs`.
+    #[derive(Debug, PartialEq)]
+    enum StoreConfig {
+        /// Exactly one config: the one to use.
+        One(PathBuf),
+        /// No store at all.
+        Missing,
+        /// A store that can't be listed, and why.
+        Unreadable(String),
+        /// A store with no config in it.
+        Empty,
+        /// Several configs, in name order: which one is the user's to say.
+        Several(Vec<PathBuf>),
+    }
+
+    /// The configs in `store`: its `.toml` files — directly in it, a symlink to one counting as
+    /// one (a config kept with the user's dotfiles, linked in).
+    fn _devmounts_store_config(store: &Path) -> StoreConfig {
+        let entries = match std::fs::read_dir(store) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return StoreConfig::Missing,
+            Err(err) => return StoreConfig::Unreadable(err.to_string()),
+        };
+        let is_config = |path: &PathBuf| {
+            path.is_file() && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+        };
+        let mut configs: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).filter(is_config).collect();
+        configs.sort();
+        match configs.len() {
+            0 => StoreConfig::Empty,
+            1 => StoreConfig::One(configs.remove(0)),
+            _ => StoreConfig::Several(configs),
+        }
+    }
+
+    /// What a bare `symlink_devs` adds to devmounts' own words, given what the store held and how
+    /// the run ended: with no single config to take, how to leave CONFIG out, and what the store
+    /// holds instead; with one that couldn't be run, which file it was — devmounts' parse errors
+    /// don't name it, and nobody named it on the command line.
+    fn _store_note(found: &StoreConfig, code: u8) -> Option<String> {
+        let store = Place::DevmountsConfigs.shown();
+        let held = match found {
+            StoreConfig::One(config) => {
+                let could_not_run = code == devmounts::cli::Exit::CouldNotRun.code();
+                return could_not_run
+                    .then(|| format!("symlink_devs: that CONFIG was {}, the one in {store}", config.display()));
+            }
+            StoreConfig::Missing => "which doesn't exist yet".to_owned(),
+            StoreConfig::Unreadable(why) => format!("which can't be read ({why})"),
+            StoreConfig::Empty => "which holds none now".to_owned(),
+            StoreConfig::Several(configs) => {
+                let names: Vec<String> =
+                    configs.iter().filter_map(|config| config.file_name()).map(|name| name.to_string_lossy().into_owned()).collect();
+                format!("which holds {} now: {}", configs.len(), names.join(", "))
+            }
+        };
+        Some(format!("symlink_devs: to leave CONFIG out, keep exactly one config (a .toml) in {store}, {held}"))
+    }
+
     #[cfg(test)]
     mod autokey_tests {
         use super::*;
 
-        /// The reader's half of the store-location pin — the profiles are the user's own writing,
-        /// so the store sits in `user-custom`; the creator's half (`install-shell` making
-        /// `<home>/user-custom/sequencer`) is pinned in `conf::install`'s tests. Either moving
-        /// without the other turns exactly one of the two red.
-        #[test]
-        fn the_profile_store_sits_in_user_custom() {
-            assert_eq!(_profile_store_dir(), crate::conf::user_custom_dir().join("sequencer"));
-        }
         /// A scratch store for one test, gone afterwards.
         fn scratch(tag: &str) -> PathBuf {
             let dir = std::env::temp_dir().join(format!("bashrs_profiles_{tag}_{}", std::process::id()));
@@ -519,6 +590,77 @@ mod commands {
             let stray = vec![("stray.toml".to_string(), PathBuf::from("/elsewhere/stray.toml"))];
             let with = _profile_listing(&store, &stray);
             assert_eq!(with[1], "stray.toml  [applied from /elsewhere/stray.toml]", "{with:?}");
+        }
+    }
+
+    #[cfg(test)]
+    mod symlink_devs_tests {
+        use super::*;
+
+        /// A scratch store for one test, gone afterwards.
+        fn scratch(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("bashrs_devmounts_{tag}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// A bare run takes the store's config only when it holds exactly one, and tells the other
+        /// cases apart. A config is a `.toml` file directly in the store — or a symlink to one —
+        /// never a directory named like one, nor anything deeper.
+        #[test]
+        fn the_store_gives_its_config_only_when_it_holds_exactly_one() {
+            let store = scratch("store");
+            assert_eq!(_devmounts_store_config(&store.join("never-made")), StoreConfig::Missing);
+            assert_eq!(_devmounts_store_config(&store), StoreConfig::Empty);
+            std::fs::create_dir_all(store.join("old.toml")).unwrap();
+            std::fs::create_dir_all(store.join("sub")).unwrap();
+            std::fs::write(store.join("sub/deep.toml"), "").unwrap();
+            std::fs::write(store.join("notes.txt"), "").unwrap();
+            assert_eq!(_devmounts_store_config(&store), StoreConfig::Empty, "none of those is a config here");
+
+            std::os::unix::fs::symlink(store.join("sub/deep.toml"), store.join("linked.TOML")).unwrap();
+            assert_eq!(_devmounts_store_config(&store), StoreConfig::One(store.join("linked.TOML")));
+            std::fs::write(store.join("home.toml"), "").unwrap();
+            let both = vec![store.join("home.toml"), store.join("linked.TOML")];
+            assert_eq!(_devmounts_store_config(&store), StoreConfig::Several(both));
+            let _ = std::fs::remove_dir_all(&store);
+        }
+
+        /// A store that can't be listed says why, rather than passing for an empty one.
+        #[test]
+        fn an_unreadable_store_is_told_from_an_empty_one() {
+            if crate::support::superuser::is_root() {
+                return; // root lists any directory
+            }
+            use std::os::unix::fs::PermissionsExt;
+            let store = scratch("unreadable");
+            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let found = _devmounts_store_config(&store);
+            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(matches!(found, StoreConfig::Unreadable(_)), "{found:?}");
+            let _ = std::fs::remove_dir_all(&store);
+        }
+
+        /// What follows devmounts' own words: how to leave CONFIG out and what the store holds
+        /// instead — or, when the store's one config couldn't be run, which file that was; and
+        /// nothing when it ran.
+        #[test]
+        fn the_note_says_what_the_store_holds() {
+            let store = Place::DevmountsConfigs.shown();
+            let leave_out = format!("symlink_devs: to leave CONFIG out, keep exactly one config (a .toml) in {store}, ");
+            let note = |found: StoreConfig| _store_note(&found, 2).unwrap();
+            assert_eq!(note(StoreConfig::Missing), format!("{leave_out}which doesn't exist yet"));
+            assert_eq!(note(StoreConfig::Empty), format!("{leave_out}which holds none now"));
+            assert_eq!(note(StoreConfig::Unreadable("Permission denied".into())), format!("{leave_out}which can't be read (Permission denied)"));
+            let several = StoreConfig::Several(vec!["/s/home.toml".into(), "/s/work.toml".into()]);
+            assert_eq!(note(several), format!("{leave_out}which holds 2 now: home.toml, work.toml"));
+
+            let one = || StoreConfig::One("/s/home.toml".into());
+            assert_eq!(_store_note(&one(), 2), Some(format!("symlink_devs: that CONFIG was /s/home.toml, the one in {store}")));
+            for ran in [0, 1] {
+                assert_eq!(_store_note(&one(), ran), None, "exit {ran}: the report says it all");
+            }
         }
     }
 

@@ -15,9 +15,8 @@ clap = { version = "4", features = ["derive"] }
 bashrs-macros = { path = "macros" }
 table_formatter = { git = "https://github.com/SirHexa10t/table_formatter.git", branch = "main" }
 filesync = { git = "https://github.com/SirHexa10t/backup_sync.git", branch = "main" }
-# UNPUSHED ITERATION: vidl's `repair` (behind `dl_fix`) is not on its main branch yet. Back to
-# `{ git = "https://github.com/SirHexa10t/vidl.git", branch = "main" }` once it is pushed.
-vidl = { path = "bashrs_dependencies/vidl" }   # the yt-dlp driver behind `dl` and `dl_fix`
+vidl = { git = "https://github.com/SirHexa10t/vidl.git", branch = "main" }   # the yt-dlp driver behind `dl` and `dl_fix`
+devmounts = { git = "https://github.com/SirHexa10t/devmounts.git", branch = "main" }   # the device links behind `symlink_devs`: a root link per device, wherever the OS mounted it
 # `package =` because that repo is a workspace (core / input / cli) rather than one crate, and
 # `-cli` is the one holding the embeddable surface. Renamed here so every companion repo reads
 # the same way at the call site.

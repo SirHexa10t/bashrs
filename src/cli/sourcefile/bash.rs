@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{substitute, Section, BIN};
+use super::{bin, substitute, Section};
 use crate::conf::keybinds::{self, Chord, Run};
 use crate::conf::RELOAD_EXIT_CODE;
 use crate::support::align::align_columns;
@@ -37,7 +37,7 @@ pub(super) fn file(body: &str) -> String {
         // Bail early (before defining anything) if the binary isn't present. `return 0`, not a
         // bare `return`: bare would silently forward the failed test's status 1 to whatever
         // sourced this file, and a not-yet-installed bashrs is a quiet no-op, not an error.
-        out += &format!("[ -f {BIN} ] || return 0\n");
+        out += &format!("[ -f {} ] || return 0\n", bin());
         out += &set_aside_aliases(&super::defined_functions(body));
         out += body;
     }
@@ -128,8 +128,9 @@ pub(super) fn definitions(section: &Section) -> String {
             .piped
             .map(|piped| format!("{} | ", text(piped, &wrapper.real)))
             .unwrap_or_default();
+        let binary = bin();
         for name in &wrapper.names {
-            lines.push(bash_function(name, &format!("{prefix}{BIN} {} \"$@\"{suffix}", wrapper.real)) + &about);
+            lines.push(bash_function(name, &format!("{prefix}{binary} {} \"$@\"{suffix}", wrapper.real)) + &about);
         }
     }
     // The category's pure-shell commands (`#[shell_body]`): inline bodies, no binary call —
@@ -292,6 +293,7 @@ fn zsh_widgets(bindings: &[(&str, &str, Run)]) -> String {
 /// the file greets: a greeting too many beats a warning lost.
 pub(super) fn greeting(text: &str, warning: &str, archives: &str) -> String {
     let (text, warning) = (printf_line(text, Shell::Bash), printf_line(warning, Shell::Bash));
+    let home = crate::conf::bashrs_home_in_shell();
     format!(
         "__bashrs_stat=\n\
          [ -r /proc/$$/stat ] && read -r __bashrs_stat < /proc/$$/stat\n\
@@ -303,7 +305,7 @@ pub(super) fn greeting(text: &str, warning: &str, archives: &str) -> String {
          local __bashrs_entry __bashrs_noglob=\n        \
          {text}\n        \
          [[ -o noglob ]] && __bashrs_noglob=1 && set +o noglob  # globbing off: on for the glob below\n        \
-         for __bashrs_entry in \"$HOME\"/.bashrs/*; do  # the whole directory, the binary's at least: no glob here matches nothing, an error in zsh\n            \
+         for __bashrs_entry in \"{home}\"/*; do  # the whole directory, the binary's at least: no glob here matches nothing, an error in zsh\n            \
          case $__bashrs_entry in */{archives}) {warning} >&2; break ;; esac\n        \
          done\n        \
          [ -n \"$__bashrs_noglob\" ] && set -o noglob\n        \
@@ -335,6 +337,7 @@ pub(super) fn completion(sections: &[Section], stainless_flags: &[(String, Strin
         .flat_map(|section| &section.wrappers)
         .flat_map(|wrapper| wrapper.names.iter().cloned())
         .collect();
+    let binary = bin();
     let section = format!(
         "\n# completion (bash only)\n\
          #   Optional flags displayed through tab-completion. Type `-` and follow up with <TAB><TAB>\n\
@@ -343,7 +346,7 @@ pub(super) fn completion(sections: &[Section], stainless_flags: &[(String, Strin
          if [ -n \"$BASH_VERSION\" ]; then\n\
          \x20   function _bashrs_complete {{\n\
          \x20       local cur=${{COMP_WORDS[COMP_CWORD]}}\n\
-         \x20       [[ $cur == -* ]] && COMPREPLY=($(compgen -W \"$({BIN} complete-flags \"${{COMP_WORDS[0]}}\")\" -- \"$cur\"))\n\
+         \x20       [[ $cur == -* ]] && COMPREPLY=($(compgen -W \"$({binary} complete-flags \"${{COMP_WORDS[0]}}\")\" -- \"$cur\"))\n\
          \x20   }}\n\
          \x20   complete -F _bashrs_complete -o default {}\n\
          {}fi\n",

@@ -16,6 +16,7 @@ pub use fetch::sync;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use crate::conf::Place;
 use crate::support::shell_dialect::{bash_function, fish_function, Shell};
 
 /// A bundled tool: where it lives, what it provides, and how its bundle comes to exist.
@@ -105,7 +106,7 @@ const TOOLS: &[Tool] = &[
         post_install: None,
     },
     Tool {
-        dir: "python",
+        dir: PYTHON_DIR,
         bins: &[("python3", "bin/python3")],
         acquire: Acquire::UvVenv { python: "3.14" },
         group: Group::Language,
@@ -143,10 +144,14 @@ pub(crate) fn interpreters_dir() -> PathBuf {
     root().join("interpreters")
 }
 
-/// `~/.bashrs/tools` — the bundled tools' home.
+/// The bundled tools' home, [`Place::Tools`].
 pub(crate) fn root() -> PathBuf {
-    crate::conf::bashrs_home().join("tools")
+    Place::Tools.path()
 }
+
+/// The bundled python environment's directory in the tools' home: its [`TOOLS`] row's, and the
+/// python driver's (the environment's rollback point is kept there).
+pub(crate) const PYTHON_DIR: &str = "python";
 
 /// Each tool's provisioned version, in table order — derived per acquisition mode by
 /// [`fetch::provisioned_version`] (which owns the on-disk markers). `None` means nothing is
@@ -190,32 +195,34 @@ pub(crate) fn resolve_uv() -> OsString {
 /// kept current by `brs_compile` — else the bare name, so the system installation (or its
 /// normal "command not found" error) takes over. A program not in the table passes through.
 pub(crate) fn resolve(program: &str) -> OsString {
-    for tool in TOOLS {
-        for (name, rel) in tool.bins {
-            if *name == program {
-                let bundled = root().join(tool.dir).join(rel);
-                if bundled.exists() {
-                    return bundled.into_os_string();
-                }
-            }
-        }
-    }
-    OsString::from(program)
+    bundled(program).map_or_else(|| OsString::from(program), PathBuf::into_os_string)
 }
 
-/// `~/.bashrs/tools/bin` — one symlink per bundled binary (maintained by [`fetch`]), prepended to
+/// `program`'s bundled copy, when this machine has one.
+pub(crate) fn bundled(program: &str) -> Option<PathBuf> {
+    TOOLS
+        .iter()
+        .flat_map(|tool| tool.bins.iter().filter(|(name, _)| *name == program).map(|(_, rel)| root().join(tool.dir).join(rel)))
+        .find(|bundled| bundled.exists())
+}
+
+/// The shim directory's name in the tools' home: [`bin_dir`]'s, and the generated shell's PATH
+/// entry's.
+const SHIM_DIR: &str = "bin";
+
+/// The shim directory — one symlink per bundled binary (maintained by [`fetch`]), prepended to
 /// PATH by the sourcefile. PATH is the only mechanism that also covers *argument* position —
 /// `which python3`, `env python3`, `xargs`, `#!/usr/bin/env python3` shebangs — where a shell
 /// function or alias is invisible.
 pub(crate) fn bin_dir() -> PathBuf {
-    root().join("bin")
+    root().join(SHIM_DIR)
 }
 
-/// The tools root as the *generated shell* spells it — `$HOME` expanded at use time (so a
-/// symlinked `~/.bashrs` keeps working). The one shell-side spelling of the directory
-/// [`root`] owns on the Rust side, shared by the PATH/shim setup below and the shim scripts
-/// [`fetch`] writes.
-const TOOLS_ROOT_SHELL: &str = "$HOME/.bashrs/tools";
+/// The shim directory as the generated shell spells it ([`Place::in_shell`]): the PATH entry, and
+/// where the `python3` function finds the bundled interpreter.
+fn bin_dir_in_shell() -> String {
+    format!("{}/{SHIM_DIR}", Place::Tools.in_shell())
+}
 
 /// The setup emitted into `sourcefile.sh` — the interactive side of the bundled tools, in two
 /// layers. The PATH prepend (idempotent; harmless when nothing is bundled) makes the shims win in
@@ -237,35 +244,35 @@ pub(crate) fn shell_setup(shell: Shell) -> String {
 }
 
 fn fish_shell_setup() -> String {
-    let root = TOOLS_ROOT_SHELL;
+    let shims = bin_dir_in_shell();
     let python3 = fish_function(
         "python3",
         Some("The bundled python3, unless a venv is active"),
         &[
-            format!("if test -z \"$VIRTUAL_ENV\"; and test -x \"{root}/bin/python3\""),
-            format!("\"{root}/bin/python3\" $argv"),
+            format!("if test -z \"$VIRTUAL_ENV\"; and test -x \"{shims}/python3\""),
+            format!("\"{shims}/python3\" $argv"),
             "else".to_string(),
             "command python3 $argv".to_string(),
             "end".to_string(),
         ],
     );
     format!(
-        "contains -- \"{root}/bin\" $PATH; or set -gx PATH \"{root}/bin\" $PATH  \
+        "contains -- \"{shims}\" $PATH; or set -gx PATH \"{shims}\" $PATH  \
          # bundled tools (python3, ffmpeg, …) win by PATH — as arguments and in shebangs — for this session only\n\
          {python3}  # a venv (or a missing bundle) falls through to PATH\n"
     )
 }
 
 fn bash_shell_setup() -> String {
-    let root = TOOLS_ROOT_SHELL;
+    let shims = bin_dir_in_shell();
     let python3 = bash_function(
         "python3",
         &format!(
-            "if [ -z \"$VIRTUAL_ENV\" ] && [ -x \"{root}/bin/python3\" ]; then \"{root}/bin/python3\" \"$@\"; else command python3 \"$@\"; fi"
+            "if [ -z \"$VIRTUAL_ENV\" ] && [ -x \"{shims}/python3\" ]; then \"{shims}/python3\" \"$@\"; else command python3 \"$@\"; fi"
         ),
     );
     format!(
-        "case \":$PATH:\" in *\":{root}/bin:\"*) ;; *) export PATH=\"{root}/bin:$PATH\";; esac  \
+        "case \":$PATH:\" in *\":{shims}:\"*) ;; *) export PATH=\"{shims}:$PATH\";; esac  \
          # bundled tools (python3, ffmpeg, …) win by PATH — as arguments and in shebangs\n\
          {python3}  \
          # defined last so it beats older same-named rc definitions; a venv (or a missing bundle) falls through to PATH\n"

@@ -5,7 +5,8 @@
 
 use std::collections::BTreeMap;
 
-use super::{substitute, Section, Wrapper, BIN, ORIGINAL};
+use super::{bin, substitute, Section, Wrapper, ORIGINAL};
+use crate::conf::Place;
 use crate::conf::keybinds::{self, Chord};
 use crate::conf::RELOAD_EXIT_CODE;
 use crate::support::align::align_columns;
@@ -28,7 +29,7 @@ pub(super) fn file(body: &str) -> String {
     // matters more than its bash twin: those must inherit nothing, above all not `python3`.
     out += "\nstatus is-interactive; or return 0  # interactive shells only — non-interactive contexts must inherit nothing\n";
     out += "if set -q _BASHRS_BARE; set -e _BASHRS_BARE; return 0; end  # shell_bare: skip bashrs for THIS shell, flag consumed (any new shell arms again)\n";
-    out += &format!("test -f {BIN}; or return 0\n");
+    out += &format!("test -f {}; or return 0\n", bin());
     out += &clear_completion_links(&super::defined_functions(body));
     out += body;
     out
@@ -83,10 +84,11 @@ pub(super) fn greeting(text: &str, warning: &str, archives: &str) -> String {
          test -r /proc/$fish_pid/stat; and read -l __bashrs_stat < /proc/$fish_pid/stat\n\
          if test -z \"$__bashrs_stat\"; or test (string replace -r -- '^.*\\) \\S+ \\S+ \\S+ (\\S+) .*$' '$1' $__bashrs_stat) = $fish_pid\n    \
          {}\n    \
-         set -l __bashrs_old $HOME/.bashrs/{archives}\n    \
+         set -l __bashrs_old {}/{archives}\n    \
          set -q __bashrs_old[1]; and {} >&2\n\
          end\n",
         printf_line(text, Shell::Fish),
+        crate::conf::bashrs_home_in_shell(),
         printf_line(warning, Shell::Fish)
     )
 }
@@ -117,7 +119,7 @@ pub(super) fn definitions(section: &Section) -> String {
 /// reload hook. The hook keeps the command's own exit status, as bash's does.
 fn wrapper_function(wrapper: &Wrapper, name: &str) -> String {
     let description = wrapper.about.as_deref();
-    let call = format!("{BIN} {} $argv", wrapper.real);
+    let call = format!("{} {} $argv", bin(), wrapper.real);
     let call = match wrapper.piped {
         None => call,
         Some(probe) => format!("{} | {call}", substitute(probe.fish(), Shell::Fish, name)),
@@ -177,7 +179,7 @@ pub(super) fn keybinds(abouts: &BTreeMap<String, String>) -> String {
 /// A name fish completes already (it ships completions for `diff`, and for Mercurial's `hg` — as
 /// files on its completion path, or, from fish 4.9, inside its binary) would get those loaded at
 /// its first TAB, merged with these — so the install writes a file of bashrs's for each such name
-/// into `~/.bashrs/fish_completions`, which this section puts first on `$fish_complete_path`: fish
+/// into [`Place::FishCompletions`], which this section puts first on `$fish_complete_path`: fish
 /// loads the first file it finds there, and falls back to a built-in one only where it finds
 /// none, so its own never run.
 /// Rejected: loading fish's file at startup and erasing what it defined. Loading means running it,
@@ -191,22 +193,25 @@ pub(super) fn completion(sections: &[Section], stainless: &[(String, String)]) -
         .flat_map(|section| &section.wrappers)
         .flat_map(|wrapper| wrapper.names.iter().cloned())
         .collect();
+    // Where the install writes those completion files, as the generated fish spells it.
+    let completions = Place::FishCompletions.in_shell();
     let section = format!(
         "\n# completion\n\
          #   Flags complete with their descriptions, asked of the binary at TAB-time as bash's are: type `-` and press <TAB>\n\
          #   e.g. `gg -<TAB>` lists gg's flags; `gg --de<TAB>` fills in `--delve`. Other words keep fish's own (file) completion.\n\
          #   Where fish has completions of its own for one of these names, the install puts a file of bashrs's in\n\
-         #   {COMPLETIONS}, first on fish's search path, so fish loads it in place of its own.\n\
-         if test -d \"{COMPLETIONS}\"; and not contains -- \"{COMPLETIONS}\" $fish_complete_path\n    \
-         set -p fish_complete_path \"{COMPLETIONS}\"\n\
+         #   {completions}, first on fish's search path, so fish loads it in place of its own.\n\
+         if test -d \"{completions}\"; and not contains -- \"{completions}\" $fish_complete_path\n    \
+         set -p fish_complete_path \"{completions}\"\n\
          end\n\
          {}\n\
          for name in {}\n    \
-         complete -c $name -n {COMPLETING_FLAG} -a \"({BIN_ESCAPED} complete-flags $name)\"\n\
+         complete -c $name -n {COMPLETING_FLAG} -a \"({} complete-flags $name)\"\n\
          end\n\
          {}",
         fish_function(COMPLETING_FLAG, Some("Whether the word being completed is a flag"), &["string match -q -- '-*' (commandline -ct)"]),
         names.join(" "),
+        bin_escaped(),
         probed_completions(stainless),
     );
     names.extend(stainless.iter().map(|(alias, _)| alias.clone()));
@@ -216,14 +221,11 @@ pub(super) fn completion(sections: &[Section], stainless: &[(String, String)]) -
 /// The condition every bashrs completion waits for: the word under the cursor is a flag.
 const COMPLETING_FLAG: &str = "__bashrs_completing_flag";
 
-/// [`BIN`] as it is written inside the double-quoted `-a` of a `complete` line: the quotes escaped,
+/// [`bin`] as it is written inside the double-quoted `-a` of a `complete` line: the quotes escaped,
 /// and `$HOME` too, so it is expanded when fish completes rather than when the line registers.
-const BIN_ESCAPED: &str = "\\\"\\$HOME/.bashrs/bashrs\\\"";
-
-/// Where the install writes bashrs's completion files for the names fish completes too — as the
-/// generated fish spells it, `$HOME` expanded at use time; `conf::fish_completions_dir` is the
-/// Rust-side name of the same directory.
-const COMPLETIONS: &str = "$HOME/.bashrs/fish_completions";
+fn bin_escaped() -> String {
+    bin().replace('"', "\\\"").replace('$', "\\$")
+}
 
 /// The stainless aliases' `complete` lines: each alias's probed flags offered once a `-` is typed.
 fn probed_completions(stainless: &[(String, String)]) -> String {

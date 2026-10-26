@@ -452,7 +452,7 @@ mod commands {
             home,
             "bash".into(),
             "--rcfile".into(),
-            crate::conf::sourcefile().into_os_string(),
+            crate::conf::Place::Sourcefile.path().into_os_string(),
             "-i".into(),
         ]
     }

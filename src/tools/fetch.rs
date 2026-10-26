@@ -381,7 +381,8 @@ fn sync_python_venv(python: &str, dir: &Path, pin: Option<&str>, problems: &mut 
         // dependencies are reinstalled by the stainless sync that follows this; manually
         // `py_install`ed packages need installing again.
         eprintln!(
-            "tools: the bundled python environment no longer runs (a moved ~/.bashrs disk?) — rebuilding it"
+            "tools: the bundled python environment no longer runs (a moved {} disk?) — rebuilding it",
+            crate::conf::bashrs_home_shown()
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -497,8 +498,7 @@ fn ensure_shims(tool: &Tool, problems: &mut Problems) {
 /// The venv-aware shim script: `exec` the binary by its real in-venv path (`$HOME`-based, so a
 /// symlinked `~/.bashrs` keeps working), preserving pyvenv.cfg discovery.
 fn venv_shim(tool_dir: &str, rel: &str) -> String {
-    let root = super::TOOLS_ROOT_SHELL;
-    format!("#!/bin/sh\nexec \"{root}/{tool_dir}/{rel}\" \"$@\"\n")
+    format!("#!/bin/sh\nexec \"{}/{tool_dir}/{rel}\" \"$@\"\n", crate::conf::Place::Tools.in_shell())
 }
 
 /// Download `url` and unpack the archive's contents into `dir` — tarballs via `tar` (root

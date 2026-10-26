@@ -89,6 +89,7 @@ dependencies = [
  "bashrs-macros",
  "clap",
  "console",
+ "devmounts",
  "filesync",
  "grep",
  "ignore",
@@ -312,6 +313,20 @@ name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
+
+[[package]]
+name = "devmounts"
+version = "0.1.0"
+source = "git+https://github.com/SirHexa10t/devmounts.git?branch=main#9e4b1a576934704f58ac16bea8172429d0e9c684"
+dependencies = [
+ "clap",
+ "indexmap",
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml 1.1.8+spec-1.1.0",
+]
 
 [[package]]
 name = "either"
@@ -554,6 +569,8 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -1260,6 +1277,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "vidl"
 version = "0.1.0"
+source = "git+https://github.com/SirHexa10t/vidl.git?branch=main#12f4d71189b1c90f21c1a217cd7ab67cd60a9b22"
 dependencies = [
  "clap",
  "lofty",

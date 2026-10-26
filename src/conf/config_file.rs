@@ -13,14 +13,15 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use super::Place;
 use crate::support::preferences;
 
-/// The configuration file's name under `~/.bashrs` — the one place it's spelled.
-pub(crate) const CONFIG_FILE: &str = "configrs.toml";
+/// The configuration file's name, [`Place::Config`]'s, for the messages that name it.
+pub(crate) const CONFIG_FILE: &str = Place::Config.name();
 
-/// `~/.bashrs/configrs.toml`.
+/// The configuration file, [`Place::Config`].
 pub(crate) fn path() -> PathBuf {
-    super::bashrs_home().join(CONFIG_FILE)
+    Place::Config.path()
 }
 
 /// The starter file written on first use: every tunable at its default, explanation beside it.
@@ -190,8 +191,9 @@ pub(crate) fn archive_glob() -> String {
 /// The stale-config warning's words: what waits, and the command that merges it.
 pub(crate) fn stale_config_warning() -> String {
     format!(
-        "bashrs: an archived config (~/.bashrs/{}) awaits merging into {CONFIG_FILE} \
+        "bashrs: an archived config ({}/{}) awaits merging into {CONFIG_FILE} \
          (run 'brs_configure -e' to merge, then delete the .old file)",
+        super::bashrs_home_shown(),
         archive_glob()
     )
 }

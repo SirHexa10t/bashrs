@@ -43,7 +43,7 @@ use crate::categories::python::PythonCommand;
 use crate::categories::shell::ShellCommand;
 use crate::categories::terminal::TerminalCommand;
 use crate::categories::styles::StyleCommand;
-use crate::conf::{config_file, environment, greeting};
+use crate::conf::{config_file, environment, greeting, Place};
 use crate::drivers::stainless;
 use crate::support::shell_dialect::{fish_original, Shell, ShellText, SET_ASIDE_RECORD};
 use crate::tools;
@@ -219,7 +219,9 @@ fn wrapper_prefix(name: &str) -> Option<ShellText> {
 
 /// The installed binary, as every function in both files calls it — quoted so `$HOME` expands at
 /// call time and a path with spaces stays one word, which bash and fish read alike.
-const BIN: &str = "\"$HOME/.bashrs/bashrs\"";
+fn bin() -> String {
+    format!("\"{}\"", Place::Binary.in_shell())
+}
 
 /// The placeholder for the arguments a function was called with.
 const ARGS: &str = "{ARGS}";
@@ -227,8 +229,10 @@ const ARGS: &str = "{ARGS}";
 const SHELL: &str = "{SHELL}";
 /// The placeholder for the project directory this binary was compiled from.
 const PROJECT_ROOT: &str = "{PROJECT_ROOT}";
-/// The placeholder for the installed binary, [`BIN`].
+/// The placeholder for the installed binary, [`bin`].
 const BINARY: &str = "{BINARY}";
+/// The placeholder for `~/.bashrs` itself, quoted as [`bin`]'s binary is.
+const BASHRS_HOME: &str = "{BASHRS_HOME}";
 /// The placeholder (fish) for the shell's own definition of an override's name.
 const ORIGINAL: &str = "{ORIGINAL}";
 /// The placeholder (bash) for the record of the aliases the file set aside.
@@ -243,7 +247,8 @@ const SET_ASIDE: &str = "{SET_ASIDE}";
 /// - [`SHELL`] — the shell running the function: `fish`, or, in bash's file — which zsh sources
 ///   too — `"${ZSH_NAME:-bash}"`, since zsh names itself there and bash leaves it unset;
 /// - [`PROJECT_ROOT`] — the project directory, quoted for the shell the fragment is written in;
-/// - [`BINARY`] — the installed binary, spelled as every generated wrapper calls it ([`BIN`]);
+/// - [`BINARY`] — the installed binary, spelled as every generated wrapper calls it ([`bin`]);
+/// - [`BASHRS_HOME`] — `~/.bashrs` itself, spelled the same way;
 /// - [`ORIGINAL`], fish only — the shell's own definition of `name`, which [`fish`] saves under
 ///   another name before the override replaces it;
 /// - [`SET_ASIDE`], bash only — the record of the aliases the file set aside under bashrs's names
@@ -251,7 +256,8 @@ const SET_ASIDE: &str = "{SET_ASIDE}";
 fn substitute(text: &str, shell: Shell, name: &str) -> String {
     let text = text
         .replace(PROJECT_ROOT, &shell.quote(env!("CARGO_MANIFEST_DIR")))
-        .replace(BINARY, BIN);
+        .replace(BINARY, &bin())
+        .replace(BASHRS_HOME, &format!("\"{}\"", crate::conf::bashrs_home_in_shell()));
     match shell {
         Shell::Bash => text.replace(ARGS, "\"$@\"").replace(SHELL, "\"${ZSH_NAME:-bash}\"").replace(SET_ASIDE, SET_ASIDE_RECORD),
         Shell::Fish => text.replace(ARGS, "$argv").replace(SHELL, "fish").replace(ORIGINAL, &fish_original(name)),
@@ -717,7 +723,7 @@ mod tests {
             crate::support::shell_quote::quote(env!("CARGO_MANIFEST_DIR"))
         );
         assert!(content.contains(&baked), "brs_cd must cd to the baked project root: {baked}");
-        for placeholder in [ARGS, SHELL, PROJECT_ROOT, BINARY, ORIGINAL, SET_ASIDE] {
+        for placeholder in [ARGS, SHELL, PROJECT_ROOT, BINARY, BASHRS_HOME, ORIGINAL, SET_ASIDE] {
             for shell in [Shell::Bash, Shell::Fish] {
                 assert!(!wrappers(shell).contains(placeholder), "{placeholder} must never survive into the emitted script");
             }
@@ -937,7 +943,7 @@ mod tests {
             for printed in [&text, &warning] {
                 assert!(ending.contains(&printf_line(printed, shell)), "{shell:?} prints it: {ending}");
             }
-            assert!(!ending.contains(BIN) && !ending.contains('\x1b'), "{shell:?}: no binary call, no raw escape: {ending}");
+            assert!(!ending.contains(&bin()) && !ending.contains('\x1b'), "{shell:?}: no binary call, no raw escape: {ending}");
         }
     }
 

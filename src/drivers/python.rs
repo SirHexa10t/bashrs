@@ -12,15 +12,14 @@ use crate::support::problems::Problems;
 
 /// The bundled interpreter, when present (`None`: not bundled on this machine).
 pub(crate) fn interpreter() -> Option<PathBuf> {
-    let python = crate::tools::root().join("python").join("bin").join("python3");
-    python.exists().then_some(python)
+    crate::tools::bundled("python3")
 }
 
 /// The freeze file capturing the environment before the most recent package change —
 /// `py_rollback`'s restore point, rewritten by every mutating operation (and by design *not* by
 /// [`rollback`] itself, so rolling back twice is a no-op rather than a ping-pong).
 fn snapshot_file() -> PathBuf {
-    crate::tools::root().join("python").join(".packages-before-last-change")
+    crate::tools::root().join(crate::tools::PYTHON_DIR).join(".packages-before-last-change")
 }
 
 /// Record the environment's current package set as the rollback point.
@@ -107,8 +106,10 @@ fn package_names(freeze: &str) -> Vec<String> {
 
 fn missing_env() -> bool {
     eprintln!(
-        "no bundled python at ~/.bashrs/tools/python — enable `[tools] always_bundle_languages` \
-         (ALT+W) and recompile, or manage packages in your own environment"
+        "no bundled python at {}/{} — enable `[tools] always_bundle_languages` \
+         (ALT+W) and recompile, or manage packages in your own environment",
+        crate::conf::Place::Tools.shown(),
+        crate::tools::PYTHON_DIR
     );
     false
 }
@@ -163,9 +164,10 @@ mod tests {
     #[test]
     fn interpreter_reports_presence_truthfully() {
         // Environment-adaptive: Some(bundled path) where the bundle exists, None elsewhere.
+        let env = crate::tools::root().join(crate::tools::PYTHON_DIR);
         match interpreter() {
-            Some(python) => assert!(python.ends_with("tools/python/bin/python3"), "{python:?}"),
-            None => assert!(!crate::tools::root().join("python/bin/python3").exists()),
+            Some(python) => assert!(python.is_file() && python.starts_with(&env), "{python:?}"),
+            None => assert!(!env.join("bin/python3").exists()),
         }
     }
 }

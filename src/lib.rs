@@ -34,10 +34,12 @@ use crate::categories::lookup::GgElevatedRescan;
 pub(crate) use support::superuser as elevation;
 
 /// The binary's internal self-invocations: the `sudo` re-execs that `#[elevated]` routines spawn to
-/// run part of themselves as root. Each routine's `try_handle` — which claims the run iff its marker
-/// leads `argv` — is listed here; [`run`] offers the process to them before the user CLI parses.
-/// Adding an `#[elevated]` routine adds one entry; nothing else changes.
-const REEXEC_HANDLERS: &[fn() -> bool] = &[GgElevatedRescan::try_handle];
+/// run part of themselves as root, and devmounts' privileged helper — `symlink_devs`' steps that
+/// need root (a link in `/`, `mount`), done by this binary started again under `sudo`, once per
+/// run. Each handler claims the run iff its marker leads `argv`; [`run`] offers the process to
+/// them before the user CLI parses. Adding an `#[elevated]` routine adds one entry; nothing else
+/// changes.
+const REEXEC_HANDLERS: &[fn() -> bool] = &[GgElevatedRescan::try_handle, devmounts::privileged::try_serve];
 
 /// Binary entry point. An internal re-exec handles itself and stops here; every other invocation is
 /// a real command, parsed and dispatched normally.

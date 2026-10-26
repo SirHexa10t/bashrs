@@ -8,14 +8,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// The sourcefile path as written INTO rc files — deliberately UNEXPANDED: the literal `$HOME`
-/// expands when the rc file is *sourced*, so the wired line stays correct across machines and
-/// users sharing one rc (dotfile repos), where an expanded home would freeze this machine's
-/// path in. (COMPILE.sh's old `SRC_PATH`, renamed for what it is.)
-const UNEXPANDED_SOURCEFILE_PATH: &str = "$HOME/.bashrs/sourcefile.sh";
-
-/// The fish sourcefile's path as fish's hook sources it — unexpanded for the same reason.
-const UNEXPANDED_FISH_SOURCEFILE_PATH: &str = "$HOME/.bashrs/sourcefile.fish";
+use super::Place;
 
 /// Markers bracketing the wired block — re-runs find the opener and skip instead of appending
 /// a duplicate.
@@ -53,19 +46,19 @@ pub fn install_shell(bash: &str, fish: &str, fish_completed: &[String]) {
             Err(warning) => eprintln!("WARNING: {warning}"),
         }
     }
-    if let Err(msg) = ensure_profile_store(&home) {
+    if let Err(msg) = ensure_stores(&home) {
         die(msg);
     }
     match install_binary(&home) {
         // Through a symlink, both ends are named: the file written is not where the user looks.
-        Ok(Some(bin)) => match home.join("bashrs") {
+        Ok(Some(bin)) => match Place::Binary.under(&home) {
             link if link == bin => println!("Installed {}", bin.display()),
             link => println!("Installed {} → {}", link.display(), bin.display()),
         },
         Ok(None) => {} // already running as the installed copy — nothing to move
         Err(msg) => die(msg),
     }
-    let (sourcefile, fish_sourcefile) = (super::sourcefile(), super::fish_sourcefile());
+    let (sourcefile, fish_sourcefile) = (Place::Sourcefile.under(&home), Place::FishSourcefile.under(&home));
     for (file, content) in [(&sourcefile, bash), (&fish_sourcefile, fish)] {
         if let Err(err) = std::fs::write(file, content) {
             die(format!("could not write {}: {err}", file.display()));
@@ -73,7 +66,7 @@ pub fn install_shell(bash: &str, fish: &str, fish_completed: &[String]) {
         println!("Generated {}", file.display());
     }
     let colliding = colliding(fish_completed, &fish_complete_path(), &fish_built_in_completions());
-    match shadow_fish_completions(&super::fish_completions_dir(), &colliding) {
+    match shadow_fish_completions(&Place::FishCompletions.under(&home), &colliding) {
         Ok(()) if colliding.is_empty() => {}
         Ok(()) => println!("Fish ships completions for {}; bashrs's own replace them", colliding.join(", ")),
         Err(msg) => die(msg),
@@ -195,23 +188,30 @@ fn ensure_home(home: &Path) -> Result<(), String> {
     std::fs::create_dir_all(home).map_err(|err| format!("could not create {}: {err}", home.display()))
 }
 
-/// Create the binds-profile store, `<home>/user-custom/sequencer` (the `<home>` form of
-/// [`super::user_custom_dir`], kept parameterised like everything here so tests install into a
-/// temp home). Nothing else creates it — profiles are hand-written — and it must exist before
-/// the first one does: it's what makes the store discoverable, and what a bare `autokey_apply`
-/// passes. The `user-appdata` dirs are NOT made here; their owners build them on first write
-/// (`dl`'s cookie store, the vendor list).
-fn ensure_profile_store(home: &Path) -> Result<(), String> {
-    let store = home.join("user-custom").join("sequencer");
-    std::fs::create_dir_all(&store)
-        .map_err(|err| format!("could not create {}: {err}", store.display()))
+/// The stores the user fills by hand, each read by a command that takes its contents when it's
+/// given nothing: the binds profiles (a bare `autokey_apply`) and the devmounts config (a bare
+/// `symlink_devs`).
+const STORES: &[Place] = &[Place::SequencerProfiles, Place::DevmountsConfigs];
+
+/// Create the [`STORES`] in the `~/.bashrs` at `home` (parameterised like everything here, so
+/// tests install into a temp home). Nothing else creates them — what's in them is hand-written —
+/// and each must exist before the first file does: it's what makes the store discoverable. The
+/// apps' own directories ([`Place::UserAppdata`]'s) are NOT made here; their owners build them
+/// on first write (`dl`'s cookie store, the vendor list).
+fn ensure_stores(home: &Path) -> Result<(), String> {
+    STORES.iter().try_for_each(|store| {
+        let dir = store.under(home);
+        std::fs::create_dir_all(&dir).map_err(|err| format!("could not create {}: {err}", dir.display()))
+    })
 }
 
-/// The user directories' earlier names under `<home>`, each with the name it has now, in the
+/// The user directories' earlier names in `~/.bashrs`, each with the place it is now, in the
 /// order the moves must happen: `user-data` held the apps' data and the user's own writing
-/// alike, so it became `user-appdata` as a whole — and then the binds-profile store, the
-/// user's own, moved on to `user-custom`. A later rename is one more row.
-const USER_DIR_MOVES: &[(&str, &str)] = &[("user-data", "user-appdata"), ("user-appdata/sequencer", "user-custom/sequencer")];
+/// alike, so it became the apps' directory as a whole — and then the binds-profile store, the
+/// user's own, moved on to the user's directory. The earlier names are history, so they stay
+/// spelled as they were; a later rename is one more row.
+const USER_DIR_MOVES: &[(&str, Place)] =
+    &[("user-data", Place::UserAppdata), ("user-appdata/sequencer", Place::SequencerProfiles)];
 
 /// Bring the user directories under `home` to their current names ([`USER_DIR_MOVES`]) — once:
 /// a move happens while the old name exists and the new one doesn't. A rename, so a symlinked
@@ -222,7 +222,7 @@ const USER_DIR_MOVES: &[(&str, &str)] = &[("user-data", "user-appdata"), ("user-
 fn migrate_user_dirs(home: &Path) -> Vec<Result<String, String>> {
     let mut said = Vec::new();
     for (old, new) in USER_DIR_MOVES {
-        let (from, to) = (home.join(old), home.join(new));
+        let (from, to) = (home.join(old), new.under(home));
         if from.symlink_metadata().is_err() {
             continue; // nothing under the old name: moved already, or never there
         }
@@ -274,7 +274,7 @@ fn is_empty_dir(path: &Path) -> bool {
 /// otherwise cut the link.
 fn install_binary(home: &Path) -> Result<Option<PathBuf>, String> {
     let source = std::env::current_exe().map_err(|err| format!("could not locate the running binary: {err}"))?;
-    let dest = super::replacement_target(&home.join("bashrs"));
+    let dest = super::replacement_target(&Place::Binary.under(home));
     if dest.exists()
         && matches!((source.canonicalize(), dest.canonicalize()), (Ok(a), Ok(b)) if a == b)
     {
@@ -297,7 +297,10 @@ fn wire_rc(rc: &Path) -> Result<Wired, String> {
     if !rc.exists() {
         return Ok(Wired::Absent);
     }
-    append_block(rc, &format!("[ -r \"{path}\" ] && . \"{path}\"", path = UNEXPANDED_SOURCEFILE_PATH))
+    // `$HOME` left for the shell to expand when it sources the rc file, so the line stays right
+    // on every machine and for every user sharing the rc (dotfile repos), where an expanded home
+    // would freeze this machine's in.
+    append_block(rc, &format!("[ -r \"{path}\" ] && . \"{path}\"", path = Place::Sourcefile.in_shell()))
 }
 
 /// Fish's configuration directory, by fish's own rule: `$XDG_CONFIG_HOME/fish`, else
@@ -325,7 +328,7 @@ fn wire_fish(fish_config: &Path) -> Result<Wired, String> {
         return Ok(Wired::Absent);
     }
     let hook = fish_hook(fish_config);
-    let line = format!("test -r \"{path}\"; and source \"{path}\"", path = UNEXPANDED_FISH_SOURCEFILE_PATH);
+    let line = format!("test -r \"{path}\"; and source \"{path}\"", path = Place::FishSourcefile.in_shell());
     if hook.exists() {
         return append_block(&hook, &line);
     }
@@ -399,8 +402,9 @@ fn shadow_fish_completions(dir: &Path, colliding: &[&str]) -> Result<(), String>
         let file = dir.join(format!("{name}.fish"));
         let text = format!(
             "# Generated by bashrs's install — do not edit.\n\
-             # bashrs completes `{name}` itself, in ~/.bashrs/sourcefile.fish. Fish has completions of its\n\
-             # own for the name; found first, this file is loaded in their place, so they never join bashrs's.\n"
+             # bashrs completes `{name}` itself, in {}. Fish has completions of its\n\
+             # own for the name; found first, this file is loaded in their place, so they never join bashrs's.\n",
+            Place::FishSourcefile.shown()
         );
         std::fs::write(&file, text).map_err(|err| format!("could not write {}: {err}", file.display()))?;
     }
@@ -453,7 +457,9 @@ mod tests {
     #[test]
     fn the_wired_path_is_left_unexpanded_for_the_shell_to_expand() {
         // A literal `$HOME`, not this machine's home: the rc line must stay portable.
-        assert!(UNEXPANDED_SOURCEFILE_PATH.starts_with("$HOME/"));
+        for sourcefile in [Place::Sourcefile, Place::FishSourcefile] {
+            assert!(sourcefile.in_shell().starts_with("$HOME/"), "{sourcefile:?}");
+        }
     }
 
     /// The closing line must match what actually happens next. When `brs_compile` will reload
@@ -629,16 +635,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The binds-profile store exists from the first install on — empty is fine, missing is
-    /// not: it's what makes the store discoverable, and what a bare `autokey_apply` passes.
+    /// The stores exist from the first install on — empty is fine, missing is not: each is what
+    /// makes its kind of file discoverable, and what a bare command reads.
     #[test]
-    fn installing_creates_the_profile_store() {
-        let home = scratch("profilestore");
-        assert_eq!(ensure_profile_store(&home), Ok(()));
-        assert!(home.join("user-custom/sequencer").is_dir());
+    fn installing_creates_the_stores() {
+        let home = scratch("stores");
+        assert_eq!(ensure_stores(&home), Ok(()));
+        for store in STORES {
+            assert!(store.under(&home).is_dir(), "{store:?}");
+        }
         // Idempotent, like the rest of the install: a second run changes nothing.
-        assert_eq!(ensure_profile_store(&home), Ok(()));
+        assert_eq!(ensure_stores(&home), Ok(()));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Everything in the user's own directory is one of the [`STORES`]: what the user writes
+    /// there needs its place to exist before the first file does — so a new place there that the
+    /// install doesn't make fails here.
+    #[test]
+    fn every_place_in_the_users_directory_is_a_store_the_install_makes() {
+        for &place in Place::ALL {
+            if place.location().0 == Some(Place::UserCustom) {
+                assert!(STORES.contains(&place), "{place:?} is the user's, but the install doesn't make it");
+            }
+        }
     }
 
     fn read(path: PathBuf) -> String {
@@ -660,11 +680,12 @@ mod tests {
         let said = migrate_user_dirs(&home);
         assert!(said.len() == 2 && said.iter().all(Result::is_ok), "{said:?}");
         assert!(home.join("user-data").symlink_metadata().is_err(), "the old name is gone");
-        assert_eq!(read(home.join("user-appdata/oui.tsv")), "vendors");
-        assert_eq!(read(home.join("user-appdata/owned-games.txt")), "Portal 2", "the user's own additions move too");
-        assert!(home.join("user-appdata/browser_cookies/youtube").is_dir());
+        assert_eq!(read(Place::OuiCache.under(&home)), "vendors");
+        let appdata = Place::UserAppdata.under(&home);
+        assert_eq!(read(appdata.join("owned-games.txt")), "Portal 2", "the user's own additions move too");
+        assert!(Place::BrowserCookies.under(&home).join("youtube").is_dir());
         assert!(home.join("user-appdata/sequencer").symlink_metadata().is_err(), "the profiles moved on");
-        assert_eq!(read(home.join("user-custom/sequencer/sub/binds.toml")), "[binds]");
+        assert_eq!(read(Place::SequencerProfiles.under(&home).join("sub/binds.toml")), "[binds]");
         assert!(migrate_user_dirs(&home).is_empty(), "once moved, nothing more to do");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -682,7 +703,7 @@ mod tests {
 
         let said = migrate_user_dirs(&home);
         assert!(said.iter().all(Result::is_ok), "{said:?}");
-        assert_eq!(std::fs::read_link(home.join("user-appdata")).unwrap(), elsewhere, "the link, renamed");
+        assert_eq!(std::fs::read_link(Place::UserAppdata.under(&home)).unwrap(), elsewhere, "the link, renamed");
         assert!(elsewhere.join("browser_cookies").is_dir(), "its target untouched");
 
         // A link is never "empty", even to an empty directory: with the new name in use, it is
@@ -702,28 +723,31 @@ mod tests {
     #[test]
     fn two_names_in_use_are_left_to_the_user_and_an_empty_one_is_no_obstacle() {
         let home = scratch("migrate_both");
+        let appdata = Place::UserAppdata.under(&home);
         std::fs::create_dir_all(home.join("user-data")).unwrap();
         std::fs::write(home.join("user-data/old.txt"), "old").unwrap();
-        std::fs::create_dir_all(home.join("user-appdata")).unwrap();
-        std::fs::write(home.join("user-appdata/new.txt"), "new").unwrap();
+        std::fs::create_dir_all(&appdata).unwrap();
+        std::fs::write(appdata.join("new.txt"), "new").unwrap();
         let said = migrate_user_dirs(&home);
         let warnings: Vec<&String> = said.iter().filter_map(|line| line.as_ref().err()).collect();
         assert!(said.len() == 1 && warnings.len() == 1, "{said:?}");
-        assert!(warnings[0].contains("user-data") && warnings[0].contains("user-appdata") && warnings[0].contains("by hand"), "{said:?}");
+        let names_both = warnings[0].contains("user-data") && warnings[0].contains(Place::UserAppdata.name());
+        assert!(names_both && warnings[0].contains("by hand"), "{said:?}");
         assert_eq!(read(home.join("user-data/old.txt")), "old", "nothing moved");
-        assert_eq!(read(home.join("user-appdata/new.txt")), "new");
+        assert_eq!(read(appdata.join("new.txt")), "new");
 
         let home = scratch("migrate_empty");
+        let store = Place::SequencerProfiles.under(&home);
         std::fs::create_dir_all(home.join("user-appdata/sequencer")).unwrap();
         std::fs::write(home.join("user-appdata/sequencer/a.toml"), "a").unwrap();
-        std::fs::create_dir_all(home.join("user-custom/sequencer")).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
         let said = migrate_user_dirs(&home);
         assert!(said.len() == 1 && said.iter().all(Result::is_ok), "{said:?}");
-        assert_eq!(read(home.join("user-custom/sequencer/a.toml")), "a", "moved into the empty store's place");
+        assert_eq!(read(store.join("a.toml")), "a", "moved into the empty store's place");
         std::fs::create_dir_all(home.join("user-appdata/sequencer")).unwrap();
         assert!(migrate_user_dirs(&home).is_empty(), "an empty old name is just removed, quietly");
         assert!(home.join("user-appdata/sequencer").symlink_metadata().is_err());
-        assert_eq!(read(home.join("user-custom/sequencer/a.toml")), "a");
+        assert_eq!(read(store.join("a.toml")), "a");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -731,7 +755,7 @@ mod tests {
     fn the_binary_self_installs_and_reinstalls_over_the_previous_copy() {
         let dir = scratch("selfinstall");
         let installed = install_binary(&dir).expect("install works").expect("a copy was made");
-        assert_eq!(installed, dir.join("bashrs"));
+        assert_eq!(installed, Place::Binary.under(&dir));
         let source_len = std::fs::metadata(std::env::current_exe().unwrap()).unwrap().len();
         assert_eq!(std::fs::metadata(&installed).unwrap().len(), source_len, "a full copy");
         use std::os::unix::fs::PermissionsExt;
@@ -757,27 +781,28 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&elsewhere).unwrap();
         let real = elsewhere.join("bashrs");
+        let binary = Place::Binary.under(&home);
         std::fs::write(&real, b"stale").unwrap();
-        symlink(&real, home.join("bashrs")).unwrap();
+        symlink(&real, &binary).unwrap();
 
         let source_len = std::fs::metadata(std::env::current_exe().unwrap()).unwrap().len();
         let installed = install_binary(&home).expect("install works").expect("a copy was made");
         assert_eq!(installed, real.canonicalize().unwrap(), "written where the link points");
-        assert!(home.join("bashrs").is_symlink(), "and the link itself survives");
+        assert!(binary.is_symlink(), "and the link itself survives");
         assert_eq!(std::fs::metadata(&real).unwrap().len(), source_len, "a full copy, through it");
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o755, 0o755);
 
-        std::fs::remove_file(home.join("bashrs")).unwrap();
-        symlink(dir.join("no/such/bashrs"), home.join("bashrs")).unwrap();
+        std::fs::remove_file(&binary).unwrap();
+        symlink(dir.join("no/such/bashrs"), &binary).unwrap();
         install_binary(&home).expect("install works").expect("a copy was made");
-        assert!(!home.join("bashrs").is_symlink(), "a dangling link is replaced, as before");
-        assert_eq!(std::fs::metadata(home.join("bashrs")).unwrap().len(), source_len);
+        assert!(!binary.is_symlink(), "a dangling link is replaced, as before");
+        assert_eq!(std::fs::metadata(&binary).unwrap().len(), source_len);
 
-        std::fs::remove_file(home.join("bashrs")).unwrap();
-        symlink(std::env::current_exe().unwrap(), home.join("bashrs")).unwrap();
+        std::fs::remove_file(&binary).unwrap();
+        symlink(std::env::current_exe().unwrap(), &binary).unwrap();
         assert_eq!(install_binary(&home), Ok(None), "linked at the running binary: installed");
-        assert!(home.join("bashrs").is_symlink());
+        assert!(binary.is_symlink());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -279,17 +279,31 @@ fn expand(args: CategoryArgs, module: ItemMod) -> syn::Result<TokenStream2> {
     })
 }
 
-/// The first `#[doc]` line of a command — its one-line summary, as the sourcefile comment.
+/// A command's one-line summary, as the sourcefile comment: its doc comment's first paragraph,
+/// made one line the way clap makes a clap command's `about` (`clap_derive`'s doc-comment
+/// preprocessing) — lines up to the first blank one, each trimmed, joined by spaces, one trailing
+/// period dropped. So a `#[shell_body]` command reads like every other in the generated files,
+/// however its doc comment is wrapped.
 fn doc_summary(docs: &[Attribute]) -> String {
-    docs.iter()
-        .find_map(|attr| match &attr.meta {
+    let lines: Vec<String> = docs
+        .iter()
+        .filter_map(|attr| match &attr.meta {
             syn::Meta::NameValue(MetaNameValue {
                 value: Expr::Lit(ExprLit { lit: Lit::Str(text), .. }),
                 ..
-            }) => Some(text.value().trim().to_string()),
+            }) => Some(text.value()),
             _ => None,
         })
-        .unwrap_or_default()
+        // A `/** … */` comment is one attribute holding every line.
+        .flat_map(|text| text.split('\n').map(|line| line.trim().to_string()).collect::<Vec<_>>())
+        .skip_while(|line| line.is_empty())
+        .take_while(|line| !line.is_empty())
+        .collect();
+    let summary = lines.join(" ");
+    match summary.strip_suffix('.') {
+        Some(stripped) if !summary.ends_with("..") => stripped.to_string(),
+        _ => summary,
+    }
 }
 
 /// A generated `pub fn <ident>(name: &str) -> Option<<value_ty>>` mapping each `pairs` key to its
@@ -663,6 +677,24 @@ mod tests {
 
     fn parsed(attr: Attribute) -> Result<(String, String), String> {
         PerShell::parse(&attr).map(|text| (text.bash, text.fish)).map_err(|err| err.to_string())
+    }
+
+    /// A `#[shell_body]` command's summary is its doc comment's whole first paragraph, on one line —
+    /// as clap makes a clap command's `about` — so wrapping the comment loses none of it, and what
+    /// follows the paragraph never joins it.
+    #[test]
+    fn a_summary_is_the_first_paragraph_on_one_line() {
+        let docs = |lines: &[&str]| -> Vec<Attribute> {
+            lines.iter().map(|line| syn::parse_quote!(#[doc = #line])).collect()
+        };
+        let wrapped = docs(&[" `cd` to ~/.bashrs — the installation: binary,", " sourcefiles, config", "", " Pure shell."]);
+        assert_eq!(doc_summary(&wrapped), "`cd` to ~/.bashrs — the installation: binary, sourcefiles, config");
+        assert_eq!(doc_summary(&docs(&[" Hop one directory up"])), "Hop one directory up");
+        assert_eq!(doc_summary(&docs(&["", " Leading blank lines are skipped"])), "Leading blank lines are skipped");
+        assert_eq!(doc_summary(&docs(&[" Start a shell."])), "Start a shell", "one trailing period dropped, as clap does");
+        assert_eq!(doc_summary(&docs(&[" Wait for it..."])), "Wait for it...", "an ellipsis stays");
+        assert_eq!(doc_summary(&docs(&["\n Two\n lines\n\n Then more"])), "Two lines", "a block comment's lines too");
+        assert_eq!(doc_summary(&[]), "");
     }
 
     /// The contract every hand-written fragment meets: what bash runs, and what fish runs.
