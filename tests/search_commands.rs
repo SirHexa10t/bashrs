@@ -127,6 +127,131 @@ fn gg_context_comes_from_the_flag_or_the_pinned_variant() {
     assert!(pinned.contains("data.txt-1-above"), "gg2 must pin -C 2 by itself: {pinned}");
 }
 
+/// A two-page PDF — the first page's lines `first`, the second's `second` — in a standard font,
+/// one line per `Td` step down.
+fn two_page_pdf(first: &[&str], second: &[&str]) -> Vec<u8> {
+    let content = |lines: &[&str]| {
+        let mut text = String::from("BT /F1 12 Tf 72 700 Td");
+        for line in lines {
+            text.push_str(&format!(" ({line}) Tj 0 -14 Td"));
+        }
+        text.push_str(" ET");
+        format!("<< /Length {} >>\nstream\n{text}\nendstream", text.len())
+    };
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+        "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /Resources << /Font << /F1 5 0 R >> >> >>".to_owned(),
+        "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>".to_owned(),
+        "<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>".to_owned(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
+        content(first),
+        content(second),
+    ];
+    let mut pdf = String::from("%PDF-1.4\n");
+    for (number, body) in (1..).zip(objects) {
+        pdf.push_str(&format!("{number} 0 obj\n{body}\nendobj\n"));
+    }
+    pdf.push_str("trailer\n<< /Root 1 0 R >>\n%%EOF\n");
+    pdf.into_bytes()
+}
+
+/// A PDF's text is searched by default — no `--delve` — page by page, each hit labelled with its
+/// page where a line number would be, and context taken from the page around it.
+#[test]
+fn gg_reads_a_pdf_page_by_page_without_delve() {
+    let tree = Tree::empty("pdf");
+    let pdf = two_page_pdf(&["Nothing to see"], &["Above it", "The Chute arrives", "Below it"]);
+    fs::write(tree.root.join("order.pdf"), pdf).unwrap();
+    let text = stdout(&bashrs(&["gg", "chute", "-d", tree.path()], None, None));
+    assert!(text.contains("order.pdf:page 2:The Chute arrives"), "{text}");
+    assert!(!text.contains("page 1"), "only the page with the hit: {text}");
+    let context = stdout(&bashrs(&["gg2", "chute", "-d", tree.path()], None, None));
+    assert!(context.contains("order.pdf-page 2-Above it") && context.contains("order.pdf-page 2-Below it"),
+        "context lines come from the same page, dash-separated: {context}");
+}
+
+/// An encrypted PDF's text can't be read until someone decrypts it, which `gg` leaves to the user:
+/// every one it met is named once the search is done — `.PDF` as well as `.pdf` — so a decrypted
+/// copy of each can be made for the next search.
+#[test]
+fn gg_names_every_encrypted_pdf_it_could_not_read() {
+    let tree = Tree::empty("encrypted");
+    let pdf = two_page_pdf(&["The Chute arrives"], &[]);
+    let locked = String::from_utf8(pdf.clone()).unwrap().replace("<< /Root 1 0 R >>", "<< /Root 1 0 R /Encrypt << /Filter /Standard >> >>");
+    fs::write(tree.root.join("open.pdf"), pdf).unwrap();
+    fs::create_dir(tree.root.join("statements")).unwrap();
+    fs::write(tree.root.join("statements/march.pdf"), &locked).unwrap();
+    fs::write(tree.root.join("april.PDF"), &locked).unwrap();
+
+    let out = bashrs(&["gg", "chute", "-d", tree.path()], None, None);
+    let (found, err) = (stdout(&out), stderr(&out));
+    assert!(found.contains("open.pdf:page 1:The Chute arrives"), "the readable one is searched: {found}");
+    assert!(!found.contains("march") && !found.contains("april"), "the encrypted ones yield nothing: {found}");
+    let listed: Vec<&str> = err.lines().skip_while(|line| !line.contains("(encrypted)")).collect();
+    let (april, march) = (tree.root.join("april.PDF"), tree.root.join("statements/march.pdf"));
+    assert_eq!(
+        listed,
+        [
+            "2 PDF(s) skipped (encrypted) — decrypt a copy of each to have its text searched:".to_owned(),
+            format!("  {}", april.display()),
+            format!("  {}", march.display()),
+        ],
+    );
+}
+
+/// Every file `gg` set out to read but couldn't is named once the search is done, grouped by why:
+/// what they are, why, and — where something would — what would have the next search read them.
+#[test]
+fn gg_names_every_file_it_set_out_to_read_but_could_not() {
+    let tree = Tree::empty("unsearched");
+    let pdf = two_page_pdf(&["The Chute arrives"], &[]);
+    let locked = String::from_utf8(pdf.clone()).unwrap().replace("<< /Root 1 0 R >>", "<< /Root 1 0 R /Encrypt << /Filter /Standard >> >>");
+    fs::write(tree.root.join("open.pdf"), &pdf).unwrap();
+    fs::write(tree.root.join("locked.pdf"), locked).unwrap();
+    fs::write(tree.root.join("scan.pdf"), two_page_pdf(&[], &[])).unwrap();
+    fs::write(tree.root.join("error.pdf"), "<html>404 Not Found</html>").unwrap();
+    fs::File::create(tree.root.join("book.pdf")).unwrap().set_len(300 << 20).unwrap(); // sparse: its bytes are never read
+    fs::write(tree.root.join("movie.mkv"), "not a video").unwrap();
+
+    let out = bashrs(&["gg", "--delve", "chute", "-d", tree.path()], None, None);
+    assert!(stdout(&out).contains("open.pdf:page 1:The Chute arrives"), "{}", stdout(&out));
+    let at = |name: &str| format!("  {}", tree.root.join(name).display());
+    let err = stderr(&out);
+    let named: Vec<&str> = err.lines().skip_while(|line| !line.contains(" skipped (")).collect();
+    assert_eq!(
+        named,
+        [
+            "1 PDF(s) skipped (encrypted) — decrypt a copy of each to have its text searched:".to_owned(),
+            at("locked.pdf"),
+            String::new(),
+            "1 PDF(s) skipped (no text — a scan?) — run a copy of each through OCR to have its text searched:".to_owned(),
+            at("scan.pdf"),
+            String::new(),
+            "1 file(s) skipped (over 256 MiB — too big to decode):".to_owned(),
+            at("book.pdf"),
+            String::new(),
+            "2 file(s) skipped (damaged, cut short, or not what its name says):".to_owned(),
+            at("error.pdf"),
+            at("movie.mkv"),
+        ],
+    );
+}
+
+/// A hit in a video's subtitles says which track holds it and when the cue starts, where a text
+/// file's line number would be — and its context comes from the same track.
+#[test]
+fn gg_delve_places_each_subtitle_hit_by_track_and_time() {
+    let tree = Tree::empty("subtitles");
+    fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/d-webvtt.mkv"), tree.root.join("kitchen.mkv")).unwrap();
+    fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tx3g-tracks.mp4"), tree.root.join("kitchen.mp4")).unwrap();
+    let found = stdout(&bashrs(&["gg", "--delve", "-C", "1", "salt", "-d", tree.path()], None, None));
+    // An untitled track goes by its language, a titled one by its title.
+    assert!(found.contains("kitchen.mkv:eng 0:00:00:The kitchen ran out of salt"), "{found}");
+    assert!(found.contains("kitchen.mkv-eng 0:00:02-Second helping is on the house"), "{found}");
+    assert!(found.contains("kitchen.mp4:English (SDH) 0:00:00:The kitchen ran out of salt"), "{found}");
+    assert!(found.contains("kitchen.mp4-English (SDH) 0:00:05-Second helping is on the house"), "{found}");
+}
+
 #[test]
 fn gg_matches_literally_by_default_and_as_regex_with_the_flag() {
     let tree = Tree::build("regex");

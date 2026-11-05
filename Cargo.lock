@@ -91,10 +91,12 @@ dependencies = [
  "console",
  "devmounts",
  "filesync",
+ "flate2",
  "grep",
  "ignore",
  "libc",
  "lofty",
+ "memchr",
  "minimad",
  "regex",
  "sequencer-cli",
@@ -823,7 +825,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "sequencer-cli"
 version = "0.8.0"
-source = "git+https://github.com/SirHexa10t/sequencer.git?branch=main#d16332532c13b333155dd0d6103495cbb646a494"
+source = "git+https://github.com/SirHexa10t/sequencer.git?branch=main#d9a9854bcfdeff1c5bb43c589f4d6c75addd94d9"
 dependencies = [
  "clap",
  "log",
@@ -840,7 +842,7 @@ dependencies = [
 [[package]]
 name = "sequencer-core"
 version = "0.8.0"
-source = "git+https://github.com/SirHexa10t/sequencer.git?branch=main#d16332532c13b333155dd0d6103495cbb646a494"
+source = "git+https://github.com/SirHexa10t/sequencer.git?branch=main#d9a9854bcfdeff1c5bb43c589f4d6c75addd94d9"
 dependencies = [
  "thiserror",
 ]
@@ -848,7 +850,7 @@ dependencies = [
 [[package]]
 name = "sequencer-input"
 version = "0.8.0"
-source = "git+https://github.com/SirHexa10t/sequencer.git?branch=main#d16332532c13b333155dd0d6103495cbb646a494"
+source = "git+https://github.com/SirHexa10t/sequencer.git?branch=main#d9a9854bcfdeff1c5bb43c589f4d6c75addd94d9"
 dependencies = [
  "evdev",
  "log",

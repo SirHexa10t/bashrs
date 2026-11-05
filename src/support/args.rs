@@ -2,7 +2,8 @@
 
 use clap::Args;
 use ignore::{DirEntry, WalkBuilder};
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 /// An empty argument set, for commands that take no arguments.
 #[derive(Args)]
@@ -105,6 +106,29 @@ pub fn walk(roots: &[PathBuf], skips: &[String]) -> WalkBuilder {
     builder
 }
 
+/// What a [`walk`] failed to read: the path, and the system's error for it. `None` for an error
+/// that names neither.
+pub fn walk_failure(err: &ignore::Error) -> Option<(&Path, &io::Error)> {
+    let error = err.io_error()?;
+    // The single-threaded walk wraps the system's error in one restating the path ("IO error for
+    // operation on …"); the system's own words are its source.
+    let system = std::error::Error::source(error).and_then(|source| source.downcast_ref::<io::Error>());
+    Some((error_path(err)?, system.unwrap_or(error)))
+}
+
+/// Dig through `ignore::Error`'s wrapping variants (depth / line-number / partial) to the
+/// underlying path, if the error carries one.
+fn error_path(err: &ignore::Error) -> Option<&Path> {
+    match err {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            error_path(err)
+        }
+        ignore::Error::Partial(errs) => errs.iter().find_map(error_path),
+        _ => None,
+    }
+}
+
 /// `entry`'s path from the root it was found under — the last of its components, as many as it
 /// lies deep.
 fn below_root(entry: &DirEntry) -> PathBuf {
@@ -168,8 +192,8 @@ pub struct GgBase {
     /// Don't prefix matches with line numbers (they're on by default for `gg`).
     #[arg(long)]
     pub(crate) no_line_number: bool,
-    /// Also search inside files normally skipped as binary, by decoding known formats
-    /// (video subtitle tracks, `.torrent` text).
+    /// Also search inside media normally skipped as binary, by decoding known formats
+    /// (video subtitle tracks, `.torrent` text). PDFs are read without it.
     #[arg(long)]
     pub(crate) delve: bool,
     /// Treat the expression(s) as regular expressions (à la `grep -E`) rather than literal text.
@@ -181,7 +205,8 @@ pub struct GgBase {
     pub(crate) save: bool,
     /// Replace every match with this string, IN PLACE: matched files/dirs are renamed and matched
     /// lines rewritten (a literal swap of each matched span). Shows what would change and asks
-    /// before touching anything; there is no undo. Skips `--delve`-decoded content, and anything
+    /// before touching anything; there is no undo. Never writes inside a binary file (a PDF, a
+    /// video, a torrent) — though a matching name is still renamed — and anything
     /// `--skip-pattern`/`--lean` excluded is never rewritten either.
     #[arg(long = "re", value_name = "REPLACEMENT")]
     pub(crate) re: Option<String>,

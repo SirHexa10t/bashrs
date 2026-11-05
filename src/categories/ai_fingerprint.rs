@@ -88,8 +88,16 @@ mod commands {
         let mut fired: Vec<tells::Family> = Vec::new();
 
         for path in _files(&target, &skips) {
-            // Read once, scan twice: both text engines want the same decoded string.
-            let text = _read_text(&path, max_file_size);
+            // Read once, scan twice: both text engines want the same decoded string. A file the
+            // system won't read is named and passed over — reading it again for its metadata
+            // would only fail the same way.
+            let text = match _read_text(&path, max_file_size) {
+                Ok(text) => text,
+                Err(err) => {
+                    _name_unreadable(&path, &err);
+                    continue;
+                }
+            };
             let hits = text
                 .as_deref()
                 .map(|text| hidden::scan(text, !skip_spaces, emoji))
@@ -97,9 +105,13 @@ mod commands {
             // Metadata is a second look at the same file, gated by whether the engine has an
             // extractor at all — no point reading a .rs file's bytes twice to learn nothing.
             let findings = if !skip_metadata && metadata::handles(&path) {
-                _read_capped(&path, max_file_size)
-                    .and_then(|bytes| metadata::extract(&path, &bytes, true))
-                    .unwrap_or_default()
+                match _read_capped(&path, max_file_size) {
+                    Ok(bytes) => bytes.and_then(|bytes| metadata::extract(&path, &bytes, true)).unwrap_or_default(),
+                    Err(err) => {
+                        _name_unreadable(&path, &err);
+                        Vec::new()
+                    }
+                }
             } else {
                 Vec::new()
             };
@@ -232,20 +244,35 @@ mod commands {
         );
     }
 
-    /// A file's raw bytes, size-capped the same way the textual scan is. No text sniff here:
-    /// the metadata extractor wants binary formats too, and does its own routing.
-    fn _read_capped(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
-        let size = std::fs::metadata(path).ok()?.len();
-        if size > max_bytes {
+    /// A file's raw bytes, size-capped the same way the textual scan is — or the error, when the
+    /// system won't read it. No text sniff here: the metadata extractor wants binary formats too,
+    /// and does its own routing.
+    fn _read_capped(path: &Path, max_bytes: u64) -> io::Result<Option<Vec<u8>>> {
+        let size = std::fs::metadata(path)?.len();
+        if _too_big(path, size, max_bytes) {
+            return Ok(None);
+        }
+        std::fs::read(path).map(Some)
+    }
+
+    /// Name a path the system wouldn't read — a file, or a directory the walk couldn't list — so
+    /// that it isn't missed in silence.
+    fn _name_unreadable(path: &Path, err: &io::Error) {
+        eprintln!("detect_ai_textual_fingerprint: skipping {} (couldn't be read: {err})", path.display());
+    }
+
+    /// Whether a file of `size` bytes is over `--max-file-size` — named as skipped when it is.
+    fn _too_big(path: &Path, size: u64, max_bytes: u64) -> bool {
+        let too_big = size > max_bytes;
+        if too_big {
             eprintln!(
                 "detect_ai_textual_fingerprint: skipping {} ({} bytes > --max-file-size {})",
                 path.display(),
                 size,
                 max_bytes
             );
-            return None;
         }
-        std::fs::read(path).ok()
+        too_big
     }
 
     /// One file's metadata findings: the field, the (display-truncated) value, and why it
@@ -315,14 +342,22 @@ mod commands {
     /// Gitignore-based filtering was tried and removed: it skipped by rules written elsewhere
     /// (a parent repo's `.gitignore` hid whole projects), and the walk root was exempt while
     /// descendants weren't — so a tree scan could report a *disjoint* set from a scan of its
-    /// own subdirectory. A detector's "nothing found" has to mean it.
+    /// own subdirectory. A detector's "nothing found" has to mean it — so a directory the walk
+    /// can't read is named, rather than its files missed in silence.
     fn _files(target: &Path, skips: &[String]) -> Vec<PathBuf> {
         if target.is_file() {
             return vec![target.to_path_buf()];
         }
         crate::support::args::walk(&[target.to_path_buf()], skips)
             .build()
-            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                entry
+                    .map_err(|err| match crate::support::args::walk_failure(&err) {
+                        Some((path, error)) => _name_unreadable(path, error),
+                        None => eprintln!("detect_ai_textual_fingerprint: {err}"),
+                    })
+                    .ok()
+            })
             .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
             .map(ignore::DirEntry::into_path)
             .collect()
@@ -341,42 +376,58 @@ mod commands {
         if parts.is_empty() { String::new() } else { format!(" (skipped: {})", parts.join(", ")) }
     }
 
-    /// A file's scannable text: whole file when valid UTF-8, the decoded text section for
-    /// containers [`delve`](crate::support::treegrep::delve) understands (.torrent names,
-    /// video subtitles), `None` otherwise. Never a lossy decode of raw binary — pixel data
-    /// contains carrier byte sequences by coincidence, and reporting those is crying wolf.
-    fn _read_text(path: &Path, max_bytes: u64) -> Option<String> {
+    /// A file's scannable text: whole file when valid UTF-8, the decoded text for the formats
+    /// [`delve`](crate::support::treegrep::delve) decodes (PDF pages, .torrent names, video
+    /// subtitles), `None` otherwise — and the error, when the system won't read it. Never a lossy
+    /// decode of raw binary — pixel data contains carrier byte sequences by coincidence, and
+    /// reporting those is crying wolf.
+    fn _read_text(path: &Path, max_bytes: u64) -> io::Result<Option<String>> {
+        use crate::support::treegrep::delve::{self, Decoded};
         use std::io::Read as _;
 
-        let size = std::fs::metadata(path).ok()?.len();
-        let mut file = std::fs::File::open(path).ok()?;
+        let size = std::fs::metadata(path)?.len();
+        // A format we decode is told by its name, never by the NUL sniff below: a PDF passes or
+        // fails that by chance, and a PDF passed over is exactly what a scan of a pile of receipts
+        // can't afford. One decoded whole in memory keeps to the size cap; a video is read
+        // piecemeal — only its subtitles — however big.
+        if let Some(format) = delve::Format::of(path) {
+            if format.is_read_whole() && _too_big(path, size, max_bytes) {
+                return Ok(None);
+            }
+            return match delve::extract(path, true) {
+                Some(Ok(Decoded::Text(sections))) => {
+                    let texts: Vec<Vec<u8>> = sections.into_iter().map(|section| section.text).collect();
+                    Ok(String::from_utf8(texts.join(&b'\n')).ok().filter(|text| !text.trim().is_empty()))
+                }
+                Some(Ok(Decoded::Unread(unread))) => {
+                    eprintln!("detect_ai_textual_fingerprint: skipping {} ({})", path.display(), unread.reason());
+                    Ok(None)
+                }
+                Some(Err(err)) => Err(err),
+                None => Ok(None),
+            };
+        }
+        let mut file = std::fs::File::open(path)?;
         // Sniff first, read second. A NUL byte in the first few KB is the classic binary test
         // (git and grep use it), and settling the question from a small prefix is the whole
         // point: reading a 300 MB `.rlib` in full only to fail a UTF-8 check is how a scan of
         // `target/` exhausts memory. Cost is bounded at SNIFF_BYTES per file either way.
         let mut head = vec![0_u8; SNIFF_BYTES.min(usize::try_from(size).unwrap_or(usize::MAX))];
-        let read = file.read(&mut head).ok()?;
+        let read = file.read(&mut head)?;
         head.truncate(read);
         if head.contains(&0) {
-            // Binary. Only a format we can decode has text worth scanning.
-            let embedded = crate::support::treegrep::delve::extract(path)?;
-            return String::from_utf8(embedded).ok().filter(|text| !text.is_empty());
+            // Binary, and in no format we decode: no text worth scanning.
+            return Ok(None);
         }
-        if size > max_bytes {
+        if _too_big(path, size, max_bytes) {
             // Text, but too big to hold. Skipping is the honest outcome — and it is announced,
             // because a file silently missed is exactly the failure this command must not have.
-            eprintln!(
-                "detect_ai_textual_fingerprint: skipping {} ({} bytes > --max-file-size {})",
-                path.display(),
-                size,
-                max_bytes
-            );
-            return None;
+            return Ok(None);
         }
         let mut bytes = head;
         bytes.reserve(usize::try_from(size).unwrap_or(0).saturating_sub(bytes.len()));
-        file.read_to_end(&mut bytes).ok()?;
-        String::from_utf8(bytes).ok()
+        file.read_to_end(&mut bytes)?;
+        Ok(String::from_utf8(bytes).ok())
     }
 
     /// How much of a file decides whether it is text. A NUL inside this prefix means binary.
@@ -547,7 +598,7 @@ mod commands {
             let mut bytes = vec![0_u8; 4];
             bytes.extend(std::iter::repeat_n(b'x', SNIFF_BYTES * 4));
             std::fs::write(&blob, &bytes).unwrap();
-            assert!(_read_text(&blob, 16 << 20).is_none(), "binary, and no decoder for .rlib");
+            assert!(_read_text(&blob, 16 << 20).unwrap().is_none(), "binary, and no decoder for .rlib");
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -571,13 +622,12 @@ mod commands {
         #[test]
         fn an_oversized_text_file_is_skipped_rather_than_loaded() {
             // The cap is enforced against real bytes, both ways.
-            assert_eq!(_read_text(Path::new("/nonexistent"), 1 << 20), None);
             let dir = std::env::temp_dir().join(format!("bashrs_wm_cap_{}", std::process::id()));
             let _ = std::fs::create_dir_all(&dir);
             let small = dir.join("ok.md");
             std::fs::write(&small, "x\u{200B}y").unwrap();
-            assert!(_read_text(&small, 16 << 20).is_some(), "an ordinary file is still read whole");
-            assert!(_read_text(&small, 2).is_none(), "and the cap really refuses one over it");
+            assert!(_read_text(&small, 16 << 20).unwrap().is_some(), "an ordinary file is still read whole");
+            assert!(_read_text(&small, 2).unwrap().is_none(), "and the cap really refuses one over it");
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -589,7 +639,7 @@ mod commands {
             // Bytes that WOULD decode to a carrier under a lossy read: E2 80 8B is U+200B.
             std::fs::write(&binary, [0xFF_u8, 0xFE, 0xE2, 0x80, 0x8B, 0x00]).unwrap();
             assert!(
-                _read_text(&binary, 16 << 20).is_none(),
+                _read_text(&binary, 16 << 20).unwrap().is_none(),
                 "raw binary is skipped, not lossily decoded — coincidental bytes are not carriers"
             );
             let _ = std::fs::remove_dir_all(&dir);
@@ -604,15 +654,62 @@ mod commands {
             let torrent = dir.join("x.torrent");
             // Minimal bencode: a dict whose "name" carries a zero-width space, plus a binary
             // "pieces" blob the decoder must leave out.
-            let mut data = b"d4:name14:clean\xe2\x80\x8bname6:pieces4:".to_vec();
+            let mut data = b"d4:name12:clean\xe2\x80\x8bname6:pieces4:".to_vec();
             data.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x01]);
             data.push(b'e');
             std::fs::write(&torrent, &data).unwrap();
             assert!(String::from_utf8(data).is_err(), "the file as a whole is not valid UTF-8");
 
-            let text = _read_text(&torrent, 16 << 20).expect("the text section is decoded");
+            let text = _read_text(&torrent, 16 << 20).unwrap().expect("the text section is decoded");
             assert!(text.contains('\u{200B}'), "the carrier in the name is reachable: {text:?}");
             assert!(!hidden::scan(&text, false, true).is_empty(), "and it is reported");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A PDF is known by its name and read through its decoder, whatever its bytes: this one
+        /// holds no NUL for the binary sniff to catch, and is spelled `.PDF` as scanners spell it.
+        /// Over the size cap it is named and skipped like any file read whole, and so is one that
+        /// is encrypted.
+        #[test]
+        fn every_pdf_is_read_through_its_decoder() {
+            let dir = std::env::temp_dir().join(format!("bashrs_wm_pdf_{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let pdf = "%PDF-1.4\n\
+                1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
+                2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n\
+                3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n\
+                4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n\
+                5 0 obj << /Length 44 >> stream\nBT /F1 12 Tf 72 712 Td (Receipt total) Tj ET\nendstream endobj\n\
+                trailer << /Root 1 0 R >>\n%%EOF\n";
+            assert!(!pdf.contains('\0'), "nothing for the sniff to catch");
+            let receipt = dir.join("receipt.PDF");
+            std::fs::write(&receipt, pdf).unwrap();
+            assert_eq!(_read_text(&receipt, 16 << 20).unwrap().as_deref(), Some("Receipt total"), "its text, not its source");
+            assert_eq!(_read_text(&receipt, 64).unwrap(), None, "over the cap: named and skipped");
+            let locked = dir.join("locked.pdf");
+            std::fs::write(&locked, pdf.replace("<< /Root 1 0 R >>", "<< /Root 1 0 R /Encrypt << /Filter /Standard >> >>")).unwrap();
+            assert_eq!(_read_text(&locked, 16 << 20).unwrap(), None, "encrypted: named and skipped");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A file the system won't read comes back as the system's error, for the scan to name —
+        /// never as a file with nothing in it.
+        #[test]
+        fn a_file_the_system_won_t_read_is_an_error_to_name() {
+            use std::os::unix::fs::PermissionsExt;
+            let missing = _read_text(Path::new("/nonexistent"), 1 << 20);
+            assert!(matches!(missing, Err(err) if err.kind() == io::ErrorKind::NotFound));
+            let dir = std::env::temp_dir().join(format!("bashrs_wm_locked_{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let locked = dir.join("locked.md");
+            std::fs::write(&locked, "x").unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Under root (some sandboxes) a mode of 000 doesn't deny: nothing to check there.
+            if std::fs::read(&locked).is_err() {
+                let denied = |read: io::Result<_>| matches!(read, Err(err) if err.kind() == io::ErrorKind::PermissionDenied);
+                assert!(denied(_read_text(&locked, 16 << 20).map(drop)), "the text read says why");
+                assert!(denied(_read_capped(&locked, 16 << 20).map(drop)), "and so does the metadata read");
+            }
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

@@ -127,6 +127,40 @@ fn a_symlinked_config_is_migrated_through_the_link() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// `detect_ai_textual_fingerprint` names what the system wouldn't let it read — a file, and a
+/// directory whose files would otherwise go unscanned — in the system's words, and still scans
+/// the rest.
+#[test]
+fn the_fingerprint_scan_names_what_it_could_not_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("bashrs_fp_unreadable_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("locked-dir")).unwrap();
+    std::fs::write(dir.join("readable.md"), "zero\u{200B}width\n").unwrap();
+    std::fs::write(dir.join("locked.md"), "secret\n").unwrap();
+    std::fs::write(dir.join("locked-dir/inner.md"), "inner\n").unwrap();
+    let lock = |path: &Path, mode| std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    lock(&dir.join("locked.md"), 0o000);
+    lock(&dir.join("locked-dir"), 0o000);
+    // Under root (some sandboxes) a mode of 000 doesn't deny: nothing to name there.
+    let denial_works = std::fs::read(dir.join("locked.md")).is_err();
+
+    let out = bashrs(&["detect_ai_textual_fingerprint", dir.to_str().unwrap()], &[]);
+    lock(&dir.join("locked-dir"), 0o755); // let the clean-up in
+    let err = String::from_utf8_lossy(&out.stderr);
+    if denial_works {
+        for name in ["locked.md", "locked-dir"] {
+            let named = format!(
+                "detect_ai_textual_fingerprint: skipping {} (couldn't be read: Permission denied (os error 13))",
+                dir.join(name).display()
+            );
+            assert!(err.lines().any(|line| line == named), "{name} is named: {err}");
+        }
+    }
+    assert!(String::from_utf8_lossy(&out.stdout).contains("readable.md"), "the rest is still scanned");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn fs_usage_count_prints_a_bare_number_and_fails_on_missing_paths() {
     let dir = std::env::temp_dir().join(format!("bashrs_usage_e2e_{}", std::process::id()));

@@ -2,11 +2,15 @@
 //! and its `GG`/`GGG` variants. Walks a tree with ripgrep's `ignore` walker and searches each file
 //! with the `grep` crate: first matching **filenames**, then matching **contents** (`path:line:text`),
 //! the expressions compiled by [`streamgrep`]'s shared matcher builder (literal, or regexes under
-//! `-E`). Binary files are skipped (NUL detection); over-long lines are swapped for a placeholder
+//! `-E`). Binary files are skipped (NUL detection) — except those [`delve`] decodes: PDFs always,
+//! their hits labelled with the page (`path:page 3:text`), and subtitles and torrent names under
+//! `--delve`; over-long lines are swapped for a placeholder
 //! (`MAX_LINE`, for minified/dumped text); under `--save`, results also stream into a live file, with
 //! a path-sorted `_sorted` sibling left on completion (`SaveSink`). Paths that can't be read for
 //! permissions are collected and returned, so the caller can offer a root re-scan (re-exec under the
-//! superuser command) scoped to just those paths.
+//! superuser command) scoped to just those paths; every other file it set out to read but couldn't
+//! — an encrypted or text-less PDF, a damaged file, one the system failed to read — is named at the
+//! end, by why ([`Unsearched`]).
 //!
 //! Two passes on purpose: the filenames pass reads no file *contents* (only directory metadata), so
 //! it's cheap, and running it first gives the "names, then contents" ordering while content matches
@@ -26,13 +30,14 @@ use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkConte
 use ignore::{DirEntry, WalkState};
 use termcolor::{Buffer, BufferWriter, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
-use crate::support::args::walk;
+use crate::support::args::{walk, walk_failure};
 use crate::support::doc_style::_header;
 use crate::support::shell;
 use crate::support::streamgrep;
+use delve::{Decoded, Place, Unread};
 
-// This module's own `--delve` binary-format decoders — a private child, since the whole crate
-// reaches them only through `scan_file`'s delve branch below.
+// This module's own binary-format decoders (PDFs on every search, media under `--delve`) —
+// `pub(crate)` because the AI-fingerprint scan reads files through `delve::extract` too.
 pub(crate) mod delve;
 
 /// Options mapped from the `gg` flags (the search roots are passed to [`search`] separately).
@@ -40,8 +45,8 @@ pub struct Options {
     pub line_number: bool,
     /// Lines of context to show around each file-content match (0 = none).
     pub context: usize,
-    /// Also search *inside* files normally skipped as binary, by decoding known formats — subtitle
-    /// tracks, torrent text (`--delve`; see [`delve`]).
+    /// Also search *inside* media normally skipped as binary, by decoding known formats — subtitle
+    /// tracks, torrent text (`--delve`; see [`delve`]). PDFs are read without it.
     pub delve: bool,
     /// Treat the expression(s) as regular expressions instead of literal text (`-E`).
     pub regex: bool,
@@ -88,6 +93,7 @@ pub(crate) fn search(expressions: &[String], roots: &[PathBuf], opts: &Options) 
     // still suppressed while saving (below), keeping the saved result stream uncluttered and sortable.
     let color = shell::stdout_color();
     let denied: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+    let unsearched: UnsearchedFiles = Mutex::new(BTreeSet::new());
 
     if save.is_none() {
         section("matching filenames", color);
@@ -98,11 +104,12 @@ pub(crate) fn search(expressions: &[String], roots: &[PathBuf], opts: &Options) 
     if save.is_none() {
         section("matching file contents", color);
     }
-    let found_contents = search_contents(&matcher, roots, opts, color, &denied, save.as_ref());
+    let found_contents = search_contents(&matcher, roots, opts, color, &denied, &unsearched, save.as_ref());
 
     if names.is_empty() && !found_contents {
         eprintln!("NO RESULTS FOUND");
     }
+    name_unsearched(unsearched.into_inner().unwrap_or_default());
     if let Some(save) = &save {
         if let Err(err) = save.finish() {
             eprintln!("gg: could not sort the saved results: {err}");
@@ -267,18 +274,29 @@ fn print_filenames(names: &[PathBuf], matcher: &RegexMatcher, color: ColorChoice
 }
 
 /// Phase 2 — matching file contents, printed `path:line:text` and streamed as each file completes.
-/// Returns whether anything matched.
+/// Returns whether anything matched. What couldn't be searched is collected on the way: the paths
+/// `denied` for permissions, and every other file it set out to read but couldn't (`unsearched`).
 fn search_contents(
     matcher: &RegexMatcher,
     roots: &[PathBuf],
     opts: &Options,
     color: ColorChoice,
     denied: &Mutex<BTreeSet<PathBuf>>,
+    unsearched: &UnsearchedFiles,
     save: Option<&SaveSink>,
 ) -> bool {
     let bufwtr = BufferWriter::stdout(color);
     let found = AtomicBool::new(false);
-    let ctx = Ctx { matcher, bufwtr: &bufwtr, found: &found, denied, delve: opts.delve, save };
+    let ctx = Ctx {
+        matcher,
+        bufwtr: &bufwtr,
+        found: &found,
+        denied,
+        unsearched,
+        delve: opts.delve,
+        context: opts.context,
+        save,
+    };
     let line_number = opts.line_number;
     let context = opts.context;
 
@@ -289,7 +307,7 @@ fn search_contents(
         Box::new(move |result| {
             match result {
                 Ok(entry) => scan_file(&entry, &mut searcher, &mut buffer, ctx),
-                Err(err) => record_walk_denied(&err, ctx.denied),
+                Err(err) => record_walk_error(&err, ctx),
             }
             WalkState::Continue
         })
@@ -304,7 +322,11 @@ struct Ctx<'a> {
     bufwtr: &'a BufferWriter,
     found: &'a AtomicBool,
     denied: &'a Mutex<BTreeSet<PathBuf>>,
+    /// Files it set out to read but couldn't, and why — named once the search is done.
+    unsearched: &'a UnsearchedFiles,
     delve: bool,
+    /// Lines of context around each match — in decoded text too.
+    context: usize,
     save: Option<&'a SaveSink>,
 }
 
@@ -331,6 +353,9 @@ struct GgSink<'a> {
     matcher: &'a RegexMatcher,
     buffer: &'a mut Buffer,
     path: Vec<u8>,
+    /// Where in a decoded file the text is (`page 3`, `eng 0:01:23`), printed where a line number
+    /// would be. `None` for a text file, whose lines are numbered.
+    place: Option<&'a Place>,
     path_color: ColorSpec,
     line_color: ColorSpec,
     match_color: ColorSpec,
@@ -342,20 +367,39 @@ impl<'a> GgSink<'a> {
             matcher,
             buffer,
             path: path.to_string_lossy().into_owned().into_bytes(),
+            place: None,
             path_color: spec(Color::Magenta, None),
             line_color: spec(named(streamgrep::LINE_NUMBER_FG), None),
             match_color: match_spec(),
         }
     }
 
-    /// Write one line as `path<sep>line<sep>text` (`sep` is `:` for a match, `-` for context). An
-    /// over-long line becomes [`TOO_LONG`]; a match line has its match spans highlighted.
+    /// The same sink, for decoded text whose lines sit at `place`.
+    fn placed(mut self, place: &'a Place) -> Self {
+        self.place = Some(place);
+        self
+    }
+
+    /// What goes where a text file's line number would: that number, or where a decoded line sits
+    /// (`page 3`, `eng 0:01:23`) — nothing for decoded text with no place to name.
+    fn place(&self, line_number: Option<u64>) -> Option<String> {
+        match self.place {
+            None => line_number.map(|number| number.to_string()),
+            Some(Place::Nowhere) => None,
+            Some(Place::Section(place)) => Some(place.clone()),
+            Some(Place::Lines(places)) => places.get(usize::try_from(line_number?).ok()?.checked_sub(1)?).cloned(),
+        }
+    }
+
+    /// Write one line as `path<sep>line<sep>text` — `path<sep>place<sep>text` for decoded text
+    /// (`sep` is `:` for a match, `-` for context). An over-long line becomes [`TOO_LONG`]; a match
+    /// line has its match spans highlighted.
     fn write_line(&mut self, raw: &[u8], line_number: Option<u64>, is_match: bool) -> io::Result<()> {
         let sep = if is_match { &b":"[..] } else { &b"-"[..] };
         shell::paint(self.buffer, &self.path_color, &self.path)?;
         self.buffer.write_all(sep)?;
-        if let Some(n) = line_number {
-            shell::paint(self.buffer, &self.line_color, n.to_string().as_bytes())?;
+        if let Some(place) = self.place(line_number) {
+            shell::paint(self.buffer, &self.line_color, place.as_bytes())?;
             self.buffer.write_all(sep)?;
         }
         let content = trim_eol(raw);
@@ -534,8 +578,10 @@ fn plan_entry(
             }
         }
     }
-    // Rewrite: readable, non-binary files whose contents match.
-    if entry.file_type().is_some_and(|ft| ft.is_file()) {
+    // Rewrite: readable, non-binary files whose contents match — never a format the search reads
+    // decoded (a PDF, a video, a torrent), whose bytes a literal swap would corrupt: a PDF or a
+    // small torrent can hold no NUL to give it away.
+    if entry.file_type().is_some_and(|ft| ft.is_file()) && delve::Format::of(entry.path()).is_none() {
         if let Ok(bytes) = std::fs::read(entry.path()) {
             if !bytes.contains(&0) {
                 if let Some((new, count)) = replace_matches(matcher, &bytes, repl) {
@@ -591,33 +637,43 @@ fn scan_file(entry: &DirEntry, searcher: &mut Searcher, buffer: &mut Buffer, ctx
         return;
     }
     buffer.clear();
-    // In `--delve` mode, a binary format we understand (subtitle tracks, torrent text) is decoded
-    // and *that* is searched; files with no decoder fall through to the normal (raw) search.
-    if ctx.delve {
-        if let Some(text) = delve::extract(entry.path()) {
-            delve_search(&text, entry.path(), buffer, ctx);
+    // A format we understand is decoded and *that* is searched — a PDF always, subtitle tracks and
+    // torrent text under `--delve`; files with no decoder fall through to the normal (raw) search.
+    match delve::extract(entry.path(), ctx.delve) {
+        Some(Ok(Decoded::Text(sections))) => {
+            delve_search(&sections, entry.path(), buffer, ctx);
             emit(entry.path(), buffer, ctx);
             return;
         }
+        Some(Ok(Decoded::Unread(unread))) => return ctx.note(Unsearched::Undecoded(unread), entry.path()),
+        Some(Err(err)) => return ctx.note_read_error(entry.path(), &err),
+        None => {}
     }
     {
         let sink = GgSink::new(ctx.matcher, buffer, entry.path());
         if let Err(err) = searcher.search_path(ctx.matcher, entry.path(), sink) {
-            if err.kind() == io::ErrorKind::PermissionDenied {
-                ctx.denied.lock().unwrap().insert(entry.path().to_path_buf());
-            }
+            ctx.note_read_error(entry.path(), &err);
         }
     } // sink dropped → the &mut borrow of `buffer` ends
     emit(entry.path(), buffer, ctx);
 }
 
-/// Search text decoded by [`delve`] for one file, printing matches as `path:text` — no line numbers,
-/// since the decoded lines don't line up with lines in the original binary file.
-fn delve_search(text: &[u8], path: &Path, buffer: &mut Buffer, ctx: &Ctx) {
-    let mut searcher =
-        SearcherBuilder::new().binary_detection(BinaryDetection::none()).line_number(false).build();
-    let sink = GgSink::new(ctx.matcher, buffer, path);
-    let _ = searcher.search_slice(ctx.matcher, text, sink);
+/// Search text decoded by [`delve`] for one file, section by section, printing matches as
+/// `path:place:text` (`path:page 3:text`, `path:eng 0:01:23:text`), or `path:text` for a section
+/// with no place — never a line number, since the decoded lines don't line up with lines in the
+/// original binary file (the searcher still numbers them, to find each line's place). Context stays
+/// within a section.
+fn delve_search(sections: &[delve::Section], path: &Path, buffer: &mut Buffer, ctx: &Ctx) {
+    let mut searcher = SearcherBuilder::new()
+        .binary_detection(BinaryDetection::none())
+        .line_number(true)
+        .before_context(ctx.context)
+        .after_context(ctx.context)
+        .build();
+    for section in sections {
+        let sink = GgSink::new(ctx.matcher, buffer, path).placed(&section.place);
+        let _ = searcher.search_slice(ctx.matcher, &section.text, sink);
+    }
 }
 
 /// Send a completed file's buffer to the terminal and — under `--save` — to the save file plus the
@@ -637,26 +693,91 @@ fn flush(buffer: &Buffer, ctx: &Ctx) {
     }
 }
 
-/// Record a walk error's path if it was a permission denial (a directory we couldn't descend).
-fn record_walk_denied(err: &ignore::Error, denied: &Mutex<BTreeSet<PathBuf>>) {
-    let is_permission = err.io_error().is_some_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
-    if is_permission {
-        if let Some(path) = error_path(err) {
-            denied.lock().unwrap().insert(path.to_path_buf());
+/// Every file a search set out to read but couldn't, with why — named at its end.
+type UnsearchedFiles = Mutex<BTreeSet<(Unsearched, PathBuf)>>;
+
+/// Why a file the search set out to read went unsearched — each named at the end of the search, so
+/// that nothing is passed over in silence. Permission denials aren't among these: they are offered
+/// a root re-scan instead.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Unsearched {
+    /// Its decoder couldn't get at its text.
+    Undecoded(Unread),
+    /// It couldn't be read at all: the system's error.
+    Unreadable(String),
+}
+
+impl Ctx<'_> {
+    /// Note `path` as unsearched, for `why`.
+    fn note(&self, why: Unsearched, path: &Path) {
+        self.unsearched.lock().unwrap().insert((why, path.to_path_buf()));
+    }
+
+    /// Note a path that couldn't be read: one denied for permissions goes to the root re-scan's
+    /// list, any other failure to the end of the search.
+    fn note_read_error(&self, path: &Path, err: &io::Error) {
+        if err.kind() == io::ErrorKind::PermissionDenied {
+            self.denied.lock().unwrap().insert(path.to_path_buf());
+        } else {
+            self.note(Unsearched::Unreadable(err.to_string()), path);
         }
     }
 }
 
-/// Dig through `ignore::Error`'s wrapping variants (depth / line-number / partial) to the
-/// underlying path, if the error carries one.
-fn error_path(err: &ignore::Error) -> Option<&Path> {
-    match err {
-        ignore::Error::WithPath { path, .. } => Some(path),
-        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
-            error_path(err)
+/// How the end of a search heads one kind of unsearched file: what they are, why, and — where
+/// there is one — what would have the next search read them.
+struct Heading {
+    kind: &'static str,
+    why: String,
+    remedy: Option<&'static str>,
+}
+
+impl Heading {
+    fn of(unsearched: &Unsearched) -> Self {
+        match unsearched {
+            Unsearched::Undecoded(unread) => {
+                let (kind, remedy) = match unread {
+                    Unread::Encrypted => ("PDF", Some("decrypt a copy of each to have its text searched")),
+                    Unread::NoText => ("PDF", Some("run a copy of each through OCR to have its text searched")),
+                    Unread::PictureSubtitles => ("video", Some("convert their subtitles to text (OCR) to have them searched")),
+                    Unread::TooLarge | Unread::Damaged => ("file", None),
+                };
+                Self { kind, why: unread.reason(), remedy }
+            }
+            Unsearched::Unreadable(error) => Self { kind: "path", why: format!("couldn't be read: {error}"), remedy: None },
         }
-        ignore::Error::Partial(errs) => errs.iter().find_map(error_path),
-        _ => None,
+    }
+}
+
+/// Name every file a search set out to read but couldn't, grouped by why — every one of them:
+/// unlike the permission-denied list, no prompt follows for a long list to scroll away, and each
+/// path is one to act on.
+fn name_unsearched(unsearched: BTreeSet<(Unsearched, PathBuf)>) {
+    let unsearched: Vec<(Unsearched, PathBuf)> = unsearched.into_iter().collect();
+    for group in unsearched.chunk_by(|(one, _), (other, _)| one == other) {
+        let Heading { kind, why, remedy } = Heading::of(&group[0].0);
+        let remedy = remedy.map(|remedy| format!(" — {remedy}")).unwrap_or_default();
+        eprintln!("\n{} {kind}(s) skipped ({why}){remedy}:", group.len());
+        for (_, path) in group {
+            eprintln!("  {}", path.display());
+        }
+    }
+}
+
+/// Note a walk error's path — a directory that couldn't be listed — by why: denied for permissions,
+/// or failing otherwise.
+fn record_walk_error(err: &ignore::Error, ctx: &Ctx) {
+    if let Some((path, error)) = walk_failure(err) {
+        ctx.note_read_error(path, error);
+    }
+}
+
+/// Record a walk error's path if it was a permission denial (a directory we couldn't descend).
+fn record_walk_denied(err: &ignore::Error, denied: &Mutex<BTreeSet<PathBuf>>) {
+    if let Some((path, error)) = walk_failure(err) {
+        if error.kind() == io::ErrorKind::PermissionDenied {
+            denied.lock().unwrap().insert(path.to_path_buf());
+        }
     }
 }
 
@@ -711,6 +832,75 @@ mod tests {
         // surrounding context is `path-line-`.
         let out = gg_output("match", b"above\nthe match\nbelow\n", true, 1);
         assert_eq!(out, "f-1-above\nf:2:the match\nf-3-below\n");
+    }
+
+    /// Decoded text prints where each line sits in place of a line number — a page for a PDF's
+    /// lines, a track and a time for each subtitle line, nothing for a torrent's names — its context
+    /// lines too, and context never reaches from one section into the next.
+    #[test]
+    fn decoded_lines_print_their_place_where_a_line_number_would_go() {
+        let cue_starts = ["eng 0:00:01", "eng 0:00:04", "eng 0:00:09"].map(str::to_owned).to_vec();
+        let sections = [
+            delve::Section { place: Place::Section("page 2".to_owned()), text: b"a match on a page\n".to_vec() },
+            delve::Section { place: Place::Lines(cue_starts), text: b"above\na match in a cue\nbelow\n".to_vec() },
+            delve::Section { place: Place::Nowhere, text: b"a match in a name\n".to_vec() },
+        ];
+        let search = Search::for_("match");
+        let mut buffer = search.bufwtr.buffer();
+        delve_search(&sections, Path::new("f"), &mut buffer, &search.ctx(1));
+        assert_eq!(
+            String::from_utf8_lossy(buffer.as_slice()),
+            "f:page 2:a match on a page\nf-eng 0:00:01-above\nf:eng 0:00:04:a match in a cue\nf-eng 0:00:09-below\nf:a match in a name\n",
+        );
+    }
+
+    /// What a [`Ctx`] borrows, owned — for a test to build one from.
+    struct Search {
+        matcher: RegexMatcher,
+        bufwtr: BufferWriter,
+        found: AtomicBool,
+        denied: Mutex<BTreeSet<PathBuf>>,
+        unsearched: UnsearchedFiles,
+    }
+
+    impl Search {
+        fn for_(pattern: &str) -> Self {
+            Self {
+                matcher: grep::regex::RegexMatcherBuilder::new().build(pattern).unwrap(),
+                bufwtr: BufferWriter::stdout(ColorChoice::Never),
+                found: AtomicBool::new(false),
+                denied: Mutex::new(BTreeSet::new()),
+                unsearched: Mutex::new(BTreeSet::new()),
+            }
+        }
+
+        fn ctx(&self, context: usize) -> Ctx<'_> {
+            Ctx {
+                matcher: &self.matcher,
+                bufwtr: &self.bufwtr,
+                found: &self.found,
+                denied: &self.denied,
+                unsearched: &self.unsearched,
+                delve: true,
+                context,
+                save: None,
+            }
+        }
+    }
+
+    /// A path that can't be read is told apart by why: a permission denial goes to the list a root
+    /// re-scan is offered for, any other failure to the end of the search, in the system's words.
+    #[test]
+    fn a_read_error_goes_where_its_kind_can_be_acted_on() {
+        let search = Search::for_("x");
+        let ctx = search.ctx(0);
+        ctx.note_read_error(Path::new("/locked"), &io::Error::from(io::ErrorKind::PermissionDenied));
+        ctx.note_read_error(Path::new("/failing"), &io::Error::other("disk on fire"));
+        assert_eq!(search.denied.into_inner().unwrap(), BTreeSet::from([PathBuf::from("/locked")]));
+        assert_eq!(
+            search.unsearched.into_inner().unwrap(),
+            BTreeSet::from([(Unsearched::Unreadable("disk on fire".to_owned()), PathBuf::from("/failing"))]),
+        );
     }
 
     #[test]
@@ -805,6 +995,35 @@ mod tests {
         std::fs::write(dir.join("data.bin"), b"fin\x00fin").unwrap(); // NUL → binary
         let plan = plan_replacements(&["fin".to_string()], std::slice::from_ref(&dir), &[], false, "lon").unwrap();
         assert!(plan.rewrites.is_empty(), "a NUL-bearing file is not rewritten: {:?}", plan.rewrites);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_never_rewrites_a_pdfs_bytes() {
+        let dir = std::env::temp_dir().join(format!("bashrs_re_pdf_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // All text, no NUL: only being a document keeps its bytes out of the rewrite.
+        std::fs::write(dir.join("plain.pdf"), b"%PDF-1.4\nBT (fin) Tj ET\n").unwrap();
+        let plan = plan_replacements(&["fin".to_string()], std::slice::from_ref(&dir), &[], false, "lon").unwrap();
+        assert!(plan.rewrites.is_empty(), "a PDF is not rewritten: {:?}", plan.rewrites);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_never_writes_inside_a_torrent_but_still_renames_it() {
+        let dir = std::env::temp_dir().join(format!("bashrs_re_torrent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A one-piece torrent whose 20-byte piece hash happens to hold no NUL (as about 92% of them
+        // do), so the NUL check can't tell it from text. A swap of unequal length would break the
+        // `7:` length prefix in front of its name.
+        let hash = b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14";
+        let torrent = [&b"d4:infod6:lengthi1e4:name7:fin.iso12:piece lengthi16384e6:pieces20:"[..], hash, b"ee"].concat();
+        std::fs::write(dir.join("fin.torrent"), torrent).unwrap();
+        let plan = plan_replacements(&["fin".to_string()], std::slice::from_ref(&dir), &[], false, "lon").unwrap();
+        assert!(plan.rewrites.is_empty(), "a torrent is not rewritten: {:?}", plan.rewrites);
+        assert_eq!(plan.renames, [(dir.join("fin.torrent"), dir.join("lon.torrent"))]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
