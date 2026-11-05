@@ -88,25 +88,6 @@ mod commands {
         _filesync(filesync::Command::Diff(args));
     }
 
-    /// Hold or toggle a key (default F9) to click — or to repeat a keyboard key — at a chosen
-    /// rate, wherever the mouse already is; F8 quits. Works on X11, Wayland and the console
-    /// alike; on X11 it needs no privileges at all. If device access is needed and missing,
-    /// the error walks you through the fix (sequencer clicker)
-    #[name("clicker")]
-    #[alias("autoclick")]
-    pub fn clicker(args: sequencer::ClickerArgs) {
-        _sequencer(sequencer::Command::Clicker(args));
-    }
-
-    /// Measure what this machine can really deliver: writes key presses as fast as asked
-    /// (or flat out, with no `--cps`) while reading its own virtual device back, printing the
-    /// live rate as it goes. The gap between written and delivered is the honest ceiling —
-    /// a rate counted from the sending loop alone would never show it (sequencer bench)
-    #[name("clicker_benchmark")]
-    pub fn clicker_benchmark(args: sequencer::BenchArgs) {
-        _sequencer(sequencer::Command::Bench(args));
-    }
-
     /// How *this* shell spells sequencer's `doctor` subcommand.
     ///
     /// Unlike the wrapper comments in `sourcefile.sh` — which are each command's own clap `about`,
@@ -116,10 +97,11 @@ mod commands {
     /// name is passed in, and a test asserts it still resolves to a real command.
     pub(crate) const DOCTOR_COMMAND: &str = "autokey_doctor";
 
-    /// Check everything the synthetic-input commands need — the uinput module loaded,
-    /// /dev/uinput writable, /dev/input readable — and print the exact commands to fix whatever
-    /// is missing. One check for the whole family: `clicker` and the `autokey_*` profile
-    /// commands open the same devices. Exit 0 means ready (sequencer doctor)
+    /// Report what the `autokey_*` commands can do here — what profiles run on (the input
+    /// devices, as you or through sudo, or X11's grabs; through Xwayland, what native Wayland
+    /// apps miss of them), who answers their program and layout gates, whether the keyboards
+    /// can be read, and which devices a profile would hold — with the exact commands to fix
+    /// whatever is missing. Exit 0 means profiles can run (sequencer doctor)
     #[name("autokey_doctor")]
     pub fn autokey_doctor(args: sequencer::DoctorArgs) {
         _sequencer(sequencer::Command::Doctor(args));
@@ -158,7 +140,8 @@ mod commands {
     /// Apply binds profiles: remap keys and run sequences until stopped. Each FILE is linked into
     /// the active set (naming a directory takes every `.toml` directly inside it, in name order);
     /// naming nothing applies the profile store, ~/.bashrs/user-custom/sequencer. The first
-    /// invocation becomes the manager and later ones add to it (sequencer profile-apply)
+    /// invocation becomes the manager and later ones add to it; in a Wayland session the manager
+    /// asks sudo for the keyboards, dropping root straight after (sequencer profile-apply)
     #[name("autokey_apply")]
     pub fn autokey_apply(mut args: sequencer::ProfileApplyArgs) {
         // Upstream requires at least one FILE; this shell relaxes that (`cli::OPTIONAL_ARGS`)
@@ -283,16 +266,15 @@ mod commands {
     /// Run one sequencer invocation — the funnel for the `sequencer`-backed commands, each
     /// wrapping one subcommand (flag completion per command; sequencer never runs bare), the
     /// same shape as [`_filesync`]. Logging must be initialized first, exactly as the upstream
-    /// binary's `main` does — the sent-rate report, the chosen backend, and drop warnings all
-    /// ride tracing, so skipping it would run the clicker mute.
+    /// binary's `main` does — its warnings (a capture that can read no keyboard, say) go
+    /// through the `log` facade, so skipping it would hide them.
     ///
-    /// Entered through `run_with_sudo_prompt` — upstream's session mode — though on an X11
-    /// session it never asks: clicks go through XTEST and hotkeys through key grabs, so no
-    /// input device is opened and there is nothing for sudo to unlock. Elsewhere (Wayland, a
-    /// console) an unprivileged run without the udev/group setup explains itself, asks once,
-    /// re-execs `bashrs <command> …` verbatim under sudo, and the elevated process sheds root
-    /// the moment the devices are open. It is handed [`DOCTOR_COMMAND`] so the advice it prints
-    /// names something this shell can actually run.
+    /// Entered through `run_with_sudo_prompt` — upstream's session mode. `autokey_detect` reads
+    /// the keyboards, and `autokey_apply` holds them in a Wayland session (where they are what
+    /// makes a profile whole); when this user can't open them, root could, and a terminal is
+    /// there, it explains itself, asks once, re-execs `bashrs <command> …` verbatim under sudo,
+    /// and the elevated process sheds root the moment the devices are open. It is handed
+    /// [`DOCTOR_COMMAND`] so the advice it prints names something this shell can actually run.
     fn _sequencer(command: sequencer::Command) {
         let global = command.global();
         let _ = sequencer::init_logging(global.verbose, global.quiet);
@@ -300,6 +282,23 @@ mod commands {
         if code != 0 {
             std::process::exit(code.into());
         }
+    }
+
+    /// Serve as sequencer's device-grab supervisor, when this run is one. A profile manager
+    /// holding the keyboards (`autokey_apply`) starts this very binary again, as the user, with
+    /// [`sequencer::SUPERVISOR_MARKER`] leading argv: the supervisor takes the grabs and gives
+    /// them back if the manager stops answering. [`crate::run`] offers every process to this
+    /// before the CLI parses (`REEXEC_HANDLERS`); without the entry the supervisor never starts,
+    /// and profiles fall back to X11's grabs. A non-zero exit — the marker typed by hand — is
+    /// surfaced the way [`_sequencer`] surfaces a command's.
+    pub(crate) fn _sequencer_supervisor() -> bool {
+        let Some(code) = sequencer::supervise_if_asked(std::env::args_os()) else {
+            return false;
+        };
+        if code != 0 {
+            std::process::exit(code.into());
+        }
+        true
     }
 
     /// Run one filesync invocation — every `backup_*` command funnels here, each wrapping one
@@ -583,13 +582,15 @@ mod commands {
         /// An empty or missing store says so — and still lists what is applied from elsewhere.
         #[test]
         fn an_empty_store_says_so_and_still_lists_what_is_applied_elsewhere() {
-            let store = scratch("empty").join("never-made");
+            let dir = scratch("empty");
+            let store = dir.join("never-made");
             let none = _profile_listing(&store, &[]);
             assert_eq!(none.len(), 1);
             assert!(none[0].starts_with(&format!("no profiles in {}", store.display())), "{none:?}");
             let stray = vec![("stray.toml".to_string(), PathBuf::from("/elsewhere/stray.toml"))];
             let with = _profile_listing(&store, &stray);
             assert_eq!(with[1], "stray.toml  [applied from /elsewhere/stray.toml]", "{with:?}");
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 

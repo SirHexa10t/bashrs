@@ -8,9 +8,9 @@
 # the machine provides the tool itself, so nothing was bundled.
 
 [tools]
-ffmpeg = "n9.0 @ autobuild-2026-09-30-13-08"
-yt-dlp = "2026.10.21"
-uv = "0.13.5"
+ffmpeg = "n9.0 @ autobuild-2026-10-31-12-59"
+yt-dlp = "2026.10.26"
+uv = "0.13.7"
 python = "3.14.6"
 deno = "v2.9.8"
 git-lfs = "v3.8.1"

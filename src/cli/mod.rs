@@ -546,7 +546,6 @@ mod tests {
                 "backup_diff", "backup_sync", "backup_find_bitrot",
                 "dl", "dl_fix",
                 "symlink_devs",
-                "clicker", "clicker_benchmark",
                 "autokey_doctor", "autokey_check", "autokey_reformat", "autokey_apply", "autokey_unapply", "autokey_detect", "autokey_list_bashrs_profiles",
             ],
         );

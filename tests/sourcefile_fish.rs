@@ -14,7 +14,7 @@
 mod common;
 
 use common::{generated, is_command, leading_shell, lines, shell, Captured, Home};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 impl Home {
@@ -37,6 +37,7 @@ impl Home {
 
     /// `script` in `fish`, set up as both of those run it.
     fn fish_in(&self, mut fish: Command, interactive: bool, script: &str) -> Output {
+        without_completion_generator(&self.dir);
         fish.env("HOME", &self.dir)
             .env("sourcefile", self.fish_sourcefile())
             .env("TZ", "UTC")
@@ -53,6 +54,15 @@ impl Home {
     fn interactive(&self, script: &str) -> Captured {
         Captured::new(&self.fish(true, script).stdout)
     }
+}
+
+/// Keeps an interactive fish from starting its man-page completion generator in `home`. A fish
+/// whose `~/.cache/fish/generated_completions` does not exist yet starts one on its first
+/// interactive start (its `__fish_config_interactive`): an orphaned python job that outlives the
+/// test and writes into the scratch home after [`Home`] has removed it. The directory being there
+/// already is all fish checks.
+fn without_completion_generator(home: &Path) {
+    std::fs::create_dir_all(home.join(".cache/fish/generated_completions")).unwrap();
 }
 
 // ——— The file ————————————————————————————————————————————————————————————
@@ -696,6 +706,7 @@ fn the_utc_clock_goes_in_front_of_whatever_prompt_is_in_place() {
 #[test]
 fn the_first_prompt_of_a_new_fish_has_the_clock_in_front() {
     let home = Home::new("pty");
+    without_completion_generator(&home.dir);
     let config = home.dir.join(".config/fish");
     std::fs::create_dir_all(config.join("conf.d")).unwrap();
     std::fs::write(config.join("conf.d/bashrs.fish"), "source \"$HOME/.bashrs/sourcefile.fish\"\n").unwrap();

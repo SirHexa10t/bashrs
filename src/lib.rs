@@ -24,6 +24,7 @@ pub mod support;
 pub mod tools;
 
 use crate::categories::lookup::GgElevatedRescan;
+use crate::categories::processes::MurderElevatedKill;
 
 /// The one in-crate path the `#[bashrs_macros::elevated]` macro names by string: its expansion
 /// emits `crate::elevation::command()` / `::revoke()`. That edge crosses a crate boundary as text,
@@ -34,12 +35,18 @@ use crate::categories::lookup::GgElevatedRescan;
 pub(crate) use support::superuser as elevation;
 
 /// The binary's internal self-invocations: the `sudo` re-execs that `#[elevated]` routines spawn to
-/// run part of themselves as root, and devmounts' privileged helper — `symlink_devs`' steps that
-/// need root (a link in `/`, `mount`), done by this binary started again under `sudo`, once per
-/// run. Each handler claims the run iff its marker leads `argv`; [`run`] offers the process to
-/// them before the user CLI parses. Adding an `#[elevated]` routine adds one entry; nothing else
-/// changes.
-const REEXEC_HANDLERS: &[fn() -> bool] = &[GgElevatedRescan::try_handle, devmounts::privileged::try_serve];
+/// run part of themselves as root; devmounts' privileged helper — `symlink_devs`' steps that need
+/// root (a link in `/`, `mount`), done by this binary started again under `sudo`, once per run;
+/// and sequencer's device-grab supervisor — this binary started again, unprivileged, by
+/// `autokey_apply`'s profile manager to hold the keyboards it grabs. Each handler claims the run
+/// iff its marker leads `argv`; [`run`] offers the process to them before the user CLI parses.
+/// Adding an `#[elevated]` routine adds one entry; nothing else changes.
+const REEXEC_HANDLERS: &[fn() -> bool] = &[
+    GgElevatedRescan::try_handle,
+    MurderElevatedKill::try_handle,
+    devmounts::privileged::try_serve,
+    categories::comfy_repos::_sequencer_supervisor,
+];
 
 /// Binary entry point. An internal re-exec handles itself and stops here; every other invocation is
 /// a real command, parsed and dispatched normally.

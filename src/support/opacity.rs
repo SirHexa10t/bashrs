@@ -210,12 +210,21 @@ fn under_kwin(vars: &Vars) -> Option<Result<(), String>> {
     vars("XDG_CURRENT_DESKTOP")?.split(':').any(|desktop| desktop.eq_ignore_ascii_case("KDE")).then_some(Ok(()))
 }
 
-/// Press KWin's own "Increase/Decrease Opacity" actions — 5% each — as often as the step needs,
-/// over D-Bus. KWin acts on the focused window.
+/// Press KWin's own "Increase/Decrease Opacity" actions — 5% each — as often as the step needs:
+/// over the session bus, in-process, through sequencer's call to KDE's global-shortcut service.
+/// KWin acts on the focused window.
 fn kwin_step(delta: f64) -> Result<Option<f64>, String> {
+    kwin_step_with(delta, |action| {
+        sequencer::input::kde::invoke_kwin_shortcut(action).map_err(|err| err.to_string())
+    })
+}
+
+/// [`kwin_step`] with the press handed in — the D-Bus call in earnest, a recorder in tests. The
+/// first refusal ends the step.
+fn kwin_step_with(delta: f64, mut press: impl FnMut(&str) -> Result<(), String>) -> Result<Option<f64>, String> {
     let action = if delta > 0.0 { "Increase Opacity" } else { "Decrease Opacity" };
     for _ in 0..kwin_presses(delta) {
-        kwin_invoke(action)?;
+        press(action)?;
     }
     Ok(None)
 }
@@ -223,37 +232,6 @@ fn kwin_step(delta: f64) -> Result<Option<f64>, String> {
 /// How many of KWin's 5% presses make a step of `delta` — one at least.
 fn kwin_presses(delta: f64) -> usize {
     ((delta.abs() / KWIN_STEP).round() as usize).max(1)
-}
-
-/// The D-Bus calls that press one of KWin's actions, in the order tried: `busctl` (systemd's)
-/// first, `dbus-send` (the reference D-Bus tools) where there is no `busctl`.
-fn kwin_calls(action: &str) -> [Vec<String>; 2] {
-    let own = |words: &[&str]| words.iter().map(|word| word.to_string()).collect::<Vec<_>>();
-    let service = ["org.kde.kglobalaccel", "/component/kwin"];
-    [
-        own(&["busctl", "--user", "call", service[0], service[1], "org.kde.kglobalaccel.Component", "invokeShortcut", "s", action]),
-        own(&[
-            "dbus-send",
-            "--session",
-            "--type=method_call",
-            &format!("--dest={}", service[0]),
-            service[1],
-            "org.kde.kglobalaccel.Component.invokeShortcut",
-            &format!("string:{action}"),
-        ]),
-    ]
-}
-
-fn kwin_invoke(action: &str) -> Result<(), String> {
-    for call in kwin_calls(action) {
-        let argv: Vec<&str> = call.iter().map(String::as_str).collect();
-        match run(&argv) {
-            Ok(_) => return Ok(()),
-            Err(None) => continue,
-            Err(Some(why)) => return Err(why),
-        }
-    }
-    Err("neither busctl nor dbus-send is installed, so KWin can't be asked".into())
 }
 
 // --- sway --------------------------------------------------------------------------------------
@@ -299,11 +277,9 @@ fn hyprland_opacity(said: &str) -> Option<f64> {
 
 // --- X11 ---------------------------------------------------------------------------------------
 
-/// An X11 session: said so outright, or a display with no Wayland one beside it.
+/// An X11 session, by the one rule there is for it ([`windows::x11_session`]).
 fn under_x11(vars: &Vars) -> Option<Result<(), String>> {
-    let x11 = vars("XDG_SESSION_TYPE").as_deref() == Some("x11")
-        || (vars("DISPLAY").is_some() && vars("WAYLAND_DISPLAY").is_none());
-    x11.then_some(Ok(()))
+    windows::x11_session(vars).then_some(Ok(()))
 }
 
 fn x11_step(delta: f64) -> Result<Option<f64>, String> {
@@ -373,10 +349,9 @@ mod tests {
         assert_eq!(under_hyprland(&vars(&[("HYPRLAND_INSTANCE_SIGNATURE", "abc")])), Some(Ok(())));
         assert_eq!(under_sway(&vars(&[])), None);
 
+        // The X11 session rule's own cases are `windows::x11_session`'s; here, that it decides.
         assert_eq!(under_x11(&vars(&[("XDG_SESSION_TYPE", "x11")])), Some(Ok(())));
-        assert_eq!(under_x11(&vars(&[("DISPLAY", ":0")])), Some(Ok(())), "a display, no Wayland");
         assert_eq!(under_x11(&vars(&[("DISPLAY", ":0"), ("WAYLAND_DISPLAY", "wayland-0")])), None, "XWayland is no X11 session");
-        assert_eq!(under_x11(&vars(&[("XDG_SESSION_TYPE", "wayland")])), None);
     }
 
     /// A step lands on the whole-percent grid — no float residue however many steps it takes —
@@ -408,18 +383,25 @@ mod tests {
         assert_eq!(hyprland_opacity("prop not found"), None);
     }
 
-    /// How each window manager is asked: KWin by as many 5% presses as the step needs, over
-    /// busctl first and dbus-send second; sway by its own relative step.
+    /// How each window manager is asked: KWin by as many of its 5% presses as the step needs,
+    /// the first refusal ending the step; sway by its own relative step.
     #[test]
     fn each_window_manager_is_asked_in_its_own_terms() {
         assert_eq!([0.05, 0.2, 0.01, -0.1].map(kwin_presses), [1, 4, 1, 2]);
-        let [busctl, dbus_send] = kwin_calls("Increase Opacity");
-        assert_eq!(
-            busctl,
-            ["busctl", "--user", "call", "org.kde.kglobalaccel", "/component/kwin", "org.kde.kglobalaccel.Component", "invokeShortcut", "s", "Increase Opacity"]
-        );
-        assert_eq!(dbus_send[0], "dbus-send");
-        assert!(dbus_send.contains(&"string:Increase Opacity".to_string()), "{dbus_send:?}");
+        let mut pressed = Vec::new();
+        let step = kwin_step_with(-0.2, |action| {
+            pressed.push(action.to_string());
+            Ok(())
+        });
+        assert_eq!(step, Ok(None), "KWin doesn't say where the opacity got to");
+        assert_eq!(pressed, ["Decrease Opacity"; 4]);
+        let mut tries = 0;
+        let refused = kwin_step_with(0.1, |_| {
+            tries += 1;
+            Err("KWin is not running in this session".to_string())
+        });
+        assert_eq!(refused, Err("KWin is not running in this session".to_string()));
+        assert_eq!(tries, 1, "the first refusal ends the step");
         assert_eq!(sway_argv(0.05), ["swaymsg", "opacity", "plus", "0.05"]);
         assert_eq!(sway_argv(-0.2), ["swaymsg", "opacity", "minus", "0.20"]);
     }

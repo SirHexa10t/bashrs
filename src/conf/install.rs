@@ -735,6 +735,7 @@ mod tests {
         assert!(names_both && warnings[0].contains("by hand"), "{said:?}");
         assert_eq!(read(home.join("user-data/old.txt")), "old", "nothing moved");
         assert_eq!(read(appdata.join("new.txt")), "new");
+        let _ = std::fs::remove_dir_all(&home);
 
         let home = scratch("migrate_empty");
         let store = Place::SequencerProfiles.under(&home);

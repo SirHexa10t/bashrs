@@ -6,21 +6,37 @@
 //! newlines, quotes — and `/proc` hands it over NUL-separated, unambiguous, with no formatting to
 //! undo.
 
+/// `murder`'s signal ladder as root, for processes that refused its signal for not being the
+/// user's. `#[elevated]` wraps this in a `sudo` self-re-exec round-trip: it generates
+/// `MurderElevatedKill`, whose `reexec(…)` (parent, called from `_offer_sudo`) spawns
+/// `sudo <self> murder-elevated-kill …` and whose `try_handle()` (child, called from
+/// [`crate::run`]) parses that back and runs this. `starts` is when each pid's process started,
+/// as the parent saw it: a pid the kernel has handed to another process since is left alone.
+// The parameters ARE the wire format: `#[elevated]` turns each into a `--flag` the child parses
+// back, so a pid and its start travel as two lists, matched by position.
+#[bashrs_macros::elevated]
+fn murder_elevated_kill(pids: Vec<u32>, starts: Vec<u64>) {
+    _terminate(pids.into_iter().zip(starts).map(|(pid, start)| Victim::known(pid, start)).collect());
+}
+
 #[bashrs_macros::category(command = ProcessesCommand, prefix = "proc_")]
 mod commands {
     use crate::support::args::NoArgs;
     use crate::support::doc_style::{self, _header, notice, problematic};
     use terminal_choice::prompt_yN;
     use crate::support::theme::Weight;
+    use crate::support::windows::WindowId;
     use clap::Args;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     /// Find running processes by any part of them — PID, program name, full command line, or the
     /// executable's path — show each match in its process-tree (ancestors above say who owns it,
     /// descendants beneath say what else goes down with it, matched text glowing `grep`-style),
-    /// then offer to terminate the matches: SIGTERM first, SIGKILL only for whatever ignores it.
-    /// With nothing to hunt at all, offers the top CPU and memory consumers as a checklist
+    /// then offer to terminate the matches: SIGTERM first, and whatever ignores it is yours to
+    /// decide on — wait more, SIGKILL, or leave it; what isn't yours can go through sudo. With
+    /// nothing to hunt at all, offers the top CPU and memory consumers as a checklist
     #[unprefixed]
     #[trailing_newline]
     pub fn murder(args: MurderArgs) {
@@ -34,9 +50,15 @@ mod commands {
                 eprintln!("murder: {why}");
                 std::process::exit(1);
             }
-            Ok(all) => {
-                let mut owned: BTreeMap<u32, Vec<(u32, String)>> = BTreeMap::new();
-                for window in all {
+            Ok(listing) => {
+                if let Some(why) = &listing.passed_over {
+                    eprintln!(
+                        "{}",
+                        notice(&format!("murder: KWin couldn't list its windows ({why}) — only XWayland's are here"))
+                    );
+                }
+                let mut owned: BTreeMap<u32, Vec<(WindowId, String)>> = BTreeMap::new();
+                for window in listing.windows {
                     if _find_ci(&window.title, needle).is_some() {
                         owned.entry(window.pid).or_default().push((window.id, window.title));
                     }
@@ -223,12 +245,12 @@ mod commands {
         /// the top CPU and memory consumers are offered as a checklist instead
         #[arg(value_name = "PATTERN", num_args = 1..)]
         pub patterns: Vec<String>,
-        /// Hunt X11 windows instead of processes: match window titles containing this
+        /// Hunt windows instead of processes: match window titles containing this
         /// (case-insensitive) and CLOSE those windows — the titlebar-✕ request, so the owning
         /// app keeps running along with its other windows. The title carries the active tab's
         /// name, so a browser's background tab is only findable while shown. PATTERNs still
-        /// narrow by the owning process (all must hold); needs X (on Wayland, only XWayland
-        /// windows are visible)
+        /// narrow by the owning process (all must hold). On Wayland, KDE Plasma's KWin lists
+        /// every window; under any other compositor only XWayland's are visible
         #[arg(short = 'w', long, value_name = "TITLE")]
         pub window: Option<String>,
         /// Cut each COMMAND at the window's edge instead of printing it whole — a tidier table
@@ -389,7 +411,7 @@ mod commands {
     /// and how many of them are actual matches.
     fn _survey(
         patterns: &[String],
-        by_window: Option<&BTreeMap<u32, Vec<(u32, String)>>>,
+        by_window: Option<&BTreeMap<u32, Vec<(WindowId, String)>>>,
     ) -> (BTreeMap<u32, Process>, usize) {
         let mut all = _snapshot();
         let matched: Vec<u32> = all
@@ -526,7 +548,7 @@ mod commands {
         )
     }
 
-    /// The pid (or window id) back out of a ticked option line — always the first token, with
+    /// The pid (or a window's row number) back out of a ticked option line — always the first token, with
     /// the ancestry star tolerated ([`_pid_cell`] appends it) and colour codes stripped first:
     /// the `--choose` options carry the grep-style glow, and a pid matched BY pid glows in this
     /// very token.
@@ -899,7 +921,7 @@ mod commands {
     fn _mark_matches(
         process: &mut Process,
         patterns: &[String],
-        by_window: Option<&BTreeMap<u32, Vec<(u32, String)>>>,
+        by_window: Option<&BTreeMap<u32, Vec<(WindowId, String)>>>,
     ) {
         // The window filter is one more conjunct: with `--window`, owning a matched window is
         // required — and sufficient by itself when no text patterns were given.
@@ -1154,9 +1176,10 @@ mod commands {
     /// the signal, their descendants are the acknowledged blast radius, dimmed ancestors are
     /// bystanders.
     ///
-    /// **Signals in order.** `SIGTERM` to every target, a grace period for cleanup, then
-    /// `SIGKILL` only for whatever is still standing — and those are named, because ignoring
-    /// SIGTERM is a fact about a program worth knowing.
+    /// **Signals in order** ([`_terminate`]). `SIGTERM` to every target, a grace period for
+    /// cleanup, then the user's call for whatever is still standing — wait more, `SIGKILL`, or
+    /// leave it — and those are named, because ignoring SIGTERM is a fact about a program worth
+    /// knowing. What isn't the user's is offered to sudo.
     ///
     /// **Refusals are printed, not silent** ([`_triage`]): PID 1, the starred ancestry, kernel
     /// threads. A row that appeared in the tree and then wasn't signalled should say why.
@@ -1213,43 +1236,275 @@ mod commands {
                 _count(killable.len(), "process", "processes")
             );
         }
-        let mut waiting: Vec<u32> = Vec::new();
-        for process in &killable {
-            match _signal(process.pid, libc::SIGTERM) {
-                Ok(()) => waiting.push(process.pid),
+        // A process gone since the scan has nothing left to signal, and no line to earn.
+        _terminate(killable.iter().filter_map(|process| Victim::now(process.pid, process.name.clone())).collect());
+    }
+
+    /// A process the ladder signals: its pid, when it started — so a pid the kernel has handed to
+    /// another process by the time the user answers is never taken for it — and its name, for
+    /// the report.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Victim {
+        pid: u32,
+        start: u64,
+        name: String,
+    }
+
+    impl Victim {
+        /// `pid` as it runs right now, or `None` once it is gone.
+        fn now(pid: u32, name: String) -> Option<Self> {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            Some(Self { pid, start: _start_ticks(&stat)?, name })
+        }
+
+        /// The process another run saw as `pid`, started at `start` — named by whatever its
+        /// `/proc/<pid>/comm` says now, since [`Self::still_there`] is what tells the two apart.
+        fn known(pid: u32, start: u64) -> Self {
+            let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .map_or_else(|_| "?".to_string(), |comm| comm.trim_end().to_string());
+            Self { pid, start, name }
+        }
+
+        /// Whether it still runs — the same process, not another with its pid since — as something
+        /// a signal can act on. A zombie is done: its exit only awaits the parent's
+        /// acknowledgement, and no signal changes that.
+        fn still_there(&self) -> bool {
+            std::fs::read_to_string(format!("/proc/{}/stat", self.pid)).is_ok_and(|stat| {
+                _start_ticks(&stat) == Some(self.start) && !matches!(_state(&stat), Some('Z' | 'X'))
+            })
+        }
+
+        /// How the report names it: `4242 (kate)`.
+        fn label(&self) -> String {
+            format!("{} ({})", self.pid, self.name)
+        }
+    }
+
+    /// `victims`, labelled and joined for a sentence: `4242 (kate), 4250 (kate)`.
+    fn _labels(victims: &[Victim]) -> String {
+        victims.iter().map(Victim::label).collect::<Vec<_>>().join(", ")
+    }
+
+    /// The ladder, for processes the user has agreed to end: **`SIGTERM` to each**, a grace period
+    /// for cleanup ([`GRACE`]), then **the user's call** for whatever is still running
+    /// ([`_settle`]) — wait more, `SIGKILL`, or leave it. Nothing is killed unasked: a program slow
+    /// to exit may be saving something, and only the user knows whether it is worth the wait. What
+    /// ignored SIGTERM is named, because that is a fact about a program worth knowing.
+    ///
+    /// **What isn't the user's** refuses the signal, and is offered to sudo ([`_offer_sudo`]),
+    /// which runs this same ladder as root. The user's own processes never go through sudo.
+    fn _terminate(victims: Vec<Victim>) {
+        let mut signalled = Vec::new();
+        let mut not_ours = Vec::new();
+        for victim in victims {
+            match _signal(victim.pid, libc::SIGTERM) {
+                Ok(()) => signalled.push(victim),
+                // Gone already is as good as gone on SIGTERM: the wait below finds it so.
+                Err(err) if err.raw_os_error() == Some(libc::ESRCH) => signalled.push(victim),
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => not_ours.push(victim),
                 Err(err) => eprintln!(
                     "{}",
-                    problematic(&format!("murder: {} refused the signal: {err}{}", process.pid,
-                        if err.kind() == std::io::ErrorKind::PermissionDenied { " (not yours — sudo?)" } else { "" }))
+                    problematic(&format!("murder: {} refused the signal: {err}", victim.label()))
                 ),
             }
         }
-        let asked = waiting.len();
-        // The grace period: SIGTERM is a request, and cleanup takes a moment. Poll rather than
-        // sleep the whole allowance, so a prompt exit ends the wait early.
-        for _ in 0..GRACE_POLLS {
-            waiting.retain(|pid| _alive(*pid));
-            if waiting.is_empty() {
+        if !signalled.is_empty() {
+            let asked = signalled.len();
+            let (still, _) = _await_exit(signalled, GRACE);
+            let survivors = still.len();
+            let settled = _settle(still, GRACE, &mut |still| {
+                let (intro, choices) = _after_sigterm_question(still);
+                _ask(intro, &choices)
+            });
+            let (summary, stuck) = _report(asked, survivors, &settled);
+            match survivors {
+                0 => eprintln!("{summary}"),
+                _ => eprintln!("{}", notice(&summary)),
+            }
+            if let Some(stuck) = stuck {
+                eprintln!("{}", problematic(&stuck));
+            }
+        }
+        if !not_ours.is_empty() {
+            _offer_sudo(not_ours);
+        }
+    }
+
+    /// Waits up to `wait` for `victims` to exit, polling so the wait ends as soon as they all
+    /// have: what is still there after it, and what went. A zero wait is one look.
+    fn _await_exit(victims: Vec<Victim>, wait: Duration) -> (Vec<Victim>, Vec<Victim>) {
+        let deadline = Instant::now() + wait;
+        let mut gone = Vec::new();
+        let mut still = victims;
+        loop {
+            let (there, went): (Vec<Victim>, Vec<Victim>) = still.into_iter().partition(Victim::still_there);
+            gone.extend(went);
+            still = there;
+            let left = deadline.saturating_duration_since(Instant::now());
+            if still.is_empty() || left.is_zero() {
+                return (still, gone);
+            }
+            std::thread::sleep(GRACE_POLL.min(left));
+        }
+    }
+
+    /// What the user may do about what is still there.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Next {
+        /// Give it another grace period, then ask again.
+        Wait,
+        /// End it: `SIGKILL` for a process, the app's own process for a window.
+        Kill,
+        /// Leave it be.
+        Leave,
+    }
+
+    /// What became of what was still running after the grace period.
+    #[derive(Debug, Default, PartialEq)]
+    struct Settled {
+        /// Gone without `SIGKILL` — during an extra wait, or while the user answered.
+        exited: Vec<Victim>,
+        /// Gone after `SIGKILL`.
+        killed: Vec<Victim>,
+        /// Still there after `SIGKILL`: stuck in the kernel, where no signal reaches until it
+        /// returns.
+        stuck: Vec<Victim>,
+        /// Left running, as the user chose.
+        left: Vec<Victim>,
+    }
+
+    /// Asks `ask` about `still` until nothing is left to ask about: wait `grace` more and ask
+    /// again, `SIGKILL` it, or leave it running. An answer takes the user a while — longer, often,
+    /// than the grace period itself — so what is acted on is looked at again once they have
+    /// answered, never the list the question showed: whatever exited meanwhile is not signalled,
+    /// and nor is a process that has one of its pids since. After `SIGKILL` it checks again, and
+    /// what survived even that is said, not assumed gone.
+    fn _settle(mut still: Vec<Victim>, grace: Duration, ask: &mut impl FnMut(&[Victim]) -> Next) -> Settled {
+        let mut settled = Settled::default();
+        while !still.is_empty() {
+            let next = ask(&still);
+            let (there, gone) = _await_exit(still, Duration::ZERO);
+            settled.exited.extend(gone);
+            still = there;
+            if still.is_empty() {
                 break;
             }
-            std::thread::sleep(GRACE_POLL);
+            match next {
+                Next::Wait => {
+                    let (there, gone) = _await_exit(still, grace);
+                    settled.exited.extend(gone);
+                    still = there;
+                }
+                Next::Kill => {
+                    for victim in &still {
+                        let _ = _signal(victim.pid, libc::SIGKILL);
+                    }
+                    let (stuck, killed) = _await_exit(std::mem::take(&mut still), grace);
+                    settled.killed = killed;
+                    settled.stuck = stuck;
+                }
+                Next::Leave => settled.left = std::mem::take(&mut still),
+            }
         }
-        waiting.retain(|pid| _alive(*pid));
-        for pid in &waiting {
-            let _ = _signal(*pid, libc::SIGKILL);
+        settled
+    }
+
+    /// Puts a question about what is still there to the user: `intro` says what, `choices` are the
+    /// answers with what each means, in order. Esc — or no terminal to ask on — leaves things as
+    /// they are.
+    fn _ask(intro: String, choices: &[(String, Next)]) -> Next {
+        let mut menu = choices
+            .iter()
+            .fold(terminal_choice::Menu::new("What now?").intro(intro), |menu, (label, _)| menu.pick(label.clone()));
+        match terminal_choice::run_menu(&mut menu) {
+            Ok(terminal_choice::Chosen::Picked(at)) => choices.get(at).map_or(Next::Leave, |(_, next)| *next),
+            Ok(terminal_choice::Chosen::Cancelled) => Next::Leave,
+            Err(err) => {
+                eprintln!("murder: {err} — leaving the rest as it is");
+                Next::Leave
+            }
         }
-        match waiting.as_slice() {
-            [] => eprintln!("murder: {} terminated", _count(asked, "process", "processes")),
-            stubborn => eprintln!(
-                "{}",
-                notice(&format!(
-                    "murder: {} went on SIGTERM; {} ignored it and got SIGKILL: {}",
-                    asked - stubborn.len(),
-                    stubborn.len(),
-                    stubborn.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
-                ))
-            ),
+    }
+
+    /// The "wait more" answer, as every question words it.
+    fn _wait_choice() -> (String, Next) {
+        (format!("wait {} s more", GRACE.as_secs()), Next::Wait)
+    }
+
+    /// The question about what `SIGTERM` did not end.
+    fn _after_sigterm_question(still: &[Victim]) -> (String, Vec<(String, Next)>) {
+        let them = if still.len() == 1 { "it" } else { "them" };
+        let intro = format!(
+            "murder: {} still running after SIGTERM: {}",
+            _count(still.len(), "process is", "processes are"),
+            _labels(still)
+        );
+        (intro, vec![_wait_choice(), (format!("kill {them} now (SIGKILL)"), Next::Kill), (format!("leave {them} running"), Next::Leave)])
+    }
+
+    /// The question about what refused `SIGTERM` for not being the user's. No waiting: the signal
+    /// never reached it.
+    fn _sudo_question(not_ours: &[Victim]) -> (String, Vec<(String, Next)>) {
+        let (it, isnt) = if not_ours.len() == 1 { ("it", "isn't") } else { ("them", "aren't") };
+        let intro = format!(
+            "murder: {} {isnt} yours, so the signal was refused: {}",
+            _count(not_ours.len(), "process", "processes"),
+            _labels(not_ours)
+        );
+        (intro, vec![(format!("kill {it} with sudo"), Next::Kill), (format!("leave {it} running"), Next::Leave)])
+    }
+
+    /// What refused `SIGTERM` for not being the user's: offered to sudo, which runs the same
+    /// ladder as root ([`murder_elevated_kill`]). In that root re-run nothing should refuse;
+    /// whatever still does is only named.
+    fn _offer_sudo(not_ours: Vec<Victim>) {
+        if crate::support::superuser::is_root() {
+            return eprintln!("{}", problematic(&format!("murder: refused even as root: {}", _labels(&not_ours))));
         }
+        let (intro, choices) = _sudo_question(&not_ours);
+        let next = _ask(intro, &choices);
+        // Looked at again once answered, as everywhere: what went meanwhile isn't handed to root.
+        let (there, _) = _await_exit(not_ours, Duration::ZERO);
+        match (next, there.is_empty()) {
+            (_, true) => eprintln!("murder: they exited while you decided"),
+            (Next::Kill, false) => {
+                let pids: Vec<u32> = there.iter().map(|victim| victim.pid).collect();
+                let starts: Vec<u64> = there.iter().map(|victim| victim.start).collect();
+                MurderElevatedKill::reexec(&pids, &starts);
+            }
+            (_, false) => eprintln!("murder: left running: {}", _labels(&there)),
+        }
+    }
+
+    /// What the ladder says once done: a summary line, and — when `SIGKILL` could not end
+    /// something — a line for that. Plain text; [`_terminate`] styles it.
+    fn _report(asked: usize, survivors: usize, settled: &Settled) -> (String, Option<String>) {
+        if survivors == 0 {
+            return (format!("murder: {} terminated", _count(asked, "process", "processes")), None);
+        }
+        let went = asked - survivors;
+        let mut parts = Vec::new();
+        if went > 0 {
+            parts.push(format!("{went} went on SIGTERM"));
+        }
+        if !settled.exited.is_empty() {
+            parts.push(format!("{} exited while you decided", settled.exited.len()));
+        }
+        // What survived even SIGKILL got it too; the second line says which still runs.
+        let sigkilled: Vec<Victim> = settled.killed.iter().chain(&settled.stuck).cloned().collect();
+        if !sigkilled.is_empty() {
+            parts.push(format!("{} ignored SIGTERM and got SIGKILL: {}", sigkilled.len(), _labels(&sigkilled)));
+        }
+        if !settled.left.is_empty() {
+            parts.push(format!("left running: {}", _labels(&settled.left)));
+        }
+        let stuck = (!settled.stuck.is_empty()).then(|| {
+            format!(
+                "murder: still running after SIGKILL: {} — stuck in the kernel, where no signal reaches until it returns",
+                _labels(&settled.stuck)
+            )
+        });
+        (format!("murder: {}", parts.join("; ")), stuck)
     }
 
     /// `3 processes`, `1 process` — a count with its noun properly declined, because "process(es)"
@@ -1289,18 +1544,18 @@ mod commands {
     /// may have excluded an owner), and this shell's own ancestry is spared here too: closing
     /// the terminal this runs in is still self-harm, just politer.
     ///
-    /// No SIGKILL rung on this ladder, deliberately. A window that ignores its close request
-    /// usually means the app is asking something ("save changes?") or is hung — and the only
-    /// harder verb X offers is against the whole client, which is exactly what the window hunt
-    /// exists to avoid. The survivor report says so and points at the process hunt instead.
+    /// **What ignores its close request is the user's call.** It usually means the app is asking
+    /// something ("save changes?") or is hung, and the only harder verb is against the app's
+    /// whole process, every window of it — so it is never taken unasked. After the grace period
+    /// the user may wait more, kill the app (down the process hunt's own ladder, [`_terminate`]),
+    /// or leave the window open.
     fn _close_windows(
         relevant: &BTreeMap<u32, Process>,
-        owned: &BTreeMap<u32, Vec<(u32, String)>>,
+        owned: &BTreeMap<u32, Vec<(WindowId, String)>>,
         choose: bool,
     ) {
         use std::io::IsTerminal;
-        let mut targets: Vec<(u32, String)> = Vec::new();
-        let mut apps = std::collections::BTreeSet::new();
+        let mut targets: Vec<(WindowId, String)> = Vec::new();
         for process in relevant.values().filter(|p| p.relation == Relation::Match) {
             let Some(windows) = owned.get(&process.pid) else { continue };
             if process.protected {
@@ -1310,7 +1565,6 @@ mod commands {
                 );
                 continue;
             }
-            apps.insert(process.pid);
             targets.extend(windows.iter().cloned());
         }
         if targets.is_empty() {
@@ -1322,8 +1576,7 @@ mod commands {
             return;
         }
         if choose {
-            let options: Vec<String> =
-                targets.iter().map(|(id, title)| format!("{id} · {title}")).collect();
+            let options = _window_rows(&targets);
             let refs: Vec<&str> = options.iter().map(String::as_str).collect();
             let mut form = terminal_choice::Form::new()
                 .title("murder — tick the windows to close")
@@ -1348,64 +1601,124 @@ mod commands {
                         })
                         .flatten()
                         .collect();
-                    targets.retain(|(id, _)| ticked.contains(id));
+                    targets = _ticked_rows(targets, &ticked);
                     if targets.is_empty() {
                         return eprintln!("murder: nothing ticked — nothing to close");
                     }
                 }
             }
         }
-        let keeps = if apps.len() == 1 { "app keeps" } else { "apps keep" };
-        let ask = format!(
-            "Close {}? The owning {keeps} running, other windows included",
-            _count(targets.len(), "window", "windows")
-        );
+        let ask = format!("Close {}? Each app is asked, as by its ✕", _count(targets.len(), "window", "windows"));
         if !prompt_yN(&ask) {
             eprintln!("murder: aborted — nothing closed");
             return;
         }
-        let ids: Vec<u32> = targets.iter().map(|(id, _)| *id).collect();
+        let ids: Vec<WindowId> = targets.iter().map(|(id, _)| id.clone()).collect();
         if let Err(why) = crate::support::windows::close(&ids) {
             eprintln!("{}", problematic(&format!("murder: {why}")));
             return;
         }
-        // The same grace idea as the signal ladder, without the hammer at the end: wait for the
-        // windows to actually go, then name whatever stayed.
-        let mut open = ids.clone();
-        for _ in 0..GRACE_POLLS {
+        // The same grace idea as the signal ladder: wait for the windows to actually go — then,
+        // for whatever stayed, the user's call. Every answer is followed by a fresh look, since
+        // the user may have dealt with the app's own question meanwhile.
+        let mut open = _await_windows(ids.clone(), GRACE);
+        while !open.is_empty() {
+            let owners = _owners_of(owned, relevant, &open);
+            let (intro, choices) = _windows_question(&_titles_of(&targets, &open), &owners);
+            let next = _ask(intro, &choices);
             open = crate::support::windows::still_open(&open);
             if open.is_empty() {
                 break;
             }
-            std::thread::sleep(GRACE_POLL);
-        }
-        open = crate::support::windows::still_open(&open);
-        match open.as_slice() {
-            [] => eprintln!("murder: {} closed", _count(ids.len(), "window", "windows")),
-            stubborn => {
-                let names: Vec<&str> = targets
-                    .iter()
-                    .filter(|(id, _)| stubborn.contains(id))
-                    .map(|(_, title)| title.as_str())
-                    .collect();
-                eprintln!(
-                    "{}",
-                    notice(&format!(
-                        "murder: {} closed; still open: {} — the app may be asking to confirm \
-                         (unsaved work?), or is hung. To kill the whole process instead, hunt it \
-                         by text: murder <name>",
-                        _count(ids.len() - stubborn.len(), "window", "windows"),
-                        names.join(", ")
-                    ))
-                );
+            match next {
+                Next::Wait => open = _await_windows(open, GRACE),
+                Next::Kill => return _terminate(_owners_of(owned, relevant, &open)),
+                Next::Leave => {
+                    return eprintln!(
+                        "{}",
+                        notice(&format!(
+                            "murder: {} closed; left open: {}",
+                            _count(ids.len() - open.len(), "window", "windows"),
+                            _titles_of(&targets, &open).join(", ")
+                        ))
+                    );
+                }
             }
+        }
+        eprintln!("murder: {} closed", _count(ids.len(), "window", "windows"));
+    }
+
+    /// Waits up to `wait` for the windows `open` names to go, polling so the wait ends as soon as
+    /// they have: the ones still open after it.
+    fn _await_windows(mut open: Vec<WindowId>, wait: Duration) -> Vec<WindowId> {
+        let deadline = Instant::now() + wait;
+        loop {
+            open = crate::support::windows::still_open(&open);
+            let left = deadline.saturating_duration_since(Instant::now());
+            if open.is_empty() || left.is_zero() {
+                return open;
+            }
+            std::thread::sleep(GRACE_POLL.min(left));
         }
     }
 
-    /// How long a SIGTERM'd process gets to clean up before SIGKILL: [`GRACE_POLLS`] ×
-    /// [`GRACE_POLL`] = two seconds, checked in small steps so quick exits end the wait early.
-    const GRACE_POLLS: u32 = 20;
-    const GRACE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+    /// The titles of the `open` windows among `targets`, quoted, in the targets' order.
+    fn _titles_of(targets: &[(WindowId, String)], open: &[WindowId]) -> Vec<String> {
+        targets.iter().filter(|(id, _)| open.contains(id)).map(|(_, title)| format!("{title:?}")).collect()
+    }
+
+    /// The processes owning any of the `open` windows, as they run now — what "kill the app" ends.
+    fn _owners_of(
+        owned: &BTreeMap<u32, Vec<(WindowId, String)>>,
+        relevant: &BTreeMap<u32, Process>,
+        open: &[WindowId],
+    ) -> Vec<Victim> {
+        owned
+            .iter()
+            .filter(|(_, windows)| windows.iter().any(|(id, _)| open.contains(id)))
+            .filter_map(|(pid, _)| Victim::now(*pid, relevant.get(pid).map_or_else(|| "?".to_string(), |p| p.name.clone())))
+            .collect()
+    }
+
+    /// The question about windows still open after their close request: wait, kill the app — when
+    /// there is one still running to kill — or leave them.
+    fn _windows_question(titles: &[String], owners: &[Victim]) -> (String, Vec<(String, Next)>) {
+        let one = titles.len() == 1;
+        let intro = format!(
+            "murder: {} still open — {} may be asking something (unsaved work?), or is hung: {}",
+            _count(titles.len(), "window is", "windows are"),
+            if owners.len() == 1 { "its app" } else { "their apps" },
+            titles.join(", ")
+        );
+        let mut choices = vec![_wait_choice()];
+        if !owners.is_empty() {
+            let (apps, theirs) = if owners.len() == 1 { ("its app", "it") } else { ("their apps", "theirs") };
+            choices.push((format!("kill {apps} — {}: every window of {theirs} goes too", _labels(owners)), Next::Kill));
+        }
+        choices.push((format!("leave {} open", if one { "it" } else { "them" }), Next::Leave));
+        (intro, choices)
+    }
+
+    /// The `--choose` rows for the windows to close: each numbered from 1, the number leading —
+    /// the token [`_picked_pid`] reads back — and the title after it. A window's own id would
+    /// tell the user nothing, and KWin's are 38-character UUIDs.
+    fn _window_rows(targets: &[(WindowId, String)]) -> Vec<String> {
+        targets.iter().zip(1..).map(|((_, title), row)| format!("{row} · {title}")).collect()
+    }
+
+    /// The targets whose rows were ticked, by the numbers [`_window_rows`] gave them, in order.
+    fn _ticked_rows(
+        targets: Vec<(WindowId, String)>,
+        ticked: &std::collections::BTreeSet<u32>,
+    ) -> Vec<(WindowId, String)> {
+        targets.into_iter().zip(1..).filter(|(_, row)| ticked.contains(row)).map(|(target, _)| target).collect()
+    }
+
+    /// How long a SIGTERM'd process — or a window asked to close — gets before the user is asked
+    /// about it, and how long each "wait more" waits: two seconds, checked every [`GRACE_POLL`]
+    /// so a quick exit ends the wait early.
+    const GRACE: Duration = Duration::from_secs(2);
+    const GRACE_POLL: Duration = Duration::from_millis(100);
 
     /// Split the matches into what may be signalled and what must not, each refusal carrying its
     /// reason. Pure, so the refusal policy is testable without killing anything.
@@ -1433,16 +1746,6 @@ mod commands {
         match unsafe { libc::kill(pid as libc::pid_t, signal) } {
             0 => Ok(()),
             _ => Err(std::io::Error::last_os_error()),
-        }
-    }
-
-    /// Whether `pid` is still something SIGKILL could act on. A zombie is done — its exit only
-    /// awaits the parent's acknowledgement, and no signal changes that — so it counts as gone
-    /// rather than "stubborn".
-    fn _alive(pid: u32) -> bool {
-        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => !matches!(_state(&stat), Some('Z' | 'X')),
-            Err(_) => false,
         }
     }
 
@@ -1821,8 +2124,10 @@ mod commands {
         /// given — sufficient alone, and disqualifying when absent even if every text pattern hit.
         #[test]
         fn the_window_filter_is_a_conjunct_like_any_pattern() {
-            let owned =
-                BTreeMap::from([(9, vec![(0xC0FFEE_u32, "Site That Breaks - Browser".to_string())])]);
+            let owned = BTreeMap::from([(
+                9,
+                vec![(WindowId::X11(0xC0FFEE), "Site That Breaks - Browser".to_string())],
+            )]);
             let mut with_window = sample(9, 1, "/usr/lib/firefox/firefox");
             _mark_matches(&mut with_window, &[], Some(&owned));
             assert_eq!(with_window.matched, ["window"], "a window match alone suffices");
@@ -2069,6 +2374,205 @@ mod commands {
             assert_eq!(_picked_pid("not a pid at all"), None);
             // The -c options glow, and a pid matched BY pid glows in this very token.
             assert_eq!(_picked_pid("\x1b[30;41m4242\x1b[0m*  me  1s"), Some(4242));
+        }
+
+        /// The window form numbers its rows from 1, whoever's id each window has — X11's, or
+        /// KWin's long UUIDs — and a ticked row reads back by that number, in order.
+        #[test]
+        fn window_rows_are_numbered_and_read_back_by_number() {
+            let targets = vec![
+                (WindowId::KWin("{0b5c9f0e-6a2e-4d6f-9a43-4b1d2f1f3c11}".into()), "Untitled — Kate".to_string()),
+                (WindowId::X11(0xC0FFEE), "xeyes".to_string()),
+                (WindowId::KWin("{77}".into()), "Downloads — Dolphin".to_string()),
+            ];
+            let rows = _window_rows(&targets);
+            assert_eq!(rows, ["1 · Untitled — Kate", "2 · xeyes", "3 · Downloads — Dolphin"]);
+            let ticked = [&rows[0], &rows[2]].iter().filter_map(|row| _picked_pid(row)).collect();
+            let kept = _ticked_rows(targets.clone(), &ticked);
+            assert_eq!(kept, [targets[0].clone(), targets[2].clone()]);
+            assert!(_ticked_rows(targets, &std::collections::BTreeSet::new()).is_empty(), "nothing ticked");
+        }
+
+        // ——— The ladder, on real processes ———————————————————————————————————————————————————
+
+        /// A grace period short enough for tests to wait through.
+        const TEST_GRACE: Duration = Duration::from_millis(200);
+
+        /// A program that ignores SIGTERM, as a stubborn or slow one does: killed and reaped when
+        /// dropped, so a failing assertion leaves nothing running.
+        struct Stubborn(std::process::Child);
+
+        impl Stubborn {
+            fn spawn() -> Self {
+                // An ignored signal stays ignored across exec, so `sleep` inherits the trap.
+                let child = std::process::Command::new("sh")
+                    .args(["-c", "trap '' TERM; exec sleep 30"])
+                    .spawn()
+                    .expect("sh is needed for the ladder's tests");
+                let stubborn = Self(child);
+                // Signalled before the trap is set, the shell would simply die; wait for the exec.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let comm = format!("/proc/{}/comm", stubborn.0.id());
+                while std::fs::read_to_string(&comm).map(|name| name.trim_end().to_string()).ok().as_deref() != Some("sleep") {
+                    assert!(Instant::now() < deadline, "the child never became sleep");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                stubborn
+            }
+
+            fn victim(&self) -> Victim {
+                Victim::now(self.0.id(), "sleep".into()).expect("it runs")
+            }
+        }
+
+        impl Drop for Stubborn {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        /// A victim is the process that had its pid when it was taken: the same pid with another
+        /// start time is someone else's, and an exited one — a zombie its parent has yet to
+        /// reap — is gone.
+        #[test]
+        fn a_victim_is_the_process_that_had_its_pid() {
+            let mut stubborn = Stubborn::spawn();
+            let victim = stubborn.victim();
+            assert!(victim.still_there());
+            assert!(!Victim { start: victim.start + 1, ..victim.clone() }.still_there(), "a pid handed on");
+            stubborn.0.kill().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while victim.still_there() {
+                assert!(Instant::now() < deadline, "the killed child never read as gone");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(Victim::known(victim.pid, victim.start).name, "sleep", "named by its comm, zombie or not");
+        }
+
+        /// SIGTERM ignored is waited out, then put to the user; "kill" sends SIGKILL — and the
+        /// ladder looks again to say it worked.
+        #[test]
+        fn what_ignores_sigterm_is_killed_only_once_the_user_says_so() {
+            let stubborn = Stubborn::spawn();
+            let victim = stubborn.victim();
+            _signal(victim.pid, libc::SIGTERM).unwrap();
+            let (still, gone) = _await_exit(vec![victim.clone()], TEST_GRACE);
+            assert_eq!((still.len(), gone.len()), (1, 0), "SIGTERM was ignored");
+            let mut asked = Vec::new();
+            let settled = _settle(still, TEST_GRACE, &mut |still| {
+                asked.push(still.to_vec());
+                Next::Kill
+            });
+            assert_eq!(asked, [vec![victim.clone()]], "asked once, about it");
+            assert_eq!(settled, Settled { killed: vec![victim.clone()], ..Settled::default() });
+            assert!(!victim.still_there(), "SIGKILL ended it");
+        }
+
+        /// "Wait more" waits, then asks again about what is still there; "leave" leaves it
+        /// running.
+        #[test]
+        fn waiting_asks_again_and_leaving_leaves_it_running() {
+            let stubborn = Stubborn::spawn();
+            let victim = stubborn.victim();
+            let mut answers = vec![Next::Wait, Next::Leave].into_iter();
+            let mut asked = 0;
+            let settled = _settle(vec![victim.clone()], TEST_GRACE, &mut |_| {
+                asked += 1;
+                answers.next().unwrap()
+            });
+            assert_eq!(asked, 2);
+            assert_eq!(settled, Settled { left: vec![victim.clone()], ..Settled::default() });
+            assert!(victim.still_there(), "left running");
+        }
+
+        /// The answer takes the user a while: what exited meanwhile is never signalled — and what
+        /// has one of its pids since isn't either.
+        #[test]
+        fn only_what_is_still_there_once_answered_is_signalled() {
+            let mut answered_late = Stubborn::spawn();
+            let late = answered_late.victim();
+            let settled = _settle(vec![late.clone()], TEST_GRACE, &mut |_| {
+                // It exits while the user is still deciding.
+                answered_late.0.kill().unwrap();
+                while late.still_there() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Next::Kill
+            });
+            assert_eq!(settled, Settled { exited: vec![late], ..Settled::default() });
+
+            let reused = Stubborn::spawn();
+            let taken = Victim { start: reused.victim().start + 1, ..reused.victim() };
+            let settled = _settle(vec![taken.clone()], TEST_GRACE, &mut |_| Next::Kill);
+            assert_eq!(settled, Settled { exited: vec![taken], ..Settled::default() });
+            assert!(reused.victim().still_there(), "the process that has the pid now is left alone");
+        }
+
+        fn named(pid: u32, name: &str) -> Victim {
+            Victim { pid, start: 1, name: name.into() }
+        }
+
+        /// The summary names what needed the user's call; what even SIGKILL could not end gets a
+        /// line of its own.
+        #[test]
+        fn the_report_says_what_went_how() {
+            assert_eq!(_report(3, 0, &Settled::default()), ("murder: 3 processes terminated".to_string(), None));
+            let settled = Settled {
+                exited: vec![named(5, "a")],
+                killed: vec![named(6, "b")],
+                stuck: vec![named(7, "c")],
+                left: vec![named(8, "d")],
+            };
+            let (summary, stuck) = _report(6, 4, &settled);
+            assert_eq!(
+                summary,
+                "murder: 2 went on SIGTERM; 1 exited while you decided; 2 ignored SIGTERM and got SIGKILL: 6 (b), 7 (c); left running: 8 (d)"
+            );
+            assert_eq!(
+                stuck.as_deref(),
+                Some("murder: still running after SIGKILL: 7 (c) — stuck in the kernel, where no signal reaches until it returns")
+            );
+            let all_stuck = Settled { stuck: vec![named(7, "c")], ..Settled::default() };
+            assert_eq!(_report(1, 1, &all_stuck).0, "murder: 1 ignored SIGTERM and got SIGKILL: 7 (c)", "never an empty summary");
+        }
+
+        /// Each question says what is still there and offers what makes sense for it: waiting for
+        /// what got the signal, sudo for what refused it, and killing a window's app only while
+        /// one runs.
+        #[test]
+        fn each_question_offers_what_fits() {
+            let meanings = |choices: &[(String, Next)]| choices.iter().map(|(_, next)| *next).collect::<Vec<_>>();
+            let (intro, choices) = _after_sigterm_question(&[named(6, "kate")]);
+            assert_eq!(intro, "murder: 1 process is still running after SIGTERM: 6 (kate)");
+            assert_eq!(meanings(&choices), [Next::Wait, Next::Kill, Next::Leave]);
+            assert_eq!(choices[0].0, "wait 2 s more");
+            assert_eq!(choices[1].0, "kill it now (SIGKILL)");
+
+            let (intro, choices) = _sudo_question(&[named(812, "nginx"), named(813, "nginx")]);
+            assert_eq!(intro, "murder: 2 processes aren't yours, so the signal was refused: 812 (nginx), 813 (nginx)");
+            assert_eq!(meanings(&choices), [Next::Kill, Next::Leave], "no waiting: the signal never reached them");
+            assert_eq!(choices[0].0, "kill them with sudo");
+
+            let titles = vec!["\"Untitled — Kate\"".to_string()];
+            let (intro, choices) = _windows_question(&titles, &[named(6, "kate")]);
+            assert_eq!(intro, "murder: 1 window is still open — its app may be asking something (unsaved work?), or is hung: \"Untitled — Kate\"");
+            assert_eq!(meanings(&choices), [Next::Wait, Next::Kill, Next::Leave]);
+            assert_eq!(choices[1].0, "kill its app — 6 (kate): every window of it goes too");
+            let (_, choices) = _windows_question(&titles, &[]);
+            assert_eq!(meanings(&choices), [Next::Wait, Next::Leave], "no app left running to kill");
+        }
+
+        /// The titles the questions show are the open ones, quoted, in the targets' order.
+        #[test]
+        fn the_titles_shown_are_the_open_windows() {
+            let targets = vec![
+                (WindowId::X11(1), "One".to_string()),
+                (WindowId::KWin("{2}".into()), "Two".to_string()),
+                (WindowId::X11(3), "Three".to_string()),
+            ];
+            assert_eq!(_titles_of(&targets, &[WindowId::X11(3), WindowId::KWin("{2}".into())]), ["\"Two\"", "\"Three\""]);
+            assert!(_titles_of(&targets, &[]).is_empty());
         }
 
         /// A zombie is done — no signal changes anything about it — so the grace-period poll must

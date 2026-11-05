@@ -93,10 +93,10 @@ mod commands {
         /// did, which terminals and window managers would.
         #[test]
         fn nothing_done_says_why_or_what_would() {
-            let reasons = [("kitty", "remote control is off".to_string()), ("KWin", "busctl failed".to_string())];
+            let reasons = [("kitty", "remote control is off".to_string()), ("KWin", "KWin is not running in this session".to_string())];
             assert_eq!(
                 _undone("term_opacity_up", &reasons),
-                "term_opacity_up: the terminal's opacity could not be changed:\n  kitty: remote control is off\n  KWin: busctl failed"
+                "term_opacity_up: the terminal's opacity could not be changed:\n  kitty: remote control is off\n  KWin: KWin is not running in this session"
             );
             let nothing = _undone("term_opacity_down", &[]);
             assert!(nothing.starts_with("term_opacity_down: nothing here can change the terminal's opacity"), "{nothing}");

@@ -21,6 +21,24 @@ fn bashrs_in(cwd: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_bashrs")).args(args).current_dir(cwd).output().expect("run bashrs")
 }
 
+/// `autokey_apply`'s profile manager starts this binary again as sequencer's device-grab
+/// supervisor (`REEXEC_HANDLERS`), and it answers as one: a supervisor started on it reports in,
+/// where a binary deaf to the marker would exit on a usage error — no supervisor, so no grab, and
+/// profiles quietly back on X11's grabs. Typed by hand, with no manager on the other end, the
+/// marker is refused with upstream's words and exit code.
+#[test]
+fn this_binary_answers_as_sequencers_supervisor() {
+    use sequencer::input::linux::supervise::Supervisor;
+    let mut program = Command::new(env!("CARGO_BIN_EXE_bashrs"));
+    program.arg(sequencer::SUPERVISOR_MARKER);
+    Supervisor::spawn(program).expect("bashrs answers as sequencer's supervisor").finish();
+
+    let by_hand = bashrs(&[sequencer::SUPERVISOR_MARKER], &[]);
+    assert_eq!(by_hand.status.code(), Some(2), "{by_hand:?}");
+    let err = String::from_utf8_lossy(&by_hand.stderr);
+    assert!(err.contains("is for sequencer's own use"), "{err}");
+}
+
 #[test]
 fn brs_configure_creates_the_config_from_the_template_and_opens_it() {
     // A private HOME, so the test can never touch the user's real ~/.bashrs.
@@ -1256,6 +1274,10 @@ fn opacity_run(tag: &str, args: &[&str], vars: &[(&str, &str)], fakes: &[(&str, 
     for var in READ {
         command.env_remove(var);
     }
+    // KWin is asked over the session bus, in-process, so no stand-in on PATH can answer for it —
+    // and a run must never reach the desktop of whoever runs the tests: every run gets a bus
+    // address with nothing behind it.
+    command.env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={}", dir.join("no-bus").display()));
     let out = command.envs(vars.iter().copied()).output().expect("run bashrs");
     let log = std::fs::read_to_string(&calls).unwrap_or_default();
     let _ = std::fs::remove_dir_all(&dir);
@@ -1283,16 +1305,14 @@ fn a_refusing_terminal_hands_the_step_to_the_window_manager_and_says_why() {
     let (out, log) = opacity_run(
         "refused",
         &["term_opacity_up"],
-        &[("KITTY_WINDOW_ID", "7"), ("XDG_CURRENT_DESKTOP", "KDE")],
-        &[("kitten", KITTY_REFUSING), ("busctl", "")],
+        &[("KITTY_WINDOW_ID", "7"), ("SWAYSOCK", "/run/user/1000/sway-ipc.sock")],
+        &[("kitten", KITTY_REFUSING), ("swaymsg", "")],
     );
     let said = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{said}");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "KWin: window opacity +5%\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "sway: window opacity +5%\n");
     assert!(said.contains("kitty couldn't — You must turn on the dynamic_background_opacity option in kitty.conf"), "{said}");
-    assert!(log.ends_with(
-        "busctl --user call org.kde.kglobalaccel /component/kwin org.kde.kglobalaccel.Component invokeShortcut s Increase Opacity\n"
-    ), "{log}");
+    assert!(log.ends_with("swaymsg opacity plus 0.05\n"), "{log}");
 }
 
 #[test]
@@ -1300,12 +1320,12 @@ fn inside_a_multiplexer_the_window_manager_steps_and_the_terminal_is_left_alone(
     let (out, log) = opacity_run(
         "tmux",
         &["term_opacity_down"],
-        &[("KITTY_WINDOW_ID", "7"), ("TMUX", "/tmp/tmux-1000/default,1,0"), ("XDG_CURRENT_DESKTOP", "KDE")],
-        &[("kitten", KITTY_AT), ("busctl", "")],
+        &[("KITTY_WINDOW_ID", "7"), ("TMUX", "/tmp/tmux-1000/default,1,0"), ("SWAYSOCK", "/run/user/1000/sway-ipc.sock")],
+        &[("kitten", KITTY_AT), ("swaymsg", "")],
     );
     let said = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{said}");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "KWin: window opacity -5%\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "sway: window opacity -5%\n");
     assert!(!log.contains("kitten"), "kitty's possibly stale window is never addressed: {log}");
     assert!(said.contains("inside tmux, kitty's own controls are out of reach"), "{said}");
 }
@@ -1330,9 +1350,12 @@ fn the_window_managers_step_the_focused_window_in_their_own_terms() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "Hyprland: window opacity 100%\n", "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(log, "hyprctl getprop activewindow opacity\nhyprctl dispatch setprop activewindow opacity 1.00\n", "never past opaque");
 
-    let (out, log) = opacity_run("kwin", &["term_opacity_down", "20"], &[("XDG_CURRENT_DESKTOP", "KDE")], &[("busctl", "")]);
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "KWin: window opacity -20%\n", "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(log.matches("invokeShortcut s Decrease Opacity").count(), 4, "four of KWin's 5% presses: {log}");
+    // KWin is asked over the session bus, in-process — its presses are counted in the unit tests,
+    // and the call itself in sequencer's. Here, as in every run, there is no bus to reach: KWin is
+    // tried, says why it couldn't, and nothing else applies.
+    let (out, _) = opacity_run("kwin", &["term_opacity_down", "20"], &[("XDG_CURRENT_DESKTOP", "KDE")], &[]);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && said.contains("\n  KWin: no session bus: "), "{said}");
 
     // Hyprland can say no while exiting 0: only its `ok` counts as done.
     let refusing = r#"case "$1" in getprop) echo 0.9 ;; dispatch) echo "Invalid dispatcher" ;; esac"#;

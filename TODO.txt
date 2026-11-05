@@ -220,3 +220,5 @@ Separate filesync's dedup into a "filededup" project (was this the name I though
 Make sure that things work with Wayland too
     autokey surely broke
 
+issue found:
+    murder --window: keep it X11-only, or add KDE-specific window listing for native Wayland windows?

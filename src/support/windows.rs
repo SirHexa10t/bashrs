@@ -1,9 +1,17 @@
-//! What's on the screen: the X11 window list, each with its title and owning process — and the
-//! few things done to a window from outside: asking it to close, stepping its opacity.
+//! What's on the screen: the windows the desktop lists, each with its title and owning process —
+//! and the few things done to a window from outside: asking it to close, stepping its opacity.
 //!
-//! In-process over `x11rb` — already in the dependency tree for sequencer's X11 backends — rather
-//! than shelling to `wmctrl`/`xdotool`, which may not be installed and whose output would need
-//! parsing back apart. Who wants which window is the caller's question.
+//! Two sources, and [`list`] takes the session's: in an X11 session the X server's list, and in a
+//! Wayland one KWin's — KDE Plasma's compositor, which manages Wayland and X11 windows alike —
+//! through sequencer's KWin scripts (`sequencer::input::kde`). Xwayland sees only its own X11
+//! windows, so KWin is the one way to a native Wayland window; a Wayland session without KWin
+//! falls back to the X server, whose XWayland windows are then all there is to see. Each window
+//! remembers who listed it ([`WindowId`]), and a close request goes back the same way.
+//!
+//! The X server is asked in-process over `x11rb` — already in the dependency tree for
+//! sequencer's X11 backends — rather than shelling to `wmctrl`/`xdotool`, which may not be
+//! installed and whose output would need parsing back apart. Who wants which window is the
+//! caller's question.
 //!
 //! The usual X11 caveats apply and are reported rather than papered over: it needs a display (on
 //! Wayland only XWayland windows are visible) and a window manager that maintains
@@ -15,26 +23,137 @@
 //! host's `/proc` finds `kthreadd`. The X-Resource extension instead asks the server who owns
 //! the window's connection, and the server answers with the pid it accepted the socket from —
 //! the real one, whatever namespace the client lives in. `_NET_WM_PID` remains only as the
-//! fallback for a server without the extension.
+//! fallback for a server without the extension. KWin's list keeps the same guarantee: it asks the
+//! X server the same way for an X11 window's owner, and a Wayland window's is whoever holds its
+//! Wayland connection.
 
+use sequencer::input::kde::KWinError;
 use x11rb::connection::Connection;
 use x11rb::protocol::res::{self, ClientIdMask, ClientIdSpec};
 use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
 
 /// One mapped window that names its owner.
 pub(crate) struct Window {
-    /// The X window id — the handle a close request is addressed to.
-    pub(crate) id: u32,
+    /// The handle a close request is addressed to.
+    pub(crate) id: WindowId,
     /// The owning process.
     pub(crate) pid: u32,
-    /// Its title: `_NET_WM_NAME` (UTF-8), or the older `WM_NAME` when that's all there is. For a
-    /// browser this carries the ACTIVE tab's title — background tabs are not windows.
+    /// Its title: `_NET_WM_NAME` (UTF-8), or the older `WM_NAME` when that's all there is — or
+    /// for KWin's list, the title as the app set it. For a browser this carries the ACTIVE tab's
+    /// title — background tabs are not windows.
     pub(crate) title: String,
 }
 
-/// Every window the window manager lists, with the PID and title of each. `Err` is a
+/// A window as whoever listed it knows it — and so who a close request goes back to.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum WindowId {
+    /// An X window id: closed over the X connection.
+    X11(u32),
+    /// KWin's id for the window, Wayland or X11 alike: closed through KWin.
+    KWin(String),
+}
+
+/// What [`list`] found — and, where KWin should have answered but could not, why the windows are
+/// XWayland's alone.
+pub(crate) struct Listing {
+    pub(crate) windows: Vec<Window>,
+    /// Why KWin was passed over: in a Wayland session it runs in, but it would not list.
+    pub(crate) passed_over: Option<String>,
+}
+
+/// Every window the desktop lists, with the PID and title of each: KWin's list in a Wayland
+/// session KWin runs, the X server's otherwise. `Err` is a human-readable reason there's nothing
+/// to enumerate (no display, no EWMH window manager).
+pub(crate) fn list() -> Result<Listing, String> {
+    let mut passed_over = None;
+    if !x11_session(&|name| std::env::var(name).ok()) {
+        match kwin_list() {
+            Ok(windows) => return Ok(Listing { windows, passed_over }),
+            // No KWin to ask — another compositor, or no session bus: the X server is all there is.
+            Err(KWinError::NotRunning | KWinError::Bus(_)) => {}
+            Err(why) => passed_over = Some(why.to_string()),
+        }
+    }
+    match x11_list() {
+        Ok(windows) => Ok(Listing { windows, passed_over }),
+        Err(why) => Err(match passed_over {
+            Some(kwin) => format!("KWin couldn't list its windows ({kwin}), and {why}"),
+            None => why,
+        }),
+    }
+}
+
+/// An X11 session: said so outright, or a display with no Wayland one beside it — Xwayland's
+/// display is no X11 session. `vars` reads the environment: the process's in earnest, a fixed set
+/// in tests.
+pub(crate) fn x11_session(vars: &dyn Fn(&str) -> Option<String>) -> bool {
+    vars("XDG_SESSION_TYPE").as_deref() == Some("x11")
+        || (vars("DISPLAY").is_some() && vars("WAYLAND_DISPLAY").is_none())
+}
+
+/// Ask each window to close, the way the titlebar's ✕ does — through whoever listed it. The
+/// application decides what that means: it may raise an "unsaved changes" dialog, and KWin ends
+/// an X11 app outright when its window takes no close request.
+pub(crate) fn close(ids: &[WindowId]) -> Result<(), String> {
+    let (x11, kwin) = by_source(ids);
+    if !x11.is_empty() {
+        x11_close(&x11)?;
+    }
+    if !kwin.is_empty() {
+        sequencer::input::kde::close(&kwin).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+/// Which of `ids` are still on screen. Errors (display gone mid-check) read as "none left" —
+/// the caller only uses this to decide whether to keep waiting.
+pub(crate) fn still_open(ids: &[WindowId]) -> Vec<WindowId> {
+    let (x11, kwin) = by_source(ids);
+    let mut open = std::collections::BTreeSet::new();
+    if !x11.is_empty() {
+        open.extend(x11_list().into_iter().flatten().map(|window| window.id));
+    }
+    if !kwin.is_empty() {
+        open.extend(kwin_list().into_iter().flatten().map(|window| window.id));
+    }
+    ids.iter().filter(|id| open.contains(*id)).cloned().collect()
+}
+
+/// `ids` split by who listed them: the X11 window ids, then KWin's.
+fn by_source(ids: &[WindowId]) -> (Vec<u32>, Vec<String>) {
+    let mut x11 = Vec::new();
+    let mut kwin = Vec::new();
+    for id in ids {
+        match id {
+            WindowId::X11(id) => x11.push(*id),
+            WindowId::KWin(id) => kwin.push(id.clone()),
+        }
+    }
+    (x11, kwin)
+}
+
+/// The one rule for a window from either source: it must name an owner, to be matched to a
+/// process, and carry a title, to be matched to a request. Missing either, it silently isn't a
+/// candidate.
+fn named(id: WindowId, pid: Option<u32>, title: Option<String>) -> Option<Window> {
+    Some(Window { id, pid: pid?, title: title.filter(|title| !title.is_empty())? })
+}
+
+// --- KWin --------------------------------------------------------------------------------------
+
+/// KWin's windows — every kind, its own special ones (desktop, panels, notifications) left out.
+fn kwin_list() -> Result<Vec<Window>, KWinError> {
+    Ok(sequencer::input::kde::windows()?
+        .into_iter()
+        .filter_map(|window| named(WindowId::KWin(window.id), window.pid, Some(window.title)))
+        .collect())
+}
+
+// --- X11 ---------------------------------------------------------------------------------------
+
+/// Every window the X11 window manager lists, with the PID and title of each. `Err` is a
 /// human-readable reason there's nothing to enumerate (no display, no EWMH window manager).
-pub(crate) fn list() -> Result<Vec<Window>, String> {
+fn x11_list() -> Result<Vec<Window>, String> {
     let (conn, screen) = x11rb::connect(None)
         .map_err(|_| "no X11 display — on Wayland, only XWayland windows would be visible anyway".to_string())?;
     let root = conn.setup().roots[screen].root;
@@ -63,14 +182,14 @@ pub(crate) fn list() -> Result<Vec<Window>, String> {
     let mut windows = Vec::new();
     for id in ids {
         // A window without a PID can't be matched to a process; without a title it can't be
-        // matched to a request. Either way it silently isn't a candidate.
-        let Some(pid) = _server_pid(&conn, id).or_else(|| _cardinal(&conn, id, net_wm_pid)) else {
-            continue;
-        };
-        let title = _text(&conn, id, net_wm_name, utf8_string)
-            .or_else(|| _text(&conn, id, AtomEnum::WM_NAME.into(), AtomEnum::ANY.into()));
-        let Some(title) = title.filter(|title| !title.is_empty()) else { continue };
-        windows.push(Window { id, pid, title });
+        // matched to a request. Either way it silently isn't a candidate ([`named`]) — and one
+        // without an owner isn't asked for its title.
+        let pid = _server_pid(&conn, id).or_else(|| _cardinal(&conn, id, net_wm_pid));
+        let title = pid.and_then(|_| {
+            _text(&conn, id, net_wm_name, utf8_string)
+                .or_else(|| _text(&conn, id, AtomEnum::WM_NAME.into(), AtomEnum::ANY.into()))
+        });
+        windows.extend(named(WindowId::X11(id), pid, title));
     }
     Ok(windows)
 }
@@ -105,7 +224,7 @@ fn _server_pid(conn: &impl Connection, window: u32) -> Option<u32> {
 ///
 /// Every send is checked, so a bad window id or a dead display comes back as an error rather
 /// than as a silently-ignored request.
-pub(crate) fn close(ids: &[u32]) -> Result<(), String> {
+fn x11_close(ids: &[u32]) -> Result<(), String> {
     use x11rb::protocol::xproto::{ClientMessageEvent, EventMask};
     let (conn, screen) = x11rb::connect(None).map_err(|_| "no X11 display".to_string())?;
     let root = conn.setup().roots[screen].root;
@@ -150,18 +269,6 @@ fn _accepts(conn: &impl Connection, window: u32, wm_protocols: u32, protocol: u3
         .and_then(|cookie| cookie.reply().ok())
         .and_then(|reply| Some(reply.value32()?.collect::<Vec<_>>()))
         .is_some_and(|protocols| protocols.contains(&protocol))
-}
-
-/// Which of `ids` are still on screen. Errors (display gone mid-check) read as "none left" —
-/// the caller only uses this to decide whether to keep waiting.
-pub(crate) fn still_open(ids: &[u32]) -> Vec<u32> {
-    match list() {
-        Ok(all) => {
-            let open: std::collections::BTreeSet<u32> = all.into_iter().map(|w| w.id).collect();
-            ids.iter().copied().filter(|id| open.contains(id)).collect()
-        }
-        Err(_) => Vec::new(),
-    }
 }
 
 /// Move the focused window's opacity to `next(now)` — the caller's stepping rule, handed the
@@ -250,6 +357,39 @@ fn _text(conn: &impl Connection, window: u32, property: u32, kind: u32) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vars<'a>(set: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| set.iter().find(|(var, _)| *var == name).map(|(_, value)| value.to_string())
+    }
+
+    /// The session decides the source: an X11 session is said so outright, or is a display with
+    /// no Wayland one beside it — Xwayland's display is no X11 session, so KWin is asked there.
+    #[test]
+    fn an_x11_session_is_said_so_or_a_display_without_wayland() {
+        assert!(x11_session(&vars(&[("XDG_SESSION_TYPE", "x11")])));
+        assert!(x11_session(&vars(&[("DISPLAY", ":0")])), "a display, no Wayland");
+        assert!(!x11_session(&vars(&[("DISPLAY", ":0"), ("WAYLAND_DISPLAY", "wayland-0")])), "XWayland is no X11 session");
+        assert!(!x11_session(&vars(&[("XDG_SESSION_TYPE", "wayland")])));
+        assert!(!x11_session(&vars(&[])), "no display at all");
+    }
+
+    /// One rule for both sources: a window is a candidate only with an owner and a title.
+    #[test]
+    fn a_window_needs_an_owner_and_a_title_to_be_a_candidate() {
+        let kept = named(WindowId::KWin("{1}".into()), Some(42), Some("Untitled — Kate".into())).expect("both");
+        assert_eq!((kept.id, kept.pid, kept.title.as_str()), (WindowId::KWin("{1}".into()), 42, "Untitled — Kate"));
+        assert!(named(WindowId::X11(7), None, Some("xeyes".into())).is_none(), "no owner");
+        assert!(named(WindowId::X11(7), Some(42), Some(String::new())).is_none(), "an empty title");
+        assert!(named(WindowId::X11(7), Some(42), None).is_none(), "no title");
+    }
+
+    /// A close request goes back to whoever listed the window, each side in the caller's order.
+    #[test]
+    fn ids_split_by_who_listed_them() {
+        let ids = [WindowId::KWin("{2}".into()), WindowId::X11(9), WindowId::KWin("{1}".into()), WindowId::X11(3)];
+        assert_eq!(by_source(&ids), (vec![9, 3], vec!["{2}".to_string(), "{1}".to_string()]));
+        assert_eq!(by_source(&[]), (vec![], vec![]));
+    }
 
     /// The property's scale end to end: its two extremes are opaque and clear, a fraction comes
     /// back within the property's resolution, and out of range is clamped rather than wrapped.
