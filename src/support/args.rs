@@ -189,7 +189,8 @@ pub struct GgBase {
     /// Directory to search.
     #[arg(short, long, default_value = ".")]
     pub(crate) directory: PathBuf,
-    /// Don't prefix matches with line numbers (they're on by default for `gg`).
+    /// Don't prefix matches with line numbers (they're on by default for `gg`) — nor a video
+    /// subtitle's time, under `--delve`.
     #[arg(long)]
     pub(crate) no_line_number: bool,
     /// Also search inside media normally skipped as binary, by decoding known formats

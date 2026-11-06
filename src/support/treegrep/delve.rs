@@ -171,8 +171,10 @@ pub(crate) enum Place {
     Nowhere,
     /// One place for every line: a PDF's `page 3`.
     Section(String),
-    /// A place per line of the section's text, in order: a subtitle track's `eng 0:01:23`.
-    Lines(Vec<String>),
+    /// A subtitle track's lines: the track's name for every one, and each one's cue start, in
+    /// order — `English 0:01:23`. The start is a position, left out where line numbers are
+    /// (`--no-line-number`).
+    Cues { track: String, starts: Vec<String> },
 }
 
 /// The largest file decoded whole in memory (a PDF, a torrent): bigger ones — scans, mostly, whose
@@ -342,13 +344,13 @@ fn subtitle_sections(tracks: &[SubtitleTrack]) -> Result<Vec<Section>, Unread> {
         .filter_map(|(index, track)| {
             let cues = track.cues.as_ref()?;
             let name = if shared(&track.name) { format!("{} #{}", track.name, index + 1) } else { track.name.clone() };
-            let (mut text, mut places) = (Vec::new(), Vec::new());
+            let (mut text, mut starts) = (Vec::new(), Vec::new());
             for (line, start) in said_lines(cues) {
                 text.extend_from_slice(line.as_bytes());
                 text.push(b'\n');
-                places.push(format!("{name} {}", clock(start)));
+                starts.push(clock(start));
             }
-            (!places.is_empty()).then_some(Section { place: Place::Lines(places), text })
+            (!starts.is_empty()).then_some(Section { place: Place::Cues { track: name, starts }, text })
         })
         .collect())
 }
@@ -1625,10 +1627,10 @@ mod tests {
     fn placed(sections: &[Section]) -> Vec<String> {
         let mut lines = Vec::new();
         for section in sections {
-            let Place::Lines(places) = &section.place else { panic!("a subtitle line is placed on its own") };
+            let Place::Cues { track, starts } = &section.place else { panic!("a subtitle line is placed on its own") };
             let text = std::str::from_utf8(&section.text).unwrap();
-            assert_eq!(places.len(), text.lines().count(), "a place for every line: {text:?}");
-            lines.extend(places.iter().zip(text.lines()).map(|(place, line)| format!("{place}:{line}")));
+            assert_eq!(starts.len(), text.lines().count(), "a start for every line: {text:?}");
+            lines.extend(starts.iter().zip(text.lines()).map(|(start, line)| format!("{track} {start}:{line}")));
         }
         lines
     }

@@ -295,6 +295,7 @@ fn search_contents(
         denied,
         noted,
         delve: opts.delve,
+        line_number: opts.line_number,
         context: opts.context,
         save,
     };
@@ -326,6 +327,8 @@ struct Ctx<'a> {
     /// Files the end of the search has something to say of — named once it's done.
     noted: &'a NotedFiles,
     delve: bool,
+    /// Whether matches carry their line numbers — and a decoded line its position.
+    line_number: bool,
     /// Lines of context around each match — in decoded text too.
     context: usize,
     save: Option<&'a SaveSink>,
@@ -357,6 +360,9 @@ struct GgSink<'a> {
     /// Where in a decoded file the text is (`page 3`, `eng 0:01:23`), printed where a line number
     /// would be. `None` for a text file, whose lines are numbered.
     place: Option<&'a Place>,
+    /// Whether a decoded line's position — a cue's start — is printed: not under
+    /// `--no-line-number`, which leaves out a text file's line numbers too.
+    positions: bool,
     path_color: ColorSpec,
     line_color: ColorSpec,
     match_color: ColorSpec,
@@ -369,15 +375,17 @@ impl<'a> GgSink<'a> {
             buffer,
             path: path.to_string_lossy().into_owned().into_bytes(),
             place: None,
+            positions: true,
             path_color: spec(Color::Magenta, None),
             line_color: spec(named(streamgrep::LINE_NUMBER_FG), None),
             match_color: match_spec(),
         }
     }
 
-    /// The same sink, for decoded text whose lines sit at `place`.
-    fn placed(mut self, place: &'a Place) -> Self {
-        self.place = Some(place);
+    /// The same sink, for decoded text whose lines sit at `place` — their positions printed, or
+    /// not.
+    fn placed(mut self, place: &'a Place, positions: bool) -> Self {
+        (self.place, self.positions) = (Some(place), positions);
         self
     }
 
@@ -388,7 +396,11 @@ impl<'a> GgSink<'a> {
             None => line_number.map(|number| number.to_string()),
             Some(Place::Nowhere) => None,
             Some(Place::Section(place)) => Some(place.clone()),
-            Some(Place::Lines(places)) => places.get(usize::try_from(line_number?).ok()?.checked_sub(1)?).cloned(),
+            Some(Place::Cues { track, .. }) if !self.positions => Some(track.clone()),
+            Some(Place::Cues { track, starts }) => {
+                let start = starts.get(usize::try_from(line_number?).ok()?.checked_sub(1)?)?;
+                Some(format!("{track} {start}"))
+            }
         }
     }
 
@@ -674,7 +686,7 @@ fn delve_search(sections: &[delve::Section], path: &Path, buffer: &mut Buffer, c
         .after_context(ctx.context)
         .build();
     for section in sections {
-        let sink = GgSink::new(ctx.matcher, buffer, path).placed(&section.place);
+        let sink = GgSink::new(ctx.matcher, buffer, path).placed(&section.place, ctx.line_number);
         let _ = searcher.search_slice(ctx.matcher, &section.text, sink);
     }
 }
@@ -839,10 +851,13 @@ mod tests {
     /// lines too, and context never reaches from one section into the next.
     #[test]
     fn decoded_lines_print_their_place_where_a_line_number_would_go() {
-        let cue_starts = ["eng 0:00:01", "eng 0:00:04", "eng 0:00:09"].map(str::to_owned).to_vec();
+        let cue_starts = ["0:00:01", "0:00:04", "0:00:09"].map(str::to_owned).to_vec();
         let sections = [
             delve::Section { place: Place::Section("page 2".to_owned()), text: b"a match on a page\n".to_vec() },
-            delve::Section { place: Place::Lines(cue_starts), text: b"above\na match in a cue\nbelow\n".to_vec() },
+            delve::Section {
+                place: Place::Cues { track: "eng".to_owned(), starts: cue_starts },
+                text: b"above\na match in a cue\nbelow\n".to_vec(),
+            },
             delve::Section { place: Place::Nowhere, text: b"a match in a name\n".to_vec() },
         ];
         let search = Search::for_("match");
@@ -851,6 +866,13 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(buffer.as_slice()),
             "f:page 2:a match on a page\nf-eng 0:00:01-above\nf:eng 0:00:04:a match in a cue\nf-eng 0:00:09-below\nf:a match in a name\n",
+        );
+        // `--no-line-number`: a cue's start is a position, and goes; its track, and a page, stay.
+        let mut buffer = search.bufwtr.buffer();
+        delve_search(&sections, Path::new("f"), &mut buffer, &Ctx { line_number: false, ..search.ctx(1) });
+        assert_eq!(
+            String::from_utf8_lossy(buffer.as_slice()),
+            "f:page 2:a match on a page\nf-eng-above\nf:eng:a match in a cue\nf-eng-below\nf:a match in a name\n",
         );
     }
 
@@ -882,6 +904,7 @@ mod tests {
                 denied: &self.denied,
                 noted: &self.noted,
                 delve: true,
+                line_number: true,
                 context,
                 save: None,
             }

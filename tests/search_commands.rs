@@ -251,6 +251,19 @@ fn gg_names_every_file_it_set_out_to_read_but_could_not() {
     );
 }
 
+/// `--no-line-number` leaves out a subtitle hit's time — a position, like a line number — and
+/// keeps its track.
+#[test]
+fn gg_no_line_number_leaves_out_a_subtitle_hit_s_time() {
+    let tree = Tree::empty("subtitles-unnumbered");
+    fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/d-webvtt.mkv"), tree.root.join("kitchen.mkv")).unwrap();
+    fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tx3g-tracks.mp4"), tree.root.join("kitchen.mp4")).unwrap();
+    let found = stdout(&bashrs(&["gg", "--delve", "--no-line-number", "salt", "-d", tree.path()], None, None));
+    assert!(found.contains("kitchen.mkv:eng:The kitchen ran out of salt"), "{found}");
+    assert!(found.contains("kitchen.mp4:English (SDH):The kitchen ran out of salt"), "{found}");
+    assert!(!found.contains("0:00:00"), "{found}");
+}
+
 /// A hit in a video's subtitles says which track holds it and when the cue starts, where a text
 /// file's line number would be — and its context comes from the same track.
 #[test]

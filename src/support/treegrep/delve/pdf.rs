@@ -9,9 +9,9 @@
 //!   cross-reference table (stale after edits, sometimes broken outright); a later definition
 //!   replaces an earlier one, as an incremental update's does. Then the objects packed into object
 //!   streams (PDF 1.5 and later).
-//! - **Streams** — inflated (Flate, with PNG predictors) or otherwise decoded (ASCIIHex, ASCII85,
-//!   RunLength). Image codecs are never needed. LZW (files from before about 2001) and encrypted
-//!   files are not read: they yield no text, never garbage.
+//! - **Streams** — inflated (Flate, with PNG predictors) or otherwise decoded (LZW, as files from
+//!   before about 2001 compress, ASCIIHex, ASCII85, RunLength). Image codecs are never needed.
+//!   Encrypted files are not read: they yield no text, never garbage.
 //! - **Pages** — in the page tree's order, each with the resources it inherits, and the text of
 //!   the form XObjects it draws.
 //! - **Text** — each show operator's bytes, split into codes and mapped through the font: its
@@ -661,6 +661,10 @@ impl<'a> Document<'a> {
         for (index, filter) in filters.into_iter().enumerate() {
             data = match filter {
                 b"FlateDecode" | b"Fl" => inflate(&data),
+                b"LZWDecode" | b"LZW" => {
+                    let early_change = params.get(index).copied().flatten().map(|params| self.get(params, b"EarlyChange"));
+                    lzw(&data, !early_change.is_some_and(|value| value.as_number() == Some(0.0)))
+                }
                 b"ASCIIHexDecode" | b"AHx" => ascii_hex(&data),
                 b"ASCII85Decode" | b"A85" => ascii85(&data),
                 b"RunLengthDecode" | b"RL" => run_length(&data),
@@ -1710,6 +1714,71 @@ const GLYPH_NAMES: &[(&str, &str)] = &[
 
 // ---- filters --------------------------------------------------------------------------------
 
+/// LZW, as PDF (and TIFF) write it: codes 9 to 12 bits wide, high bit first; 256 clears the table
+/// and 257 ends the data. With `early_change` — the default, which only `EarlyChange 0` turns off —
+/// a code widens one code before the table needs it (pdf.js's rule: when the next code, plus one
+/// for an early change, is a power of two). A broken stream gives what decoded before the break.
+fn lzw(data: &[u8], early_change: bool) -> Vec<u8> {
+    let fresh = || (0..=255u8).map(|byte| vec![byte]).chain([Vec::new(), Vec::new()]).collect::<Vec<_>>();
+    let (mut table, mut width, mut previous): (Vec<Vec<u8>>, u32, Option<usize>) = (fresh(), 9, None);
+    let (mut codes, mut out) = (LzwCodes { bytes: data.iter(), buffer: 0, held: 0 }, Vec::new());
+    while let Some(code) = codes.take(width) {
+        let code = code as usize;
+        match code {
+            256 => {
+                (table, width, previous) = (fresh(), 9, None);
+                continue;
+            }
+            257 => break,
+            _ => {}
+        }
+        let entry = match (table.get(code), previous) {
+            (Some(entry), _) => entry.clone(),
+            // The one code an encoder sends before its decoder has it: the previous entry, then
+            // that entry's first byte again.
+            (None, Some(prior)) if code == table.len() => [&table[prior][..], &table[prior][..1]].concat(),
+            _ => break,
+        };
+        if let Some(prior) = previous.filter(|_| table.len() < 4096) {
+            table.push([&table[prior][..], &entry[..1]].concat());
+        }
+        out.extend_from_slice(&entry);
+        if out.len() as u64 > MAX_INFLATED {
+            break;
+        }
+        previous = Some(code);
+        width = match table.len() + usize::from(early_change) {
+            next if next >= 2048 => 12,
+            next if next >= 1024 => 11,
+            next if next >= 512 => 10,
+            _ => 9,
+        };
+    }
+    out
+}
+
+/// LZW's codes, read high bit first from its bytes.
+struct LzwCodes<'a> {
+    bytes: std::slice::Iter<'a, u8>,
+    /// Bits read but not yet taken: the low `held` bits of `buffer`.
+    buffer: u32,
+    held: u32,
+}
+
+impl LzwCodes<'_> {
+    /// The next `width` bits as a number, or `None` where the data ends first.
+    fn take(&mut self, width: u32) -> Option<u32> {
+        while self.held < width {
+            self.buffer = self.buffer << 8 | u32::from(*self.bytes.next()?);
+            self.held += 8;
+        }
+        self.held -= width;
+        let code = self.buffer >> self.held;
+        self.buffer &= (1 << self.held) - 1;
+        Some(code)
+    }
+}
+
 /// Flate: zlib, or — as some writers leave it — bare deflate. A broken or truncated stream gives
 /// what inflated before the break.
 fn inflate(data: &[u8]) -> Vec<u8> {
@@ -2097,5 +2166,32 @@ mod tests {
         assert_eq!(ascii85(b"<~87cURD]i,\"Ebo7~>"), b"Hello World");
         assert_eq!(run_length(&[2, b'a', b'b', b'c', 254, b'z', 128]), b"abczzz");
         assert_eq!(inflate(&deflated(b"inflated")), b"inflated");
+    }
+
+    /// The PDF specification's own LZW example (ISO 32000-1, 7.4.4.2) — the very bytes libtiff's
+    /// encoder writes for it too — and the same cut short: what decoded before the cut.
+    #[test]
+    fn lzw_decodes_the_specification_s_example() {
+        let encoded = [0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01];
+        assert_eq!(lzw(&encoded, true), [45, 45, 45, 45, 45, 65, 45, 45, 45, 66]);
+        assert_eq!(lzw(&encoded[..5], true), [45; 5], "four codes, and part of a fifth");
+    }
+
+    /// A page of 500 lines whose content stream libtiff's encoder compressed — long enough for
+    /// its codes to grow to 12 bits and its table to fill and be cleared — read back whole.
+    #[test]
+    fn an_lzw_compressed_page_reads_whole() {
+        let bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lzw-text.pdf"));
+        let [page] = &pages(bytes)[..] else { panic!("one page") };
+        let lines: Vec<&str> = page.lines().collect();
+        assert_eq!(lines.len(), 500, "{page}");
+        assert_eq!(lines[0], "Line 0001: basil chef table bread oven mint rice noon");
+        assert_eq!(lines[249], "Line 0250: cheese menu rice flour pepper tomato broth thyme");
+        assert_eq!(lines[499], "Line 0500: oven tomato butter honey oven lemon table tomato");
+        // `EarlyChange 0` widens codes a code later: the same stream then reads differently.
+        let start = memmem::find(bytes, b"stream\n").unwrap() + "stream\n".len();
+        let stream = &bytes[start..memmem::rfind(bytes, b"\nendstream").unwrap()];
+        assert!(lzw(stream, true).starts_with(b"BT /F1 9 Tf"));
+        assert_ne!(lzw(stream, false), lzw(stream, true));
     }
 }
