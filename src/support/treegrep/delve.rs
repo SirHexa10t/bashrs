@@ -169,7 +169,8 @@ pub(crate) struct Section {
 pub(crate) enum Place {
     /// Nowhere worth naming: a torrent's names.
     Nowhere,
-    /// One place for every line: a PDF's `page 3`.
+    /// One place for every line: a PDF's `page 3`. A position, left out where line numbers are
+    /// (`--no-line-number`).
     Section(String),
     /// A subtitle track's lines: the track's name for every one, and each one's cue start, in
     /// order — `English 0:01:23`. The start is a position, left out where line numbers are

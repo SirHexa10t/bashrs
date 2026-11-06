@@ -251,6 +251,16 @@ fn gg_names_every_file_it_set_out_to_read_but_could_not() {
     );
 }
 
+/// `--no-line-number` leaves out a PDF hit's page — a position, like a line number.
+#[test]
+fn gg_no_line_number_leaves_out_a_pdf_hit_s_page() {
+    let tree = Tree::empty("pdf-unnumbered");
+    fs::write(tree.root.join("order.pdf"), two_page_pdf(&["Nothing to see"], &["The Chute arrives"])).unwrap();
+    let found = stdout(&bashrs(&["gg", "--no-line-number", "Chute", "-d", tree.path()], None, None));
+    assert!(found.contains("order.pdf:The Chute arrives"), "{found}");
+    assert!(!found.contains("page 2"), "{found}");
+}
+
 /// `--no-line-number` leaves out a subtitle hit's time — a position, like a line number — and
 /// keeps its track.
 #[test]

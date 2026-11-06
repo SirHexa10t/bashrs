@@ -360,7 +360,7 @@ struct GgSink<'a> {
     /// Where in a decoded file the text is (`page 3`, `eng 0:01:23`), printed where a line number
     /// would be. `None` for a text file, whose lines are numbered.
     place: Option<&'a Place>,
-    /// Whether a decoded line's position — a cue's start — is printed: not under
+    /// Whether a decoded line's position — a PDF's page, a cue's start — is printed: not under
     /// `--no-line-number`, which leaves out a text file's line numbers too.
     positions: bool,
     path_color: ColorSpec,
@@ -395,7 +395,7 @@ impl<'a> GgSink<'a> {
         match self.place {
             None => line_number.map(|number| number.to_string()),
             Some(Place::Nowhere) => None,
-            Some(Place::Section(place)) => Some(place.clone()),
+            Some(Place::Section(place)) => self.positions.then(|| place.clone()),
             Some(Place::Cues { track, .. }) if !self.positions => Some(track.clone()),
             Some(Place::Cues { track, starts }) => {
                 let start = starts.get(usize::try_from(line_number?).ok()?.checked_sub(1)?)?;
@@ -867,12 +867,12 @@ mod tests {
             String::from_utf8_lossy(buffer.as_slice()),
             "f:page 2:a match on a page\nf-eng 0:00:01-above\nf:eng 0:00:04:a match in a cue\nf-eng 0:00:09-below\nf:a match in a name\n",
         );
-        // `--no-line-number`: a cue's start is a position, and goes; its track, and a page, stay.
+        // `--no-line-number`: a page and a cue's start are positions, and go; a track stays.
         let mut buffer = search.bufwtr.buffer();
         delve_search(&sections, Path::new("f"), &mut buffer, &Ctx { line_number: false, ..search.ctx(1) });
         assert_eq!(
             String::from_utf8_lossy(buffer.as_slice()),
-            "f:page 2:a match on a page\nf-eng-above\nf:eng:a match in a cue\nf-eng-below\nf:a match in a name\n",
+            "f:a match on a page\nf-eng-above\nf:eng:a match in a cue\nf-eng-below\nf:a match in a name\n",
         );
     }
 
