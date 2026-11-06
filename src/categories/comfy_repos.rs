@@ -141,7 +141,8 @@ mod commands {
     /// the active set (naming a directory takes every `.toml` directly inside it, in name order);
     /// naming nothing applies the profile store, ~/.bashrs/user-custom/sequencer. The first
     /// invocation becomes the manager and later ones add to it; in a Wayland session the manager
-    /// asks sudo for the keyboards, dropping root straight after (sequencer profile-apply)
+    /// asks sudo for the keyboards, dropping root straight after — or, with `-n`, runs on X11's
+    /// grabs without asking (sequencer profile-apply)
     #[name("autokey_apply")]
     pub fn autokey_apply(mut args: sequencer::ProfileApplyArgs) {
         // Upstream requires at least one FILE; this shell relaxes that (`cli::OPTIONAL_ARGS`)

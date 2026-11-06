@@ -201,6 +201,9 @@ fn gg_names_every_encrypted_pdf_it_could_not_read() {
 
 /// Every file `gg` set out to read but couldn't is named once the search is done, grouped by why:
 /// what they are, why, and — where something would — what would have the next search read them.
+/// A file named like a format it isn't — an INI file Microsoft's SMS named `.pdf`, a web page a
+/// failed download saved as one — is searched like any other file, and named under a heading
+/// saying so.
 #[test]
 fn gg_names_every_file_it_set_out_to_read_but_could_not() {
     let tree = Tree::empty("unsearched");
@@ -209,12 +212,17 @@ fn gg_names_every_file_it_set_out_to_read_but_could_not() {
     fs::write(tree.root.join("open.pdf"), &pdf).unwrap();
     fs::write(tree.root.join("locked.pdf"), locked).unwrap();
     fs::write(tree.root.join("scan.pdf"), two_page_pdf(&[], &[])).unwrap();
+    fs::write(tree.root.join("broken.pdf"), "%PDF-1.4\n%%EOF\n").unwrap();
+    fs::write(tree.root.join("book.pdf"), "%PDF-1.4\n").unwrap();
+    fs::OpenOptions::new().write(true).open(tree.root.join("book.pdf")).unwrap().set_len(300 << 20).unwrap(); // sparse: never read
     fs::write(tree.root.join("error.pdf"), "<html>404 Not Found</html>").unwrap();
-    fs::File::create(tree.root.join("book.pdf")).unwrap().set_len(300 << 20).unwrap(); // sparse: its bytes are never read
+    fs::write(tree.root.join("package.pdf"), "[PDF]\nVersion = 2.0\n[Setup]\nCommandLine = install the Chute\n").unwrap();
     fs::write(tree.root.join("movie.mkv"), "not a video").unwrap();
 
     let out = bashrs(&["gg", "--delve", "chute", "-d", tree.path()], None, None);
-    assert!(stdout(&out).contains("open.pdf:page 1:The Chute arrives"), "{}", stdout(&out));
+    let found = stdout(&out);
+    assert!(found.contains("open.pdf:page 1:The Chute arrives"), "{found}");
+    assert!(found.contains("package.pdf:4:CommandLine = install the Chute"), "searched as the text it is: {found}");
     let at = |name: &str| format!("  {}", tree.root.join(name).display());
     let err = stderr(&out);
     let named: Vec<&str> = err.lines().skip_while(|line| !line.contains(" skipped (")).collect();
@@ -230,8 +238,14 @@ fn gg_names_every_file_it_set_out_to_read_but_could_not() {
             "1 file(s) skipped (over 256 MiB — too big to decode):".to_owned(),
             at("book.pdf"),
             String::new(),
-            "2 file(s) skipped (damaged, cut short, or not what its name says):".to_owned(),
+            "1 file(s) skipped (damaged or cut short):".to_owned(),
+            at("broken.pdf"),
+            String::new(),
+            "2 file(s) named as a PDF, but not one — searched like any other file:".to_owned(),
             at("error.pdf"),
+            at("package.pdf"),
+            String::new(),
+            "1 file(s) named as a Matroska file, but not one — searched like any other file:".to_owned(),
             at("movie.mkv"),
         ],
     );

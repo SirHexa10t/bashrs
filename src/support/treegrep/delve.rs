@@ -3,7 +3,9 @@
 //! (treegrep), whose `scan_file` searches what they decode; `pub(crate)` because the AI-fingerprint
 //! scan (`detect_ai_textual_fingerprint`) reads files through [`extract`] too. One decoder per
 //! format; [`extract`] dispatches on the [`Format`] a file's extension names, so adding a format is
-//! a `Format` row, a decoder and a dispatch arm. Files with no decoder return `None` and stay
+//! a `Format` row, a decoder and a dispatch arm — and decodes a file only when it starts like that
+//! format ([`Format::starts`]): one named like a format it isn't comes back [`Decoded::Misnamed`],
+//! for the caller to search like any other file. Files with no decoder return `None` and stay
 //! skipped (no raw `strings`-style fallback — that's the noisy, slow approach `gg` deliberately
 //! avoids).
 //!
@@ -22,7 +24,9 @@
 //!   fragments (fragmented) and read from `mdat`.
 //!
 //! A video's subtitle lines are placed as its player lists them: by their track — its title, else
-//! its language — and the second their cue starts (`English (SDH) 0:01:23`). A file whose text
+//! its language — and the second their cue starts (`English (SDH) 0:01:23`). Each line comes once,
+//! as it is said: rolling captions' repeats left out, and a line marked with tags (YouTube's word
+//! times) followed by its clean copy. ASS/SSA events give their dialogue alone. A file whose text
 //! can't be read comes back saying why ([`Unread`]: encrypted, a scan, picture subtitles, too big,
 //! damaged), for the search to name it rather than pass over it in silence.
 
@@ -34,7 +38,7 @@ use std::path::Path;
 mod pdf;
 
 /// A format [`extract`] decodes, told by the file's extension.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Format {
     Pdf,
     Torrent,
@@ -67,7 +71,41 @@ impl Format {
     pub(crate) fn is_read_whole(self) -> bool {
         matches!(self, Self::Pdf | Self::Torrent)
     }
+
+    /// Whether a file whose first bytes are `head` (up to [`SIGNATURE_SPAN`] of them) starts like
+    /// this format. One named like it that doesn't is something else: an INI file Microsoft's SMS
+    /// named `.pdf`, a web page a failed download saved as one.
+    fn starts(self, head: &[u8]) -> bool {
+        match self {
+            // Where PDF readers look for the header: anywhere in the first 1024 bytes.
+            Self::Pdf => memchr::memmem::find(head, b"%PDF-").is_some(),
+            // A bencoded dictionary: `d`, then its first key's length.
+            Self::Torrent => head.first() == Some(&b'd') && head.get(1).is_some_and(u8::is_ascii_digit),
+            // The EBML header's ID.
+            Self::Matroska => head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]),
+            // A top-level box, its type after its size.
+            Self::Mp4 => head.get(4..8).is_some_and(|kind| MP4_OPENERS.iter().any(|opener| kind == opener.as_slice())),
+        }
+    }
+
+    /// The format as a person names it — what a file named like it, but starting otherwise, isn't.
+    pub(crate) fn described(self) -> &'static str {
+        match self {
+            Self::Pdf => "a PDF",
+            Self::Torrent => "a torrent",
+            Self::Matroska => "a Matroska file",
+            Self::Mp4 => "an MP4 file",
+        }
+    }
 }
+
+/// How far into a file [`Format::starts`] looks: PDF readers take a `%PDF-` header anywhere in the
+/// first 1024 bytes; the other formats' signatures open the file.
+const SIGNATURE_SPAN: usize = 1024;
+
+/// The box types an ISO-BMFF file opens with: MP4's `ftyp`; QuickTime's `moov`, `mdat`, `free`,
+/// `skip`, `wide` and `pnot`; a fragment's `styp`, `sidx` and `moof`.
+const MP4_OPENERS: [&[u8; 4]; 10] = [b"ftyp", b"moov", b"mdat", b"free", b"skip", b"wide", b"pnot", b"styp", b"sidx", b"moof"];
 
 /// What [`extract`] made of a file it could read.
 pub(crate) enum Decoded {
@@ -75,6 +113,9 @@ pub(crate) enum Decoded {
     Text(Vec<Section>),
     /// Text it couldn't get at, and why.
     Unread(Unread),
+    /// Named like this format, but not starting like it: something else, for the caller to search
+    /// like any other file — and to say so.
+    Misnamed(Format),
 }
 
 impl From<Result<Vec<Section>, Unread>> for Decoded {
@@ -97,7 +138,8 @@ pub(crate) enum Unread {
     PictureSubtitles,
     /// Bigger than [`MAX_WHOLE`], so not decoded.
     TooLarge,
-    /// Not readable as the format its name says: damaged, cut short, or misnamed.
+    /// Starting like its format, but not readable as it: damaged, or cut short before what says
+    /// what it holds.
     Damaged,
 }
 
@@ -109,7 +151,7 @@ impl Unread {
             Self::NoText => "no text — a scan?".to_owned(),
             Self::PictureSubtitles => "subtitles are pictures".to_owned(),
             Self::TooLarge => format!("over {} MiB — too big to decode", MAX_WHOLE >> 20),
-            Self::Damaged => "damaged, cut short, or not what its name says".to_owned(),
+            Self::Damaged => "damaged or cut short".to_owned(),
         }
     }
 }
@@ -148,21 +190,32 @@ pub(crate) fn extract(path: &Path, delving: bool) -> Option<io::Result<Decoded>>
     (delving || format.is_document()).then(|| decode(path, format))
 }
 
-/// Decode `path` as `format`.
+/// Decode `path` as `format`, if it starts like one ([`Format::starts`]).
 fn decode(path: &Path, format: Format) -> io::Result<Decoded> {
-    if format.is_read_whole() && std::fs::metadata(path)?.len() > MAX_WHOLE {
+    let mut file = File::open(path)?;
+    let mut head = [0u8; SIGNATURE_SPAN];
+    let read = fill(&mut file, &mut head)?;
+    if !format.starts(&head[..read]) {
+        return Ok(Decoded::Misnamed(format));
+    }
+    if format.is_read_whole() && file.metadata()?.len() > MAX_WHOLE {
         return Ok(Decoded::Unread(Unread::TooLarge));
     }
+    file.rewind()?;
+    let whole = |mut file: File| {
+        let mut data = Vec::new();
+        file.read_to_end(&mut data).map(|_| data)
+    };
     Ok(match format {
-        Format::Pdf => pdf_pages(&std::fs::read(path)?).into(),
-        Format::Torrent => torrent_names(&std::fs::read(path)?).into(),
-        Format::Matroska => video_text(matroska_subtitles(io::BufReader::with_capacity(128 * 1024, File::open(path)?)))?,
-        Format::Mp4 => video_text(mp4_subtitles(File::open(path)?))?,
+        Format::Pdf => pdf_pages(&whole(file)?).into(),
+        Format::Torrent => torrent_names(&whole(file)?).into(),
+        Format::Matroska => video_text(matroska_subtitles(io::BufReader::with_capacity(128 * 1024, file)))?,
+        Format::Mp4 => video_text(mp4_subtitles(file))?,
     })
 }
 
 /// A video's subtitles as decoded text — or as damaged, where its decoder met bytes that aren't the
-/// format (or that end) before its track list. An error reading the bytes stays an error.
+/// format, or the end, before its track list. An error reading the bytes stays an error.
 fn video_text(tracks: io::Result<Vec<SubtitleTrack>>) -> io::Result<Decoded> {
     match tracks {
         Ok(tracks) => Ok(subtitle_sections(&tracks).into()),
@@ -273,11 +326,11 @@ struct Cue {
     text: String,
 }
 
-/// One section per text track with any cue, in the video's track order: its cues' lines, blank
-/// ones left out, each placed by the track's name and its cue's start — `English 0:01:23`. Where
-/// two text tracks share a name, each is numbered by its place among the video's subtitle tracks,
-/// as a player's menu counts them (`English #2`). A video whose only subtitles are pictures is
-/// [`Unread::PictureSubtitles`]; one with none has nothing to read.
+/// One section per text track with any cue, in the video's track order: its lines as they are
+/// said ([`said_lines`]), each placed by the track's name and its cue's start — `English 0:01:23`.
+/// Where two text tracks share a name, each is numbered by its place among the video's subtitle
+/// tracks, as a player's menu counts them (`English #2`). A video whose only subtitles are
+/// pictures is [`Unread::PictureSubtitles`]; one with none has nothing to read.
 fn subtitle_sections(tracks: &[SubtitleTrack]) -> Result<Vec<Section>, Unread> {
     if !tracks.is_empty() && tracks.iter().all(|track| track.cues.is_none()) {
         return Err(Unread::PictureSubtitles);
@@ -290,17 +343,97 @@ fn subtitle_sections(tracks: &[SubtitleTrack]) -> Result<Vec<Section>, Unread> {
             let cues = track.cues.as_ref()?;
             let name = if shared(&track.name) { format!("{} #{}", track.name, index + 1) } else { track.name.clone() };
             let (mut text, mut places) = (Vec::new(), Vec::new());
-            for cue in cues {
-                let place = format!("{name} {}", clock(cue.start));
-                for line in cue.text.lines().filter(|line| !line.trim().is_empty()) {
-                    text.extend_from_slice(line.as_bytes());
-                    text.push(b'\n');
-                    places.push(place.clone());
-                }
+            for (line, start) in said_lines(cues) {
+                text.extend_from_slice(line.as_bytes());
+                text.push(b'\n');
+                places.push(format!("{name} {}", clock(start)));
             }
             (!places.is_empty()).then_some(Section { place: Place::Lines(places), text })
         })
         .collect())
+}
+
+/// A track's lines as they are said, each with its cue's start: every cue's lines in order, but
+/// for blank ones and roll-up copies — a line repeating one of the cue just before it, as
+/// YouTube's auto-captions show each line three times (word by word while it is said, alone for
+/// 10 ms, then above the next line). A marked line — word times, styling, character references —
+/// is followed by its clean copy ([`clean_cue_line`]) at its own time, so a phrase is found across
+/// its tags. A line said again later is said again: kept.
+fn said_lines(cues: &[Cue]) -> Vec<(String, u64)> {
+    let (mut said, mut previous) = (Vec::new(), Vec::new());
+    for cue in cues {
+        let mut shown = Vec::new();
+        for line in cue.text.lines() {
+            let clean = clean_cue_line(line);
+            if clean.trim().is_empty() {
+                continue;
+            }
+            if !previous.contains(&clean) {
+                said.push((line.to_owned(), cue.start));
+                if clean != line {
+                    said.push((clean.clone(), cue.start));
+                }
+            }
+            shown.push(clean);
+        }
+        previous = shown;
+    }
+    said
+}
+
+/// A cue line as it reads on screen: its tags gone — WebVTT's and SRT's alike (`<i>`,
+/// `<c.yellow>`, `<v Roger>`, `<font color="red">`, YouTube's word times `<00:00:03.590>`) — and
+/// its character references made characters (`&amp;`, `&lt;`, `&#39;`; `&nbsp;` a plain space,
+/// the invisible direction marks `&lrm;` and `&rlm;` dropped). A `<` or `&` opening neither stays.
+fn clean_cue_line(line: &str) -> String {
+    let (mut clean, mut rest) = (String::with_capacity(line.len()), line);
+    while let Some(at) = rest.find(['<', '&']) {
+        clean.push_str(&rest[..at]);
+        rest = &rest[at..];
+        if let Some(length) = tag_length(rest) {
+            rest = &rest[length..];
+        } else if let Some((character, length)) = character_reference(rest) {
+            clean.extend(character);
+            rest = &rest[length..];
+        } else {
+            clean.push_str(&rest[..1]);
+            rest = &rest[1..];
+        }
+    }
+    clean.push_str(rest);
+    clean
+}
+
+/// The length of the tag `text` opens with — `<`, then a letter, a `/` or a digit (a word time),
+/// up to its `>` — if it opens one.
+fn tag_length(text: &str) -> Option<usize> {
+    let opener = text.strip_prefix('<')?.chars().next()?;
+    (opener.is_ascii_alphanumeric() || opener == '/').then_some(())?;
+    Some(text.find('>')? + 1)
+}
+
+/// The character the reference `text` opens with stands for — `None` for an invisible direction
+/// mark — and the reference's length, if it opens one this knows.
+fn character_reference(text: &str) -> Option<(Option<char>, usize)> {
+    let end = text.find(';')?;
+    let character = match &text[1..end] {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some(' '),
+        "lrm" | "rlm" => None,
+        name => {
+            let number = name.strip_prefix('#')?;
+            let code = match number.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => number.parse().ok()?,
+            };
+            Some(char::from_u32(code)?)
+        }
+    };
+    Some((character, end + 1))
 }
 
 /// `seconds` as the clock time a player seeks to, `H:MM:SS`.
@@ -561,8 +694,11 @@ fn children(body: &[u8]) -> impl Iterator<Item = (u64, &[u8])> {
 /// How a Matroska text subtitle track lays its text out in a block's frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum TextCodec {
-    /// `S_TEXT/*` (SRT's `UTF8`, ASS/SSA, `WEBVTT`): the frame is the text.
+    /// `S_TEXT/*` (SRT's `UTF8`, `WEBVTT`): the frame is the text.
     SText,
+    /// `S_TEXT/ASS` and `S_TEXT/SSA` (and the older `S_ASS`, `S_SSA`): the frame is an event's
+    /// fields, its text last — see [`ass_dialogue`].
+    Ass,
     /// `D_WEBVTT/*`, WebM's WebVTT — which ffmpeg writes into `.mkv` too, so it is what YouTube
     /// subtitles embedded by yt-dlp arrive as. The frame starts with the cue's identifier line and
     /// settings line (`align:start position:0%`), both always present even when empty; the cue
@@ -574,7 +710,9 @@ enum TextCodec {
 impl TextCodec {
     /// The family of a track's `CodecID`, if it is a text one.
     fn of(codec_id: &str) -> Option<Self> {
-        if codec_id.starts_with("S_TEXT") {
+        if ["S_TEXT/ASS", "S_TEXT/SSA", "S_ASS", "S_SSA"].iter().any(|ass| codec_id.starts_with(ass)) {
+            Some(Self::Ass)
+        } else if codec_id.starts_with("S_TEXT") {
             Some(Self::SText)
         } else if codec_id.starts_with("D_WEBVTT/") {
             Some(Self::WebmVtt)
@@ -583,13 +721,47 @@ impl TextCodec {
         }
     }
 
-    /// The text a block's frame carries.
-    fn text(self, frame: &[u8]) -> &[u8] {
+    /// The text a block's frame carries — as far as it goes, should the file end inside it (see
+    /// [`utf8_text`]).
+    fn text(self, frame: &[u8]) -> Option<String> {
         match self {
-            Self::SText => frame,
-            Self::WebmVtt => after_two_lines(frame),
+            Self::SText => utf8_text(frame).map(str::to_owned),
+            Self::Ass => utf8_text(frame).map(ass_dialogue),
+            Self::WebmVtt => utf8_text(after_two_lines(frame)).map(str::to_owned),
         }
     }
+}
+
+/// What an ASS/SSA event says: its `Text`, the last of the nine fields its Matroska frame holds
+/// (`ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text` — SSA's `Marked` in place of
+/// `Layer`), without its override blocks (`{\i1}`, and `{comments}` alike) or its drawings
+/// (`{\p1}m 0 0 l …{\p0}`), its `\N` line breaks made lines and its `\n`, `\h` spaces. A frame
+/// of fewer fields is taken whole, and a `{` never closed is text.
+fn ass_dialogue(frame: &str) -> String {
+    let (mut said, mut drawing) = (String::new(), false);
+    let mut rest = frame.splitn(9, ',').nth(8).unwrap_or(frame);
+    while let Some(open) = rest.find('{') {
+        let Some(length) = rest[open..].find('}') else { break };
+        if !drawing {
+            said.push_str(&rest[..open]);
+        }
+        drawing = drawing_after(&rest[open + 1..open + length], drawing);
+        rest = &rest[open + length + 1..];
+    }
+    if !drawing {
+        said.push_str(rest);
+    }
+    said.replace("\\N", "\n").replace("\\n", " ").replace("\\h", " ")
+}
+
+/// Whether what follows an ASS override block is a drawing: its last `\p<scale>` tag says — on
+/// above 0, off at 0 — and a block without one leaves it as it was.
+fn drawing_after(block: &str, drawing: bool) -> bool {
+    block
+        .split('\\')
+        .filter_map(|tag| tag.strip_prefix('p')?.parse::<u32>().ok())
+        .next_back()
+        .map_or(drawing, |scale| scale > 0)
 }
 
 /// What follows `frame`'s first two lines (a WebVTT line ends at CRLF, LF or CR) — nothing when
@@ -716,8 +888,8 @@ fn read_subtitle_frame<R: BufRead + Seek>(r: &mut R, rest: u64, codec: TextCodec
     buf.truncate(read);
     // lacing bits (flags & 0x06) == 0 means a single plain frame; buf[3..] is the frame.
     if buf.len() > 3 && buf[2] & 0x06 == 0 {
-        if let Some(text) = utf8_text(codec.text(&buf[3..])) {
-            return Ok(Some((i16::from_be_bytes([buf[0], buf[1]]), text.to_owned())));
+        if let Some(text) = codec.text(&buf[3..]) {
+            return Ok(Some((i16::from_be_bytes([buf[0], buf[1]]), text)));
         }
     }
     Ok(None)
@@ -1752,19 +1924,56 @@ mod tests {
         assert_eq!(unread("receipt.pdf", pdf("BT /F1 12 Tf (Paid) Tj ET", open).as_bytes(), false), None, "it has text");
         assert_eq!(unread("locked.pdf", pdf("BT /F1 12 Tf (Paid) Tj ET", "<< /Root 1 0 R /Encrypt << /Filter /Standard >> >>").as_bytes(), false), Some(Unread::Encrypted));
         assert_eq!(unread("scan.pdf", pdf("0 0 m 100 100 l S", open).as_bytes(), false), Some(Unread::NoText), "a line drawn, no text");
-        assert_eq!(unread("error.pdf", b"<html>404 Not Found</html>", false), Some(Unread::Damaged), "a web page saved as a PDF");
+        // Starting like their format, but not readable as it.
+        assert_eq!(unread("broken.pdf", b"%PDF-1.4\n%%EOF\n", false), Some(Unread::Damaged), "no page in it");
         assert_eq!(unread("cut.torrent", b"d4:name5:hel", true), Some(Unread::Damaged), "cut short");
-        assert_eq!(unread("movie.mkv", b"not a video", true), Some(Unread::Damaged));
-        assert_eq!(unread("movie.mp4", b"not a video", true), Some(Unread::Damaged));
-        // Too big to hold, told from its size alone: a sparse file, its bytes never read.
+        assert_eq!(unread("cut.mkv", &[0x1A, 0x45, 0xDF, 0xA3], true), Some(Unread::Damaged), "cut before its track list");
+        assert_eq!(unread("cut.mp4", b"\0\0\0\x20ftypisom", true), Some(Unread::Damaged), "cut before its index");
+        // Named like a format, but not starting like it: something else, searched like any other file.
+        let misnamed = |name: &str, contents: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, contents).unwrap();
+            match extract(&path, true) {
+                Some(Ok(Decoded::Misnamed(format))) => Some(format),
+                _ => None,
+            }
+        };
+        assert_eq!(misnamed("error.pdf", b"<html>404 Not Found</html>"), Some(Format::Pdf), "a web page saved as a PDF");
+        assert_eq!(misnamed("notes.torrent", b"dear diary"), Some(Format::Torrent));
+        assert_eq!(misnamed("movie.mkv", b"not a video"), Some(Format::Matroska));
+        assert_eq!(misnamed("movie.mp4", b"not a video"), Some(Format::Mp4));
+        // Too big to hold, told from its size alone: a PDF's header, then a sparse file's zeros.
         let huge = dir.join("scan-of-a-book.pdf");
-        std::fs::File::create(&huge).unwrap().set_len(MAX_WHOLE + 1).unwrap();
+        std::fs::write(&huge, "%PDF-1.4\n").unwrap();
+        std::fs::OpenOptions::new().write(true).open(&huge).unwrap().set_len(MAX_WHOLE + 1).unwrap();
         assert!(matches!(extract(&huge, false), Some(Ok(Decoded::Unread(Unread::TooLarge)))));
         // Media without `--delve` is left alone by choice — nothing to name.
         assert!(extract(&dir.join("movie.mkv"), false).is_none());
         // A file that can't be read at all is the caller's to report.
         assert!(matches!(extract(&dir.join("gone.pdf"), false), Some(Err(err)) if err.kind() == io::ErrorKind::NotFound));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each format is known by how it starts, as the programs that read it know it.
+    #[test]
+    fn a_file_starts_like_its_format_or_is_something_else() {
+        let pdf_late = [vec![b' '; SIGNATURE_SPAN], b"%PDF-1.4".to_vec()].concat();
+        for (format, head, starts) in [
+            (Format::Pdf, &b"%PDF-1.7\n"[..], true),
+            (Format::Pdf, b"\xEF\xBB\xBFjunk a reader skips\n%PDF-1.4", true),
+            (Format::Pdf, &pdf_late[..SIGNATURE_SPAN], false), // past where readers look
+            (Format::Pdf, b"[PDF]\r\nVersion = 2.0\r\n[Package Definition]", false), // Microsoft SMS's
+            (Format::Torrent, b"d8:announce35:udp://tracker.example:1337", true),
+            (Format::Torrent, b"dear diary", false),
+            (Format::Matroska, &[0x1A, 0x45, 0xDF, 0xA3, 0x9F], true),
+            (Format::Matroska, b"not a video", false),
+            (Format::Mp4, b"\0\0\0\x20ftypisom", true),
+            (Format::Mp4, b"\0\0\0\x08wide\0\0\x10\0mdat", true), // QuickTime
+            (Format::Mp4, b"not a video", false),
+            (Format::Mp4, b"", false),
+        ] {
+            assert_eq!(format.starts(head), starts, "{format:?}: {:?}", String::from_utf8_lossy(head));
+        }
     }
 
     /// Once its track list is read, a video is read as it is: cut short — even inside a cue — its
@@ -1815,6 +2024,90 @@ mod tests {
     }
 
     #[test]
+    fn rolling_captions_give_each_line_once_marked_then_once_clean() {
+        // YouTube-style auto-captions, muxed by ffmpeg: each line shows in three cues — word by
+        // word while it is said (its words timed by tags), alone for 10 ms, then above the next
+        // line. "the kitchen opens at noon" is said again six seconds on; `&amp;` is a character
+        // reference.
+        let bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rollup-webvtt.mkv"));
+        let marked = |words: &[(&str, &str)]| {
+            words.iter().map(|(time, word)| if time.is_empty() { (*word).to_owned() } else { format!("<{time}><c> {word}</c>") }).collect::<String>()
+        };
+        let noon = |at: u32| marked(&[("", "the"), (&format!("00:00:0{}.400", at), "kitchen"), (&format!("00:00:0{}.800", at), "opens"), (&format!("00:00:0{}.200", at + 1), "at"), (&format!("00:00:0{}.600", at + 1), "noon")]);
+        let salt = marked(&[("", "bring"), ("00:00:03.400", "your"), ("00:00:03.800", "own"), ("00:00:04.200", "salt")]) + " &amp; pepper";
+        let place = |at: &str, line: &str| format!("English (auto-generated) {at}:{line}");
+        assert_eq!(
+            lines(matroska_subtitles(io::Cursor::new(&bytes[..]))),
+            [
+                place("0:00:00", &noon(0)),
+                place("0:00:00", "the kitchen opens at noon"),
+                place("0:00:03", &salt),
+                place("0:00:03", "bring your own salt & pepper"),
+                place("0:00:06", &noon(6)),
+                place("0:00:06", "the kitchen opens at noon"),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_cue_line_reads_clean_without_its_tags_and_references() {
+        assert_eq!(clean_cue_line("? <00:00:03.590><c>Do </c><00:00:03.940><c>you</c>"), "? Do you");
+        assert_eq!(clean_cue_line("<v Roger><i>Hi</i></v> <c.yellow>there</c>"), "Hi there");
+        assert_eq!(clean_cue_line(r#"<font color="red">Stop</font>"#), "Stop");
+        assert_eq!(clean_cue_line("salt &amp; pepper &lt;3 &#39;n&#x27; &nbsp;x&lrm;"), "salt & pepper <3 'n'  x");
+        // What opens neither a tag nor a reference stays.
+        assert_eq!(clean_cue_line("a < b & c &unknown; d <3"), "a < b & c &unknown; d <3");
+    }
+
+    #[test]
+    fn a_marked_line_is_followed_by_its_clean_copy_in_any_format() {
+        // An SRT-style italic line, then a plain one: only the marked one gets a clean copy.
+        let cues = [
+            Cue { start: 1, text: "<i>Hello</i> there".to_owned() },
+            Cue { start: 2, text: "General Kenobi".to_owned() },
+        ];
+        let said = said_lines(&cues);
+        let said: Vec<(&str, u64)> = said.iter().map(|(line, start)| (line.as_str(), *start)).collect();
+        assert_eq!(said, [("<i>Hello</i> there", 1), ("Hello there", 1), ("General Kenobi", 2)]);
+    }
+
+    #[test]
+    fn an_ass_track_s_cues_are_what_is_said_alone() {
+        // Four events ffmpeg muxed from a script of its own (`S_TEXT/ASS`). Each frame is
+        // `ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text`, and the text carries
+        // override tags, a comment, line breaks (`\N`, `\h`) and a vector drawing.
+        let bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ass-tracks.mkv"));
+        // Before: the frames hold all of that…
+        let raw = ["0,0,Default,Chef,0,0,0,,", "{\\i1}", "{a note to the typesetter}", "\\N", "{\\p1}m 0 0 l 100 0"];
+        for part in raw {
+            assert!(memchr::memmem::find(bytes, part.as_bytes()).is_some(), "the fixture holds {part}");
+        }
+        // …after: what is said, and nothing else.
+        assert_eq!(
+            lines(matroska_subtitles(io::Cursor::new(&bytes[..]))),
+            [
+                "eng 0:00:01:Welcome, the kitchen is open",
+                "eng 0:00:04:Salt, pepper",
+                "eng 0:00:04:and a pinch of thyme",
+                "eng 0:00:07:TODAY'S SPECIAL",
+                "eng 0:00:10:Menu",
+            ],
+        );
+    }
+
+    #[test]
+    fn an_ass_event_s_text_is_its_last_field_without_what_isn_t_said() {
+        // SSA's `Marked` stands where ASS's `Layer` does: the text is the ninth field either way.
+        assert_eq!(ass_dialogue("0,Marked=0,Default,,0,0,0,,Fine, thanks"), "Fine, thanks");
+        // A drawing switched off and on again within one block; a baseline tag that isn't one.
+        assert_eq!(ass_dialogue("0,0,Sign,,0,0,0,,{\\p2}m 0 0{\\pbo10\\p0}Open{\\p1}l 5 5"), "Open");
+        // A `{` never closed is shown as it is.
+        assert_eq!(ass_dialogue("0,0,Default,,0,0,0,,3 { 4"), "3 { 4");
+        // Too few fields to be an event: taken whole.
+        assert_eq!(ass_dialogue("just text"), "just text");
+    }
+
+    #[test]
     fn a_webm_webvtt_frame_s_text_follows_two_lines_ended_any_webvtt_way() {
         assert_eq!(after_two_lines(b"id\nalign:start\ncue text"), b"cue text");
         assert_eq!(after_two_lines(b"\n\ncue text"), b"cue text"); // both lines are there even empty
@@ -1828,7 +2121,9 @@ mod tests {
     #[test]
     fn subtitle_codecs_are_read_only_when_they_carry_text() {
         assert_eq!(TextCodec::of("S_TEXT/UTF8"), Some(TextCodec::SText));
-        assert_eq!(TextCodec::of("S_TEXT/ASS"), Some(TextCodec::SText));
+        for ass in ["S_TEXT/ASS", "S_TEXT/SSA", "S_ASS", "S_SSA"] {
+            assert_eq!(TextCodec::of(ass), Some(TextCodec::Ass), "{ass}");
+        }
         assert_eq!(TextCodec::of("S_TEXT/WEBVTT"), Some(TextCodec::SText)); // its cue settings live outside the frame
         assert_eq!(TextCodec::of("D_WEBVTT/SUBTITLES"), Some(TextCodec::WebmVtt));
         assert_eq!(TextCodec::of("D_WEBVTT/CAPTIONS"), Some(TextCodec::WebmVtt));

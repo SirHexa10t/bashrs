@@ -10,7 +10,7 @@
 //! permissions are collected and returned, so the caller can offer a root re-scan (re-exec under the
 //! superuser command) scoped to just those paths; every other file it set out to read but couldn't
 //! — an encrypted or text-less PDF, a damaged file, one the system failed to read — is named at the
-//! end, by why ([`Unsearched`]).
+//! end, by why, and so is a file named like a format it isn't, searched like any other ([`Note`]).
 //!
 //! Two passes on purpose: the filenames pass reads no file *contents* (only directory metadata), so
 //! it's cheap, and running it first gives the "names, then contents" ordering while content matches
@@ -34,7 +34,7 @@ use crate::support::args::{walk, walk_failure};
 use crate::support::doc_style::_header;
 use crate::support::shell;
 use crate::support::streamgrep;
-use delve::{Decoded, Place, Unread};
+use delve::{Decoded, Format, Place, Unread};
 
 // This module's own binary-format decoders (PDFs on every search, media under `--delve`) —
 // `pub(crate)` because the AI-fingerprint scan reads files through `delve::extract` too.
@@ -93,7 +93,7 @@ pub(crate) fn search(expressions: &[String], roots: &[PathBuf], opts: &Options) 
     // still suppressed while saving (below), keeping the saved result stream uncluttered and sortable.
     let color = shell::stdout_color();
     let denied: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
-    let unsearched: UnsearchedFiles = Mutex::new(BTreeSet::new());
+    let noted: NotedFiles = Mutex::new(BTreeSet::new());
 
     if save.is_none() {
         section("matching filenames", color);
@@ -104,12 +104,12 @@ pub(crate) fn search(expressions: &[String], roots: &[PathBuf], opts: &Options) 
     if save.is_none() {
         section("matching file contents", color);
     }
-    let found_contents = search_contents(&matcher, roots, opts, color, &denied, &unsearched, save.as_ref());
+    let found_contents = search_contents(&matcher, roots, opts, color, &denied, &noted, save.as_ref());
 
     if names.is_empty() && !found_contents {
         eprintln!("NO RESULTS FOUND");
     }
-    name_unsearched(unsearched.into_inner().unwrap_or_default());
+    name_noted(noted.into_inner().unwrap_or_default());
     if let Some(save) = &save {
         if let Err(err) = save.finish() {
             eprintln!("gg: could not sort the saved results: {err}");
@@ -275,14 +275,15 @@ fn print_filenames(names: &[PathBuf], matcher: &RegexMatcher, color: ColorChoice
 
 /// Phase 2 — matching file contents, printed `path:line:text` and streamed as each file completes.
 /// Returns whether anything matched. What couldn't be searched is collected on the way: the paths
-/// `denied` for permissions, and every other file it set out to read but couldn't (`unsearched`).
+/// `denied` for permissions, and every other file the end of the search has something to say of
+/// (`noted`).
 fn search_contents(
     matcher: &RegexMatcher,
     roots: &[PathBuf],
     opts: &Options,
     color: ColorChoice,
     denied: &Mutex<BTreeSet<PathBuf>>,
-    unsearched: &UnsearchedFiles,
+    noted: &NotedFiles,
     save: Option<&SaveSink>,
 ) -> bool {
     let bufwtr = BufferWriter::stdout(color);
@@ -292,7 +293,7 @@ fn search_contents(
         bufwtr: &bufwtr,
         found: &found,
         denied,
-        unsearched,
+        noted,
         delve: opts.delve,
         context: opts.context,
         save,
@@ -322,8 +323,8 @@ struct Ctx<'a> {
     bufwtr: &'a BufferWriter,
     found: &'a AtomicBool,
     denied: &'a Mutex<BTreeSet<PathBuf>>,
-    /// Files it set out to read but couldn't, and why — named once the search is done.
-    unsearched: &'a UnsearchedFiles,
+    /// Files the end of the search has something to say of — named once it's done.
+    noted: &'a NotedFiles,
     delve: bool,
     /// Lines of context around each match — in decoded text too.
     context: usize,
@@ -638,14 +639,16 @@ fn scan_file(entry: &DirEntry, searcher: &mut Searcher, buffer: &mut Buffer, ctx
     }
     buffer.clear();
     // A format we understand is decoded and *that* is searched — a PDF always, subtitle tracks and
-    // torrent text under `--delve`; files with no decoder fall through to the normal (raw) search.
+    // torrent text under `--delve`; files with no decoder fall through to the normal (raw) search,
+    // and so does one named like a format it isn't, noted for the end.
     match delve::extract(entry.path(), ctx.delve) {
         Some(Ok(Decoded::Text(sections))) => {
             delve_search(&sections, entry.path(), buffer, ctx);
             emit(entry.path(), buffer, ctx);
             return;
         }
-        Some(Ok(Decoded::Unread(unread))) => return ctx.note(Unsearched::Undecoded(unread), entry.path()),
+        Some(Ok(Decoded::Unread(unread))) => return ctx.note(Note::Undecoded(unread), entry.path()),
+        Some(Ok(Decoded::Misnamed(format))) => ctx.note(Note::Misnamed(format), entry.path()),
         Some(Err(err)) => return ctx.note_read_error(entry.path(), &err),
         None => {}
     }
@@ -693,24 +696,27 @@ fn flush(buffer: &Buffer, ctx: &Ctx) {
     }
 }
 
-/// Every file a search set out to read but couldn't, with why — named at its end.
-type UnsearchedFiles = Mutex<BTreeSet<(Unsearched, PathBuf)>>;
+/// Every file the end of a search names, with what it says of each.
+type NotedFiles = Mutex<BTreeSet<(Note, PathBuf)>>;
 
-/// Why a file the search set out to read went unsearched — each named at the end of the search, so
-/// that nothing is passed over in silence. Permission denials aren't among these: they are offered
-/// a root re-scan instead.
+/// What the end of a search says of a file, each kind under a heading of its own, so that nothing
+/// is passed over in silence: why it went unsearched — or that it is named like a format it isn't,
+/// and was searched like any other file. Permission denials aren't among these: they are offered a
+/// root re-scan instead.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Unsearched {
+enum Note {
     /// Its decoder couldn't get at its text.
     Undecoded(Unread),
     /// It couldn't be read at all: the system's error.
     Unreadable(String),
+    /// Named like this format, but something else: searched like any other file.
+    Misnamed(Format),
 }
 
 impl Ctx<'_> {
-    /// Note `path` as unsearched, for `why`.
-    fn note(&self, why: Unsearched, path: &Path) {
-        self.unsearched.lock().unwrap().insert((why, path.to_path_buf()));
+    /// Note `path`, for the end of the search to say `note` of it.
+    fn note(&self, note: Note, path: &Path) {
+        self.noted.lock().unwrap().insert((note, path.to_path_buf()));
     }
 
     /// Note a path that couldn't be read: one denied for permissions goes to the root re-scan's
@@ -719,45 +725,39 @@ impl Ctx<'_> {
         if err.kind() == io::ErrorKind::PermissionDenied {
             self.denied.lock().unwrap().insert(path.to_path_buf());
         } else {
-            self.note(Unsearched::Unreadable(err.to_string()), path);
+            self.note(Note::Unreadable(err.to_string()), path);
         }
     }
 }
 
-/// How the end of a search heads one kind of unsearched file: what they are, why, and — where
-/// there is one — what would have the next search read them.
-struct Heading {
-    kind: &'static str,
-    why: String,
-    remedy: Option<&'static str>,
-}
-
-impl Heading {
-    fn of(unsearched: &Unsearched) -> Self {
-        match unsearched {
-            Unsearched::Undecoded(unread) => {
-                let (kind, remedy) = match unread {
-                    Unread::Encrypted => ("PDF", Some("decrypt a copy of each to have its text searched")),
-                    Unread::NoText => ("PDF", Some("run a copy of each through OCR to have its text searched")),
-                    Unread::PictureSubtitles => ("video", Some("convert their subtitles to text (OCR) to have them searched")),
-                    Unread::TooLarge | Unread::Damaged => ("file", None),
-                };
-                Self { kind, why: unread.reason(), remedy }
-            }
-            Unsearched::Unreadable(error) => Self { kind: "path", why: format!("couldn't be read: {error}"), remedy: None },
+/// The heading the end of a search gives `count` files it notes for `note`: what they are, what
+/// became of them and why — and, where something would, what would have the next search read them.
+fn heading(note: &Note, count: usize) -> String {
+    match note {
+        Note::Undecoded(unread) => {
+            let (kind, remedy) = match unread {
+                Unread::Encrypted => ("PDF", Some("decrypt a copy of each to have its text searched")),
+                Unread::NoText => ("PDF", Some("run a copy of each through OCR to have its text searched")),
+                Unread::PictureSubtitles => ("video", Some("convert their subtitles to text (OCR) to have them searched")),
+                Unread::TooLarge | Unread::Damaged => ("file", None),
+            };
+            let remedy = remedy.map(|remedy| format!(" — {remedy}")).unwrap_or_default();
+            format!("{count} {kind}(s) skipped ({}){remedy}:", unread.reason())
+        }
+        Note::Unreadable(error) => format!("{count} path(s) skipped (couldn't be read: {error}):"),
+        Note::Misnamed(format) => {
+            format!("{count} file(s) named as {}, but not one — searched like any other file:", format.described())
         }
     }
 }
 
-/// Name every file a search set out to read but couldn't, grouped by why — every one of them:
-/// unlike the permission-denied list, no prompt follows for a long list to scroll away, and each
-/// path is one to act on.
-fn name_unsearched(unsearched: BTreeSet<(Unsearched, PathBuf)>) {
-    let unsearched: Vec<(Unsearched, PathBuf)> = unsearched.into_iter().collect();
-    for group in unsearched.chunk_by(|(one, _), (other, _)| one == other) {
-        let Heading { kind, why, remedy } = Heading::of(&group[0].0);
-        let remedy = remedy.map(|remedy| format!(" — {remedy}")).unwrap_or_default();
-        eprintln!("\n{} {kind}(s) skipped ({why}){remedy}:", group.len());
+/// Name every file a search noted, grouped by what it says of them — every one of them: unlike the
+/// permission-denied list, no prompt follows for a long list to scroll away, and each path is one
+/// to act on.
+fn name_noted(noted: BTreeSet<(Note, PathBuf)>) {
+    let noted: Vec<(Note, PathBuf)> = noted.into_iter().collect();
+    for group in noted.chunk_by(|(one, _), (other, _)| one == other) {
+        eprintln!("\n{}", heading(&group[0].0, group.len()));
         for (_, path) in group {
             eprintln!("  {}", path.display());
         }
@@ -860,7 +860,7 @@ mod tests {
         bufwtr: BufferWriter,
         found: AtomicBool,
         denied: Mutex<BTreeSet<PathBuf>>,
-        unsearched: UnsearchedFiles,
+        noted: NotedFiles,
     }
 
     impl Search {
@@ -870,7 +870,7 @@ mod tests {
                 bufwtr: BufferWriter::stdout(ColorChoice::Never),
                 found: AtomicBool::new(false),
                 denied: Mutex::new(BTreeSet::new()),
-                unsearched: Mutex::new(BTreeSet::new()),
+                noted: Mutex::new(BTreeSet::new()),
             }
         }
 
@@ -880,7 +880,7 @@ mod tests {
                 bufwtr: &self.bufwtr,
                 found: &self.found,
                 denied: &self.denied,
-                unsearched: &self.unsearched,
+                noted: &self.noted,
                 delve: true,
                 context,
                 save: None,
@@ -898,8 +898,8 @@ mod tests {
         ctx.note_read_error(Path::new("/failing"), &io::Error::other("disk on fire"));
         assert_eq!(search.denied.into_inner().unwrap(), BTreeSet::from([PathBuf::from("/locked")]));
         assert_eq!(
-            search.unsearched.into_inner().unwrap(),
-            BTreeSet::from([(Unsearched::Unreadable("disk on fire".to_owned()), PathBuf::from("/failing"))]),
+            search.noted.into_inner().unwrap(),
+            BTreeSet::from([(Note::Unreadable("disk on fire".to_owned()), PathBuf::from("/failing"))]),
         );
     }
 

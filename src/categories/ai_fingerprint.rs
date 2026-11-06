@@ -386,26 +386,32 @@ mod commands {
         use std::io::Read as _;
 
         let size = std::fs::metadata(path)?.len();
-        // A format we decode is told by its name, never by the NUL sniff below: a PDF passes or
-        // fails that by chance, and a PDF passed over is exactly what a scan of a pile of receipts
-        // can't afford. One decoded whole in memory keeps to the size cap; a video is read
-        // piecemeal — only its subtitles — however big.
+        // A format we decode is told by its name and its first bytes, never by the NUL sniff below:
+        // a PDF passes or fails that by chance, and a PDF passed over is exactly what a scan of a
+        // pile of receipts can't afford. One decoded whole in memory keeps to the size cap; a video
+        // is read piecemeal — only its subtitles — however big.
         if let Some(format) = delve::Format::of(path) {
             if format.is_read_whole() && _too_big(path, size, max_bytes) {
                 return Ok(None);
             }
-            return match delve::extract(path, true) {
+            match delve::extract(path, true) {
                 Some(Ok(Decoded::Text(sections))) => {
                     let texts: Vec<Vec<u8>> = sections.into_iter().map(|section| section.text).collect();
-                    Ok(String::from_utf8(texts.join(&b'\n')).ok().filter(|text| !text.trim().is_empty()))
+                    return Ok(String::from_utf8(texts.join(&b'\n')).ok().filter(|text| !text.trim().is_empty()));
                 }
                 Some(Ok(Decoded::Unread(unread))) => {
                     eprintln!("detect_ai_textual_fingerprint: skipping {} ({})", path.display(), unread.reason());
-                    Ok(None)
+                    return Ok(None);
                 }
-                Some(Err(err)) => Err(err),
-                None => Ok(None),
-            };
+                // Named like the format, but something else: read below, like any other file.
+                Some(Ok(Decoded::Misnamed(_))) => eprintln!(
+                    "detect_ai_textual_fingerprint: {} is named as {}, but isn't one — scanned like any other file",
+                    path.display(),
+                    format.described()
+                ),
+                Some(Err(err)) => return Err(err),
+                None => {}
+            }
         }
         let mut file = std::fs::File::open(path)?;
         // Sniff first, read second. A NUL byte in the first few KB is the classic binary test
@@ -689,6 +695,19 @@ mod commands {
             let locked = dir.join("locked.pdf");
             std::fs::write(&locked, pdf.replace("<< /Root 1 0 R >>", "<< /Root 1 0 R /Encrypt << /Filter /Standard >> >>")).unwrap();
             assert_eq!(_read_text(&locked, 16 << 20).unwrap(), None, "encrypted: named and skipped");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A file named like a format it isn't — an INI file Microsoft's SMS named `.pdf` — is read
+        /// like any other file: a carrier in its text is found.
+        #[test]
+        fn a_file_named_like_a_format_it_isn_t_is_read_as_what_it_is() {
+            let dir = std::env::temp_dir().join(format!("bashrs_wm_misnamed_{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let package = dir.join("package.pdf");
+            std::fs::write(&package, "[PDF]\nVersion = 2.0\n[Setup]\nName = zero\u{200B}width\n").unwrap();
+            let text = _read_text(&package, 16 << 20).unwrap().expect("read as the text it is");
+            assert!(!hidden::scan(&text, false, true).is_empty(), "and its carrier reported: {text:?}");
             let _ = std::fs::remove_dir_all(&dir);
         }
 
