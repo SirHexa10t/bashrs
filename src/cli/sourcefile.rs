@@ -217,6 +217,13 @@ fn wrapper_prefix(name: &str) -> Option<ShellText> {
     surfaces().find_map(|surface| (surface.wrapper_prefix)(name))
 }
 
+/// The call printing the reminders at a terminal's start: the binary's reminders command, quiet
+/// when nothing is due.
+fn reminders_call() -> String {
+    use crate::categories::comfy_repos::{REMINDERS_COMMAND, REMINDERS_QUIET};
+    format!("{} {REMINDERS_COMMAND} {REMINDERS_QUIET}", bin())
+}
+
 /// The installed binary, as every function in both files calls it — quoted so `$HOME` expands at
 /// call time and a path with spaces stays one word, which bash and fish read alike.
 fn bin() -> String {
@@ -385,16 +392,19 @@ pub(super) fn generated(shell: Shell) -> (String, Vec<String>) {
     };
     body += &completion;
 
-    // The very end, deliberately: the greeting, and — while an archived config sits unmerged —
-    // its red warning, which is then the closest thing to the user's prompt. Written in, their
-    // text resolved here (`conf::greeting`), so a shell start runs no process for them — made in
-    // a terminal's first shell only, which each file tells itself; zsh makes them at its first
-    // prompt (`bash::greeting`, `fish::greeting`).
+    // The very end, deliberately: the greeting, the reminders, and — while an archived config sits
+    // unmerged — its red warning, which is then the closest thing to the user's prompt. The
+    // greeting and the warning are written in, their text resolved here (`conf::greeting`), so a
+    // shell start runs no process for them; the reminders are one call to the binary, the same
+    // every time, which reads the user's files (`remind`: nothing of them is kept in here). All
+    // made in a terminal's first shell only, which each file tells itself; zsh makes them at its
+    // first prompt (`bash::greeting`, `fish::greeting`).
     let (text, warning, archives) = (greeting::text(), greeting::warning(), config_file::archive_glob());
-    body += "\n# greeting — and, while an archived config waits to be merged, the warning — in a terminal's first shell: the one leading its session\n";
+    let reminders = reminders_call();
+    body += "\n# greeting, reminders — and, while an archived config waits to be merged, the warning — in a terminal's first shell: the one leading its session\n";
     body += &match shell {
-        Shell::Bash => bash::greeting(&text, &warning, &archives),
-        Shell::Fish => fish::greeting(&text, &warning, &archives),
+        Shell::Bash => bash::greeting(&text, &reminders, &warning, &archives),
+        Shell::Fish => fish::greeting(&text, &reminders, &warning, &archives),
     };
 
     let file = match shell {
@@ -598,7 +608,8 @@ mod tests {
             .collect();
         assert_eq!(comment_columns.len(), 1, "bind comments are not aligned: {comment_columns:?}");
         assert!(script.contains(&typed(r"\eh", "brs_sourcefile")), "ALT+H keybind missing");
-        assert!(script.contains(&typed(r"\ew", "brs_configure")), "ALT+W keybind missing");
+        assert!(script.contains(&typed(r"\ew", "brs_edit")), "ALT+W keybind missing");
+        assert!(script.contains(&typed(r"\er", "remind_schedule")), "ALT+R keybind missing");
         assert!(script.contains(&typed(r"\eq", "brs_compile")), "ALT+Q keybind missing");
         assert!(script.contains(&typed(r"\el", "proc_restart_desktop")), "ALT+L keybind missing");
         assert!(script.contains("if [ -n \"$BASH_VERSION\" ]; then"), "keybinds should be bash-guarded");
@@ -927,23 +938,27 @@ mod tests {
         assert!(script.lines().filter(|line| line.trim_start().starts_with("function ")).count() > 100);
     }
 
-    /// Both files end with the greeting and, while an archived config waits, its warning — the last
-    /// thing before the prompt — written in, so that no shell start runs the binary for them: each
-    /// file's last section prints both texts, their escapes spelled out, and calls nothing. Which
-    /// shells greet, and when the warning comes, is driven through the real shells, in each one's
-    /// suite under tests/.
+    /// Both files end with the greeting, the reminders and, while an archived config waits, its
+    /// warning — the last thing before the prompt. The greeting's and the warning's texts are
+    /// written in, their escapes spelled out, so no process runs for them; the one call to the
+    /// binary is the reminders', which reads the user's files — nothing of them is kept in here.
+    /// Which shells greet, and when the warning comes, is driven through the real shells, in each
+    /// one's suite under tests/.
     #[test]
-    fn both_files_end_with_the_greeting_written_in() {
+    fn both_files_end_with_the_greeting_written_in_and_one_call_for_the_reminders() {
         let (text, warning, archives) = (greeting::text(), greeting::warning(), config_file::archive_glob());
+        let reminders = reminders_call();
+        assert!(reminders.ends_with(" remind --quiet"), "{reminders}");
         for (shell, ending) in [
-            (Shell::Bash, bash::greeting(&text, &warning, &archives)),
-            (Shell::Fish, fish::greeting(&text, &warning, &archives)),
+            (Shell::Bash, bash::greeting(&text, &reminders, &warning, &archives)),
+            (Shell::Fish, fish::greeting(&text, &reminders, &warning, &archives)),
         ] {
             assert!(wrappers(shell).ends_with(&ending), "{shell:?}'s file ends with its greeting: {ending}");
-            for printed in [&text, &warning] {
-                assert!(ending.contains(&printf_line(printed, shell)), "{shell:?} prints it: {ending}");
-            }
-            assert!(!ending.contains(&bin()) && !ending.contains('\x1b'), "{shell:?}: no binary call, no raw escape: {ending}");
+            let at = |part: &str| ending.find(part).unwrap_or_else(|| panic!("{shell:?} has {part}: {ending}"));
+            let (greets, reminds, warns) = (at(&printf_line(&text, shell)), at(&reminders), at(&printf_line(&warning, shell)));
+            assert!(greets < reminds && reminds < warns, "{shell:?}: greeting, reminders, warning — in that order: {ending}");
+            assert_eq!(ending.matches(&bin()).count(), 1, "{shell:?}: one binary call, the reminders': {ending}");
+            assert!(!ending.contains('\x1b'), "{shell:?}: no raw escape: {ending}");
         }
     }
 

@@ -1,6 +1,7 @@
 //! Commands backed by my other repos, imported as dependencies. Each is exposed under the
 //! external tool's own name (`table`), a task-named family wrapping its subcommands (`backup_*`
-//! over filesync), a task name of its own (`symlink_devs`, over devmounts' `apply`), or the verb
+//! over filesync, `remind_*` over terminalert), a task name of its own (`symlink_devs`, over
+//! devmounts' `apply`), or the verb
 //! it has always had here (`dl`, over the `vidl` crate, with `dl_fix` over its `repair`) — each
 //! named outright with `#[name]`, being an alias of a repo rather than a command of a bashrs
 //! category (whose prefix `#[unprefixed]` drops), and each reusing the upstream argument structs
@@ -495,6 +496,64 @@ mod commands {
         };
         Some(format!("symlink_devs: to leave CONFIG out, keep exactly one config (a .toml) in {store}, {held}"))
     }
+
+    // --- remind --------------------------------------------------------------
+
+    /// Print what is due in the reminder files: the reminders coming up and due today, and how
+    /// many are pending — the files in ~/.bashrs/user-custom/terminalert, unless --folder names
+    /// others; asked, it says when nothing is. A terminal's first shell runs it as it starts,
+    /// quietly (terminalert show)
+    #[name("remind")]
+    pub fn remind(mut args: terminalert::cli::ShowArgs) {
+        _reminder_folder(&mut args.folder);
+        _terminalert(terminalert::cli::Command::Show(args));
+    }
+
+    /// Mark reminders done or skipped — picked in a form, or named — pushing them aside into
+    /// their topic's .done record, never deleting them (terminalert mark)
+    #[name("remind_mark")]
+    pub fn remind_mark(mut args: terminalert::cli::MarkArgs) {
+        _reminder_folder(&mut args.folder);
+        _terminalert(terminalert::cli::Command::Mark(args));
+    }
+
+    /// Undo a reminder's mark — picked in a form, or named (terminalert undo)
+    #[name("remind_undo")]
+    pub fn remind_undo(mut args: terminalert::cli::UndoArgs) {
+        _reminder_folder(&mut args.folder);
+        _terminalert(terminalert::cli::Command::Undo(args));
+    }
+
+    /// Spell out each reminder topic's schedule: every timing in words with its next dates, and
+    /// every problem in its file (terminalert schedule)
+    #[name("remind_schedule")]
+    pub fn remind_schedule(mut args: terminalert::cli::TopicsArgs) {
+        _reminder_folder(&mut args.folder);
+        _terminalert(terminalert::cli::Command::Schedule(args));
+    }
+
+    /// The folder every `remind*` command reads: the one named, else the reminder store
+    /// ([`Place::TerminalertReminders`]) — handed over as terminalert's own `--folder`, so its
+    /// default (`~/.config/terminalert`) is never this shell's.
+    fn _reminder_folder(folder: &mut terminalert::cli::Folder) {
+        folder.folder.get_or_insert_with(|| Place::TerminalertReminders.path());
+    }
+
+    /// Run one terminalert command, its exit status this process's.
+    fn _terminalert(command: terminalert::cli::Command) {
+        let code = command.run();
+        if code != 0 {
+            std::process::exit(code.into());
+        }
+    }
+
+    /// The command a terminal's first shell runs as it starts, printing the reminders: named once,
+    /// here, for the sourcefile to call — and a test asserts it is a real command, which takes the
+    /// flag the call passes.
+    pub(crate) const REMINDERS_COMMAND: &str = "remind";
+
+    /// The flag the sourcefile's call passes: at a shell's start, nothing due is nothing said.
+    pub(crate) const REMINDERS_QUIET: &str = "--quiet";
 
     #[cfg(test)]
     mod autokey_tests {

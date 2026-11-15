@@ -1067,6 +1067,39 @@ fn the_install_moves_the_old_user_data_to_the_new_homes() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The `remind` commands read the reminder store under `~/.bashrs/user-custom` — never
+/// terminalert's own default folder — unless `--folder` names another; a mark changes the store's
+/// file and keeps its record beside it.
+#[test]
+fn the_remind_commands_read_the_reminder_store() {
+    let home = std::env::temp_dir().join(format!("bashrs_remind_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let store = home.join(".bashrs/user-custom/terminalert");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("housefix.toml"), "pending = '''\n-  Fix the door\n-  Paint\n'''\n").unwrap();
+    let elsewhere = home.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("chores.toml"), "pending = '''\n-  Sweep\n'''\n").unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+            .args(args)
+            .env("HOME", &home)
+            .env("TERMINALERT_CONFIG_DIR", &elsewhere) // terminalert's own default, never this shell's
+            .output()
+            .expect("run bashrs");
+        (String::from_utf8_lossy(&out.stdout).into_owned(), out.status.code())
+    };
+    assert_eq!(run(&["remind"]), ("You have 2 housefix reminders pending.\n".to_owned(), Some(0)));
+    assert!(run(&["remind_schedule"]).0.starts_with("housefix.toml — a to-do list"));
+    let folder = elsewhere.to_str().unwrap();
+    assert_eq!(run(&["remind", "--folder", folder]).0, "You have 1 chores reminders pending.\n");
+    assert!(run(&["remind_mark", "housefix", "Paint"]).0.starts_with("Marked housefix:Paint done"));
+    assert_eq!(std::fs::read_to_string(store.join("housefix.toml")).unwrap(), "pending = '''\n-  Fix the door\n'''\n");
+    assert!(store.join("housefix.done").is_file(), "its record beside it");
+    assert_eq!(run(&["remind_mark", "housefix", "Nope"]).1, Some(2), "terminalert's exit status, passed on");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// `install-stainless --use-stable-carstay`, run for real in the private `home` with `path` as its
 /// `PATH` and nowhere to connect to: every proxy variable aimed at a closed port, and nothing
 /// routing around it — NO_PROXY goes, and so does the system git config, which could name a proxy

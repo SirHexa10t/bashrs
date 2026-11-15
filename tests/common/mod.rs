@@ -25,7 +25,7 @@ fn stand_in() -> String {
         "#!/bin/sh\ncase \"$1\" in\n\
          \x20 hg) exec cat ;;\n\
          \x20 brs_compile) exit \"${{FAKE_EXIT:-0}}\" ;;\n\
-         \x20 complete-flags|brs_sourcefile|shell_def|shell_args_print|lll|cd-listing) exec '{}' \"$@\" ;;\n\
+         \x20 complete-flags|brs_sourcefile|shell_def|shell_args_print|lll|cd-listing|remind) exec '{}' \"$@\" ;;\n\
          esac\n",
         env!("CARGO_BIN_EXE_bashrs")
     )

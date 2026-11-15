@@ -255,6 +255,24 @@ fn the_warning_comes_while_an_archived_config_waits() {
     assert!(stderr().contains("awaits merging"), "so does one from before the name gained .toml.");
 }
 
+/// Fish's file, like bash's: the reminders between the greeting and the warning, from the user's
+/// reminder files.
+#[test]
+fn the_reminders_come_between_the_greeting_and_the_warning() {
+    let home = Home::new("fish_remind");
+    let bashrs = home.dir.join(".bashrs");
+    std::fs::write(bashrs.join("configrs.toml.2026102112.old"), "").unwrap();
+    let reminders = bashrs.join("user-custom/terminalert");
+    std::fs::create_dir_all(&reminders).unwrap();
+    std::fs::write(reminders.join("housefix.toml"), "pending = '''\n-  Fix the door\n'''\n").unwrap();
+    let said = Captured::new(&home.first_fish("source $sourcefile 2>&1").stdout).plain().to_string();
+    let said = lines(&said);
+    assert_eq!(said.len(), 3, "{said:?}");
+    assert!(said[0].starts_with("Loaded Bashrs!"), "{said:?}");
+    assert_eq!(said[1], "You have 1 housefix reminders pending.");
+    assert!(said[2].contains("awaits merging"), "{said:?}");
+}
+
 // ——— What was there before bashrs ———————————————————————————————————————
 
 /// A fish alias is a function, which bashrs's of the name replaces — fish's last definition wins —

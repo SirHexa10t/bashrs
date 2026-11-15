@@ -296,6 +296,27 @@ fn the_warning_comes_while_an_archived_config_waits() {
     assert!(Captured::new(&off.stdout).ends_with("still-off\n"), "and globbing is off again: {}", Captured::new(&off.stdout));
 }
 
+/// The reminders come in a terminal's first shell, between the greeting and the warning — which
+/// stays the last thing before the prompt — printed by the binary from the user's reminder files:
+/// the one call the greeting makes. With none due, nothing at all is said for them.
+#[test]
+fn the_reminders_come_between_the_greeting_and_the_warning() {
+    let home = Home::new("bash_remind");
+    let bashrs = home.dir.join(".bashrs");
+    std::fs::write(bashrs.join("configrs.toml.2026102112.old"), "").unwrap();
+    let quiet = Captured::new(&first_bash(&home, "exec 2>&1", "").stdout).plain().to_string();
+    assert_eq!(lines(&quiet).len(), 2, "greeting and warning only: {quiet}");
+    let reminders = bashrs.join("user-custom/terminalert");
+    std::fs::create_dir_all(&reminders).unwrap();
+    std::fs::write(reminders.join("housefix.toml"), "pending = '''\n-  Fix the door\n'''\n").unwrap();
+    let said = Captured::new(&first_bash(&home, "exec 2>&1", "").stdout).plain().to_string();
+    let said = lines(&said);
+    assert_eq!(said.len(), 3, "{said:?}");
+    assert!(said[0].starts_with("Loaded Bashrs!"), "{said:?}");
+    assert_eq!(said[1], "You have 1 housefix reminders pending.");
+    assert!(said[2].contains("awaits merging"), "{said:?}");
+}
+
 /// With no alias set aside, the record is still there, empty — `shell_def`'s lookup in it needs it
 /// to be an associative array: undeclared, bash would read a name like `..` there as arithmetic,
 /// and the report would never come.

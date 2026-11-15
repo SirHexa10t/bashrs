@@ -2,7 +2,8 @@
 //! under `~/.bashrs/` (whose layout this module owns: [`bashrs_home`], and every [`Place`] in
 //! it): the sourcefile's shell settings (environment/prompt exports, keybinds, the load
 //! greeting), assembled by [`crate::cli`], and the user's hand-edited configuration file
-//! ([`config_file`], opened by `brs_configure`/ALT+W and read wherever behavior is tunable).
+//! ([`config_file`], opened by `brs_configure` — ALT+W's first choice — and read wherever behavior
+//! is tunable).
 //!
 //! Sits below [`crate::tools`] in the crate layering (see [`crate`]'s diagram): tools reads the
 //! config, so nothing here may import upward. Subsystem-derived shell lines (command wrappers,
@@ -93,6 +94,11 @@ pub(crate) enum Place {
     SequencerProfiles,
     /// The devmounts config a bare `symlink_devs` applies; the install creates it.
     DevmountsConfigs,
+    /// The reminder files `remind` and `remind_*` read — terminalert's topics, a file each — with
+    /// terminalert's records of what was marked beside them, `.done` files it alone writes (the
+    /// developer's call: a topic's record lives with it). The install creates it, and every install
+    /// writes terminalert's example files anew into its `examples/`.
+    TerminalertReminders,
 }
 
 impl Place {
@@ -112,6 +118,7 @@ impl Place {
         Place::UserCustom,
         Place::SequencerProfiles,
         Place::DevmountsConfigs,
+        Place::TerminalertReminders,
     ];
 
     /// Where it sits — right in `~/.bashrs` (`None`) or in another place — and its own name.
@@ -130,6 +137,7 @@ impl Place {
             Place::UserCustom => (None, "user-custom"),
             Place::SequencerProfiles => (Some(Place::UserCustom), "sequencer"),
             Place::DevmountsConfigs => (Some(Place::UserCustom), "devmounts"),
+            Place::TerminalertReminders => (Some(Place::UserCustom), "terminalert"),
         }
     }
 
@@ -220,9 +228,10 @@ mod tests {
             Place::UserCustom => 10,
             Place::SequencerProfiles => 11,
             Place::DevmountsConfigs => 12,
+            Place::TerminalertReminders => 13,
         };
         let positions: Vec<usize> = Place::ALL.iter().map(|&place| position(place)).collect();
-        assert_eq!(positions, (0..13).collect::<Vec<_>>());
+        assert_eq!(positions, (0..14).collect::<Vec<_>>());
     }
 
     /// Each name is one path component that every shell reads as it stands, so that a spelling of
@@ -262,7 +271,7 @@ mod tests {
     /// keep for them in `UserAppdata`.
     #[test]
     fn the_users_files_sit_by_who_chose_them() {
-        for written in [Place::SequencerProfiles, Place::DevmountsConfigs] {
+        for written in [Place::SequencerProfiles, Place::DevmountsConfigs, Place::TerminalertReminders] {
             assert_eq!(written.location().0, Some(Place::UserCustom), "{written:?}");
         }
         for kept in [Place::BrowserCookies, Place::OuiCache] {

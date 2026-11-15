@@ -1,4 +1,4 @@
-# bashrs configuration — ticked on and off by `brs_configure` (ALT+W), read when
+# bashrs configuration — ticked on and off by `brs_configure` (ALT+W, then 1), read when
 # commands and compiles run. `brs_configure -e` opens this file in your editor, for
 # adding your own keys or anything the form doesn't show.
 # When bashrs adds or renames settings, an outdated file is archived as configrs.toml.<time>.old

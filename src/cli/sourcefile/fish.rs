@@ -78,12 +78,13 @@ fn clear_completion_links(names: &[&str]) -> String {
 /// as bash's file tells it (`bash::greeting`, which says why the field is cut out exactly).
 /// Unreadable, the file greets. The archives are matched by `set`, which a glob matching nothing
 /// leaves empty — the one place it does: anywhere else, it fails its command.
-pub(super) fn greeting(text: &str, warning: &str, archives: &str) -> String {
+pub(super) fn greeting(text: &str, reminders: &str, warning: &str, archives: &str) -> String {
     format!(
         "set -l __bashrs_stat\n\
          test -r /proc/$fish_pid/stat; and read -l __bashrs_stat < /proc/$fish_pid/stat\n\
          if test -z \"$__bashrs_stat\"; or test (string replace -r -- '^.*\\) \\S+ \\S+ \\S+ (\\S+) .*$' '$1' $__bashrs_stat) = $fish_pid\n    \
          {}\n    \
+         {reminders}  # what is due in the user's reminder files\n    \
          set -l __bashrs_old {}/{archives}\n    \
          set -q __bashrs_old[1]; and {} >&2\n\
          end\n",

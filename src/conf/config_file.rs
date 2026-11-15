@@ -1,5 +1,5 @@
 //! The user's bashrs configuration — `~/.bashrs/configrs.toml`, edited through
-//! `brs_configure`'s form (ALT+W; `-e` opens the file itself) and read wherever behavior is
+//! `brs_configure`'s form (ALT+W's first choice; `-e` opens the file itself) and read wherever behavior is
 //! user-tunable. [`settings`] and [`with_values`] are what that form reads and writes: both work
 //! on the file's LINES, because the comments beside each key are the only documentation it has
 //! and a round-trip through `toml` would drop every one of them. Every reader falls back to the

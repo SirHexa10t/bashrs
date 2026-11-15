@@ -291,7 +291,7 @@ fn zsh_widgets(bindings: &[(&str, &str, Run)]) -> String {
 /// exactly when it leads one. Cut out exactly, not matched loosely: a later field — the
 /// terminal's foreground group — holds the same pid in a shell started from another. Unreadable,
 /// the file greets: a greeting too many beats a warning lost.
-pub(super) fn greeting(text: &str, warning: &str, archives: &str) -> String {
+pub(super) fn greeting(text: &str, reminders: &str, warning: &str, archives: &str) -> String {
     let (text, warning) = (printf_line(text, Shell::Bash), printf_line(warning, Shell::Bash));
     let home = crate::conf::bashrs_home_in_shell();
     format!(
@@ -304,6 +304,7 @@ pub(super) fn greeting(text: &str, warning: &str, archives: &str) -> String {
          function {GREET} {{\n        \
          local __bashrs_entry __bashrs_noglob=\n        \
          {text}\n        \
+         {reminders}  # what is due in the user's reminder files\n        \
          [[ -o noglob ]] && __bashrs_noglob=1 && set +o noglob  # globbing off: on for the glob below\n        \
          for __bashrs_entry in \"{home}\"/*; do  # the whole directory, the binary's at least: no glob here matches nothing, an error in zsh\n            \
          case $__bashrs_entry in */{archives}) {warning} >&2; break ;; esac\n        \

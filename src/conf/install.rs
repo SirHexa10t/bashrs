@@ -49,6 +49,11 @@ pub fn install_shell(bash: &str, fish: &str, fish_completed: &[String]) {
     if let Err(msg) = ensure_stores(&home) {
         die(msg);
     }
+    match seed_reminder_examples(&home) {
+        Ok(Some(examples)) => println!("Refreshed terminalert's example files in {}", examples.display()),
+        Ok(None) => {}
+        Err(msg) => eprintln!("WARNING: {msg}"),
+    }
     match install_binary(&home) {
         // Through a symlink, both ends are named: the file written is not where the user looks.
         Ok(Some(bin)) => match Place::Binary.under(&home) {
@@ -189,9 +194,9 @@ fn ensure_home(home: &Path) -> Result<(), String> {
 }
 
 /// The stores the user fills by hand, each read by a command that takes its contents when it's
-/// given nothing: the binds profiles (a bare `autokey_apply`) and the devmounts config (a bare
-/// `symlink_devs`).
-const STORES: &[Place] = &[Place::SequencerProfiles, Place::DevmountsConfigs];
+/// given nothing: the binds profiles (a bare `autokey_apply`), the devmounts config (a bare
+/// `symlink_devs`) and the reminder files (`remind` and `remind_*`).
+const STORES: &[Place] = &[Place::SequencerProfiles, Place::DevmountsConfigs, Place::TerminalertReminders];
 
 /// Create the [`STORES`] in the `~/.bashrs` at `home` (parameterised like everything here, so
 /// tests install into a temp home). Nothing else creates them — what's in them is hand-written —
@@ -203,6 +208,19 @@ fn ensure_stores(home: &Path) -> Result<(), String> {
         let dir = store.under(home);
         std::fs::create_dir_all(&dir).map_err(|err| format!("could not create {}: {err}", dir.display()))
     })
+}
+
+/// Give the reminder store terminalert's example files, in its `examples/` — anew at every install,
+/// so they keep in step with its format (the developer's call): they're terminalert's, never read
+/// as reminders, and each says it is rewritten. Returns where they are, when any had to be written.
+/// Never fatal: without them, reminders still work.
+fn seed_reminder_examples(home: &Path) -> Result<Option<PathBuf>, String> {
+    let store = Place::TerminalertReminders.under(home);
+    match terminalert::folder::write_examples(&store) {
+        Ok(0) => Ok(None),
+        Ok(_) => Ok(Some(store.join(terminalert::words::EXAMPLES_DIR))),
+        Err(err) => Err(format!("could not write terminalert's examples into {}: {err}", store.display())),
+    }
 }
 
 /// The user directories' earlier names in `~/.bashrs`, each with the place it is now, in the
@@ -646,6 +664,21 @@ mod tests {
         }
         // Idempotent, like the rest of the install: a second run changes nothing.
         assert_eq!(ensure_stores(&home), Ok(()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The reminder store's examples are terminalert's, kept in step at every install: written
+    /// where they're missing or changed, and nothing said where they're as they should be.
+    #[test]
+    fn the_reminder_store_keeps_the_examples_in_step() {
+        let home = scratch("reminder_examples");
+        assert_eq!(ensure_stores(&home), Ok(()));
+        let examples = Place::TerminalertReminders.under(&home).join("examples");
+        assert_eq!(seed_reminder_examples(&home), Ok(Some(examples.clone())));
+        assert_eq!(std::fs::read_dir(&examples).unwrap().count(), terminalert::folder::EXAMPLES.len());
+        assert_eq!(seed_reminder_examples(&home), Ok(None), "already in step: nothing written, nothing said");
+        std::fs::remove_dir_all(&examples).unwrap();
+        assert_eq!(seed_reminder_examples(&home), Ok(Some(examples.clone())), "a deleted folder comes back");
         let _ = std::fs::remove_dir_all(&home);
     }
 

@@ -19,7 +19,7 @@ pub(crate) fn text() -> String {
     let words = format!(
         "Loaded Bashrs! Press {} to view your functions! Press {} to edit configurations!",
         bold(&key_for("brs_sourcefile")),
-        bold(&key_for("brs_configure"))
+        bold(&key_for("brs_edit"))
     );
     _scoped(&_wrap(&[&Weight::Bold, &Basic::Green]), &words)
 }

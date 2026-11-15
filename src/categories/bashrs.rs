@@ -122,6 +122,25 @@ mod commands {
         }
     }
 
+    /// Pick what to change, by its number: the bashrs settings (`brs_configure`'s form), or the
+    /// reminders, marking them done or skipped (`remind_mark`) — ALT+W
+    pub fn edit(_args: NoArgs) {
+        let picks: [(&str, fn()); 2] = [
+            ("the bashrs settings — brs_configure", || configure(ConfigureArgs { editor: false })),
+            ("the reminders: mark them done or skipped — remind_mark", || {
+                crate::categories::comfy_repos::remind_mark(terminalert::cli::MarkArgs::default())
+            }),
+        ];
+        let mut menu = picks
+            .iter()
+            .fold(terminal_choice::Menu::new("What do you want to change?"), |menu, (label, _)| menu.pick(*label));
+        match terminal_choice::run_menu(&mut menu) {
+            Ok(terminal_choice::Chosen::Picked(at)) => (picks[at].1)(),
+            Ok(terminal_choice::Chosen::Cancelled) => println!("brs_edit: unchanged"),
+            Err(err) => eprintln!("brs_edit: {err}"),
+        }
+    }
+
     /// The settings as a form: each `[section]` announced once, each setting's own comment block
     /// above its box. The boxes are ANONYMOUS single-option groups rather than one group per
     /// section, because that's the only shape that lets a setting's explanation sit directly above

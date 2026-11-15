@@ -23,7 +23,8 @@ pub fn bindings() -> &'static [(&'static str, &'static str, Run)] {
         (r"\en", "shell_new", Run::AsTyped),         // ALT+N → start a fresh shell session
         (r"\e\C-n", "shell_bare", Run::AsTyped),     // CTRL+ALT+N → fresh session WITHOUT bashrs (one-shot; any new shell arms again)
         (r"\eh", "brs_sourcefile", Run::AsTyped), // ALT+H → run brs_sourcefile
-        (r"\ew", "brs_configure", Run::AsTyped),  // ALT+W → the settings form
+        (r"\ew", "brs_edit", Run::AsTyped),       // ALT+W → a numbered menu: the settings form, or marking the reminders
+        (r"\er", "remind_schedule", Run::AsTyped), // ALT+R → every reminder: its schedule
         (r"\eq", "brs_compile", Run::AsTyped),    // ALT+Q → run brs_compile
         (r"\el", "proc_restart_desktop", Run::AsTyped), // ALT+L → restart / reload the running desktop environment
         (r"\e=", "term_opacity_up", Run::InPlace),   // ALT+= → a step more opaque: the '+' key, its Shift left out
@@ -37,8 +38,9 @@ pub fn bindings() -> &'static [(&'static str, &'static str, Run)] {
         // readline's own (word motion and friends) — ALT+N and ALT+L given over to bashrs on
         // purpose; ALT+Z/W/H/Q/V were free.
         // ALT+- and ALT+= are readline's digit-argument and possible-completions, and ALT+- is
-        // zsh's neg-argument — given over to bashrs too. '+' takes Shift on US-style layouts, so
-        // ALT+= is bound beside ALT++; fish spells '-' `minus` (`alt--` it rejects).
+        // zsh's neg-argument — given over to bashrs too, and so is ALT+R, readline's revert-line:
+        // the reminders' key. '+' takes Shift on US-style layouts, so ALT+= is bound beside
+        // ALT++; fish spells '-' `minus` (`alt--` it rejects).
     ]
 }
 

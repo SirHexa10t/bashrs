@@ -355,6 +355,17 @@ mod tests {
         );
     }
 
+    /// The command a terminal's first shell runs to print the reminders is named in the sourcefile
+    /// by hand-written text; a rename would leave every terminal running a command that isn't one.
+    #[test]
+    fn the_reminders_call_names_a_real_command() {
+        let command = crate::categories::comfy_repos::REMINDERS_COMMAND;
+        assert!(Cli::command().find_subcommand(command).is_some(), "the sourcefile would run `{command}`, which this shell does not have");
+        let quiet = crate::categories::comfy_repos::REMINDERS_QUIET;
+        let parsed = adjust_pinned(Cli::command()).try_get_matches_from(["bashrs", command, quiet]);
+        assert!(parsed.is_ok(), "`{command}` doesn't take `{quiet}`");
+    }
+
     /// Declaration order is what the generated sourcefile lists commands in, so related ones sit
     /// together. Hiding a pinned flag must not disturb that — `mut_subcommand` re-appends what it
     /// touches, which used to strand every pinned command at the bottom of its category.
@@ -536,8 +547,9 @@ mod tests {
         // `table_fancy`), the verb they have always had here (`dl` and its `dl_fix`, over the
         // `vidl` crate), a task name (`symlink_devs`, over devmounts' `apply`: symlinks to the
         // devices, wherever mounted), or a task-named family — all unprefixed by design
-        // (`backup_*` flattens filesync's subcommands into directly-completable commands, and
-        // `autokey_*` does the same for sequencer's profile and key-naming subcommands).
+        // (`backup_*` flattens filesync's subcommands into directly-completable commands,
+        // `autokey_*` does the same for sequencer's profile and key-naming subcommands, and
+        // `remind` with its `remind_*` for terminalert's).
         assert_prefixed(
             &command_names::<ComfyReposCommand>(),
             "comfy_",
@@ -547,6 +559,7 @@ mod tests {
                 "dl", "dl_fix",
                 "symlink_devs",
                 "autokey_doctor", "autokey_check", "autokey_reformat", "autokey_apply", "autokey_unapply", "autokey_detect", "autokey_list_bashrs_profiles",
+                "remind", "remind_mark", "remind_undo", "remind_schedule",
             ],
         );
     }
