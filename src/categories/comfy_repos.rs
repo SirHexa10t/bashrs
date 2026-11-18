@@ -532,6 +532,15 @@ mod commands {
         _terminalert(terminalert::cli::Command::Schedule(args));
     }
 
+    /// Open a reminder topic's file in your editor — picked from a menu, or named — or make a new
+    /// topic from terminalert's template; its problems are told once the editor closes
+    /// (terminalert edit)
+    #[name("remind_edit")]
+    pub fn remind_edit(mut args: terminalert::cli::EditArgs) {
+        _reminder_folder(&mut args.folder);
+        _terminalert(terminalert::cli::Command::Edit(args));
+    }
+
     /// The folder every `remind*` command reads: the one named, else the reminder store
     /// ([`Place::TerminalertReminders`]) — handed over as terminalert's own `--folder`, so its
     /// default (`~/.config/terminalert`) is never this shell's.

@@ -15,6 +15,11 @@ always_bundle_languages = true
 # false: bundle only what the system lacks — and remove an earlier bundle of one it now has,
 # so the system's own is used.
 always_bundle_utilities = true
+# Bundle the middleware (Proton, the Windows-compatibility layer `gm_run_exe` runs games through)
+# even when the system provides it.
+# false: bundle only what the system lacks — and remove an earlier bundle once the system has its
+# own, so the system's is used.
+always_bundle_middleware = false
 # Install optional extras — tools bashrs never calls itself, but can set up for you instead of a
 # manual install. Off by default (opt-in); when on, each is bundled only if the system lacks it,
 # and an earlier bundle of one the system has is removed.

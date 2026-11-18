@@ -14,6 +14,7 @@ use crate::categories::comfy_repos::ComfyReposCommand;
 use crate::categories::download::DownloadCommand;
 use crate::categories::exposed_helpers::ExposedHelpersCommand;
 use crate::categories::filesystem::FilesystemCommand;
+use crate::categories::gaming::GamingCommand;
 use crate::categories::git::GitCommand;
 use crate::categories::lookup::LookupCommand;
 use crate::categories::media::audio_fx::MediaAudioFxCommand;
@@ -69,6 +70,8 @@ pub enum Command {
     MediaImages(MediaImagesCommand),
     #[command(flatten)]
     MediaCorrection(MediaCorrectionCommand),
+    #[command(flatten)]
+    Gaming(GamingCommand),
     #[command(flatten)]
     ComfyRepos(ComfyReposCommand),
     #[command(flatten)]
@@ -155,6 +158,7 @@ impl Command {
             Command::MediaAudioFx(cmd) => cmd.run(),
             Command::MediaImages(cmd) => cmd.run(),
             Command::MediaCorrection(cmd) => cmd.run(),
+            Command::Gaming(cmd) => cmd.run(),
             Command::ComfyRepos(cmd) => cmd.run(),
             Command::AiFingerprint(cmd) => cmd.run(),
             Command::Network(cmd) => cmd.run(),
@@ -516,6 +520,11 @@ mod tests {
     }
 
     #[test]
+    fn gaming_commands_follow_naming_standard() {
+        assert_prefixed(&command_names::<GamingCommand>(), "gm_", &[]);
+    }
+
+    #[test]
     fn network_commands_follow_naming_standard() {
         // No exceptions: every probe here is a `net_*` verb, and there is no upstream tool whose
         // own name it should borrow.
@@ -559,7 +568,7 @@ mod tests {
                 "dl", "dl_fix",
                 "symlink_devs",
                 "autokey_doctor", "autokey_check", "autokey_reformat", "autokey_apply", "autokey_unapply", "autokey_detect", "autokey_list_bashrs_profiles",
-                "remind", "remind_mark", "remind_undo", "remind_schedule",
+                "remind", "remind_mark", "remind_undo", "remind_schedule", "remind_edit",
             ],
         );
     }

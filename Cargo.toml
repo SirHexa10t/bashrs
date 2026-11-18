@@ -11,7 +11,7 @@ members = ["macros"]
 exclude = ["bashrs_dependencies"]
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "string"] }   # `string`: flags named at run time — `brs_sourcefile`'s, one per section of the sourcefile
 bashrs-macros = { path = "macros" }
 table_formatter = { git = "https://github.com/SirHexa10t/table_formatter.git", branch = "main" }
 filesync = { git = "https://github.com/SirHexa10t/backup_sync.git", branch = "main" }
@@ -24,9 +24,7 @@ sequencer = { package = "sequencer-cli", git = "https://github.com/SirHexa10t/se
 terminal_choice = { git = "https://github.com/SirHexa10t/terminal_choice.git", branch = "main" }   # interactive TUI forms + yes/no prompts (murder's picker/choose UI)
 ai_detection = { git = "https://github.com/SirHexa10t/ai_detection.git", branch = "main" }   # the AI-trace engines behind `detect_ai_textual_fingerprint`: hidden characters, metadata provenance, writing tells
 software_inventory = { git = "https://github.com/SirHexa10t/software_inventory.git", branch = "main" }   # the software-world resource lists: package managers, language ecosystems, browser cookie stores
-# A local path while terminalert is unpushed iteration: back to its git source, as the others are,
-# once it is pushed.
-terminalert = { git = "https://github.com/SirHexa10t/terminalert.git", branch = "main" }  # reminders — what is due in the files of `~/.bashrs/user-custom/terminalert`, behind `remind` and `remind_*`
+terminalert = { git = "https://github.com/SirHexa10t/terminalert.git", branch = "main" }   # reminders — what is due in the files of `~/.bashrs/user-custom/terminalert`, behind `remind` and `remind_*`
 x11rb = { version = "0.14", features = ["res"] }    # X window enumeration for `murder --window` — already in the tree via sequencer, so this adds no new package; `res` asks the X SERVER for each client's true pid (a sandboxed app's self-reported _NET_WM_PID is a pid from inside its namespace)
 synoptic = "2"
 libc = "0.2"
@@ -35,7 +33,7 @@ serde_json = "1"
 grep = "0.4"          # ripgrep's search engine, run in-process by the lookup/style search commands
 regex = "1"           # regex::escape for the g/gg literal (-F) mode, and `diff`'s hunk-header reader — already fully in the tree via synoptic + table_formatter, so this adds zero crates
 ignore = "0.4"        # ripgrep's parallel .gitignore-aware directory walker — the `gg` tree search
-flate2 = "1"          # inflating a PDF's streams for `gg` — already in the tree via lofty, so this adds no new package
+flate2 = "1"          # inflating a PDF's streams for `gg`, and the itch app's gzipped install receipts for `gm_id_itch`; its CRC-32 names `gm_run_exe`'s game folders — already in the tree via lofty, so this adds no new package
 memchr = "2"          # fast byte search through a PDF for `gg` (`obj`, `endstream`) — already in the tree via grep, so this adds no new package
 termcolor = "1"       # ColorChoice for grep's Standard printer, and ColorSpec/WriteColor for the printers that colour their own output (`gg`, `diff` — through support::shell::paint)
 console = "0.16"      # ANSI-escape stripping (strip_ansi_codes) for `lll`'s .lnk detection

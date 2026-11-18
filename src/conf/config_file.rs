@@ -211,6 +211,13 @@ pub(crate) fn always_bundle_utilities() -> bool {
     read().and_then(|config| flag(&config, "tools", "always_bundle_utilities")).unwrap_or(true)
 }
 
+/// Bundle the middleware (Proton, which `gm_run_exe` runs Windows games through) even when the
+/// system provides it (`[tools] always_bundle_middleware`, default `false` — a system's Proton,
+/// kept current by Steam or the package manager, serves as well, and a bundle is hundreds of MB).
+pub(crate) fn always_bundle_middleware() -> bool {
+    read().and_then(|config| flag(&config, "tools", "always_bundle_middleware")).unwrap_or(false)
+}
+
 /// Install the optional extras — tools bashrs doesn't need for its own commands but can set up
 /// for you (`[tools] install_extras`, default `false`). Opt-in on purpose: unlike the
 /// `always_bundle_*` groups, nothing depends on these, so the safe default is to add nothing. When
@@ -247,7 +254,7 @@ mod tests {
         // legal values — all current fields are booleans, and `flag` yields `None` for a non-bool
         // — but the SPECIFIC defaults are the template author's business and may change freely.
         let config: toml::Value = toml::from_str(TEMPLATE).expect("template must stay valid TOML");
-        for key in ["always_bundle_languages", "always_bundle_utilities", "install_extras"] {
+        for key in ["always_bundle_languages", "always_bundle_utilities", "always_bundle_middleware", "install_extras"] {
             assert!(
                 flag(&config, "tools", key).is_some(),
                 "template must carry `[tools] {key}` with a true/false value"
@@ -292,7 +299,12 @@ mod tests {
         let paths: Vec<&str> = found.iter().map(|s| s.path.as_str()).collect();
         assert_eq!(
             paths,
-            ["tools.always_bundle_languages", "tools.always_bundle_utilities", "tools.install_extras"]
+            [
+                "tools.always_bundle_languages",
+                "tools.always_bundle_utilities",
+                "tools.always_bundle_middleware",
+                "tools.install_extras"
+            ]
         );
         for setting in &found {
             assert_eq!(setting.split().0, "tools");

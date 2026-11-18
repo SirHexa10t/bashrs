@@ -13,6 +13,7 @@ pub mod comfy_repos;
 pub mod download;
 pub mod exposed_helpers;
 pub mod filesystem;
+pub mod gaming;
 pub mod git;
 pub mod lookup;
 pub mod media;

@@ -10,8 +10,10 @@
 //! the fallback — except that an activated venv still wins for interactive `python3`.
 
 mod fetch;
+pub(crate) mod proton;
 
 pub use fetch::sync;
+pub(crate) use fetch::bundle_now;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -30,6 +32,10 @@ struct Tool {
     acquire: Acquire,
     /// Which configuration group governs whether it's bundled ([`Group`]).
     group: Group,
+    /// Where the system's own copy is, given the probe (the first `bins` name) — `None` when the
+    /// system has none. A program on `PATH` is found there ([`fetch::system_copy`]); Proton,
+    /// which nothing puts on `PATH`, where Steam and packages keep it ([`proton::on_system`]).
+    system: fn(&str) -> Option<PathBuf>,
     /// A one-time action to run right after this tool is *freshly* fetched (install or update) —
     /// `None` for the tools that need nothing beyond their binary. Fired only on a fetch (see
     /// [`fetch::sync`]), so it does not repeat on later compiles: git-lfs registers Git's global
@@ -43,17 +49,21 @@ type PostInstall = fn(&std::path::Path) -> Result<(), String>;
 
 /// The configuration groups of [`Tool`]s.
 ///
-/// [`Language`](Group::Language) and [`Utility`](Group::Utility) are things bashrs's own commands
-/// depend on, each with an `[tools] always_bundle_*` flag: languages default to bundled (bashrs
-/// and its companion repos run on them — near non-negotiable), utilities to
-/// bundle-only-what's-missing. [`Extra`](Group::Extra) is neither — a useful tool nothing bashrs
-/// calls, off unless `[tools] install_extras` opts in, and then bundled only where the system
-/// lacks it. The distinction is the whole point of the group: an extra failing to install can
-/// never break a bashrs command, because no command relies on one.
+/// [`Language`](Group::Language), [`Utility`](Group::Utility) and
+/// [`Middleware`](Group::Middleware) are things bashrs's own commands depend on, each with an
+/// `[tools] always_bundle_*` flag: languages default to bundled (bashrs and its companion repos
+/// run on them — near non-negotiable), utilities and middleware to bundle-only-what's-missing.
+/// Middleware is what a command runs *other* programs through (Proton, for Windows games): never
+/// run by name, so it gets no PATH shim, and its copies are big — a system's serves as well.
+/// [`Extra`](Group::Extra) is none of these — a useful tool nothing bashrs calls, off unless
+/// `[tools] install_extras` opts in, and then bundled only where the system lacks it. The
+/// distinction is the whole point of the group: an extra failing to install can never break a
+/// bashrs command, because no command relies on one.
 #[derive(Clone, Copy)]
 enum Group {
     Language,
     Utility,
+    Middleware,
     Extra,
 }
 
@@ -88,6 +98,7 @@ const TOOLS: &[Tool] = &[
         acquire: Acquire::Archive(fetch::ffmpeg_url),
         group: Group::Utility,
         post_install: None,
+        system: fetch::system_copy,
     },
     Tool {
         dir: "yt-dlp",
@@ -95,6 +106,7 @@ const TOOLS: &[Tool] = &[
         acquire: Acquire::Binary(fetch::ytdlp_url),
         group: Group::Utility,
         post_install: None,
+        system: fetch::system_copy,
     },
     // uv's archive carries the binaries at its root (no bin/); it manages the python below —
     // which is why it belongs to the Language group despite being a utility in shape.
@@ -104,6 +116,7 @@ const TOOLS: &[Tool] = &[
         acquire: Acquire::Archive(fetch::uv_url),
         group: Group::Language,
         post_install: None,
+        system: fetch::system_copy,
     },
     Tool {
         dir: PYTHON_DIR,
@@ -111,6 +124,7 @@ const TOOLS: &[Tool] = &[
         acquire: Acquire::UvVenv { python: "3.14" },
         group: Group::Language,
         post_install: None,
+        system: fetch::system_copy,
     },
     // deno exists here to serve yt-dlp: YouTube extraction needs a JS runtime (EJS) or formats
     // go missing. Listed after python on purpose — its release is a .zip, and the fetcher
@@ -121,6 +135,20 @@ const TOOLS: &[Tool] = &[
         acquire: Acquire::Archive(fetch::deno_url),
         group: Group::Utility,
         post_install: None,
+        system: fetch::system_copy,
+    },
+    // --- Middleware: what a command runs other programs through (see `Group::Middleware`).
+    // Proton, for `gm_run_exe`: CachyOS's build of Valve's newest Proton, with Wine's Wayland driver
+    // in it, which runs outside Steam as it is. Its archive's root folder is stripped on unpack,
+    // leaving the `proton` script at the dir's root — never shimmed: Proton finds its own files
+    // beside the path it was started by.
+    Tool {
+        dir: proton::PROTON_DIR,
+        bins: &[("proton", "proton")],
+        acquire: Acquire::Archive(fetch::proton_url),
+        group: Group::Middleware,
+        post_install: None,
+        system: proton::on_system,
     },
     // --- Extras: useful, but nothing above depends on them (see `Group::Extra`). Off by default;
     // `[tools] install_extras` opts in, and then only where the system lacks the tool.
@@ -135,6 +163,7 @@ const TOOLS: &[Tool] = &[
         acquire: Acquire::Archive(fetch::gitlfs_url),
         group: Group::Extra,
         post_install: Some(fetch::activate_git_lfs),
+        system: fetch::system_copy,
     },
 ];
 

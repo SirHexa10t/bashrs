@@ -76,6 +76,10 @@ fn brs_configure_creates_the_config_from_the_template_and_opens_it() {
     let again = bashrs(&["brs_configure"], &[("HOME", home.to_str().unwrap()), ("EDITOR", "cat")]);
     assert!(String::from_utf8_lossy(&again.stdout).contains("# my edited config"),
         "a current-shaped config must never be overwritten");
+    // $EDITOR goes through the shell, as git runs it: the editor's flags can be written in it.
+    let flagged = bashrs(&["brs_configure"], &[("HOME", home.to_str().unwrap()), ("EDITOR", "cat -n")]);
+    assert!(String::from_utf8_lossy(&flagged.stdout).starts_with("     1\t# my edited config"),
+        "{}", String::from_utf8_lossy(&flagged.stdout));
 
     // A file with an OUTDATED shape (missing template keys) is archived as `.old` + rewritten.
     std::fs::write(&file, "[tools]\nalways_bundle = true\n").unwrap();
@@ -1067,6 +1071,41 @@ fn the_install_moves_the_old_user_data_to_the_new_homes() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// `brs_sourcefile TERM` prints only the sourcefile's lines holding TERM, as `brs_sourcefile | g
+/// TERM` would — case-insensitive and literal, as `g` matches — and nothing where no line does. A
+/// section's flag prints that section alone, several in the file's order, a TERM searching only
+/// them; a section the file hasn't is said so.
+#[test]
+fn brs_sourcefile_prints_sections_and_the_lines_holding_a_term() {
+    let home = std::env::temp_dir().join(format!("bashrs_sourcefile_term_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(".bashrs")).unwrap();
+    let file = "#!/usr/bin/env bash\n\n# bashrs\nalias ll='ls -l'\nfunction remind() { :; }\n\n# lookup\nalias G='grep'\n\
+                \n# completion (bash only)\ncomplete -F _g g\n";
+    std::fs::write(home.join(".bashrs/sourcefile.sh"), file).unwrap();
+    let run = |args: &[&str]| {
+        let out = bashrs(&[&["brs_sourcefile"], args].concat(), &[("HOME", home.to_str().unwrap())]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let plain = |bytes: &[u8]| console::strip_ansi_codes(&String::from_utf8_lossy(bytes)).into_owned();
+        (plain(&out.stdout), plain(&out.stderr))
+    };
+    assert_eq!(run(&["ALIAS"]).0, "alias ll='ls -l'\nalias G='grep'\n", "case-insensitive");
+    assert_eq!(run(&["remind()"]).0, "function remind() { :; }\n", "literal: no regex in the parentheses");
+    assert_eq!(run(&["nothing like it"]).0, "");
+    assert!(run(&[]).0.contains("# source file: "), "no TERM: the whole file");
+
+    let (lookup, _) = run(&["--lookup"]);
+    assert!(lookup.starts_with("# lookup\nalias G='grep'\n"), "{lookup}");
+    assert!(!lookup.contains("alias ll") && lookup.contains("# source file: "), "{lookup}");
+    let (both, _) = run(&["--lookup", "--bashrs"]);
+    assert!(both.starts_with("# bashrs\n") && both.find("# bashrs") < both.find("# lookup"), "in the file's order: {both}");
+    assert_eq!(run(&["--lookup", "--completion", "g"]).0, "alias G='grep'\ncomplete -F _g g\n", "TERM within the sections");
+    let (none, said) = run(&["--git"]);
+    assert!(said.contains("has no `git` section"), "{said}");
+    assert!(!none.contains("alias"), "{none}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// The `remind` commands read the reminder store under `~/.bashrs/user-custom` — never
 /// terminalert's own default folder — unless `--folder` names another; a mark changes the store's
 /// file and keeps its record beside it.
@@ -1085,18 +1124,21 @@ fn the_remind_commands_read_the_reminder_store() {
             .args(args)
             .env("HOME", &home)
             .env("TERMINALERT_CONFIG_DIR", &elsewhere) // terminalert's own default, never this shell's
+            .env("EDITOR", "true") // `remind_edit` opens and closes at once — never the desktop's opener
             .output()
             .expect("run bashrs");
         (String::from_utf8_lossy(&out.stdout).into_owned(), out.status.code())
     };
-    assert_eq!(run(&["remind"]), ("You have 2 housefix reminders pending.\n".to_owned(), Some(0)));
+    assert_eq!(run(&["remind"]), ("You have 2 pending reminders for housefix.\n".to_owned(), Some(0)));
     assert!(run(&["remind_schedule"]).0.starts_with("housefix.toml — a to-do list"));
     let folder = elsewhere.to_str().unwrap();
-    assert_eq!(run(&["remind", "--folder", folder]).0, "You have 1 chores reminders pending.\n");
+    assert_eq!(run(&["remind", "--folder", folder]).0, "You have 1 pending reminder for chores.\n");
     assert!(run(&["remind_mark", "housefix", "Paint"]).0.starts_with("Marked housefix:Paint done"));
     assert_eq!(std::fs::read_to_string(store.join("housefix.toml")).unwrap(), "pending = '''\n-  Fix the door\n'''\n");
     assert!(store.join("housefix.done").is_file(), "its record beside it");
     assert_eq!(run(&["remind_mark", "housefix", "Nope"]).1, Some(2), "terminalert's exit status, passed on");
+    assert_eq!(run(&["remind_edit", "housefix"]).1, Some(0), "the store's file, opened and read cleanly");
+    assert_eq!(run(&["remind_edit", "chores"]).1, Some(2), "terminalert's own folder isn't the store");
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -1454,6 +1496,509 @@ fn where_nothing_can_change_the_opacity_it_fails_and_names_what_could() {
     assert!(said.contains("nothing here can change the terminal's opacity"), "{said}");
     assert!(said.contains("kitty, Alacritty") && said.contains("KWin, sway, Hyprland"), "{said}");
     assert!(log.is_empty(), "no tool was even tried: {log}");
+}
+
+/// `gm_id_itch` finds an installed game through the receipt in its install, by its page however the
+/// address was pasted, by its name or by its title, and prints the install, the saves' folder that
+/// exists and the id, a line each, under the itch app's data folder of the `XDG_CONFIG_HOME` it's
+/// given. A name nothing here has fails, asking for the page; an address that is no game page
+/// fails too, before anything is looked up.
+#[test]
+fn gm_id_itch_prints_an_installed_games_folder_saves_and_id() {
+    let home = std::env::temp_dir().join(format!("bashrs_itch_home_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let config = home.join("config");
+    let itch = config.join("itch");
+    let install = itch.join("apps/some-game");
+    std::fs::create_dir_all(install.join(".itch")).unwrap();
+    let receipt = r#"{"game":{"id":42,"url":"https://some-creator.itch.io/some-game","title":"Some Game"},"upload":{"type":"html"}}"#;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(receipt.as_bytes()).unwrap();
+    std::fs::write(install.join(".itch/receipt.json.gz"), gz.finish().unwrap()).unwrap();
+    let partition = itch.join("Partitions/gamesession_42");
+    std::fs::create_dir_all(&partition).unwrap();
+    let envs = [("HOME", home.to_str().unwrap()), ("XDG_CONFIG_HOME", config.to_str().unwrap())];
+
+    for named in ["Some-Creator.itch.io/some-game/devlog", "https://some-creator.itch.io/some-game", "some-game", "Some Game"] {
+        let out = bashrs(&["gm_id_itch", named], &envs);
+        assert!(out.status.success(), "{named}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{}\n{}\n42\n", install.display(), partition.display()), "{named}");
+    }
+
+    let unknown = bashrs(&["gm_id_itch", "another-game"], &envs);
+    assert!(!unknown.status.success());
+    let said = String::from_utf8_lossy(&unknown.stderr);
+    assert!(said.contains("no game called another-game is on this computer") && said.contains("creator.itch.io/another-game"), "{said}");
+
+    let refused = bashrs(&["gm_id_itch", "https://itch.io/games"], &envs);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("names no itch.io game"), "{refused:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `gm_id_steam` finds a game in the Steam under `HOME` — one installed in a library that
+/// `libraryfolders.vdf` lists, by its store page, its id or its title, and a non-Steam game an
+/// account added, by its title or its .exe's folder — and prints its install, its Proton prefix,
+/// its Steam Cloud folder where it has one, and its id, a line each. A name nothing here has fails,
+/// asking for the page or the id; an address that holds no game's id fails too.
+#[test]
+fn gm_id_steam_prints_a_games_folder_prefix_cloud_folder_and_id() {
+    let home = std::env::temp_dir().join(format!("bashrs_steam_home_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let steam = home.join(".local/share/Steam");
+    let disk = home.join("disk");
+    let install = disk.join("steamapps/common/Portal 2");
+    let (prefix, cloud) = (disk.join("steamapps/compatdata/620"), steam.join("userdata/76197245/620"));
+    // A non-Steam game, as Steam's binary shortcuts.vdf keeps it, its prefix in Steam's own library.
+    let added = home.join("games/ice/チルノの最強かき氷大作戦！");
+    let added_prefix = steam.join("steamapps/compatdata/3640112877");
+    for dir in [&install, &prefix, &cloud, &steam.join("userdata/76197245/config"), &added, &added_prefix] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(
+        steam.join("steamapps/libraryfolders.vdf"),
+        format!("\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t}}\n}}\n", disk.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        disk.join("steamapps/appmanifest_620.acf"),
+        "\"AppState\"\n{\n\t\"appid\"\t\t\"620\"\n\t\"name\"\t\t\"Portal 2\"\n\t\"installdir\"\t\t\"Portal 2\"\n}\n",
+    )
+    .unwrap();
+    let shortcuts = shortcuts_vdf(&[(3_640_112_877, "itchio-Cirno-ice-shave", &added.join("Game.exe"))]);
+    std::fs::write(steam.join("userdata/76197245/config/shortcuts.vdf"), shortcuts).unwrap();
+    let envs = [("HOME", home.to_str().unwrap())];
+
+    for named in ["https://store.steampowered.com/app/620/Portal_2/", "620", "portal 2"] {
+        let out = bashrs(&["gm_id_steam", named], &envs);
+        assert!(out.status.success(), "{named}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{}\n{}\n{}\n620\n", install.display(), prefix.display(), cloud.display()), "{named}");
+    }
+    for named in ["itchio-cirno-ice-shave", "チルノの最強かき氷大作戦！"] {
+        let out = bashrs(&["gm_id_steam", named], &envs);
+        assert!(out.status.success(), "{named}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{}\n{}\n3640112877\n", added.display(), added_prefix.display()), "{named}");
+    }
+
+    let unknown = bashrs(&["gm_id_steam", "Half-Life 3"], &envs);
+    assert!(!unknown.status.success());
+    let said = String::from_utf8_lossy(&unknown.stderr);
+    assert!(said.contains("no game called Half-Life 3 is on this computer") && said.contains("store.steampowered.com/app/"), "{said}");
+
+    let refused = bashrs(&["gm_id_steam", "https://example.com/app/620"], &envs);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("names no Steam game"), "{refused:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A `shortcuts.vdf` the way Steam writes one (binary KeyValues): a map per non-Steam game an account
+/// added, with the id Steam gave it, its title, and its .exe, quoted.
+fn shortcuts_vdf(games: &[(u32, &str, &Path)]) -> Vec<u8> {
+    let mut vdf = b"\x00shortcuts\x00".to_vec();
+    for (index, (id, title, exe)) in games.iter().enumerate() {
+        vdf.extend(format!("\x00{index}\x00\x02appid\x00").bytes());
+        vdf.extend(id.to_le_bytes());
+        vdf.extend(format!("\x01AppName\x00{title}\x00\x01Exe\x00\"{}\"\x00\x08", exe.display()).bytes());
+    }
+    vdf.extend(b"\x08\x08");
+    vdf
+}
+
+/// A home whose Steam has a non-Steam game added — its .exe, and the prefix Proton made under the id
+/// Steam gave it, holding a marker file — for `gm_run_exe --prefix-continue` and `--take-ownership`:
+/// the home, the .exe, the prefix's folder, and where a stand-in Proton goes.
+fn home_with_steam_prefix(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let home = std::env::temp_dir().join(format!("bashrs_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let steam = home.join(".local/share/Steam");
+    let (exe, prefix) = (home.join("games/ice/Game.exe"), steam.join("steamapps/compatdata/3640112877"));
+    for dir in [&home.join("games/ice"), &prefix.join("pfx"), &steam.join("userdata/76197245/config")] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(&exe, "MZ").unwrap();
+    std::fs::write(prefix.join("pfx/marker"), "Steam's").unwrap();
+    std::fs::write(steam.join("userdata/76197245/config/shortcuts.vdf"), shortcuts_vdf(&[(3_640_112_877, "itchio-Cirno-ice-shave", &exe)])).unwrap();
+    let proton = home.join("protons/stand-in");
+    (home, exe, prefix, proton)
+}
+
+/// `--prefix-continue` runs the game on the prefix Steam made for its .exe, where it is, and
+/// `--take-ownership` on a copy of it in the game's own folder — which a dry run only says it would
+/// make. Refused: taking over where the game's own folder is already there; either, where no
+/// launcher has a prefix for the .exe, or where several have and their menu can't show (stderr is
+/// no terminal here), every one named; and either beside --prefix, or both together.
+#[test]
+fn gm_run_exe_goes_on_from_the_prefix_steam_made_or_says_why_not() {
+    let (home, exe, steams, proton) = home_with_steam_prefix("past_prefix");
+    fake_proton(&proton, "100 stand-in-proton", false, "#!/bin/sh\nexit 0\n");
+    let run = |exe: &Path, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_bashrs"))
+            .args(["gm_run_exe", "--dry-run", "--no-performance", "--proton"])
+            .arg(&proton)
+            .args(args)
+            .arg(exe)
+            .env("HOME", &home)
+            .env_remove("WAYLAND_DISPLAY")
+            .output()
+            .unwrap()
+    };
+    let printed = |out: &Output| String::from_utf8_lossy(&out.stdout).into_owned();
+    let said = |out: &Output| String::from_utf8_lossy(&out.stderr).into_owned();
+
+    let continued = run(&exe, &["--prefix-continue"]);
+    assert!(continued.status.success(), "{}", said(&continued));
+    assert!(printed(&continued).contains(&format!("STEAM_COMPAT_DATA_PATH '{}' ", steams.display())), "{}", printed(&continued));
+
+    let owned = home.join("Games/manual_run_proton_prefixes");
+    let taken = run(&exe, &["--take-ownership"]);
+    assert!(taken.status.success(), "{}", said(&taken));
+    assert!(said(&taken).contains(&format!("would copy Steam's prefix for itchio-Cirno-ice-shave ({}) into {}/ice-", steams.display(), owned.display())), "{}", said(&taken));
+    assert!(printed(&taken).contains(&format!("STEAM_COMPAT_DATA_PATH '{}/ice-", owned.display())), "{}", printed(&taken));
+    assert!(!home.join("Games").exists(), "a dry run copies nothing");
+
+    let mine = owned.join("mine");
+    std::fs::create_dir_all(&mine).unwrap();
+    let there = run(&exe, &["--take-ownership", "--prefix", mine.to_str().unwrap()]);
+    assert_eq!(there.status.code(), Some(1));
+    assert!(said(&there).contains(&format!("{} is already there: the game has a prefix of its own", mine.display())), "{}", said(&there));
+
+    std::fs::write(home.join("games/ice/Other.exe"), "MZ").unwrap();
+    for flag in ["--prefix-continue", "--take-ownership"] {
+        let none = run(&home.join("games/ice/Other.exe"), &[flag]);
+        assert_eq!(none.status.code(), Some(1), "{flag}");
+        assert!(said(&none).contains("no launcher here has a prefix for") && said(&none).contains("(looked in: Steam)"), "{flag}: {}", said(&none));
+    }
+
+    let again = steams.with_file_name("3000000001");
+    std::fs::create_dir_all(again.join("pfx")).unwrap();
+    let both = shortcuts_vdf(&[(3_640_112_877, "itchio-Cirno-ice-shave", &exe), (3_000_000_001, "Ice, again", &exe)]);
+    std::fs::write(home.join(".local/share/Steam/userdata/76197245/config/shortcuts.vdf"), both).unwrap();
+    for flag in ["--prefix-continue", "--take-ownership"] {
+        let several = run(&exe, &[flag]);
+        assert_eq!(several.status.code(), Some(1), "{flag}");
+        let said = said(&several);
+        assert!(said.contains("more than one prefix was made for") && said.contains("the menu to pick one can't show"), "{flag}: {said}");
+        assert!(said.contains(&format!("Steam's prefix for itchio-Cirno-ice-shave ({})", steams.display())), "{flag}: {said}");
+        assert!(said.contains(&format!("Steam's prefix for Ice, again ({})", again.display())), "{flag}: {said}");
+    }
+
+    for clash in [&["--prefix-continue", "--prefix", "/somewhere"][..], &["--prefix-continue", "--take-ownership"]] {
+        assert_eq!(run(&exe, clash).status.code(), Some(2), "{clash:?}");
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `--take-ownership` for real: the prefix Steam made is copied into the game's own folder, its
+/// source left as it was, and the game runs on the copy. Skipped, saying so, where bubblewrap can't
+/// make a sandbox.
+#[test]
+fn gm_run_exe_takes_over_the_prefix_steam_made_and_runs_the_game_on_the_copy() {
+    let sandboxes = Command::new("bwrap").args(["--ro-bind", "/", "/", "true"]).stderr(Stdio::null()).status();
+    if !matches!(sandboxes, Ok(status) if status.success()) {
+        eprintln!("skipped: bubblewrap can't make a sandbox here");
+        return;
+    }
+    let (home, exe, steams, proton) = home_with_steam_prefix("take_ownership");
+    let report = home.join("games/ice/report");
+    let script = format!("#!/bin/sh\n{{ echo \"data=$STEAM_COMPAT_DATA_PATH\"; cat \"$STEAM_COMPAT_DATA_PATH/pfx/marker\"; }} > '{}'\n", report.display());
+    fake_proton(&proton, "100 stand-in-proton", false, &script);
+    let out = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+        .args(["gm_run_exe", "--no-performance", "--take-ownership", "--proton"])
+        .arg(&proton)
+        .arg(&exe)
+        .env("HOME", &home)
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .output()
+        .expect("run bashrs");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}");
+    assert!(said.contains("gm_run_exe: copying Steam's prefix for itchio-Cirno-ice-shave"), "{said}");
+    let owned: Vec<PathBuf> = std::fs::read_dir(home.join("Games/manual_run_proton_prefixes")).unwrap().map(|entry| entry.unwrap().path()).collect();
+    assert_eq!(owned.len(), 1, "only the game's own folder, nothing left beside it: {owned:?}");
+    assert_eq!(std::fs::read_to_string(&report).unwrap(), format!("data={}\nSteam's", owned[0].display()), "the game ran on the copy");
+    assert_eq!(std::fs::read_to_string(owned[0].join("pfx/marker")).unwrap(), "Steam's");
+    assert_eq!(std::fs::read_to_string(steams.join("pfx/marker")).unwrap(), "Steam's", "the source stays");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A stand-in Proton in `dir`: its script (`body`), its version file, and — where `wayland` says
+/// so — Wine's Wayland driver and the switch for it, which is what makes a Proton run games on
+/// Wayland.
+fn fake_proton(dir: &Path, version: &str, wayland: bool, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let switch = if wayland { "# reads PROTON_ENABLE_WAYLAND\n" } else { "" };
+    std::fs::write(dir.join("proton"), format!("{body}{switch}")).unwrap();
+    std::fs::set_permissions(dir.join("proton"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.join("version"), format!("{version}\n")).unwrap();
+    if wayland {
+        let driver = dir.join("files/lib/wine/x86_64-unix/winewayland.so");
+        std::fs::create_dir_all(driver.parent().unwrap()).unwrap();
+        std::fs::write(driver, "").unwrap();
+    }
+}
+
+/// `gm_run_exe` runs the game through Proton inside a sandbox, tried here with a stand-in Proton:
+/// a script that reports what it sees there. Proton's verb, then the game and its arguments as
+/// given; a home of its own, in the game's own folder under `~/Games/manual_run_proton_prefixes`,
+/// writable; no network but
+/// the loopback; nothing of the user's home but the game's folders; the Wayland socket, the
+/// driver's switch and no X display. The game's exit status is the run's. Skipped, saying so,
+/// where bubblewrap can't make a sandbox (no bwrap, or no user namespaces, as in some containers).
+#[test]
+fn gm_run_exe_runs_the_game_in_a_sandbox_that_sees_only_its_own_folders() {
+    let sandboxes = Command::new("bwrap").args(["--ro-bind", "/", "/", "true"]).stderr(Stdio::null()).status();
+    if !matches!(sandboxes, Ok(status) if status.success()) {
+        eprintln!("skipped: bubblewrap can't make a sandbox here");
+        return;
+    }
+    let home = std::env::temp_dir().join(format!("bashrs_run_exe_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let (game, proton, runtime) = (home.join("games/Some Game"), home.join("protons/stand-in"), home.join("run"));
+    for dir in [&game, &runtime] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(home.join("secret.txt"), "the user's own").unwrap();
+    std::fs::write(game.join("game.exe"), "MZ").unwrap();
+    std::fs::write(runtime.join("wayland-test"), "").unwrap(); // stands in for the compositor's socket
+    let report = game.join("report");
+    let script = format!(
+        r#"#!/bin/sh
+{{
+echo "verb=$1"; shift
+echo "game=$1"; shift
+echo "args=$*"
+echo "home=$HOME"
+echo "wayland=$WAYLAND_DISPLAY $PROTON_ENABLE_WAYLAND"
+echo "display=${{DISPLAY:-none}}"
+echo "data=$STEAM_COMPAT_DATA_PATH"
+echo "interfaces=$(grep -c : /proc/net/dev)"
+[ -e '{secret}' ] && echo secret=seen || echo secret=hidden
+[ -e "$XDG_RUNTIME_DIR/wayland-test" ] && echo socket=there || echo socket=missing
+touch "$HOME/written" && echo home=writable
+grep '^Seccomp:' /proc/self/status
+unshare -U true 2>/dev/null && echo userns=made || echo userns=refused
+}} > '{report}'
+exit 7
+"#,
+        secret = home.join("secret.txt").display(),
+        report = report.display(),
+    );
+    fake_proton(&proton, "100 stand-in-proton", true, &script);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bashrs"))
+        .args(["gm_run_exe", "--no-performance", "--proton"])
+        .arg(&proton)
+        .arg(game.join("game.exe"))
+        .args(["-windowed", "two words"])
+        .env("HOME", &home)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("WAYLAND_DISPLAY", "wayland-test")
+        .env_remove("DISPLAY")
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .expect("run bashrs");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(7), "the game's status is the run's: {said}");
+    assert!(said.contains("gm_run_exe: stand-in-proton on Wayland, network off"), "{said}");
+
+    let prefixes: Vec<PathBuf> = std::fs::read_dir(home.join("Games/manual_run_proton_prefixes"))
+        .expect("the game's own folder is made under ~/Games/manual_run_proton_prefixes")
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(prefixes.len(), 1, "{prefixes:?}");
+    let prefix = &prefixes[0];
+    assert!(prefix.file_name().unwrap().to_string_lossy().starts_with("Some Game-"), "{prefix:?}");
+    let report = std::fs::read_to_string(&report).expect("the stand-in reported");
+    let expected = [
+        "verb=waitforexitandrun".to_string(),
+        format!("game={}", game.join("game.exe").display()),
+        "args=-windowed two words".to_string(),
+        format!("home={}", prefix.join("home").display()),
+        "wayland=wayland-test 1".to_string(),
+        "display=none".to_string(),
+        format!("data={}", prefix.display()),
+        "interfaces=1".to_string(),
+        "secret=hidden".to_string(),
+        "socket=there".to_string(),
+        "home=writable".to_string(),
+        // The syscall filter (x86-64's) holds the game: no namespace of its own, by it or by bubblewrap.
+        format!("Seccomp:\t{}", if cfg!(target_arch = "x86_64") { 2 } else { 0 }),
+        "userns=refused".to_string(),
+    ];
+    assert_eq!(report.lines().collect::<Vec<_>>(), expected);
+    assert!(prefix.join("home/written").exists(), "what the game writes in its home stays, in its own folder");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `--dry-run` prints the sandbox's command and runs nothing; what isn't a game, or isn't in the
+/// folder given as the game's, is refused before anything runs.
+#[test]
+fn gm_run_exe_says_what_it_would_run_and_refuses_what_it_cannot() {
+    let home = std::env::temp_dir().join(format!("bashrs_run_exe_dry_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let (game, proton) = (home.join("game"), home.join("proton"));
+    std::fs::create_dir_all(&game).unwrap();
+    std::fs::write(game.join("game.exe"), "MZ").unwrap();
+    fake_proton(&proton, "100 stand-in-proton", false, "#!/bin/sh\nexit 0\n");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_bashrs")).arg("gm_run_exe").args(args).env("HOME", &home).env_remove("WAYLAND_DISPLAY").output().unwrap()
+    };
+    let (exe, proton) = (game.join("game.exe"), proton.to_str().unwrap().to_string());
+    let out = run(&["--dry-run", "--no-performance", "--proton", &proton, exe.to_str().unwrap(), "-arg"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let printed = String::from_utf8_lossy(&out.stdout);
+    assert!(printed.starts_with("bwrap --die-with-parent --new-session"), "{printed}");
+    assert!(printed.contains("--unshare-net") && printed.trim_end().ends_with("-arg"), "{printed}");
+    assert!(!home.join(".bashrs").exists() && !home.join("Games").exists(), "a dry run makes nothing");
+    let by_folder = run(&["--dry-run", "--no-performance", "--proton", &proton, game.to_str().unwrap()]);
+    assert!(by_folder.status.success(), "{}", String::from_utf8_lossy(&by_folder.stderr));
+    assert!(String::from_utf8_lossy(&by_folder.stdout).trim_end().ends_with("game.exe'"), "a folder with one .exe runs it: {by_folder:?}");
+
+    let missing = run(&["--proton", &proton, "/no/such/game.exe"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("gm_run_exe: /no/such/game.exe is no file"), "{missing:?}");
+    let elsewhere = run(&["--proton", &proton, "--game-dir", home.join("proton").to_str().unwrap(), exe.to_str().unwrap()]);
+    assert_eq!(elsewhere.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&elsewhere.stderr).contains("isn't inside the game's folder"), "{elsewhere:?}");
+    let unknown = run(&["--proton", "no-such-proton-anywhere", exe.to_str().unwrap()]);
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("no Proton here is called that"), "{unknown:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// No folder the game may write to may be, or hold, the user's own folders: an .exe right in the
+/// home, or right in Downloads, is refused, as are `--allow` and `--prefix` of such a folder; a
+/// game in a folder of its own inside Downloads is fine. Nothing runs either way (dry runs).
+#[test]
+fn gm_run_exe_refuses_folders_too_broad_for_the_game_to_write_to() {
+    let home = std::env::temp_dir().join(format!("bashrs_broad_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let proton = home.join("protons/stand-in");
+    fake_proton(&proton, "100 stand-in-proton", false, "#!/bin/sh\nexit 0\n");
+    for exe in ["loose.exe", "Downloads/setup.exe", "Downloads/Some Game/game.exe"] {
+        std::fs::create_dir_all(home.join(exe).parent().unwrap()).unwrap();
+        std::fs::write(home.join(exe), "MZ").unwrap();
+    }
+    let run = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bashrs"));
+        command.args(["gm_run_exe", "--dry-run", "--no-performance", "--proton"]).arg(&proton).args(args).env("HOME", &home);
+        for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "WAYLAND_DISPLAY"] {
+            command.env_remove(key);
+        }
+        command.output().unwrap()
+    };
+    let path = |relative: &str| home.join(relative).to_str().unwrap().to_string();
+    let refused = |args: &[&str], said: &str| {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(said), "{args:?}: {stderr}");
+    };
+    refused(&[&path("loose.exe")], &format!("the game could write to all of its folder, {}, and it is your home folder", home.display()));
+    refused(&[&path("Downloads/setup.exe")], "and it is ~/Downloads, one of your own folders (put the .exe in a folder of its own");
+    let game = path("Downloads/Some Game/game.exe");
+    refused(&["--allow", home.to_str().unwrap(), &game], "--allow");
+    refused(&["--prefix", &path("Documents"), &game], "it is ~/Documents, one of your own folders");
+    let fine = run(&[&game]);
+    assert!(fine.status.success(), "{}", String::from_utf8_lossy(&fine.stderr));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `gm_protons` lists the Protons where Steam keeps them — a library's and the compatibility
+/// tools' — newest first, with what each runs games on and which one `gm_run_exe` takes.
+#[test]
+fn gm_protons_lists_steams_protons_newest_first() {
+    let home = std::env::temp_dir().join(format!("bashrs_protons_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let steam = home.join(".local/share/Steam");
+    // Built far in the future, so they top the list whatever the system has.
+    fake_proton(&steam.join("steamapps/common/Proton - Stand-in"), "9999999999 stand-in-experimental", false, "");
+    fake_proton(&steam.join("compatibilitytools.d/Stand-in-Wayland"), "9999999998 stand-in-wayland", true, "");
+    let out = Command::new(env!("CARGO_BIN_EXE_bashrs")).arg("gm_protons").env("HOME", &home).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let listed = String::from_utf8_lossy(&out.stdout);
+    let rows: Vec<&str> = listed.lines().skip(1).collect();
+    assert!(rows[0].starts_with("stand-in-experimental") && rows[0].contains("2286-11-20") && rows[0].contains(" X11 ") && rows[0].contains("with --xwayland"), "{listed}");
+    assert!(rows[1].starts_with("stand-in-wayland") && rows[1].contains(" Wayland ") && rows[1].contains(" yes "), "{listed}");
+    assert!(rows[1].trim_end().ends_with("compatibilitytools.d/Stand-in-Wayland"), "{listed}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `gm_run_exe` on a computer with no Proton at all, made so here by hiding the system's Protons and
+/// giving it an empty home, in an outer bubblewrap: `extra` goes to that bwrap (`--unshare-net`
+/// for one with no network), then the run. Its output; or `None` where bubblewrap can't (said).
+fn run_exe_without_protons(home: &Path, extra: &[&str], exe: &Path) -> Option<Output> {
+    let sandboxes = Command::new("bwrap").args(["--ro-bind", "/", "/", "true"]).stderr(Stdio::null()).status();
+    if !matches!(sandboxes, Ok(status) if status.success()) {
+        eprintln!("skipped: bubblewrap can't make a sandbox here");
+        return None;
+    }
+    let hidden = ["/usr/share/steam", "/usr/local/share/steam"].into_iter().filter(|dir| Path::new(dir).exists());
+    let output = Command::new("bwrap")
+        .args(["--dev-bind", "/", "/"])
+        .args(hidden.flat_map(|dir| ["--tmpfs", dir]))
+        .args(extra)
+        .arg("--")
+        .arg(env!("CARGO_BIN_EXE_bashrs"))
+        .args(["gm_run_exe", "--no-performance"])
+        .arg(exe)
+        .env("HOME", home)
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .output()
+        .expect("run bwrap");
+    Some(output)
+}
+
+/// With no Proton on the computer, `gm_run_exe` goes to the network for one — and with no network,
+/// says it couldn't, and runs nothing.
+#[test]
+fn gm_run_exe_with_no_proton_and_no_network_says_so() {
+    let home = std::env::temp_dir().join(format!("bashrs_no_proton_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("game")).unwrap();
+    std::fs::write(home.join("game/game.exe"), "MZ").unwrap();
+    let Some(out) = run_exe_without_protons(&home, &["--unshare-net"], &home.join("game/game.exe")) else { return };
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{said}");
+    assert!(said.contains("no Proton on this computer — downloading the latest proton-cachyos"), "{said}");
+    assert!(said.contains("gm_run_exe: no Proton on this computer, and none could be downloaded: could not reach GitHub"), "{said}");
+    assert!(!home.join(".bashrs/tools/proton/proton").exists(), "nothing half-made is taken for a Proton");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// With no Proton on the computer, `gm_run_exe` downloads the latest proton-cachyos into
+/// `~/.bashrs/tools/proton` and runs the game on it: a real Windows program, made here with clang
+/// and lld-link, that exits with 42. Live: about 330 MB comes down, so it runs only when asked for.
+#[test]
+#[ignore = "network: downloads proton-cachyos, about 330 MB, and runs a Windows program on it"]
+fn live_gm_run_exe_downloads_a_proton_where_there_is_none_and_runs_on_it() {
+    let home = std::env::temp_dir().join(format!("bashrs_fetched_proton_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let game = home.join("game");
+    std::fs::create_dir_all(&game).unwrap();
+    std::fs::write(game.join("tiny.c"), "int mainCRTStartup(void) { return 42; }\n").unwrap();
+    let built = Command::new("clang")
+        .args(["--target=x86_64-pc-windows-msvc", "-ffreestanding", "-fno-stack-protector", "-O2", "-c", "tiny.c", "-o", "tiny.obj"])
+        .current_dir(&game)
+        .status()
+        .is_ok_and(|status| status.success())
+        && Command::new("lld-link")
+            .args(["/nologo", "/entry:mainCRTStartup", "/subsystem:console", "/nodefaultlib", "tiny.obj", "/out:tiny.exe"])
+            .current_dir(&game)
+            .status()
+            .is_ok_and(|status| status.success());
+    assert!(built, "making the test program takes clang and lld-link");
+    let Some(out) = run_exe_without_protons(&home, &[], &game.join("tiny.exe")) else { return };
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(42), "{said}");
+    assert!(said.contains("downloading the latest proton-cachyos") && said.contains("gm_run_exe: cachyos-"), "{said}");
+    let bundle = home.join(".bashrs/tools/proton");
+    assert!(bundle.join("proton").is_file() && bundle.join("version").is_file(), "{}", bundle.display());
+    assert!(std::fs::read_to_string(bundle.join(".source_url")).unwrap().contains("/CachyOS/proton-cachyos/releases/download/"));
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// Compile-time guard that the fixture path stays valid if this file grows path-dependent tests.

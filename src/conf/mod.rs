@@ -1,7 +1,8 @@
 //! bashrs's own configuration domain — the pieces that define the user's bashrs environment
 //! under `~/.bashrs/` (whose layout this module owns: [`bashrs_home`], and every [`Place`] in
 //! it): the sourcefile's shell settings (environment/prompt exports, keybinds, the load
-//! greeting), assembled by [`crate::cli`], and the user's hand-edited configuration file
+//! greeting), assembled by [`crate::cli`], its sections' order and headers
+//! ([`sourcefile_sections`], read back by `brs_sourcefile`), and the user's hand-edited configuration file
 //! ([`config_file`], opened by `brs_configure` — ALT+W's first choice — and read wherever behavior
 //! is tunable).
 //!
@@ -14,6 +15,7 @@ pub mod environment;
 pub mod greeting;
 pub mod install;
 pub mod keybinds;
+pub mod sourcefile_sections;
 
 use std::path::{Path, PathBuf};
 

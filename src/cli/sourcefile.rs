@@ -28,6 +28,7 @@ use crate::categories::comfy_repos::ComfyReposCommand;
 use crate::categories::download::DownloadCommand;
 use crate::categories::exposed_helpers::ExposedHelpersCommand;
 use crate::categories::filesystem::FilesystemCommand;
+use crate::categories::gaming::GamingCommand;
 use crate::categories::git::GitCommand;
 use crate::categories::lookup::LookupCommand;
 use crate::categories::media::audio_fx::MediaAudioFxCommand;
@@ -93,6 +94,7 @@ const CATEGORIES: &[(&str, &[Surface])] = &[
     ("media", &[surface!(MediaTranscodeCommand), surface!(MediaMetadataCommand),
                 surface!(MediaAudioFxCommand), surface!(MediaImagesCommand),
                 surface!(MediaCorrectionCommand)]),
+    ("gaming", &[surface!(GamingCommand)]),
     ("network", &[surface!(NetworkCommand)]),
     ("packages", &[surface!(PackagesCommand)]),
     ("processes", &[surface!(ProcessesCommand)]),
@@ -417,6 +419,24 @@ pub(super) fn generated(shell: Shell) -> (String, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sections `brs_sourcefile` takes flags for ([`crate::conf::sourcefile_sections`]) are
+    /// the ones both files write, in their order, each found at its header — the categories'
+    /// first, as this generator's table names them. Only the stainless one may be missing: it is
+    /// written when there are stainless repos to alias.
+    #[test]
+    fn the_sections_brs_sourcefile_knows_are_the_files_own() {
+        use crate::conf::sourcefile_sections::{find, SECTIONS};
+        let categories: Vec<&str> = CATEGORIES.iter().map(|(label, _)| *label).collect();
+        assert_eq!(categories, SECTIONS[..categories.len()]);
+        for shell in [Shell::Bash, Shell::Fish] {
+            let (file, _) = generated(shell);
+            let found: Vec<&str> = find(&file).into_iter().map(|(label, _)| label).collect();
+            let written = |label: &&str| *label != "stainless comfy repos" || found.contains(label);
+            let expected: Vec<&str> = SECTIONS.iter().copied().filter(written).collect();
+            assert_eq!(found, expected, "{shell:?}");
+        }
+    }
 
     /// `text` with every run of two-plus spaces collapsed to one — for asserting a line's
     /// CONTENT while staying agnostic about the aligner's gaps, which have their own

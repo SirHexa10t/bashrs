@@ -269,7 +269,7 @@ fn the_reminders_come_between_the_greeting_and_the_warning() {
     let said = lines(&said);
     assert_eq!(said.len(), 3, "{said:?}");
     assert!(said[0].starts_with("Loaded Bashrs!"), "{said:?}");
-    assert_eq!(said[1], "You have 1 housefix reminders pending.");
+    assert_eq!(said[1], "You have 1 pending reminder for housefix.");
     assert!(said[2].contains("awaits merging"), "{said:?}");
 }
 

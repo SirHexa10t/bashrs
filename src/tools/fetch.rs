@@ -27,43 +27,39 @@ pub(super) const SOURCE_MARKER: &str = ".source_url";
 const TAG_MARKER: &str = ".build_tag";
 
 /// SIDE EFFECTS — bundle the tools, keeping each current per its acquisition mode. The
-/// `[tools] always_bundle_languages` / `always_bundle_utilities` settings decide, per group,
-/// whether to bundle even what the system already provides (languages default to yes — bashrs
-/// runs on them, so the project controlling their versions is the reliable default) or only
-/// what the system lacks (the utilities' default).
+/// `[tools] always_bundle_languages` / `always_bundle_utilities` / `always_bundle_middleware`
+/// settings decide, per group, whether to bundle even what the system already provides (languages
+/// default to yes — bashrs runs on them, so the project controlling their versions is the reliable
+/// default) or only what the system lacks (the utilities' and the middleware's default).
 /// `pins` (from Carstay.toml, via `--use-stable-carstay`) names the exact version to provision per tool —
 /// a tool absent from it, or an empty slice, means "the latest published", today's default.
 /// Returns whether anything new landed (a fetch or a fresh environment) — the caller's cue to
 /// point at the stability-revert path. Whatever could not be done goes to `problems`.
 pub fn sync(pins: &[(String, String)], problems: &mut Problems) -> bool {
-    let bundle_languages = config_file::always_bundle_languages();
-    let bundle_utilities = config_file::always_bundle_utilities();
-    let install_extras = config_file::install_extras();
+    let settings = Settings {
+        languages: config_file::always_bundle_languages(),
+        utilities: config_file::always_bundle_utilities(),
+        middleware: config_file::always_bundle_middleware(),
+        extras: config_file::install_extras(),
+    };
 
-    // Plan first, on local information only: a config flag and a PATH probe decide whether this
-    // machine bundles each tool at all, and Carstay names the version when pinned. Settling the
-    // whole set up front costs nothing and keeps these messages in table order.
+    // Plan first, on local information only: a config flag and a look for the system's own copy
+    // (on PATH, or where Steam keeps Proton) decide whether this machine bundles each tool at all,
+    // and Carstay names the version when pinned. Settling the whole set up front costs nothing and
+    // keeps these messages in table order.
     // `None` — not bundled here; `Some(pin)` — bundled, at `pin`'s recorded version if any.
     // Beside it, whether the system has the tool itself.
     let (plan, on_system): (Vec<Option<Option<&str>>>, Vec<bool>) = TOOLS
         .iter()
         .map(|tool| {
             let probe = tool.bins[0].0;
-            let system = system_copy(probe);
+            let system = (tool.system)(probe);
             let present = system.is_some();
-            // Dependencies (Language/Utility) are bundled unless the flag says "only what's
-            // missing" AND the system already has it. An Extra is the mirror: never bundled unless
-            // opted in, and even then only to fill a gap — the user asked for the tool, not
-            // necessarily for OUR copy over one they already have.
-            let (wanted, field) = match tool.group {
-                Group::Language => (bundle_languages || !present, "always_bundle_languages"),
-                Group::Utility => (bundle_utilities || !present, "always_bundle_utilities"),
-                Group::Extra => (install_extras && !present, "install_extras"),
-            };
+            let (wanted, field) = bundling(tool.group, settings, present);
             if !wanted {
                 // "You already have it" is worth saying; a switched-off opt-in extra is not —
                 // that's the default state for everyone, and a line per compile would be noise.
-                let opted_out_extra = matches!(tool.group, Group::Extra) && !install_extras;
+                let opted_out_extra = matches!(tool.group, Group::Extra) && !settings.extras;
                 if let (Some(system), false) = (&system, opted_out_extra) {
                     eprintln!(
                         "tools: {probe} is already on this system ({}) — not bundling (override: [tools] {field} in {})",
@@ -158,6 +154,29 @@ pub fn sync(pins: &[(String, String)], problems: &mut Problems) -> bool {
     fetched_any
 }
 
+/// The `[tools]` settings that decide, per group, what a sync bundles.
+#[derive(Clone, Copy)]
+struct Settings {
+    languages: bool,
+    utilities: bool,
+    middleware: bool,
+    extras: bool,
+}
+
+/// Whether a tool of `group` is bundled here, by the `settings` and by whether the system has its
+/// own (`present`) — and the setting that decides it. A dependency (language, utility, middleware)
+/// is bundled unless its setting says "only what's missing" AND the system already has it. An
+/// extra is the mirror: never bundled unless opted in, and even then only to fill a gap — the user
+/// asked for the tool, not necessarily for OUR copy over one they already have.
+fn bundling(group: Group, settings: Settings, present: bool) -> (bool, &'static str) {
+    match group {
+        Group::Language => (settings.languages || !present, "always_bundle_languages"),
+        Group::Utility => (settings.utilities || !present, "always_bundle_utilities"),
+        Group::Middleware => (settings.middleware || !present, "always_bundle_middleware"),
+        Group::Extra => (settings.extras && !present, "install_extras"),
+    }
+}
+
 /// The GitHub API requests a sync of `plan` makes — [`api_requests`] for each tool it bundles.
 fn lookups_needed(plan: &[Option<Option<&str>>]) -> usize {
     TOOLS.iter().zip(plan).filter_map(|(tool, planned)| planned.map(|pin| api_requests(tool, pin))).sum()
@@ -194,7 +213,7 @@ fn rate_limit_note(urls: &[Option<Result<String, LookupError>>], plan: &[Option<
 /// ([`root`]) — so a bundle's shim, which every bashrs shell puts on `PATH`, is never taken for
 /// the system's, and the answer is the same from whichever shell the compile runs. `None` when
 /// the system has none.
-fn system_copy(program: &str) -> Option<PathBuf> {
+pub(super) fn system_copy(program: &str) -> Option<PathBuf> {
     outside(exec::path_hits(program), &root())
 }
 
@@ -463,10 +482,12 @@ fn uv_managed(args: &[&str]) -> bool {
 
 /// Symlink each of `tool`'s bundled binaries into `~/.bashrs/tools/bin` (refreshing stale links).
 /// A binary that isn't bundled gets no shim — and any leftover one is pruned, so deleting a
-/// bundle by hand doesn't strand a dangling symlink on PATH.
+/// bundle by hand doesn't strand a dangling symlink on PATH. Middleware gets none either: it is
+/// run by its path, never by name (Proton, started through a link, would look for its own files
+/// beside the link).
 fn ensure_shims(tool: &Tool, problems: &mut Problems) {
     for (name, rel) in tool.bins {
-        if !root().join(tool.dir).join(rel).exists() {
+        if !shimmed(tool) || !root().join(tool.dir).join(rel).exists() {
             let _ = std::fs::remove_file(bin_dir().join(name));
             continue;
         }
@@ -493,6 +514,11 @@ fn ensure_shims(tool: &Tool, problems: &mut Problems) {
             problems.report(format!("tools: could not shim {name}: {err}"));
         }
     }
+}
+
+/// Whether `tool`'s programs get PATH shims: all but middleware's, which is run by its path.
+fn shimmed(tool: &Tool) -> bool {
+    !matches!(tool.group, Group::Middleware)
 }
 
 /// The venv-aware shim script: `exec` the binary by its real in-venv path (`$HOME`-based, so a
@@ -882,6 +908,71 @@ fn find_gitlfs_asset(json: &str, arch: &str) -> Option<String> {
             token.starts_with("https://") && token.contains(&infix) && token.ends_with(".tar.gz")
         })
         .map(str::to_owned)
+}
+
+/// Proton for this machine, from CachyOS's latest proton-cachyos release: CachyOS's build of
+/// Valve's newest Proton (its experimental line), with Wine's Wayland driver in it, made to run
+/// outside Steam too. Middleware for `gm_run_exe`, bundled where the system has no Proton (or under
+/// `[tools] always_bundle_middleware`). On x86-64 the build for x86-64-v3 processors, when this
+/// one is one ([`x86_64_v3`]), else the baseline build.
+pub(super) fn proton_url(pin: Option<&str>) -> Result<String, LookupError> {
+    let builds: &[&str] = match std::env::consts::ARCH {
+        "x86_64" if x86_64_v3() => &["x86_64_v3", "x86_64"],
+        "x86_64" => &["x86_64"],
+        "aarch64" => &["arm64"],
+        other => return Err(format!("CachyOS publishes no Proton build for {other}").into()),
+    };
+    find_proton_asset(&release_json("CachyOS/proton-cachyos", pin)?, builds)
+        .ok_or_else(|| missing_from("proton-cachyos", pin, &format!("{} build", builds[0])))
+}
+
+/// The first of `builds` the release has an archive of, by its exact `-<build>.tar.xz` ending —
+/// which `x86_64` and `x86_64_v3` can't satisfy for each other, nor a checksum file for either.
+fn find_proton_asset(json: &str, builds: &[&str]) -> Option<String> {
+    builds.iter().find_map(|build| {
+        let suffix = format!("-{build}.tar.xz");
+        json.split('"').find(|token| token.starts_with("https://") && token.ends_with(&suffix)).map(str::to_owned)
+    })
+}
+
+/// Whether this processor runs x86-64-v3 code: AVX2, FMA and the rest of that level, which a v3
+/// build is compiled to use.
+fn x86_64_v3() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx")
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("bmi1")
+            && std::arch::is_x86_feature_detected!("bmi2")
+            && std::arch::is_x86_feature_detected!("f16c")
+            && std::arch::is_x86_feature_detected!("fma")
+            && std::arch::is_x86_feature_detected!("lzcnt")
+            && std::arch::is_x86_feature_detected!("movbe")
+            && std::arch::is_x86_feature_detected!("xsave")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// SIDE EFFECTS — bundle the tool whose dir is `name` now, outside a compile: the last resort of a
+/// command that found no copy of it anywhere, so it looks the latest release up and downloads it.
+/// `Err` says why it couldn't — offline, nothing published for this machine, the download failed.
+pub(crate) fn bundle_now(name: &str) -> Result<PathBuf, String> {
+    let tool = TOOLS.iter().find(|tool| tool.dir == name).ok_or_else(|| format!("bashrs bundles no {name}"))?;
+    let (Acquire::Archive(resolve) | Acquire::Binary(resolve)) = tool.acquire else {
+        return Err(format!("{name} is made by a compile, not downloaded"));
+    };
+    let url = resolve(None).map_err(|why| why.to_string())?;
+    let dir = root().join(tool.dir);
+    eprintln!("tools: fetching {} into {}", tool.dir, dir.display());
+    match tool.acquire {
+        Acquire::Binary(_) => download_binary(&url, &dir.join(tool.bins[0].1))?,
+        _ => fetch(&url, &dir)?,
+    }
+    let _ = std::fs::write(dir.join(SOURCE_MARKER), &url);
+    Ok(dir)
 }
 
 /// The release asset named exactly `asset` — a `/`-anchored suffix match on the download URL,
@@ -1318,6 +1409,76 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proton_asset_takes_the_best_build_this_machine_runs() {
+        // A release carries a build per processor level, each with a checksum file beside it; the
+        // finder takes the first build asked for that the release has, by its exact ending.
+        let base = "https://github.com/CachyOS/proton-cachyos/releases/download/cachyos-11.0-20261015-slr";
+        let asset = |build: &str| format!("{base}/proton-cachyos-11.0-20261015-slr-{build}");
+        let json = format!(
+            r#"{{"assets":[{{"browser_download_url":"{}"}},{{"browser_download_url":"{}"}},{{"browser_download_url":"{}"}},{{"browser_download_url":"{}"}}]}}"#,
+            asset("arm64.tar.xz"),
+            asset("x86_64.sha512sum"),
+            asset("x86_64.tar.xz"),
+            asset("x86_64_v3.tar.xz"),
+        );
+        assert_eq!(find_proton_asset(&json, &["x86_64_v3", "x86_64"]), Some(asset("x86_64_v3.tar.xz")));
+        assert_eq!(find_proton_asset(&json, &["x86_64"]), Some(asset("x86_64.tar.xz")), "never the v3 build for a baseline machine");
+        assert_eq!(find_proton_asset(&json, &["arm64"]), Some(asset("arm64.tar.xz")));
+        let no_v3 = json.replace("x86_64_v3.tar.xz", "x86_64_v3.tar.zst");
+        assert_eq!(find_proton_asset(&no_v3, &["x86_64_v3", "x86_64"]), Some(asset("x86_64.tar.xz")), "the baseline build when there's no v3 one");
+        assert_eq!(find_proton_asset("{}", &["x86_64"]), None);
+        // The release tag reads out of the chosen URL, so the version marker records it.
+        assert_eq!(release_tag(&asset("x86_64.tar.xz")).as_deref(), Some("cachyos-11.0-20261015-slr"));
+    }
+
+    /// Proton is middleware: bundled by the middleware setting, downloaded as an archive, never
+    /// shimmed (it finds its own files beside the path it's started by), and its system copy
+    /// looked for where Steam keeps Protons rather than on PATH — so asked about `sh`, it finds
+    /// a Proton or nothing, where every other tool's probe finds the `sh` on PATH.
+    #[test]
+    fn proton_is_middleware_found_off_path_and_never_shimmed() {
+        let proton = TOOLS.iter().find(|tool| tool.dir == crate::tools::proton::PROTON_DIR).expect("a proton row");
+        assert!(matches!(proton.group, Group::Middleware));
+        assert!(matches!(proton.acquire, Acquire::Archive(_)));
+        assert!(!shimmed(proton));
+        assert!((proton.system)("sh").is_none_or(|dir| dir.join("proton").is_file()));
+        for tool in TOOLS.iter().filter(|tool| tool.dir != proton.dir) {
+            assert!(shimmed(tool), "{}", tool.dir);
+            assert!((tool.system)("sh").is_some(), "{} looks on PATH", tool.dir);
+        }
+    }
+
+    /// Each group answers to its own setting alone. A dependency — middleware too — is bundled where
+    /// the system lacks it whatever its setting, and where the system has it only when its setting
+    /// says always; an extra only when opted in, and then only where the system lacks it.
+    #[test]
+    fn each_group_is_bundled_by_its_own_setting() {
+        let off = Settings { languages: false, utilities: false, middleware: false, extras: false };
+        let on = Settings { languages: true, utilities: true, middleware: true, extras: true };
+        for group in [Group::Language, Group::Utility, Group::Middleware] {
+            assert!(bundling(group, off, false).0, "missing, so bundled");
+            assert!(!bundling(group, off, true).0, "the system's own is used");
+            assert!(bundling(group, on, true).0, "always");
+        }
+        assert_eq!(bundling(Group::Middleware, off, true), (false, "always_bundle_middleware"));
+        assert!(!bundling(Group::Extra, off, false).0);
+        assert!(bundling(Group::Extra, on, false).0);
+        assert!(!bundling(Group::Extra, on, true).0);
+        let only_middleware = Settings { middleware: true, ..off };
+        assert!(bundling(Group::Middleware, only_middleware, true).0);
+        assert!(!bundling(Group::Utility, only_middleware, true).0);
+        assert!(!bundling(Group::Language, only_middleware, true).0);
+    }
+
+    /// Bundling on demand takes only what a release download makes: an unknown name, or the
+    /// python environment a compile builds, is refused before anything is looked up.
+    #[test]
+    fn bundling_now_refuses_what_it_cannot_download() {
+        assert_eq!(bundle_now("no-such-tool"), Err("bashrs bundles no no-such-tool".to_string()));
+        assert_eq!(bundle_now(crate::tools::PYTHON_DIR), Err("python is made by a compile, not downloaded".to_string()));
     }
 
     #[test]
